@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Вход · JobHunter{% endblock %}
+{% block body_class %}login-page{% endblock %}
+{% block body %}
+<main class="login-card">
+  <div class="login-brand"><div class="brand-mark">JH</div><div><h1>JobHunter</h1><div class="panel-subtitle">Operator Console</div></div></div>
+  <p>Войдите в защищённую панель управления поиском, матчингом и откликами.</p>
+  {% if error %}<div class="notice danger" style="margin-bottom:14px">{{ error }}</div>{% endif %}
+  <form method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="field">Пользователь<input type="text" name="username" autocomplete="username" required autofocus></label>
+    <label class="field">Пароль<input type="password" name="password" autocomplete="current-password" required></label>
+    <button class="btn btn-primary" type="submit">Войти в панель</button>
+  </form>
+  <div style="display:flex;justify-content:center;margin-top:18px"><button class="btn btn-sm btn-ghost" type="button" data-theme-toggle>◐ Сменить тему</button></div>
+</main>
+{% endblock %}

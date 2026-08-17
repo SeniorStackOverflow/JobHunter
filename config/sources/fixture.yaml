@@ -1,0 +1,36 @@
+source:
+  id: fixture_jobs
+  name: Local Fixture Jobs
+  adapter: generic_html
+  base_url: http://fixture-site:8090
+  allowed_domains: [fixture-site]
+  locales:
+    - code: en
+      start_urls: [http://fixture-site:8090/en/jobs]
+    - code: ro
+      start_urls: [http://fixture-site:8090/ro/jobs]
+  discovery:
+    category_pages: [http://fixture-site:8090/en/categories, http://fixture-site:8090/ro/categories]
+    region_pages: [http://fixture-site:8090/en/regions, http://fixture-site:8090/ro/regions]
+  selectors:
+    category_link: a.category
+    region_link: a.region
+    listing_card: section.opening
+    listing_link: a.opening-link
+    next_page: "a.more::attr(href)"
+    job_id: "[data-key]::attr(data-key)"
+    title: h1.role
+    company: a.employer
+    description: div.job-copy
+    salary: dd.pay
+    city: dd.where
+    published_at: time.published
+    updated_at: time.updated
+    email: a.apply-email
+    application_url: "a.official-apply::attr(href)"
+    canonical_url: "link[rel='canonical']::attr(href)"
+  pagination: {mode: next_page}
+  limits: {requests_per_minute: 600, concurrent_requests: 2, max_pages: 1000, max_depth: 100}
+  incremental_scan: {known_unchanged_stop_threshold: 3, max_pages_per_entrypoint: 2}
+  transforms: {id_regex: "/job/([^/?#]+)"}
+

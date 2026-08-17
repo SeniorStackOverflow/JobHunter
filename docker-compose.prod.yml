@@ -1,0 +1,106 @@
+x-production-app: &production-app
+  environment: &production-environment
+    ENVIRONMENT: production
+    DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required in production}
+    REDIS_URL: ${REDIS_URL:?REDIS_URL with the Redis password is required in production}
+    PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required in production}
+    SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required in production}
+    ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH is required in production}
+    TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+    MCP_API_KEYS_HASHED: ${MCP_API_KEYS_HASHED:-[]}
+    REAL_EMAIL_DELIVERY_ENABLED: ${REAL_EMAIL_DELIVERY_ENABLED:-false}
+    EMERGENCY_EMAIL_KILL_SWITCH: ${EMERGENCY_EMAIL_KILL_SWITCH:-false}
+    EMAIL_PROVIDER: ${EMAIL_PROVIDER:-fake}
+    GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
+    GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_MODEL: ${OPENAI_MODEL:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    RESUME_STORAGE_PATH: /data/resumes
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=128m
+  restart: unless-stopped
+
+services:
+  postgres:
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required in production}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        printf 'requirepass %s\nappendonly yes\nappendfsync everysec\n' "$${REDIS_PASSWORD}" > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$${REDIS_PASSWORD} redis-cli ping | grep -q PONG"]
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+
+  migrate:
+    <<: *production-app
+    restart: "no"
+    read_only: true
+
+  api:
+    <<: *production-app
+    volumes:
+      - resumes:/data/resumes
+
+  worker:
+    <<: *production-app
+    volumes:
+      - resumes:/data/resumes:ro
+
+  beat:
+    <<: *production-app
+
+  caddy:
+    environment:
+      CADDY_ADDRESS: ${CADDY_ADDRESS:?CADDY_ADDRESS is required in production}
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+
+  fixture-site:
+    profiles: ["never-production"]
+
+  backup:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+      BACKUP_DIR: /backups
+    security_opt:
+      - no-new-privileges:true
+
+  restore:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+      BACKUP_DIR: /backups
+      BACKUP_FILE: ${BACKUP_FILE:-}
+      RESTORE_CONFIRM: ${RESTORE_CONFIRM:-}
+    security_opt:
+      - no-new-privileges:true

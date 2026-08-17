@@ -1,0 +1,15 @@
+services:
+  api:
+    ports:
+      - "127.0.0.1:${JOBHUNTER_HTTP_PORT:-8091}:8000"
+
+  # TLS is terminated by the server's existing system Caddy instance. Keeping the embedded
+  # proxy behind an inactive profile avoids competing for the host's ports 80 and 443.
+  caddy:
+    profiles: ["embedded-caddy"]
+
+volumes:
+  # This volume is provisioned and restored independently before the application starts.
+  resumes:
+    external: true
+    name: jobhunter_resumes

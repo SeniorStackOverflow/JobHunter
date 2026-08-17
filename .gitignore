@@ -1,0 +1,28 @@
+.env
+.mcp-token
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+storage/
+backups/
+deploy-credentials*.txt
+playwright-report/
+*.db
+.codegraph/
+
+# Local secrets
+.admin-password
+
+# Local backup/editor artifacts
+*.pre-*
+*.bak
+*.backup
+*~

@@ -1,0 +1,47 @@
+source:
+  id: example_jobs
+  name: Example Jobs
+  adapter: generic_html
+  base_url: https://jobs.example.com
+  allowed_domains:
+    - jobs.example.com
+  locales:
+    - code: ru
+      start_urls:
+        - https://jobs.example.com/ru/jobs
+  discovery:
+    category_pages:
+      - https://jobs.example.com/ru/categories
+    region_pages: []
+    additional_entrypoints: []
+  selectors:
+    category_link: null
+    region_link: null
+    listing_card: null
+    listing_link: null
+    next_page: null
+    job_id: null
+    title: null
+    company: null
+    description: null
+    salary: null
+    city: null
+    published_at: null
+    updated_at: null
+    email: null
+  pagination:
+    mode: next_page
+  limits:
+    requests_per_minute: 20
+    concurrent_requests: 2
+    max_pages: 1000
+    max_depth: 100
+  incremental_scan:
+    known_unchanged_stop_threshold: 100
+    max_pages_per_entrypoint: 20
+  transforms:
+    date_formats: []
+    id_regex: null
+    salary_regex: null
+  playwright_fallback: false
+

@@ -1,0 +1,274 @@
+{% extends "base.html" %}
+{% block title %}JobHunter · Панель управления{% endblock %}
+{% block body_class %}dashboard-page{% endblock %}
+{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">JH</div>
+      <div class="brand-copy"><strong>JobHunter</strong><span>Operator Console</span></div>
+    </div>
+
+    <div class="nav-caption">Рабочее пространство</div>
+    <nav class="side-nav">
+      <a class="nav-link" href="#overview" data-section-link data-title="Обзор"><span class="nav-icon">⌂</span><span>Обзор</span></a>
+      <a class="nav-link" href="#jobs" data-section-link data-title="Вакансии"><span class="nav-icon">▣</span><span>Вакансии</span><span class="nav-count">{{ counts.active_jobs }}</span></a>
+      <a class="nav-link" href="#matches" data-section-link data-title="Матчинг"><span class="nav-icon">◎</span><span>Матчинг</span></a>
+      <a class="nav-link" href="#applications" data-section-link data-title="Отклики"><span class="nav-icon">✉</span><span>Отклики</span>{% if counts.pending_review %}<span class="nav-count">{{ counts.pending_review }}</span>{% endif %}</a>
+      <a class="nav-link" href="#scans" data-section-link data-title="Сканы"><span class="nav-icon">↻</span><span>Сканы</span>{% if counts.running_scans %}<span class="nav-count">{{ counts.running_scans }}</span>{% endif %}</a>
+    </nav>
+
+    <div class="nav-caption">Конфигурация</div>
+    <nav class="side-nav">
+      <a class="nav-link" href="#profile" data-section-link data-title="Профиль"><span class="nav-icon">◉</span><span>Профиль</span></a>
+      <a class="nav-link" href="#preferences" data-section-link data-title="Поиск и auto-send"><span class="nav-icon">⚙</span><span>Настройки</span></a>
+      <a class="nav-link" href="#resumes" data-section-link data-title="Резюме"><span class="nav-icon">▤</span><span>Резюме</span></a>
+      <a class="nav-link" href="#sources" data-section-link data-title="Источники"><span class="nav-icon">◫</span><span>Источники</span><span class="nav-count">{{ counts.enabled_sources }}</span></a>
+      <a class="nav-link" href="#health" data-section-link data-title="Система"><span class="nav-icon">◌</span><span>Система</span>{% if counts.unacknowledged_alerts %}<span class="nav-count">{{ counts.unacknowledged_alerts }}</span>{% endif %}</a>
+    </nav>
+
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-status">
+      <span class="badge {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Auto-send на паузе' if preferences.global_pause else ('Auto-send активен' if preferences.auto_send_enabled else 'Auto-send выключен') }}</span>
+      <div class="sidebar-status-row"><span>Источник</span><strong>{{ counts.healthy_sources }}/{{ counts.enabled_sources }} healthy</strong></div>
+      <div class="sidebar-status-row"><span>Matcher</span><strong>{{ overview.rules_version }}</strong></div>
+    </div>
+    <div class="sidebar-footer">
+      <button class="btn btn-icon btn-ghost" type="button" data-theme-toggle title="Сменить тему">◐</button>
+      <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-ghost" style="width:100%">Выйти</button></form>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <div style="display:flex;align-items:center;gap:10px;min-width:0">
+        <button class="btn btn-icon btn-ghost mobile-menu" type="button" data-menu-toggle>☰</button>
+        <div class="topbar-title"><strong data-current-section>Обзор</strong><span>{{ now_local.strftime('%d.%m.%Y · %H:%M') }} · Europe/Chisinau</span></div>
+      </div>
+      <div class="topbar-actions">
+        <form method="get" action="/" style="display:flex;align-items:center;gap:8px">
+          <select name="profile_id" class="btn" onchange="this.form.submit()" aria-label="Выбрать профиль">
+            {% for item in profiles %}<option value="{{ item.id }}" {% if item.id == selected_profile_id %}selected{% endif %}>{{ item.name }}{% if item.is_default %} · default{% endif %}</option>{% endfor %}
+          </select>
+        </form>
+        <span class="badge {{ 'success' if settings.real_email_delivery_enabled else 'muted' }}"><span class="badge-dot"></span>{{ 'Real delivery' if settings.real_email_delivery_enabled else 'Dry run' }}</span>
+        <button class="btn btn-icon btn-ghost" type="button" data-theme-toggle title="Сменить тему">◐</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <section id="overview" class="admin-section">
+        <div class="section-heading">
+          <div><h1>Обзор</h1><p>Главные показатели JobHunter за текущий день и состояние автоматизации прямо сейчас.</p></div>
+          <div class="section-actions"><a class="btn" href="#health">Состояние системы</a><a class="btn btn-primary" href="#applications">Открыть отклики</a></div>
+        </div>
+
+        <div class="status-strip">
+          <span class="status-dot {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'danger') }}"></span>
+          <div><strong>{{ 'Автоотправка временно приостановлена' if preferences.global_pause else ('Автоотправка работает' if preferences.auto_send_enabled else 'Автоотправка выключена') }}</strong><br><span>{% if preferences.global_pause %}Новые отклики не будут отправлены автоматически, пока пауза не снята.{% elif preferences.auto_send_enabled %}Policy и дневной лимит продолжают применяться перед каждой отправкой.{% else %}Автоматическая отправка отключена настройками.{% endif %}</span></div>
+          <span class="badge {{ 'success' if counts.healthy_sources == counts.enabled_sources and counts.enabled_sources else 'warning' }} push">Источники {{ counts.healthy_sources }}/{{ counts.enabled_sources }}</span>
+        </div>
+
+        <div class="grid grid-6" style="margin-bottom:16px">
+          <div class="metric-card"><div class="metric-label">Обработано сегодня</div><div class="metric-value">{{ overview.today_found }}</div><div class="metric-note">{{ overview.today_new }} новых · {{ overview.today_updated }} обновлено</div></div>
+          <div class="metric-card"><div class="metric-label">Матчей сегодня</div><div class="metric-value">{{ overview.today_matches }}</div><div class="metric-note">{{ overview.auto_apply }} AUTO_APPLY · {{ overview.review }} REVIEW</div></div>
+          <div class="metric-card"><div class="metric-label">Backlog</div><div class="metric-value">{{ overview.matching_backlog }}</div><div class="metric-note">активных вакансий ждут {{ overview.rules_version }}</div></div>
+          <div class="metric-card"><div class="metric-label">Отправлено сегодня</div><div class="metric-split"><div class="metric-value">{{ overview.sent_today }}</div><small>/ {{ overview.daily_limit }}</small></div>{% set usage = (overview.sent_today * 100 / overview.daily_limit) if overview.daily_limit else 0 %}<div class="progress"><span style="width:{{ [usage, 100]|min }}%"></span></div></div>
+          <div class="metric-card"><div class="metric-label">На ручной проверке</div><div class="metric-value">{{ counts.pending_review }}</div><div class="metric-note">текущий application backlog</div></div>
+          <div class="metric-card"><div class="metric-label">Активные вакансии</div><div class="metric-value">{{ counts.active_jobs }}</div><div class="metric-note">из {{ counts.jobs }} сохранённых публикаций</div></div>
+        </div>
+
+        <div class="grid grid-2">
+          <div class="panel">
+            <div class="panel-head"><div><div class="panel-title">Последние отклики</div><div class="panel-subtitle">Недавние подготовленные и отправленные applications</div></div><a class="btn btn-sm" href="#applications">Все</a></div>
+            <div class="panel-pad" style="padding-top:8px;padding-bottom:8px">
+              <div class="activity-list">
+                {% for item in applications[:7] %}{% set job = application_jobs.get(item.source_job_id) %}
+                <a class="activity-item" href="/admin/applications/{{ item.id }}">
+                  <div class="activity-time">{{ format_dt(item.sent_at or item.created_at, false) }}</div>
+                  <div><div class="activity-title">{{ job.title if job else item.subject }}</div><div class="activity-meta">{{ job.company if job and job.company else item.subject }}</div></div>
+                  <span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span>
+                </a>
+                {% else %}<div class="empty-state">Откликов пока нет.</div>{% endfor %}
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><div><div class="panel-title">Последние сканы</div><div class="panel-subtitle">Ход обходов источников и ошибки crawler</div></div><a class="btn btn-sm" href="#scans">Все</a></div>
+            <div class="panel-pad" style="padding-top:8px;padding-bottom:8px">
+              <div class="activity-list">
+                {% for item in scans[:7] %}
+                <div class="activity-item">
+                  <div class="activity-time">{{ format_dt(item.started_at, false) }}</div>
+                  <div><div class="activity-title">{{ source_names.get(item.source_id, 'Источник') }} · {{ status_label(item.scan_type) }}</div><div class="activity-meta">{{ item.found_jobs }} найдено · {{ item.new_jobs }} новых · {{ item.updated_jobs }} обновлено</div></div>
+                  <span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span>
+                </div>
+                {% else %}<div class="empty-state">Сканов пока нет.</div>{% endfor %}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="profile" class="admin-section">
+        <div class="section-heading"><div><h1>Профиль</h1><p>Доверенные данные выбранного кандидата. Резюме, matching и отклики изолированы по профилю.</p></div><div class="section-actions">{% if not profile.is_default %}<form method="post" action="/admin/profiles/{{ profile.id }}/default"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn">Сделать default</button></form>{% else %}<span class="badge info">default profile</span>{% endif %}</div></div>
+        <div class="grid grid-2" style="margin-bottom:16px">
+          <div class="panel panel-pad"><div class="panel-title">Текущий профиль</div><div class="panel-subtitle">{{ profile.name }} · {{ profile.id }}</div></div>
+          <div class="panel panel-pad">
+            <form method="post" action="/admin/profiles">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <div class="form-grid"><label class="field">Новый профиль<input type="text" name="name" placeholder="Имя кандидата" required></label><div class="switch-row"><div class="switch-copy"><strong>Default</strong><span>Сделать основным сразу</span></div><label class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></label></div></div>
+              <div class="form-actions"><button class="btn">Создать профиль</button></div>
+            </form>
+          </div>
+        </div>
+        <div class="panel panel-pad">
+          <form method="post" action="/admin/profile">
+            <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-grid">
+              <label class="field">Имя<input type="text" name="name" value="{{ profile.name if profile else '' }}" required></label>
+              <label class="field">Email<input type="email" name="contact_email" value="{{ profile.contact_email if profile and profile.contact_email else '' }}"></label>
+              <label class="field">Телефон<input type="text" name="phone" value="{{ profile.phone if profile and profile.phone else '' }}"></label>
+              <label class="field">Город<input type="text" name="location" value="{{ profile.location if profile and profile.location else '' }}"></label>
+              <label class="field full">Языки <span class="field-help">Через запятую</span><input type="text" name="languages" value="{{ profile.languages|map(attribute='code')|join(', ') if profile else '' }}"></label>
+              <label class="field full">Навыки <span class="field-help">Через запятую</span><input type="text" name="skills" value="{{ profile.skills|join(', ') if profile else '' }}"></label>
+            </div>
+            <div class="form-actions"><button class="btn btn-primary">Сохранить профиль</button></div>
+          </form>
+        </div>
+      </section>
+
+      <section id="preferences" class="admin-section">
+        <div class="section-heading"><div><h1>Поиск и auto-send</h1><p>Критерии поиска, пороги матчинга и предохранители автоматической отправки.</p></div></div>
+        <div class="grid grid-3" style="margin-bottom:16px">
+          <div class="metric-card"><div class="metric-label">Auto-send</div><div style="margin-top:15px"><span class="badge {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Глобальная пауза' if preferences.global_pause else ('Включён' if preferences.auto_send_enabled else 'Выключен') }}</span></div><div class="metric-note">реальная доставка: {{ 'включена' if settings.real_email_delivery_enabled else 'выключена' }}</div></div>
+          <div class="metric-card"><div class="metric-label">Дневной лимит</div><div class="metric-value">{{ preferences.maximum_daily_applications }}</div><div class="metric-note">сегодня использовано {{ overview.sent_today }}</div></div>
+          <div class="metric-card"><div class="metric-label">Минимальный score</div><div class="metric-value">{{ preferences.minimum_auto_send_score }}</div><div class="metric-note">порог автоматического отклика</div></div>
+        </div>
+
+        <div class="panel panel-pad" style="margin-bottom:16px">
+          <div style="display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+            <div><div class="panel-title">Аварийная пауза отправки</div><div class="panel-subtitle">Меняет только состояние auto-send. Критерии поиска не затрагиваются.</div></div>
+            <form method="post" action="/admin/pause/{{ 'false' if preferences.global_pause else 'true' }}" data-confirm="{{ 'Снять глобальную паузу и разрешить auto-send?' if preferences.global_pause else 'Немедленно поставить auto-send на глобальную паузу?' }}">
+              <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="btn {{ 'btn-primary' if preferences.global_pause else 'btn-danger' }}">{{ 'Снять паузу' if preferences.global_pause else 'Поставить на паузу' }}</button>
+            </form>
+          </div>
+        </div>
+
+        <div class="panel panel-pad">
+          <form method="post" action="/admin/preferences">
+            <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-grid">
+              <label class="field full">Разрешённые категории <span class="field-help">Через запятую</span><input type="text" name="allowed_categories" value="{{ preferences.allowed_categories|join(', ') }}"></label>
+              <label class="field">Категории auto-send<input type="text" name="auto_send_categories" value="{{ preferences.auto_send_categories|join(', ') }}"></label>
+              <label class="field">Запрещённые категории<input type="text" name="forbidden_categories" value="{{ preferences.forbidden_categories|join(', ') }}"></label>
+              <label class="field">Разрешённые города<input type="text" name="allowed_cities" value="{{ preferences.allowed_cities|join(', ') }}"></label>
+              <label class="field">Дневной лимит<input type="number" min="0" max="100" name="maximum_daily_applications" value="{{ preferences.maximum_daily_applications }}"></label>
+              <label class="field">Минимальный score<input type="number" min="0" max="100" name="minimum_auto_send_score" value="{{ preferences.minimum_auto_send_score }}"></label>
+              <div class="full grid grid-3">
+                <div class="switch-row"><div class="switch-copy"><strong>Remote</strong><span>Разрешать удалённые вакансии</span></div><label class="switch"><input type="checkbox" name="remote_allowed" {% if preferences.remote_allowed %}checked{% endif %}><span class="switch-ui"></span></label></div>
+                <div class="switch-row"><div class="switch-copy"><strong>Без опыта</strong><span>Рассматривать entry-level роли</span></div><label class="switch"><input type="checkbox" name="willing_without_experience" {% if preferences.willing_without_experience %}checked{% endif %}><span class="switch-ui"></span></label></div>
+                <div class="switch-row"><div class="switch-copy"><strong>Вне основного CV</strong><span>Допускать смену категории</span></div><label class="switch"><input type="checkbox" name="consider_outside_primary_resume" {% if preferences.consider_outside_primary_resume %}checked{% endif %}><span class="switch-ui"></span></label></div>
+              </div>
+            </div>
+            <div class="form-actions"><button class="btn btn-primary">Сохранить настройки</button></div>
+          </form>
+        </div>
+      </section>
+
+      <section id="resumes" class="admin-section">
+        <div class="section-heading"><div><h1>Резюме</h1><p>Управление CV, их категориями и верификацией.</p></div></div>
+        <div class="grid grid-2">
+          <div class="panel panel-pad">
+            <div class="panel-title" style="margin-bottom:14px">Добавить резюме</div>
+            <form method="post" action="/admin/resumes" enctype="multipart/form-data">
+              <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <div class="form-grid">
+                <label class="field">Название<input type="text" name="name" required></label>
+                <label class="field">Категория<input type="text" name="category" required></label>
+                <label class="field full">PDF<input type="file" name="file" accept="application/pdf,.pdf" required></label>
+                <div class="switch-row full"><div class="switch-copy"><strong>Сделать основным</strong><span>Использовать как default resume</span></div><label class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></label></div>
+              </div>
+              <div class="form-actions"><button class="btn btn-primary">Загрузить PDF</button></div>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><div><div class="panel-title">Сохранённые резюме</div><div class="panel-subtitle">{{ resumes|length }} в текущем профиле</div></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Резюме</th><th>Статус</th><th></th></tr></thead><tbody>
+              {% for item in resumes %}<tr><td><div class="cell-title">{{ item.name }}{% if item.is_default %} <span class="badge info">default</span>{% endif %}</div><div class="cell-meta">{{ item.category }} · {{ item.original_filename }}</div></td><td><span class="badge {{ 'success' if item.verified and item.active else ('warning' if item.active else 'muted') }}">{{ 'Verified · active' if item.verified and item.active else ('Unverified' if not item.verified else 'Inactive') }}</span></td><td><div class="cell-actions">{% if not item.verified %}<form method="post" action="/admin/resumes/{{ item.id }}/verify"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Подтвердить</button></form>{% endif %}</div></td></tr>
+              {% else %}<tr><td colspan="3"><div class="empty-state">Резюме ещё не загружены.</div></td></tr>{% endfor %}
+            </tbody></table></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="sources" class="admin-section">
+        <div class="section-heading"><div><h1>Источники</h1><p>Настроенные job boards и адаптеры. Выключенные тестовые источники не считаются проблемой health.</p></div><div class="section-actions"><span class="badge {{ 'success' if counts.healthy_sources == counts.enabled_sources and counts.enabled_sources else 'warning' }}">{{ counts.healthy_sources }} healthy / {{ counts.enabled_sources }} enabled / {{ sources|length }} configured</span></div></div>
+        <div class="grid grid-2">
+          {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}
+          <div class="source-card">
+            <div class="source-main"><h3>{% if source_link %}<a href="{{ source_link }}" rel="noreferrer" target="_blank">{{ item.name }} ↗</a>{% else %}{{ item.name }}{% endif %}</h3><p>{{ item.base_url }}</p><div class="source-meta"><span class="badge {{ status_tone(item.health_status) }}"><span class="badge-dot"></span>{{ status_label(item.health_status) }}</span><span class="badge muted">{{ item.adapter_type }}</span><span class="badge {{ 'success' if item.enabled else 'muted' }}">{{ 'Enabled' if item.enabled else 'Disabled' }}</span></div></div>
+            <div class="source-actions"><form method="post" action="/admin/sources/{{ item.id }}/toggle" data-confirm="{{ 'Выключить источник ' ~ item.name ~ '?' if item.enabled else 'Включить источник ' ~ item.name ~ '?' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm {{ 'btn-danger' if item.enabled else '' }}">{{ 'Выключить' if item.enabled else 'Включить' }}</button></form>{% if item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Incremental</button></form><form method="post" action="/admin/sources/{{ item.id }}/scan/full" data-confirm="Запустить полный скан {{ item.name }}? Это может занять заметное время."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-warning">Full scan</button></form>{% endif %}</div>
+          </div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section id="scans" class="admin-section">
+        <div class="section-heading"><div><h1>Сканы</h1><p>Последние обходы источников, объём найденных вакансий и ошибки crawler.</p></div><div class="section-actions"><span class="badge {{ 'success' if counts.running_scans == 0 else 'warning' }}">{{ counts.running_scans }} active</span></div></div>
+        <div class="panel"><div class="table-tools"><div class="table-search"><input type="text" placeholder="Найти скан…" data-table-filter="scans-table"></div></div><div class="table-wrap"><table id="scans-table"><thead><tr><th>Время</th><th>Источник / тип</th><th>Статус</th><th>Результат</th><th>Ошибки</th></tr></thead><tbody>
+          {% for item in scans %}<tr><td><div class="cell-title">{{ format_dt(item.started_at) }}</div><div class="cell-meta">{% if item.finished_at %}до {{ format_dt(item.finished_at, false) }}{% else %}—{% endif %}</div></td><td><div class="cell-title">{{ source_names.get(item.source_id, 'Источник') }}</div><div class="cell-meta">{{ status_label(item.scan_type) }}</div></td><td><span class="badge {{ status_tone(item.status) }}"><span class="badge-dot"></span>{{ status_label(item.status) }}</span></td><td><div class="cell-title">{{ item.found_jobs }} найдено</div><div class="cell-meta">{{ item.new_jobs }} новых · {{ item.updated_jobs }} обновлено · {{ item.scanned_pages }} стр.</div></td><td>{% set err = item.parsing_errors + item.network_errors %}<span class="badge {{ 'danger' if err else 'success' }}">{{ err }}</span></td></tr>
+          {% else %}<tr><td colspan="5"><div class="empty-state">Истории сканов пока нет.</div></td></tr>{% endfor %}
+        </tbody></table></div></div>
+      </section>
+
+      <section id="jobs" class="admin-section">
+        <div class="section-heading"><div><h1>Вакансии</h1><p>Последние 50 публикаций. Поиск работает прямо в таблице без перезагрузки.</p></div><div class="section-actions"><span class="badge success">{{ counts.active_jobs }} active</span><span class="badge muted">{{ counts.jobs }} total</span></div></div>
+        <div class="panel"><div class="table-tools"><div class="table-search"><input type="text" placeholder="Название, компания, город…" data-table-filter="jobs-table"></div></div><div class="table-wrap"><table id="jobs-table"><thead><tr><th>Вакансия</th><th>Источник</th><th>Категория</th><th>Статус</th><th>Последний раз</th></tr></thead><tbody>
+          {% for item in jobs %}{% set job_link = safe_external_link(item.canonical_url) %}<tr><td><div class="cell-title">{% if job_link %}<a href="{{ job_link }}" rel="noreferrer" target="_blank">{{ item.title }} ↗</a>{% else %}{{ item.title }}{% endif %}</div><div class="cell-meta">{{ item.company or 'Компания не указана' }}{% if item.location %} · {{ item.location }}{% endif %}{% if item.salary_text %} · {{ item.salary_text }}{% endif %}</div></td><td><div class="cell-muted">{{ source_names.get(item.source_id, '—') }}</div></td><td><div class="cell-muted">{{ item.category or item.subcategory or '—' }}</div></td><td><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></td><td><div class="cell-muted">{{ format_dt(item.last_seen_at) }}</div></td></tr>
+          {% else %}<tr><td colspan="5"><div class="empty-state">Вакансий пока нет.</div></td></tr>{% endfor %}
+        </tbody></table></div></div>
+      </section>
+
+      <section id="matches" class="admin-section">
+        <div class="section-heading"><div><h1>Матчинг</h1><p>Последние решения matcher'а с итоговым score и кратким объяснением.</p></div><div class="section-actions"><span class="badge success">{{ overview.auto_apply }} AUTO_APPLY today</span><span class="badge warning">{{ overview.review }} REVIEW</span><span class="badge muted">{{ overview.skip }} SKIP</span></div></div>
+        <div class="panel"><div class="table-tools"><div class="table-search"><input type="text" placeholder="Вакансия, решение, причина…" data-table-filter="matches-table"></div></div><div class="table-wrap"><table id="matches-table"><thead><tr><th>Вакансия</th><th>Score</th><th>Решение</th><th>Объяснение</th><th>Время</th></tr></thead><tbody>
+          {% for item in matches %}{% set job = match_jobs.get(item.source_job_id) %}<tr><td><div class="cell-title">{{ job.title if job else 'Вакансия' }}</div><div class="cell-meta">{{ job.company if job and job.company else '—' }}</div></td><td><div class="score"><span class="score-number">{{ item.overall_fit }}</span><span class="score-track"><span style="width:{{ item.overall_fit }}%"></span></span></div><div class="cell-meta">CV {{ item.resume_fit }} · prefs {{ item.preference_fit }}</div></td><td><span class="badge {{ status_tone(item.decision) }}">{{ status_label(item.decision) }}</span></td><td><div class="cell-muted truncate" title="{{ item.explanation }}">{{ item.explanation }}</div>{% if item.risks %}<div class="cell-meta">{{ item.risks|join(' · ') }}</div>{% endif %}</td><td><div class="cell-muted">{{ format_dt(item.created_at) }}</div></td></tr>
+          {% else %}<tr><td colspan="5"><div class="empty-state">Оценок пока нет.</div></td></tr>{% endfor %}
+        </tbody></table></div></div>
+      </section>
+
+      <section id="applications" class="admin-section">
+        <div class="section-heading"><div><h1>Отклики</h1><p>Подготовленные, ожидающие проверки и отправленные заявления.</p></div><div class="section-actions"><span class="badge warning">{{ counts.pending_review }} review</span><span class="badge success">{{ overview.sent_today }} sent today</span></div></div>
+        <div class="panel"><div class="table-tools"><div class="table-search"><input type="text" placeholder="Вакансия, компания, статус…" data-table-filter="applications-table"></div></div><div class="table-wrap"><table id="applications-table"><thead><tr><th>Отклик</th><th>Статус</th><th>Policy</th><th>Создан</th><th></th></tr></thead><tbody>
+          {% for item in applications %}{% set job = application_jobs.get(item.source_job_id) %}<tr><td><div class="cell-title">{{ job.title if job else item.subject }}</div><div class="cell-meta">{{ job.company if job and job.company else item.subject }}</div></td><td><span class="badge {{ status_tone(item.status) }}"><span class="badge-dot"></span>{{ status_label(item.status) }}</span></td><td>{% if item.policy_decision %}<span class="badge {{ status_tone(item.policy_decision) }}">{{ status_label(item.policy_decision) }}</span>{% else %}<span class="cell-muted">—</span>{% endif %}</td><td><div class="cell-muted">{{ format_dt(item.created_at) }}</div></td><td><div class="cell-actions"><a class="btn btn-sm" href="/admin/applications/{{ item.id }}">Открыть →</a></div></td></tr>
+          {% else %}<tr><td colspan="5"><div class="empty-state">Откликов пока нет.</div></td></tr>{% endfor %}
+        </tbody></table></div></div>
+      </section>
+
+      <section id="health" class="admin-section">
+        <div class="section-heading"><div><h1>Система</h1><p>Alerts, audit trail и ключевые признаки здоровья JobHunter.</p></div></div>
+        <div class="grid grid-4" style="margin-bottom:16px">
+          <div class="metric-card"><div class="metric-label">Healthy sources</div><div class="metric-value">{{ counts.healthy_sources }}/{{ counts.enabled_sources }}</div><div class="metric-note">{{ sources|length }} всего настроено</div></div>
+          <div class="metric-card"><div class="metric-label">Активные сканы</div><div class="metric-value">{{ counts.running_scans }}</div><div class="metric-note">queued + running</div></div>
+          <div class="metric-card"><div class="metric-label">Ошибки сканов сегодня</div><div class="metric-value">{{ overview.today_scan_errors }}</div><div class="metric-note">parsing + network</div></div>
+          <div class="metric-card"><div class="metric-label">Alerts</div><div class="metric-value">{{ counts.unacknowledged_alerts }}</div><div class="metric-note">не подтверждены</div></div>
+        </div>
+        <div class="grid grid-2">
+          <div class="panel"><div class="panel-head"><div><div class="panel-title">Последние alerts</div><div class="panel-subtitle">Сохранённые диагностические события</div></div></div><div class="panel-pad">
+            {% for item in alerts %}<div class="alert-card {{ 'danger' if item.severity in ['high','critical'] else '' }}"><strong>{{ item.code }}</strong> <span class="badge {{ 'danger' if item.severity in ['high','critical'] else 'warning' }}">{{ item.severity }}</span><p>{{ item.message }} · {{ format_dt(item.created_at) }}</p></div>{% else %}<div class="empty-state">Alerts отсутствуют.</div>{% endfor %}
+          </div></div>
+          <div class="panel"><div class="panel-head"><div><div class="panel-title">Audit trail</div><div class="panel-subtitle">Последние административные и автоматические действия</div></div></div><div class="table-wrap"><table style="min-width:560px"><thead><tr><th>Время</th><th>Actor</th><th>Действие</th><th>Решение</th></tr></thead><tbody>{% for item in audits %}<tr><td class="cell-muted">{{ format_dt(item.timestamp) }}</td><td><span class="badge muted">{{ item.actor }}</span></td><td><div class="cell-title">{{ item.action }}</div></td><td class="cell-muted">{{ item.decision or '—' }}</td></tr>{% endfor %}</tbody></table></div></div>
+        </div>
+      </section>
+
+      <noscript><style>.admin-section{display:block!important;margin-bottom:48px}</style><div class="notice warning">Для переключения разделов без перезагрузки нужен JavaScript. Все данные ниже всё равно доступны.</div></noscript>
+    </main>
+  </div>
+</div>
+{% endblock %}

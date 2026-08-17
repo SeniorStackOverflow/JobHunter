@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-and-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://job_agent:test-password@127.0.0.1:5432/job_agent_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
+      EMAIL_PROVIDER: fake
+      REAL_EMAIL_DELIVERY_ENABLED: "false"
+      EMERGENCY_EMAIL_KILL_SWITCH: "true"
+      LLM_PROVIDER: mock
+      RESUME_STORAGE_PATH: /tmp/job-agent-resumes
+      RUN_SERVICE_INTEGRATION_TESTS: "1"
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: job_agent_test
+          POSTGRES_USER: job_agent
+          POSTGRES_PASSWORD: test-password
+        options: >-
+          --health-cmd "pg_isready -U job_agent -d job_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --extra dev --frozen
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy app fixture_site
+      - name: Apply migrations to a clean PostgreSQL database
+        run: uv run alembic upgrade head
+      - name: Check model and migration drift
+        run: uv run alembic check
+      - name: Test
+        run: uv run pytest
+
+  dependency-and-code-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --extra dev --frozen
+      - name: Dependency audit
+        run: uv run pip-audit
+      - name: Minimal static security scan
+        run: uvx --from bandit==1.8.6 bandit -q -r app -ll
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build --tag job-agent:${{ github.sha }} .
+      - name: Validate development Compose
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+      - name: Validate production Compose
+        env:
+          DATABASE_URL: postgresql+asyncpg://job_agent:compose-check@postgres:5432/job_agent
+          REDIS_URL: redis://:compose-check@redis:6379/0
+          PUBLIC_BASE_URL: https://job-agent.example.invalid
+          SECRET_KEY: compose-check-only-secret-with-more-than-32-characters
+          ADMIN_PASSWORD_HASH: compose-check-not-a-real-password-hash
+          POSTGRES_PASSWORD: compose-check
+          REDIS_PASSWORD: compose-check
+          CADDY_ADDRESS: job-agent.example.invalid
+        run: docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet

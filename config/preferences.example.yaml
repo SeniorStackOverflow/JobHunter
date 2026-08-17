@@ -1,0 +1,44 @@
+profile:
+  name: Example Candidate
+  contact_email: candidate@example.test
+  phone: null
+  location: Chisinau
+  languages:
+    - code: ro
+      level: B2
+      confirmed: true
+    - code: ru
+      level: B2
+      confirmed: true
+  work_experience: []
+  education: []
+  skills: []
+  driving_licences: []
+  confirmed_facts: []
+  availability: {}
+
+preferences:
+  allowed_categories:
+    - technology
+    - cybersecurity
+    - courier
+    - hospitality
+    - warehouse
+  auto_send_categories: []
+  forbidden_categories: []
+  allowed_cities:
+    - Chisinau
+  remote_allowed: true
+  minimum_salary: null
+  salary_currency: MDL
+  allowed_schedules: []
+  forbidden_schedules: []
+  willing_without_experience: true
+  consider_outside_primary_resume: true
+  language_constraints: []
+  maximum_daily_applications: 3
+  minimum_auto_send_score: 85
+  additional_rules: {}
+  auto_send_enabled: false
+  global_pause: true
+

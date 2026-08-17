@@ -1,0 +1,270 @@
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: job-agent:local
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-environment
+    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://job_agent:change-me@postgres:5432/job_agent}
+    REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    RESUME_STORAGE_PATH: /data/resumes
+    REAL_EMAIL_DELIVERY_ENABLED: ${REAL_EMAIL_DELIVERY_ENABLED:-false}
+    EMAIL_PROVIDER: ${EMAIL_PROVIDER:-fake}
+  networks:
+    - backend
+  init: true
+
+x-app-healthcheck: &app-healthcheck
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "shared_buffers=64MB"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - backend
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      - backend
+    logging: *default-logging
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: "no"
+    volumes:
+      - resumes:/data/resumes
+    logging: *default-logging
+
+  api:
+    <<: *app
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+    expose:
+      - "8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    volumes:
+      - resumes:/data/resumes
+    healthcheck:
+      <<: *app-healthcheck
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+    restart: unless-stopped
+    logging: *default-logging
+
+  worker:
+    <<: *app
+    command:
+      - celery
+      - -A
+      - app.scheduler.celery_app:celery_app
+      - worker
+      - --loglevel=${LOG_LEVEL:-INFO}
+      - --hostname=worker@%h
+      - --queues=crawling,matching,applications,email,reports,maintenance,celery
+      - --pool=solo
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    volumes:
+      - resumes:/data/resumes
+    shm_size: 1gb
+    healthcheck:
+      <<: *app-healthcheck
+      test:
+        - CMD-SHELL
+        - test -r /proc/1/status
+    restart: unless-stopped
+    stop_grace_period: 45s
+    logging: *default-logging
+
+  beat:
+    <<: *app
+    command:
+      - celery
+      - -A
+      - app.scheduler.celery_app:celery_app
+      - beat
+      - --loglevel=${LOG_LEVEL:-INFO}
+      - --pidfile=/tmp/celerybeat.pid
+      - --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *app-healthcheck
+      test:
+        - CMD-SHELL
+        - test -s /tmp/celerybeat.pid && kill -0 "$$(cat /tmp/celerybeat.pid)"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      CADDY_ADDRESS: ${CADDY_ADDRESS:-http://localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - backend
+    logging: *default-logging
+
+  fixture-site:
+    <<: *app
+    profiles: ["test"]
+    command:
+      - uvicorn
+      - fixture_site.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8090"
+    environment:
+      <<: *app-environment
+      ENVIRONMENT: test
+      REAL_EMAIL_DELIVERY_ENABLED: "false"
+      EMAIL_PROVIDER: fake
+    expose:
+      - "8090"
+    healthcheck:
+      <<: *app-healthcheck
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).read()
+    restart: "no"
+    logging: *default-logging
+
+  backup:
+    image: postgres:16-alpine
+    profiles: ["ops"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      BACKUP_DIR: /backups
+    volumes:
+      - ./deploy/backup.sh:/usr/local/bin/job-agent-backup:ro
+      - backup_data:/backups
+    entrypoint: ["/usr/local/bin/job-agent-backup"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "no"
+    logging: *default-logging
+
+  restore:
+    image: postgres:16-alpine
+    profiles: ["ops"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      BACKUP_DIR: /backups
+      BACKUP_FILE: ${BACKUP_FILE:-}
+      RESTORE_CONFIRM: ${RESTORE_CONFIRM:-}
+    volumes:
+      - ./deploy/restore.sh:/usr/local/bin/job-agent-restore:ro
+      - backup_data:/backups:ro
+    entrypoint: ["/usr/local/bin/job-agent-restore"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "no"
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  redis_data:
+  resumes:
+  caddy_data:
+  caddy_config:
+  backup_data:
+
+networks:
+  backend:
+    driver: bridge

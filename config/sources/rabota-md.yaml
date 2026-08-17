@@ -1,0 +1,24 @@
+source:
+  id: rabota_md
+  name: Rabota.md
+  adapter: rabota_md
+  base_url: https://www.rabota.md
+  enabled: false
+  policy_review_acknowledged: true
+  policy_review_reference: "operator-approved-2026-08-11"
+  locale_priority: [ru]
+  use_stealth_browser: true
+  requests_per_minute: 50
+  minimum_interval_seconds: 1.2
+  incremental_scan:
+    schedule: "0 * * * *"
+    category_slugs: [others]
+    known_unchanged_stop_threshold: 100
+    known_detail_refresh_hours: 24
+    max_pages_per_entrypoint: 20
+  active_job_recheck:
+    schedule: "0 2 * * *"
+    close_after_confirmed_absence_count: 3
+  full_scan:
+    schedule: "0 3 * * *"
+    resume_from_checkpoint: true

@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "job-agent"
+version = "0.1.0"
+description = "Autonomous, policy-gated multi-source job search agent"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = { text = "Proprietary" }
+dependencies = [
+  "alembic>=1.16,<2",
+  "asyncpg>=0.30,<1",
+  "celery[redis]>=5.5,<6",
+  "cryptography>=50,<51",
+  "defusedxml>=0.7,<1",
+  "email-validator>=2.2,<3",
+  "fastapi>=0.116,<1",
+  "google-api-python-client>=2.176,<3",
+  "google-auth-oauthlib>=1.2,<2",
+  "httpx>=0.28,<1",
+  "itsdangerous>=2.2,<3",
+  "jinja2>=3.1,<4",
+  "mcp>=1.13,<2",
+  "nh3>=0.3,<1",
+  "openai>=2.46,<3",
+  "phonenumbers>=9,<10",
+  "prometheus-client>=0.22,<1",
+  "pwdlib[argon2]>=0.2,<1",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "pyyaml>=6.0,<7",
+  "redis>=6,<7",
+  "selectolax>=0.3.32,<1",
+  "sqlalchemy[asyncio]>=2.0.41,<3",
+  "structlog>=25,<26",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+playwright = [
+  "playwright>=1.54,<2",
+  "playwright-stealth>=2.0.3,<3",
+]
+dev = [
+  "aiosqlite>=0.21,<1",
+  "mypy>=1.17,<2",
+  "pip-audit>=2.9,<3",
+  "pre-commit>=4.2,<5",
+  "pytest>=9.0.3,<10",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6.2,<8",
+  "respx>=0.22,<1",
+  "ruff>=0.12,<1",
+  "types-pyyaml>=6.0,<7",
+  "types-defusedxml>=0.7,<1",
+]
+
+[project.scripts]
+job-agent = "app.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "fixture_site"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: requires local integration services",
+  "e2e: end-to-end pipeline test",
+  "live: opt-in live network smoke test",
+]
+filterwarnings = ["error"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106", "S108", "S311"]
+"app/settings/config.py" = ["S104"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+exclude = ["migrations"]
+
+[[tool.mypy.overrides]]
+module = [
+  "celery.*",
+  "googleapiclient.*",
+  "google_auth_oauthlib.*",
+  "nh3.*",
+  "selectolax.*",
+  "yaml.*",
+  "playwright.*",
+]
+ignore_missing_imports = true
