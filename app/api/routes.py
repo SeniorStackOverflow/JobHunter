@@ -19,6 +19,7 @@ from app.applications import (
 )
 from app.applications.service import ApplicationPreparationError, ApplicationService
 from app.audit import record_audit_event
+from app.crawlers.lifecycle import managed_adapter
 from app.crawlers.registry import build_default_registry
 from app.crawlers.source_control import disable_source_record, enable_source_record
 from app.database import get_session
@@ -74,7 +75,8 @@ async def _validate_source_configuration(source: JobSource) -> None:
     """Reject malformed adapter configuration before it can be persisted."""
     registry = build_default_registry()
     try:
-        validation = await registry.create(source).validate_source()
+        async with managed_adapter(registry.create(source)) as adapter:
+            validation = await adapter.validate_source()
     except (RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=422,

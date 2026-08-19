@@ -16,6 +16,7 @@ from app.applications import (
     reconcile_stale_delivery_unknown,
 )
 from app.audit import record_audit_event
+from app.crawlers.lifecycle import managed_adapter
 from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
 from app.crawlers.source_control import disable_source_record, enable_source_record
@@ -150,7 +151,8 @@ async def _audit_write(session: Any, action: str, entity_type: str, entity_id: s
 async def _validate_source_configuration(source: JobSource) -> None:
     """Validate adapter construction and static capabilities without making network requests."""
     try:
-        validation = await build_default_registry().create(source).validate_source()
+        async with managed_adapter(build_default_registry().create(source)) as adapter:
+            validation = await adapter.validate_source()
     except (RuntimeError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid source configuration ({type(exc).__name__})") from exc
     if not validation.valid:
@@ -584,9 +586,9 @@ async def validate_source(source_id: str) -> dict[str, Any]:
         source = await session.get(JobSource, UUID(source_id))
         if source is None:
             raise ValueError("source not found")
-        adapter = build_default_registry().create(source)
-        validation = await adapter.validate_source()
-        access = await adapter.check_access_policy()
+        async with managed_adapter(build_default_registry().create(source)) as adapter:
+            validation = await adapter.validate_source()
+            access = await adapter.check_access_policy()
         await _audit_write(session, "source.validated", "job_source", str(source.id))
         await session.commit()
         return {
@@ -604,7 +606,8 @@ async def discover_categories(source_id: str) -> list[dict[str, Any]]:
         source = await session.get(JobSource, UUID(source_id))
         if source is None:
             raise ValueError("source not found")
-        values = await build_default_registry().create(source).discover_categories()
+        async with managed_adapter(build_default_registry().create(source)) as adapter:
+            values = await adapter.discover_categories()
         return [item.model_dump(mode="json") for item in values]
 
 
@@ -620,7 +623,7 @@ async def get_source_health(source_id: str) -> dict[str, Any]:
         scan = await session.scalar(
             select(ScanRun)
             .where(ScanRun.source_id == source.id)
-            .order_by(desc(ScanRun.started_at))
+            .order_by(desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast())
             .limit(1)
         )
         return {

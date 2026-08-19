@@ -418,3 +418,29 @@ async def test_access_degradation_pauses_only_the_affected_source(
         alert = await session.scalar(select(Alert).where(Alert.source_id == source_id))
         assert alert is not None
         assert alert.code == "adapter_access_degraded"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_successful_scan_recovers_automatic_pause_after_degradation(
+    fixture_site_client: httpx.AsyncClient,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    source = make_source(generic_source_configuration, name="Recovery fixture source")
+    source.health_status = SourceHealth.DEGRADED
+    source.automatic_actions_paused = True
+    source_id = await persist_source(sqlite_session_factory, source)
+    registry = build_default_registry(
+        client_factory=lambda _source: FixtureSiteFetcher(fixture_site_client)
+    )
+    service = ScanService(sqlite_session_factory, registry)
+
+    run = await run_full_scan(service, source_id)
+
+    assert run.status == RunStatus.SUCCEEDED
+    async with sqlite_session_factory() as session:
+        stored_source = await session.get(JobSource, source_id)
+        assert stored_source is not None
+        assert stored_source.health_status == SourceHealth.HEALTHY
+        assert stored_source.automatic_actions_paused is False

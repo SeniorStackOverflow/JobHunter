@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
@@ -138,7 +138,7 @@ class ScanService:
                     ScanRun.scan_type == scan_type,
                     ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
                 )
-                .order_by(desc(ScanRun.started_at))
+                .order_by(desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast())
                 .limit(1)
             )
             if active is not None:
@@ -152,7 +152,9 @@ class ScanService:
                         ScanRun.scan_type == scan_type,
                         ScanRun.status.in_([RunStatus.FAILED, RunStatus.PARTIAL]),
                     )
-                    .order_by(desc(ScanRun.started_at))
+                    .order_by(
+                        desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast()
+                    )
                     .limit(1)
                 )
                 if previous is not None:
@@ -212,6 +214,13 @@ class ScanService:
             if source.health_status == SourceHealth.PAUSED:
                 await self._fail_run(session, run, source, "source crawling is paused")
                 return run
+
+            recovering_automatic_pause = (
+                source.health_status == SourceHealth.DEGRADED and source.automatic_actions_paused
+            )
+            # Validation/access failures are real scan attempts too. Persist a start time so
+            # completed early failures sort correctly against later successful scans.
+            run.started_at = run.started_at or datetime.now(UTC)
 
             adapter = self.registry.create(source)
             try:
@@ -395,6 +404,8 @@ class ScanService:
                 run.status = RunStatus.PARTIAL
             else:
                 source.health_status = SourceHealth.HEALTHY
+                if recovering_automatic_pause:
+                    source.automatic_actions_paused = False
                 run.status = RunStatus.SUCCEEDED if run.parsing_errors == 0 else RunStatus.PARTIAL
             source.last_scan_status = run.status
             run.finished_at = datetime.now(UTC)
