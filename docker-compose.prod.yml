@@ -60,6 +60,8 @@ services:
 
   api:
     <<: *production-app
+    ports:
+      - "127.0.0.1:8091:8000"
     volumes:
       - resumes:/data/resumes
 
@@ -72,6 +74,7 @@ services:
     <<: *production-app
 
   caddy:
+    profiles: ["container-edge"]
     environment:
       CADDY_ADDRESS: ${CADDY_ADDRESS:?CADDY_ADDRESS is required in production}
     restart: always
