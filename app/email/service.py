@@ -432,13 +432,21 @@ class EmailService:
 async def send_auto_approved_applications() -> int:
     from app.database.session import async_session_factory
 
-    service = EmailService(get_settings(), async_session_factory)
+    settings = get_settings()
+    if settings.environment != "test" and not settings.real_email_delivery_enabled:
+        return 0
+
+    service = EmailService(settings, async_session_factory)
     async with async_session_factory() as session:
         application_ids = list(
             (
                 await session.scalars(
-                    select(Application.id).where(
-                        Application.status == ApplicationStatus.AUTO_APPROVED
+                    select(Application.id)
+                    .join(JobPreference, JobPreference.profile_id == Application.profile_id)
+                    .where(
+                        Application.status == ApplicationStatus.AUTO_APPROVED,
+                        JobPreference.auto_send_enabled.is_(True),
+                        JobPreference.global_pause.is_(False),
                     )
                 )
             ).all()
