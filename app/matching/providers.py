@@ -106,6 +106,13 @@ class LLMProvider(Protocol):
     async def evaluate(self, request: MatchRequest) -> MatchResult: ...
 
 
+class LLMProviderUnavailable(RuntimeError):
+    def __init__(self, provider: str, retry_after_seconds: int = 60) -> None:
+        self.provider = provider
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        super().__init__(f"{provider} unavailable; retry after {self.retry_after_seconds}s")
+
+
 def _safe_fallback(provider: str, failure_code: str) -> MatchResult:
     return MatchResult(
         resume_fit=0,
@@ -448,11 +455,33 @@ class LLMRouterProvider:
                         if response.status_code == 429:
                             raw_retry_after = response.headers.get("Retry-After", "").strip()
                             try:
-                                retry_after_seconds = min(60.0, max(0.0, float(raw_retry_after)))
+                                retry_after_seconds = max(0.0, float(raw_retry_after))
                             except ValueError:
                                 retry_after_seconds = 0.0
+                            try:
+                                payload = response.json()
+                            except json.JSONDecodeError:
+                                payload = {}
+                            error = payload.get("error") if isinstance(payload, dict) else None
+                            if (
+                                isinstance(error, dict)
+                                and error.get("type") == "all_providers_exhausted"
+                            ):
+                                raw_payload_retry = error.get("retry_after_seconds")
+                                try:
+                                    payload_retry = max(0.0, float(raw_payload_retry))
+                                except (TypeError, ValueError):
+                                    payload_retry = 0.0
+                                if structured:
+                                    switch_to_unstructured = True
+                                    break
+                                raise LLMProviderUnavailable(
+                                    "llmrouter",
+                                    max(1, int(max(retry_after_seconds, payload_retry, 60.0))),
+                                )
+                            retry_after_seconds = min(60.0, retry_after_seconds)
                         if not retryable:
-                            return _safe_fallback("llmrouter", last_failure)
+                            raise LLMProviderUnavailable("llmrouter", 300)
                     else:
                         return _llmrouter_result(response.json())
                 except InvalidLLMResponse as exc:
@@ -468,8 +497,8 @@ class LLMRouterProvider:
             if switch_to_unstructured:
                 continue
             if last_failure.startswith("http_"):
-                return _safe_fallback("llmrouter", last_failure)
-        return _safe_fallback("llmrouter", last_failure)
+                raise LLMProviderUnavailable("llmrouter", 300)
+        raise LLMProviderUnavailable("llmrouter", 300)
 
 
 def _gemini_result(payload: Any) -> MatchResult:

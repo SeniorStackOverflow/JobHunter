@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.contacts import ContactDiscoveryService
@@ -27,6 +27,26 @@ from app.settings import Settings, get_settings
 
 class ApplicationPreparationError(ValueError):
     """A safe application cannot be prepared from the persisted state."""
+
+
+_POLICY_ONLY_REFRESH_RULES = {
+    "deployment_emergency_switch_off",
+    "auto_send_enabled",
+    "global_pause_off",
+    "source_healthy",
+    "source_actions_enabled",
+    "vacancy_active",
+    "verified_email_contact",
+    "contact_verified",
+    "resume_active_verified",
+    "daily_limit",
+}
+
+
+def _policy_only_refresh_needed(application: Application) -> bool:
+    raw_failed = (application.policy_result or {}).get("rules_failed", [])
+    failed = {item for item in raw_failed if isinstance(item, str)}
+    return bool(failed) and failed <= _POLICY_ONLY_REFRESH_RULES
 
 
 def _confirmed_fact(profile: UserProfile, job: SourceJob) -> tuple[str | None, str | None]:
@@ -278,6 +298,28 @@ class ApplicationService:
         )
         return application
 
+    async def reevaluate_policy(
+        self, session: AsyncSession, application: Application
+    ) -> Application:
+        evaluation = await session.get(MatchEvaluation, application.match_evaluation_id)
+        source_job = await session.get(SourceJob, application.source_job_id)
+        resume = await session.get(Resume, application.resume_id)
+        contact = await session.get(EmployerContact, application.recipient_contact_id)
+        profile = await session.get(UserProfile, application.profile_id)
+        if (
+            evaluation is None
+            or source_job is None
+            or resume is None
+            or contact is None
+            or profile is None
+        ):
+            raise ApplicationPreparationError("application bindings are incomplete")
+        preferences = await self.profile_service.get_preferences(session, application.profile_id)
+        await self.policy_engine.apply(
+            session, application, preferences, evaluation, source_job, resume, contact, profile
+        )
+        return application
+
     async def approve(self, session: AsyncSession, application_id: UUID) -> Application:
         application = await session.get(Application, application_id)
         if application is None:
@@ -297,20 +339,75 @@ class ApplicationService:
 
 
 async def prepare_pending_applications() -> int:
-    """Prepare or refresh applications independently for every candidate profile."""
+    """Prepare only missing/stale applications and cheaply refresh transient policy gates."""
     from app.database.session import async_session_factory
 
     prepared = 0
     service = ApplicationService(get_settings())
+    refreshable = {
+        ApplicationStatus.PREPARED,
+        ApplicationStatus.PENDING_REVIEW,
+        ApplicationStatus.BLOCKED,
+    }
     async with async_session_factory() as session:
-        pairs = list(
-            (
-                await session.execute(
-                    select(MatchEvaluation.profile_id, MatchEvaluation.canonical_job_id).distinct()
+        ranked = (
+            select(
+                MatchEvaluation.profile_id.label("profile_id"),
+                MatchEvaluation.canonical_job_id.label("canonical_job_id"),
+                MatchEvaluation.id.label("evaluation_id"),
+                func.row_number().over(
+                    partition_by=(
+                        MatchEvaluation.profile_id,
+                        MatchEvaluation.canonical_job_id,
+                    ),
+                    order_by=(MatchEvaluation.created_at.desc(), MatchEvaluation.id.desc()),
+                ).label("rank"),
+            )
+        ).subquery()
+        rows = (
+            await session.execute(
+                select(
+                    ranked.c.profile_id,
+                    ranked.c.canonical_job_id,
+                    ranked.c.evaluation_id,
+                    Application,
                 )
-            ).all()
-        )
-        for profile_id, canonical_id in pairs:
+                .outerjoin(
+                    Application,
+                    and_(
+                        Application.profile_id == ranked.c.profile_id,
+                        Application.canonical_job_id == ranked.c.canonical_job_id,
+                    ),
+                )
+                .where(
+                    ranked.c.rank == 1,
+                    or_(Application.id.is_(None), Application.status.in_(refreshable)),
+                )
+            )
+        ).all()
+
+        full_refresh: list[tuple[UUID, UUID]] = []
+        policy_refresh: list[Application] = []
+        for profile_id, canonical_id, latest_evaluation_id, application in rows:
+            if (
+                application is None
+                or application.status == ApplicationStatus.PREPARED
+                or application.match_evaluation_id != latest_evaluation_id
+            ):
+                full_refresh.append((profile_id, canonical_id))
+            elif _policy_only_refresh_needed(application):
+                policy_refresh.append(application)
+
+        for application in policy_refresh:
+            try:
+                before = application.policy_decision
+                await service.reevaluate_policy(session, application)
+                if before != application.policy_decision:
+                    prepared += 1
+            except ApplicationPreparationError:
+                continue
+
+        for profile_id, canonical_id in full_refresh:
             try:
                 existing = await session.scalar(
                     select(Application).where(
@@ -318,12 +415,6 @@ async def prepare_pending_applications() -> int:
                         Application.canonical_job_id == canonical_id,
                     )
                 )
-                if existing is not None and existing.status not in {
-                    ApplicationStatus.PREPARED,
-                    ApplicationStatus.PENDING_REVIEW,
-                    ApplicationStatus.BLOCKED,
-                }:
-                    continue
                 before = existing.match_evaluation_id if existing is not None else None
                 application = await service.prepare(session, canonical_id, profile_id)
                 if before is None or before != application.match_evaluation_id:

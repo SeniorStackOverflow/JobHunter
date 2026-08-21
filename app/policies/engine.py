@@ -102,8 +102,29 @@ class PolicyEngine:
             .where(
                 EmailDelivery.created_at >= start_of_day,
                 Application.profile_id == application.profile_id,
+                EmailDelivery.status.in_(
+                    {
+                        DeliveryStatus.SENT,
+                        DeliveryStatus.SENDING,
+                        DeliveryStatus.DELIVERY_UNKNOWN,
+                    }
+                ),
             )
         )
+        sent_today = await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.profile_id == application.profile_id,
+                Application.status == ApplicationStatus.SENT,
+                Application.sent_at >= start_of_day,
+            )
+        )
+        raw_minimum_daily = additional_rules.get("minimum_daily_applications", 0)
+        try:
+            minimum_daily = max(0, min(int(raw_minimum_daily), preferences.maximum_daily_applications))
+        except (TypeError, ValueError):
+            minimum_daily = 0
+        force_minimum = additional_rules.get("force_minimum_daily_applications") is True
+        minimum_catchup_active = force_minimum and int(sent_today or 0) < minimum_daily
         prior_unknown = await session.scalar(
             select(func.count(EmailDelivery.id)).where(
                 EmailDelivery.application_id == application.id,
@@ -122,15 +143,23 @@ class PolicyEngine:
         rule("category_allowed_for_auto_send", category in auto_categories)
         rule("job_title_allowed_by_preferences", not title_forbidden)
         rule(
-            "overall_score_threshold", evaluation.overall_fit >= preferences.minimum_auto_send_score
+            "overall_score_threshold",
+            minimum_catchup_active
+            or evaluation.overall_fit >= preferences.minimum_auto_send_score,
         )
         rule("mandatory_requirements_met", not evaluation.missing_requirements)
         rule(
             "match_not_blocked",
             evaluation.decision != MatchDecision.BLOCK,
         )
-        rule("match_not_skipped", evaluation.decision != MatchDecision.SKIP)
-        rule("match_auto_apply", evaluation.decision == MatchDecision.AUTO_APPLY)
+        rule(
+            "match_not_skipped",
+            minimum_catchup_active or evaluation.decision != MatchDecision.SKIP,
+        )
+        rule(
+            "match_auto_apply",
+            minimum_catchup_active or evaluation.decision == MatchDecision.AUTO_APPLY,
+        )
         rule("verified_email_contact", contact.contact_type == ContactType.EMAIL)
         rule("contact_verified", contact.verification_status == VerificationStatus.VERIFIED)
         rule("vacancy_active", job.status == JobStatus.ACTIVE)
@@ -175,7 +204,7 @@ class PolicyEngine:
         }
         if hard_block_rules & set(failed):
             decision = PolicyDecision.BLOCKED
-        elif evaluation.decision == MatchDecision.SKIP:
+        elif evaluation.decision == MatchDecision.SKIP and not minimum_catchup_active:
             decision = PolicyDecision.SKIPPED
         elif failed:
             decision = PolicyDecision.PENDING_REVIEW

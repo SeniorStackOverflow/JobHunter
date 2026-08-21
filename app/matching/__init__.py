@@ -2,6 +2,7 @@ from app.matching.prefilter import DeterministicPrefilter, deterministic_prefilt
 from app.matching.providers import (
     GeminiCompatibleProvider,
     LLMProvider,
+    LLMProviderUnavailable,
     LLMRouterProvider,
     MockProvider,
     OpenAIProvider,
@@ -20,6 +21,7 @@ __all__ = [
     "DeterministicPrefilter",
     "GeminiCompatibleProvider",
     "LLMProvider",
+    "LLMProviderUnavailable",
     "LLMRouterProvider",
     "MatchRequest",
     "MatchResult",

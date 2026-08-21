@@ -48,7 +48,14 @@ def preference_fingerprint(preference: JobPreference) -> str:
             "willing_without_experience": preference.willing_without_experience,
             "consider_outside_primary_resume": preference.consider_outside_primary_resume,
             "language_constraints": preference.language_constraints,
-            "additional_rules": preference.additional_rules,
+            "additional_rules": {
+                key: value
+                for key, value in (preference.additional_rules or {}).items()
+                if key not in {
+                    "minimum_daily_applications",
+                    "force_minimum_daily_applications",
+                }
+            },
         }
     )
 

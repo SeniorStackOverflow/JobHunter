@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, time
 from pathlib import Path
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
@@ -437,20 +438,63 @@ async def send_auto_approved_applications() -> int:
         return 0
 
     service = EmailService(settings, async_session_factory)
+    start_of_day = datetime.combine(datetime.now(UTC).date(), time.min, UTC)
     async with async_session_factory() as session:
-        application_ids = list(
+        attempts_by_profile = dict(
             (
-                await session.scalars(
-                    select(Application.id)
-                    .join(JobPreference, JobPreference.profile_id == Application.profile_id)
+                await session.execute(
+                    select(Application.profile_id, func.count(EmailDelivery.id))
+                    .join(EmailDelivery, EmailDelivery.application_id == Application.id)
                     .where(
-                        Application.status == ApplicationStatus.AUTO_APPROVED,
+                        EmailDelivery.created_at >= start_of_day,
+                        EmailDelivery.status.in_(
+                            {
+                                DeliveryStatus.SENT,
+                                DeliveryStatus.SENDING,
+                                DeliveryStatus.DELIVERY_UNKNOWN,
+                            }
+                        ),
+                    )
+                    .group_by(Application.profile_id)
+                )
+            ).all()
+        )
+        capacities = {
+            profile_id: max(0, maximum - int(attempts_by_profile.get(profile_id, 0)))
+            for profile_id, maximum in (
+                await session.execute(
+                    select(
+                        JobPreference.profile_id,
+                        JobPreference.maximum_daily_applications,
+                    ).where(
                         JobPreference.auto_send_enabled.is_(True),
                         JobPreference.global_pause.is_(False),
                     )
                 )
             ).all()
-        )
+        }
+        if not any(capacities.values()):
+            logger.info("automatic_email_deferred", reason="daily_limit")
+            return 0
+        candidate_rows = (
+            await session.execute(
+                select(Application.id, Application.profile_id)
+                .join(JobPreference, JobPreference.profile_id == Application.profile_id)
+                .where(
+                    Application.status == ApplicationStatus.AUTO_APPROVED,
+                    JobPreference.auto_send_enabled.is_(True),
+                    JobPreference.global_pause.is_(False),
+                )
+                .order_by(Application.created_at, Application.id)
+            )
+        ).all()
+        application_ids: list[UUID] = []
+        for application_id, profile_id in candidate_rows:
+            remaining = capacities.get(profile_id, 0)
+            if remaining <= 0:
+                continue
+            application_ids.append(application_id)
+            capacities[profile_id] = remaining - 1
     sent = 0
     for application_id in application_ids:
         try:
@@ -475,9 +519,18 @@ async def retry_temporary_failures() -> int:
         ids = list(
             (
                 await session.scalars(
-                    select(EmailDelivery.application_id).where(
+                    select(EmailDelivery.application_id)
+                    .join(Application, Application.id == EmailDelivery.application_id)
+                    .where(
                         EmailDelivery.status == DeliveryStatus.TEMPORARY_FAILURE,
                         EmailDelivery.attempt_count < 3,
+                        Application.status.in_(
+                            {
+                                ApplicationStatus.AUTO_APPROVED,
+                                ApplicationStatus.APPROVED,
+                                ApplicationStatus.FAILED,
+                            }
+                        ),
                     )
                 )
             ).all()

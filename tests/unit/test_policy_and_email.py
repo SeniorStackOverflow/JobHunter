@@ -314,6 +314,39 @@ async def test_review_or_skip_match_can_never_be_auto_approved(
         assert "match_not_skipped" in skipped.rules_failed
 
 
+async def test_force_minimum_daily_overrides_soft_match_gates_but_not_requirements(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile, preference, resume, job, evaluation, contact, application = (
+            values[1], values[2], values[3], values[5], values[6], values[7], values[8]
+        )
+        preference.additional_rules = {
+            "minimum_daily_applications": 2,
+            "force_minimum_daily_applications": True,
+        }
+        preference.minimum_auto_send_score = 90
+        evaluation.overall_fit = 5
+        evaluation.decision = MatchDecision.SKIP
+        engine = PolicyEngine(settings(tmp_path))
+
+        forced = await engine.evaluate(
+            session, application, preference, evaluation, job, resume, contact, profile
+        )
+        assert forced.decision == PolicyDecision.AUTO_APPROVED
+        assert "overall_score_threshold" in forced.rules_passed
+        assert "match_not_skipped" in forced.rules_passed
+        assert "match_auto_apply" in forced.rules_passed
+
+        evaluation.missing_requirements = ["mandatory licence"]
+        blocked_by_requirement = await engine.evaluate(
+            session, application, preference, evaluation, job, resume, contact, profile
+        )
+        assert blocked_by_requirement.decision != PolicyDecision.AUTO_APPROVED
+        assert "mandatory_requirements_met" in blocked_by_requirement.rules_failed
+
+
 async def test_global_pause_daily_limit_and_delivery_unknown_block_auto_send(
     sqlite_session_factory, tmp_path: Path
 ) -> None:
@@ -539,3 +572,43 @@ async def test_email_service_rejects_unapproved_application(
         ).send_application(application_id)
     async with sqlite_session_factory() as session:
         assert await session.scalar(select(EmailDelivery.id)) is None
+
+
+async def test_retry_temporary_failures_skips_pending_review_application(
+    sqlite_session_factory, tmp_path: Path, monkeypatch
+) -> None:
+    from app.email import service as email_service
+
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        contact = values[7]
+        application = values[8]
+        application.status = ApplicationStatus.PENDING_REVIEW
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        session.add(
+            EmailDelivery(
+                application_id=application.id,
+                provider="fake",
+                recipient=contact.value,
+                status=DeliveryStatus.TEMPORARY_FAILURE,
+                sanitized_provider_response={},
+                attempt_count=1,
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(
+        "app.database.session.async_session_factory", sqlite_session_factory
+    )
+    monkeypatch.setattr(email_service, "get_settings", lambda: settings(tmp_path))
+
+    assert await email_service.retry_temporary_failures() == 0
+
+    async with sqlite_session_factory() as session:
+        delivery = await session.scalar(
+            select(EmailDelivery).where(EmailDelivery.application_id == application_id)
+        )
+        assert delivery is not None
+        assert delivery.status == DeliveryStatus.TEMPORARY_FAILURE
+        assert delivery.attempt_count == 1

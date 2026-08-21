@@ -17,6 +17,7 @@ from app.matching import (
     DeterministicPrefilter,
     GeminiCompatibleProvider,
     LLMProvider,
+    LLMProviderUnavailable,
     LLMRouterProvider,
     MatchingService,
     MatchRequest,
@@ -1016,10 +1017,10 @@ async def test_llmrouter_exhausted_429_does_not_retry_without_schema() -> None:
             max_attempts=2,
             retry_delay_seconds=0,
         )
-        result = await provider.evaluate(make_request())
-
-    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
-    assert result.risks == ["llm_provider_failure:llmrouter:http_429"]
+        with pytest.raises(LLMProviderUnavailable) as exc:
+            await provider.evaluate(make_request())
+    assert exc.value.provider == "llmrouter"
+    assert exc.value.retry_after_seconds == 300
     assert len(bodies) == 2
     assert all("response_format" in body for body in bodies)
 
@@ -1084,6 +1085,57 @@ async def test_llmrouter_falls_back_when_backend_rejects_json_schema() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         provider = LLMRouterProvider(
             model="smart",
+            api_key="router-key",
+            base_url="http://router.example.test",
+            client=client,
+            max_attempts=1,
+            retry_delay_seconds=0,
+        )
+        result = await provider.evaluate(make_request())
+
+    assert result == expected
+    assert len(bodies) == 2
+    assert "response_format" in bodies[0]
+    assert "response_format" not in bodies[1]
+    assert "JSON Schema" in bodies[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_llmrouter_exhausted_structured_pool_falls_back_without_schema() -> None:
+    expected = make_result()
+    bodies: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "response_format" in body:
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"Retry-After": "5"},
+                json={
+                    "error": {
+                        "type": "all_providers_exhausted",
+                        "retry_after_seconds": 5,
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": expected.model_dump_json()},
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = LLMRouterProvider(
+            model="jobhunter",
             api_key="router-key",
             base_url="http://router.example.test",
             client=client,

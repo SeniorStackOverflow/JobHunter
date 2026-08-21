@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
+from redis.asyncio import Redis
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,12 +23,14 @@ from app.matching.providers import (
     MATCHING_RULES_VERSION,
     GeminiCompatibleProvider,
     LLMProvider,
+    LLMProviderUnavailable,
     LLMRouterProvider,
     MockProvider,
     OpenAIProvider,
 )
 from app.matching.schemas import DeterministicFilterResult, MatchRequest, MatchResult
 from app.models.entities import (
+    Application,
     JobPreference,
     JobSnapshot,
     MatchEvaluation,
@@ -35,13 +38,42 @@ from app.models.entities import (
     SourceJob,
     UserProfile,
 )
-from app.models.enums import JobStatus, MatchDecision
+from app.models.enums import ApplicationStatus, JobStatus, MatchDecision
 from app.profiles.service import ProfileService, choose_resume_for_job
 from app.settings import Settings, get_settings
 
 _MAX_JOB_FIELD_CHARS = 50_000
 _MAX_RESUME_SUMMARY_CHARS = 50_000
+_MATCHING_PROVIDER_BACKOFF_KEY = "job-agent:matching:provider-backoff"
 logger = structlog.get_logger(__name__)
+
+
+async def _matching_provider_backoff_remaining(settings: Settings) -> int:
+    if settings.environment == "test":
+        return 0
+    client: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        ttl = await client.ttl(_MATCHING_PROVIDER_BACKOFF_KEY)
+        return max(0, int(ttl))
+    except Exception as exc:
+        logger.warning("matching_provider_backoff_read_failed", error_type=type(exc).__name__)
+        return 0
+    finally:
+        await client.aclose()
+
+
+async def _set_matching_provider_backoff(settings: Settings, retry_after_seconds: int) -> int:
+    ttl = max(60, min(int(retry_after_seconds), settings.matching_provider_failure_retry_seconds))
+    if settings.environment == "test":
+        return ttl
+    client: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await client.set(_MATCHING_PROVIDER_BACKOFF_KEY, "1", ex=ttl)
+    except Exception as exc:
+        logger.warning("matching_provider_backoff_write_failed", error_type=type(exc).__name__)
+    finally:
+        await client.aclose()
+    return ttl
 
 
 class MatchingConfigurationError(RuntimeError):
@@ -191,6 +223,35 @@ def _estimate_resume_fit(
     if category_match and not normalized_skills:
         category_score = 75
     return min(100, category_score + skill_score)
+
+
+async def _minimum_catchup_active(
+    session: AsyncSession, preference: JobPreference, profile_id: UUID
+) -> bool:
+    rules = preference.additional_rules or {}
+    if rules.get("force_minimum_daily_applications") is not True:
+        return False
+    try:
+        minimum_daily = max(
+            0,
+            min(
+                int(rules.get("minimum_daily_applications", 0)),
+                preference.maximum_daily_applications,
+            ),
+        )
+    except (TypeError, ValueError):
+        return False
+    if minimum_daily <= 0:
+        return False
+    start_of_day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    sent_today = await session.scalar(
+        select(func.count(Application.id)).where(
+            Application.profile_id == profile_id,
+            Application.status == ApplicationStatus.SENT,
+            Application.sent_at >= start_of_day,
+        )
+    )
+    return int(sent_today or 0) < minimum_daily
 
 
 async def _select_resume(session: AsyncSession, profile_id: UUID, job: SourceJob) -> Resume | None:
@@ -355,13 +416,32 @@ class MatchingService:
         resume = await _select_resume(session, profile.id, job)
         resume_category = resume.category if resume is not None else None
         resume_fit = _estimate_resume_fit(job, profile, resume_category)
-        result = await self.evaluate(
-            job,
-            preference,
-            profile,
-            resume_fit=resume_fit,
-            resume_category=resume_category,
+        minimum_catchup_active = await _minimum_catchup_active(
+            session, preference, profile.id
         )
+        if minimum_catchup_active:
+            deterministic = self.prefilter.evaluate(
+                job, preference, profile, resume_fit=resume_fit
+            )
+            if deterministic.eligible_for_ai:
+                result = deterministic.to_match_result().model_copy(
+                    update={
+                        "reason": (
+                            "; ".join(deterministic.reasons)
+                            or "deterministic minimum-daily catch-up evaluation"
+                        )
+                    }
+                )
+            else:
+                result = deterministic.to_match_result()
+        else:
+            result = await self.evaluate(
+                job,
+                preference,
+                profile,
+                resume_fit=resume_fit,
+                resume_category=resume_category,
+            )
         evaluation = MatchEvaluation(
             profile_id=profile.id,
             canonical_job_id=job.canonical_job_id,
@@ -395,6 +475,7 @@ async def process_unprocessed_jobs() -> int:
     from app.database.session import async_session_factory
 
     settings = get_settings()
+    backoff_remaining = await _matching_provider_backoff_remaining(settings)
     service = MatchingService(settings)
     processed = 0
     async with async_session_factory() as session:
@@ -496,13 +577,23 @@ async def process_unprocessed_jobs() -> int:
 
             batch: list[tuple[UUID, bool]] = []
             ai_selected = 0
+            ai_deferred = 0
             for source_job_id, needs_ai in candidates:
                 if len(batch) >= settings.matching_max_jobs_per_cycle:
                     break
+                if needs_ai and backoff_remaining > 0:
+                    ai_deferred += 1
+                    continue
                 if needs_ai and ai_selected >= settings.matching_batch_size:
                     continue
                 batch.append((source_job_id, needs_ai))
                 ai_selected += int(needs_ai)
+
+            if ai_deferred:
+                logger.info(
+                    "job_matching_deferred", reason="provider_backoff",
+                    retry_after_seconds=backoff_remaining, ai_jobs_deferred=ai_deferred,
+                )
 
             logger.info(
                 "job_matching_batch_selected",
@@ -514,9 +605,23 @@ async def process_unprocessed_jobs() -> int:
                 configured_max_jobs_per_cycle=settings.matching_max_jobs_per_cycle,
             )
             for index, (source_job_id, needs_ai) in enumerate(batch):
+                if needs_ai and backoff_remaining > 0:
+                    continue
                 try:
                     async with session.begin_nested():
                         await service.analyze(session, source_job_id, profile.id)
+                except LLMProviderUnavailable as exc:
+                    ttl = await _set_matching_provider_backoff(
+                        settings, exc.retry_after_seconds
+                    )
+                    logger.warning(
+                        "job_matching_provider_backoff",
+                        provider=exc.provider,
+                        retry_after_seconds=ttl,
+                    )
+                    backoff_remaining = ttl
+                    await session.commit()
+                    continue
                 except (LookupError, ValueError) as exc:
                     logger.warning(
                         "job_matching_skipped",
@@ -528,6 +633,7 @@ async def process_unprocessed_jobs() -> int:
                 processed += 1
                 if (
                     needs_ai
+                    and backoff_remaining <= 0
                     and settings.matching_inter_job_delay_seconds > 0
                     and any(item_needs_ai for _, item_needs_ai in batch[index + 1 :])
                 ):

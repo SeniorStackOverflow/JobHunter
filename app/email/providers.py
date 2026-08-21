@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Any, Protocol
 
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -119,6 +120,12 @@ class GmailApiProvider:
 
         try:
             response = await asyncio.to_thread(execute)
+        except RefreshError as exc:
+            # OAuth refresh happens before the Gmail send request, so a rejected
+            # refresh is a known non-delivery outcome rather than an unknown send.
+            raise TemporaryDeliveryError(
+                "Gmail OAuth refresh failed; reauthorization is required"
+            ) from exc
         except HttpError as exc:
             status = getattr(exc.resp, "status", None)
             if status == 429:

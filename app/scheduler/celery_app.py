@@ -59,27 +59,27 @@ celery_app.conf.update(
         "dispatch-per-source-schedules": {
             "task": "job_agent.scheduler.dispatch_due_sources",
             "schedule": crontab(minute="*"),
-            "options": {"queue": "maintenance"},
+            "options": {"queue": "maintenance", "expires": 55},
         },
         "process-unprocessed-jobs": {
             "task": "job_agent.scheduler.process_unprocessed_jobs",
             "schedule": 300.0,
-            "options": {"queue": "matching"},
+            "options": {"queue": "matching", "expires": 270},
         },
         "prepare-pending-applications": {
             "task": "job_agent.scheduler.prepare_pending_applications",
             "schedule": 300.0,
-            "options": {"queue": "applications"},
+            "options": {"queue": "applications", "expires": 270},
         },
         "send-auto-approved-applications": {
             "task": "job_agent.scheduler.send_auto_approved_applications",
             "schedule": 60.0,
-            "options": {"queue": "email"},
+            "options": {"queue": "email", "expires": 55},
         },
         "retry-temporary-email-failures": {
             "task": "job_agent.scheduler.retry_temporary_failures",
             "schedule": 900.0,
-            "options": {"queue": "email"},
+            "options": {"queue": "email", "expires": 840},
         },
         "daily-report": {
             "task": "job_agent.scheduler.generate_daily_report",
