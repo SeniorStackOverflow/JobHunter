@@ -127,6 +127,15 @@ def _safe_fallback(provider: str, failure_code: str) -> MatchResult:
     )
 
 
+def _schema_validation_failure(exc: ValidationError) -> str:
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    if not errors:
+        return "schema_validation:unknown"
+    t = str(errors[0].get("type") or "unknown")
+    t = "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in t)
+    return f"schema_validation:{t or 'unknown'}"
+
+
 def _request_payload(request: MatchRequest) -> str:
     dumped = request.model_dump(mode="json")
     deterministic = dumped.pop("deterministic_context", None)
@@ -432,10 +441,11 @@ class LLMRouterProvider:
             "X-LLMRouter-Prefer": self.prefer,
         }
         last_failure = "unknown"
-        # Prefer strict provider-side JSON Schema. If the selected llmRouter backend
-        # rejects response_format (some failover models do), retry without that feature
-        # while still requiring and locally validating the exact same schema.
-        for structured in (True, False):
+        # Prefer strict provider-side JSON Schema. Only a direct 400 rejection of
+        # response_format may downgrade to prompt-enforced JSON. Provider exhaustion
+        # stays retryable so weak unstructured backends cannot create schema noise.
+        structured = True
+        while True:
             switch_to_unstructured = False
             for attempt in range(self.max_attempts):
                 retryable = True
@@ -472,9 +482,6 @@ class LLMRouterProvider:
                                     payload_retry = max(0.0, float(raw_payload_retry))
                                 except (TypeError, ValueError):
                                     payload_retry = 0.0
-                                if structured:
-                                    switch_to_unstructured = True
-                                    break
                                 raise LLMProviderUnavailable(
                                     "llmrouter",
                                     max(1, int(max(retry_after_seconds, payload_retry, 60.0))),
@@ -486,8 +493,10 @@ class LLMRouterProvider:
                         return _llmrouter_result(response.json())
                 except InvalidLLMResponse as exc:
                     last_failure = exc.code
-                except (ValidationError, json.JSONDecodeError):
-                    last_failure = "schema_validation"
+                except ValidationError as exc:
+                    last_failure = _schema_validation_failure(exc)
+                except json.JSONDecodeError:
+                    last_failure = "response_json_invalid"
                 except httpx.RequestError as exc:
                     last_failure = type(exc).__name__
                 if retryable and attempt + 1 < self.max_attempts:
@@ -495,10 +504,11 @@ class LLMRouterProvider:
                     if delay:
                         await asyncio.sleep(delay)
             if switch_to_unstructured:
+                structured = False
                 continue
             if last_failure.startswith("http_"):
                 raise LLMProviderUnavailable("llmrouter", 300)
-        raise LLMProviderUnavailable("llmrouter", 300)
+            return _safe_fallback("llmrouter", last_failure)
 
 
 def _gemini_result(payload: Any) -> MatchResult:
