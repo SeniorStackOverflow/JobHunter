@@ -1,9 +1,10 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import asyncio
 import json
 from collections.abc import Sequence
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 from urllib.parse import quote
 
 import httpx
@@ -22,6 +23,8 @@ from app.models.enums import MatchDecision
 
 MATCHING_RULES_VERSION = "matching-v5"
 
+# The matching prompt is intentionally kept as reviewable prose. Reflowing it to
+# satisfy source line length would silently change the model input.
 _SYSTEM_INSTRUCTIONS = """You are a conservative but decisive job-matching evaluator. Evaluate the vacancy only against
 trusted_profile_data, trusted_resume_data, trusted_preference_data, and deterministic_prefilter.
 Return only the requested structured result.
@@ -302,16 +305,11 @@ class OpenAIProvider:
         return _safe_fallback("openai", last_failure)
 
 
-
 def _llmrouter_result(payload: Any) -> MatchResult:
     if not isinstance(payload, dict):
         raise InvalidLLMResponse("invalid_response_object")
     choices = payload.get("choices")
-    if (
-        not isinstance(choices, Sequence)
-        or isinstance(choices, (str, bytes))
-        or not choices
-    ):
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
         raise InvalidLLMResponse("missing_choice")
     choice = choices[0]
     if not isinstance(choice, dict):
@@ -342,7 +340,7 @@ def _llmrouter_result(payload: Any) -> MatchResult:
 class LLMRouterProvider:
     """OpenAI-chat-compatible provider backed by the local llmRouter service."""
 
-    _VALID_PREFER = {"fast", "cheap", "quality", "balanced"}
+    _VALID_PREFER: ClassVar[set[str]] = {"fast", "cheap", "quality", "balanced"}
 
     def __init__(
         self,
@@ -385,9 +383,7 @@ class LLMRouterProvider:
     def endpoint(self) -> str:
         return f"{self.base_url}/v1/chat/completions"
 
-    def _body(
-        self, request: MatchRequest, *, structured: bool = True
-    ) -> dict[str, Any]:
+    def _body(self, request: MatchRequest, *, structured: bool = True) -> dict[str, Any]:
         system_instructions = _SYSTEM_INSTRUCTIONS
         if not structured:
             schema = json.dumps(
@@ -478,9 +474,12 @@ class LLMRouterProvider:
                                 and error.get("type") == "all_providers_exhausted"
                             ):
                                 raw_payload_retry = error.get("retry_after_seconds")
-                                try:
-                                    payload_retry = max(0.0, float(raw_payload_retry))
-                                except (TypeError, ValueError):
+                                if isinstance(raw_payload_retry, (str, int, float)):
+                                    try:
+                                        payload_retry = max(0.0, float(raw_payload_retry))
+                                    except ValueError:
+                                        payload_retry = 0.0
+                                else:
                                     payload_retry = 0.0
                                 raise LLMProviderUnavailable(
                                     "llmrouter",

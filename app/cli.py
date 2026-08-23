@@ -14,14 +14,21 @@ from app.database.session import async_session_factory
 from app.models.entities import JobSource
 from app.models.enums import SourceHealth
 from app.profiles import ProfileService
+from app.profiles.schemas import UserProfileInput
 from app.security.auth import hash_api_key, hash_password
 
 
 async def seed_defaults(include_fixture: bool) -> None:
     async with async_session_factory() as session:
-        profile = await ProfileService().get_profile(session)
-        if profile is not None:
-            await ProfileService().get_preferences(session, profile.id)
+        profile_service = ProfileService()
+        profile = await profile_service.get_profile(session)
+        if profile is None:
+            profile = await profile_service.create_profile(
+                session,
+                UserProfileInput(name="Основной профиль"),
+                make_default=True,
+            )
+        await profile_service.get_preferences(session, profile.id)
         rabota = await session.scalar(
             select(JobSource).where(JobSource.adapter_type == "rabota_md")
         )

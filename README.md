@@ -155,8 +155,9 @@ curl --fail --silent --show-error \
 
 ## Первый full scan Rabota.md
 
-`job-agent seed` создаёт Rabota.md как `enabled=false`, `PAUSED` и
-`automatic_actions_paused=true`. Не считайте этот README юридическим разрешением.
+`job-agent seed` создаёт основной профиль с безопасными остановленными настройками,
+а Rabota.md — как `enabled=false`, `PAUSED` и `automatic_actions_paused=true`.
+Не считайте этот README юридическим разрешением.
 Первый live scan выполняйте только после явного разрешения владельца установки и
 актуального review, описанного в `docs/sources/rabota-md.md`:
 

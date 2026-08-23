@@ -320,7 +320,13 @@ async def test_force_minimum_daily_overrides_soft_match_gates_but_not_requiremen
     async with sqlite_session_factory() as session:
         values = await make_graph(session, tmp_path)
         profile, preference, resume, job, evaluation, contact, application = (
-            values[1], values[2], values[3], values[5], values[6], values[7], values[8]
+            values[1],
+            values[2],
+            values[3],
+            values[5],
+            values[6],
+            values[7],
+            values[8],
         )
         preference.additional_rules = {
             "minimum_daily_applications": 2,
@@ -399,7 +405,13 @@ async def test_forbidden_title_rule_is_a_final_policy_hard_block(
     async with sqlite_session_factory() as session:
         values = await make_graph(session, tmp_path)
         profile, preference, resume, job, evaluation, contact, application = (
-            values[1], values[2], values[3], values[5], values[6], values[7], values[8]
+            values[1],
+            values[2],
+            values[3],
+            values[5],
+            values[6],
+            values[7],
+            values[8],
         )
         job.title = "Operator Call Center"
         preference.additional_rules = {"forbidden_title_terms": ["call center"]}
@@ -598,9 +610,7 @@ async def test_retry_temporary_failures_skips_pending_review_application(
         )
         await session.commit()
 
-    monkeypatch.setattr(
-        "app.database.session.async_session_factory", sqlite_session_factory
-    )
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
     monkeypatch.setattr(email_service, "get_settings", lambda: settings(tmp_path))
 
     assert await email_service.retry_temporary_failures() == 0

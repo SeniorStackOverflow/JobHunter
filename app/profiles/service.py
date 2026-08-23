@@ -57,7 +57,7 @@ class ProfileService:
             select(UserProfile).where(UserProfile.is_default.is_(True)).limit(1)
         )
         if profile is not None:
-            return cast(UserProfile, profile)
+            return profile
         return cast(
             UserProfile | None,
             await session.scalar(

@@ -159,9 +159,7 @@ def test_build_match_request_includes_confirmed_structured_profile_context() -> 
             {"role": "Warehouse operator", "company": "FedEx", "confirmed": True},
             {"role": "Unverified role", "company": "Unknown", "confirmed": False},
         ],
-        education=[
-            {"level": "Secondary education", "institution": "School", "confirmed": True}
-        ],
+        education=[{"level": "Secondary education", "institution": "School", "confirmed": True}],
         driving_licences=["B"],
     )
     prefilter = DeterministicPrefilter().evaluate(
@@ -394,7 +392,11 @@ def test_drivers_category_alone_does_not_require_licence() -> None:
             title="Вело-курьер",
             category="drivers",
             categories_seen=["drivers"],
-            description="Требуются вело-курьеры с личным велосипедом. Ответственность и желание работать.",
+            description=(
+                "Требуются вело-курьеры "
+                "с личным велосипедом. "  # noqa: RUF001 - intentional Cyrillic fixture
+                "Ответственность и желание работать."
+            ),
         ),
         make_preference(allowed_categories=["delivery"]),
         make_profile(driving_licences=[]),

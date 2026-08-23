@@ -16,26 +16,35 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "source_jobs",
-        sa.Column("public_emails", sa.JSON(), nullable=False, server_default=sa.text("'[]'")),
-    )
-    op.add_column(
-        "source_jobs",
-        sa.Column("public_phones", sa.JSON(), nullable=False, server_default=sa.text("'[]'")),
+    with op.batch_alter_table("source_jobs") as batch_op:
+        batch_op.add_column(
+            sa.Column("public_emails", sa.JSON(), nullable=False, server_default=sa.text("'[]'"))
+        )
+        batch_op.add_column(
+            sa.Column("public_phones", sa.JSON(), nullable=False, server_default=sa.text("'[]'"))
+        )
+
+    json_array_function = (
+        "json_array" if op.get_bind().dialect.name == "sqlite" else "json_build_array"
     )
     op.execute(
-        "UPDATE source_jobs SET public_emails = json_build_array(public_email) "
-        "WHERE public_email IS NOT NULL"
+        sa.text(
+            f"UPDATE source_jobs SET public_emails = {json_array_function}(public_email) "
+            "WHERE public_email IS NOT NULL"
+        )
     )
     op.execute(
-        "UPDATE source_jobs SET public_phones = json_build_array(public_phone) "
-        "WHERE public_phone IS NOT NULL"
+        sa.text(
+            f"UPDATE source_jobs SET public_phones = {json_array_function}(public_phone) "
+            "WHERE public_phone IS NOT NULL"
+        )
     )
-    op.alter_column("source_jobs", "public_emails", server_default=None)
-    op.alter_column("source_jobs", "public_phones", server_default=None)
+    with op.batch_alter_table("source_jobs") as batch_op:
+        batch_op.alter_column("public_emails", server_default=None)
+        batch_op.alter_column("public_phones", server_default=None)
 
 
 def downgrade() -> None:
-    op.drop_column("source_jobs", "public_phones")
-    op.drop_column("source_jobs", "public_emails")
+    with op.batch_alter_table("source_jobs") as batch_op:
+        batch_op.drop_column("public_phones")
+        batch_op.drop_column("public_emails")

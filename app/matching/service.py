@@ -416,13 +416,9 @@ class MatchingService:
         resume = await _select_resume(session, profile.id, job)
         resume_category = resume.category if resume is not None else None
         resume_fit = _estimate_resume_fit(job, profile, resume_category)
-        minimum_catchup_active = await _minimum_catchup_active(
-            session, preference, profile.id
-        )
+        minimum_catchup_active = await _minimum_catchup_active(session, preference, profile.id)
         if minimum_catchup_active:
-            deterministic = self.prefilter.evaluate(
-                job, preference, profile, resume_fit=resume_fit
-            )
+            deterministic = self.prefilter.evaluate(job, preference, profile, resume_fit=resume_fit)
             if deterministic.eligible_for_ai:
                 result = deterministic.to_match_result().model_copy(
                     update={
@@ -591,8 +587,10 @@ async def process_unprocessed_jobs() -> int:
 
             if ai_deferred:
                 logger.info(
-                    "job_matching_deferred", reason="provider_backoff",
-                    retry_after_seconds=backoff_remaining, ai_jobs_deferred=ai_deferred,
+                    "job_matching_deferred",
+                    reason="provider_backoff",
+                    retry_after_seconds=backoff_remaining,
+                    ai_jobs_deferred=ai_deferred,
                 )
 
             logger.info(
@@ -611,9 +609,7 @@ async def process_unprocessed_jobs() -> int:
                     async with session.begin_nested():
                         await service.analyze(session, source_job_id, profile.id)
                 except LLMProviderUnavailable as exc:
-                    ttl = await _set_matching_provider_backoff(
-                        settings, exc.retry_after_seconds
-                    )
+                    ttl = await _set_matching_provider_backoff(settings, exc.retry_after_seconds)
                     logger.warning(
                         "job_matching_provider_backoff",
                         provider=exc.provider,

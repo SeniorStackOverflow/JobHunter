@@ -440,25 +440,26 @@ async def send_auto_approved_applications() -> int:
     service = EmailService(settings, async_session_factory)
     start_of_day = datetime.combine(datetime.now(UTC).date(), time.min, UTC)
     async with async_session_factory() as session:
-        attempts_by_profile = dict(
-            (
-                await session.execute(
-                    select(Application.profile_id, func.count(EmailDelivery.id))
-                    .join(EmailDelivery, EmailDelivery.application_id == Application.id)
-                    .where(
-                        EmailDelivery.created_at >= start_of_day,
-                        EmailDelivery.status.in_(
-                            {
-                                DeliveryStatus.SENT,
-                                DeliveryStatus.SENDING,
-                                DeliveryStatus.DELIVERY_UNKNOWN,
-                            }
-                        ),
-                    )
-                    .group_by(Application.profile_id)
+        attempt_rows = (
+            await session.execute(
+                select(Application.profile_id, func.count(EmailDelivery.id))
+                .join(EmailDelivery, EmailDelivery.application_id == Application.id)
+                .where(
+                    EmailDelivery.created_at >= start_of_day,
+                    EmailDelivery.status.in_(
+                        {
+                            DeliveryStatus.SENT,
+                            DeliveryStatus.SENDING,
+                            DeliveryStatus.DELIVERY_UNKNOWN,
+                        }
+                    ),
                 )
-            ).all()
-        )
+                .group_by(Application.profile_id)
+            )
+        ).all()
+        attempts_by_profile: dict[UUID, int] = {
+            profile_id: int(attempt_count) for profile_id, attempt_count in attempt_rows
+        }
         capacities = {
             profile_id: max(0, maximum - int(attempts_by_profile.get(profile_id, 0)))
             for profile_id, maximum in (

@@ -145,12 +145,13 @@ def _driving_licence_is_hard_requirement(text: str) -> bool:
 
         # Also inspect a small local window for forms such as
         # "Permis de conducere categoria B - obligatoriu".
-        local = text[max(0, match.start() - 120): min(len(text), match.end() + 160)]
+        local = text[max(0, match.start() - 120) : min(len(text), match.end() + 160)]
         if _DRIVING_OPTIONAL.search(local):
             continue
         if _DRIVING_REQUIRED.search(local):
             return True
     return False
+
 
 # Rabota.md exposes source-taxonomy slugs while profile preferences use the
 # application's stable category vocabulary. Keep this translation deterministic
@@ -254,11 +255,7 @@ def _string_list_rule(rules: dict[str, Any], key: str) -> list[str]:
     value = rules.get(key, [])
     if not isinstance(value, list):
         return []
-    return _unique(
-        item.strip()
-        for item in value
-        if isinstance(item, str) and item.strip()
-    )
+    return _unique(item.strip() for item in value if isinstance(item, str) and item.strip())
 
 
 def _profile_language_names(profile: UserProfile) -> set[str]:

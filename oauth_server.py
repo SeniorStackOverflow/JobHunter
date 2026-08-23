@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import importlib.util
@@ -9,7 +10,11 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
-TOKEN_FILE = Path(os.getenv("JOBHUNTER_MCP_OAUTH_TOKEN_FILE", "/home/andrei/.config/jobhunter-mcp/oauth-token"))
+# OAuth metadata and the embedded standalone login document contain deliberately
+# indivisible URLs/HTML attributes.
+TOKEN_FILE = Path(
+    os.getenv("JOBHUNTER_MCP_OAUTH_TOKEN_FILE", "/home/andrei/.config/jobhunter-mcp/oauth-token")
+)
 
 
 def _shared_password() -> str:
@@ -17,7 +22,9 @@ def _shared_password() -> str:
     env_value = os.getenv("MCP_SECRET_PASSWORD")
     if env_value:
         return env_value
-    spec = importlib.util.spec_from_file_location("existing_playwright_oauth", "/home/andrei/playwright_oauth_server.py")
+    spec = importlib.util.spec_from_file_location(
+        "existing_playwright_oauth", "/home/andrei/playwright_oauth_server.py"
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("unable to load existing MCP OAuth password source")
     module = importlib.util.module_from_spec(spec)
@@ -42,45 +49,58 @@ auth_codes: dict[str, bool | dict[str, str]] = {}
 async def openid_config(request):
     host = request.headers.get("host", "jobhunter.46-225-103-75.sslip.io")
     base_url = f"https://{host}"
-    return JSONResponse({
-        "issuer": base_url,
-        "authorization_endpoint": f"{base_url}/oauth/authorize",
-        "token_endpoint": f"{base_url}/oauth/token",
-        "registration_endpoint": f"{base_url}/oauth/register",
-        "userinfo_endpoint": f"{base_url}/oauth/userinfo",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
-        "scopes_supported": ["openid", "profile", "email"],
-        "code_challenge_methods_supported": ["S256"],
-    })
+    return JSONResponse(
+        {
+            "issuer": base_url,
+            "authorization_endpoint": f"{base_url}/oauth/authorize",
+            "token_endpoint": f"{base_url}/oauth/token",
+            "registration_endpoint": f"{base_url}/oauth/register",
+            "userinfo_endpoint": f"{base_url}/oauth/userinfo",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "token_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ],
+            "scopes_supported": ["openid", "profile", "email"],
+            "code_challenge_methods_supported": ["S256"],
+        }
+    )
 
 
 async def protected_resource_config(request):
     host = request.headers.get("host", "jobhunter.46-225-103-75.sslip.io")
     base_url = f"https://{host}"
-    return JSONResponse({
-        "resource": f"{base_url}/mcp",
-        "authorization_servers": [base_url],
-        "scopes_supported": ["openid", "profile", "email"],
-        "bearer_methods_supported": ["header"],
-    })
+    return JSONResponse(
+        {
+            "resource": f"{base_url}/mcp",
+            "authorization_servers": [base_url],
+            "scopes_supported": ["openid", "profile", "email"],
+            "bearer_methods_supported": ["header"],
+        }
+    )
 
 
 async def register_endpoint(request):
-    return JSONResponse({
-        "client_id": "chatgpt-jobhunter-mcp",
-        "client_secret": "chatgpt-jobhunter-mcp-public-client",
-        "client_id_issued_at": 1786570000,
-        "client_secret_expires_at": 0,
-    }, status_code=201)
+    return JSONResponse(
+        {
+            "client_id": "chatgpt-jobhunter-mcp",
+            "client_secret": "chatgpt-jobhunter-mcp-public-client",
+            "client_id_issued_at": 1786570000,
+            "client_secret_expires_at": 0,
+        },
+        status_code=201,
+    )
 
 
 async def userinfo_endpoint(request):
-    return JSONResponse({
-        "sub": "andrei",
-        "name": "Andrei",
-    })
+    return JSONResponse(
+        {
+            "sub": "andrei",
+            "name": "Andrei",
+        }
+    )
 
 
 async def authorize_get(request):
@@ -109,7 +129,9 @@ async def authorize_post(request):
     redirect_uri = str(form.get("redirect_uri", ""))
     state = str(form.get("state", ""))
     if not secrets.compare_digest(password, SECRET_PASSWORD):
-        return HTMLResponse("<h3 style='color:red;text-align:center;'>Invalid password</h3>", status_code=401)
+        return HTMLResponse(
+            "<h3 style='color:red;text-align:center;'>Invalid password</h3>", status_code=401
+        )
     code = secrets.token_urlsafe(32)
     auth_codes[code] = True
     separator = "&" if "?" in redirect_uri else "?"
@@ -121,22 +143,30 @@ async def token_endpoint(request):
     code = str(form.get("code", ""))
     if code in auth_codes:
         del auth_codes[code]
-        return JSONResponse({
-            "access_token": _access_token(),
-            "token_type": "Bearer",
-            "expires_in": 3600 * 24 * 365,
-        })
+        return JSONResponse(
+            {
+                "access_token": _access_token(),
+                "token_type": "Bearer",
+                "expires_in": 3600 * 24 * 365,
+            }
+        )
     return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
 
-app = Starlette(routes=[
-    Route("/.well-known/oauth-authorization-server", openid_config, methods=["GET"]),
-    Route("/.well-known/openid-configuration", openid_config, methods=["GET"]),
-    Route("/.well-known/oauth-protected-resource", protected_resource_config, methods=["GET"]),
-    Route("/.well-known/oauth-protected-resource/{path:path}", protected_resource_config, methods=["GET"]),
-    Route("/oauth/authorize", authorize_get, methods=["GET"]),
-    Route("/oauth/authorize", authorize_post, methods=["POST"]),
-    Route("/oauth/token", token_endpoint, methods=["GET", "POST"]),
-    Route("/oauth/register", register_endpoint, methods=["GET", "POST"]),
-    Route("/oauth/userinfo", userinfo_endpoint, methods=["GET", "POST"]),
-])
+app = Starlette(
+    routes=[
+        Route("/.well-known/oauth-authorization-server", openid_config, methods=["GET"]),
+        Route("/.well-known/openid-configuration", openid_config, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource", protected_resource_config, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-protected-resource/{path:path}",
+            protected_resource_config,
+            methods=["GET"],
+        ),
+        Route("/oauth/authorize", authorize_get, methods=["GET"]),
+        Route("/oauth/authorize", authorize_post, methods=["POST"]),
+        Route("/oauth/token", token_endpoint, methods=["GET", "POST"]),
+        Route("/oauth/register", register_endpoint, methods=["GET", "POST"]),
+        Route("/oauth/userinfo", userinfo_endpoint, methods=["GET", "POST"]),
+    ]
+)

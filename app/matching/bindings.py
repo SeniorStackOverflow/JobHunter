@@ -51,7 +51,8 @@ def preference_fingerprint(preference: JobPreference) -> str:
             "additional_rules": {
                 key: value
                 for key, value in (preference.additional_rules or {}).items()
-                if key not in {
+                if key
+                not in {
                     "minimum_daily_applications",
                     "force_minimum_daily_applications",
                 }

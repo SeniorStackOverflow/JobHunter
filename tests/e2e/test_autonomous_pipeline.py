@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -88,7 +89,10 @@ async def test_autonomous_fixture_pipeline_is_safe_and_idempotent(
     (resume_dir / "technical.pdf").write_bytes(resume_data)
     settings = make_test_settings(resume_dir)
     async with sqlite_session_factory() as session:
+        profile_id = uuid4()
         profile = UserProfile(
+            id=profile_id,
+            is_default=True,
             name="Fixture Candidate",
             location="Chisinau",
             languages=[
@@ -107,6 +111,7 @@ async def test_autonomous_fixture_pipeline_is_safe_and_idempotent(
             ],
         )
         preferences = JobPreference(
+            profile_id=profile_id,
             allowed_categories=[
                 "technology",
                 "delivery",
@@ -135,6 +140,7 @@ async def test_autonomous_fixture_pipeline_is_safe_and_idempotent(
             global_pause=False,
         )
         resume = Resume(
+            profile_id=profile_id,
             name="Technical CV",
             category="technology",
             storage_key="technical.pdf",

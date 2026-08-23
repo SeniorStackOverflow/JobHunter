@@ -120,7 +120,9 @@ class PolicyEngine:
         )
         raw_minimum_daily = additional_rules.get("minimum_daily_applications", 0)
         try:
-            minimum_daily = max(0, min(int(raw_minimum_daily), preferences.maximum_daily_applications))
+            minimum_daily = max(
+                0, min(int(raw_minimum_daily), preferences.maximum_daily_applications)
+            )
         except (TypeError, ValueError):
             minimum_daily = 0
         force_minimum = additional_rules.get("force_minimum_daily_applications") is True
@@ -144,8 +146,7 @@ class PolicyEngine:
         rule("job_title_allowed_by_preferences", not title_forbidden)
         rule(
             "overall_score_threshold",
-            minimum_catchup_active
-            or evaluation.overall_fit >= preferences.minimum_auto_send_score,
+            minimum_catchup_active or evaluation.overall_fit >= preferences.minimum_auto_send_score,
         )
         rule("mandatory_requirements_met", not evaluation.missing_requirements)
         rule(

@@ -168,8 +168,8 @@ async def test_persistent_browser_rejects_invalid_fragment_payload(
 async def test_persistent_browser_stops_started_playwright_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from types import ModuleType
     import sys
+    from types import ModuleType
 
     class FakeProbe:
         async def evaluate(self, _expression: str) -> str:
