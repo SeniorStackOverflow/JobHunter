@@ -828,7 +828,9 @@ async def gmail_oauth_callback(
                 max_age=settings.session_ttl_seconds,
                 secure=service.secure_cookie,
                 httponly=True,
-                samesite="strict",
+                # The session is issued on Google's cross-site callback. Lax is required so
+                # the browser sends it on the immediate top-level GET redirect to the dashboard.
+                samesite="lax",
                 path="/",
             )
         else:

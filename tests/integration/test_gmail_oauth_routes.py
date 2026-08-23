@@ -279,7 +279,9 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
     set_cookie = callback.headers["set-cookie"]
     assert "HttpOnly" in set_cookie
     assert "Secure" in set_cookie
-    assert "SameSite=strict" in set_cookie
+    # OAuth returns from a different site, so Strict would suppress this cookie on the
+    # callback's immediate dashboard redirect and bounce the operator back to /login.
+    assert "SameSite=lax" in set_cookie
 
     async with oauth_api.session_factory() as session:
         credential = await session.scalar(select(OAuthCredential))
