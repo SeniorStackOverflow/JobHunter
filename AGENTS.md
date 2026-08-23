@@ -14,6 +14,26 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 Use Python 3.12 semantics. Before handing off changes run `ruff check .`, `ruff format --check .`,
 `mypy app fixture_site`, and `pytest`. Never enable real email delivery or live crawling in tests.
 
+## Production deployment gate
+
+Develop and validate JobHunter changes in the local WSL checkout by default. Do not edit files,
+pull commits, build images, run migrations, restart services, or deploy changes on the production
+server while implementing or debugging a change.
+
+Before any production mutation, the exact changed behavior must pass the relevant focused tests,
+the project checks above, and an end-to-end test in a local or non-production environment. Browser,
+authentication, OAuth, redirect, cookie, and other integration-sensitive changes must be exercised
+through Playwright with a clean browser context and must complete successfully at least three
+consecutive times. Mocked provider responses and narrow route tests do not replace this end-to-end
+gate. A production read-only diagnostic may help reproduce a bug, but a successful production test
+must never be used as a substitute for pre-deployment validation.
+
+After the evidence is collected, report the tests and proposed rollout/rollback plan to the operator.
+Mutate production only after explicit deployment authorization in the current conversation. Earlier
+authorization does not carry forward to later changes, and ordinary deployment authorization does
+not waive this testing gate; bypassing it requires the operator to explicitly declare an emergency
+override.
+
 
 ## Docker image and disk hygiene
 
