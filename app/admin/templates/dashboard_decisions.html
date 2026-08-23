@@ -17,8 +17,8 @@
       <div class="queue-actions">
         <a class="btn" href="/admin/applications/{{ item.id }}">Проверить письмо</a>
         {% if item.status == 'pending_review' or item.status == 'prepared' %}
-        <form method="post" action="/admin/applications/{{ item.id }}/approve" data-confirm="Одобрить этот отклик?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-primary">Одобрить</button></form>
-        <form method="post" action="/admin/applications/{{ item.id }}/reject" data-confirm="Отклонить этот отклик? Он не будет отправлен."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-danger">Отклонить</button></form>
+        <form method="post" action="/admin/applications/{{ item.id }}/approve" data-confirm-title="Одобрить отклик?" data-confirm="После одобрения письмо сможет быть отправлено работодателю по правилам профиля." data-confirm-action="Одобрить"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-primary">Одобрить</button></form>
+        <form method="post" action="/admin/applications/{{ item.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Причина сохранится в истории решений." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Например: не подходит вакансия, график или зарплата"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-danger">Отклонить</button></form>
         {% endif %}
       </div>
     </article>

@@ -27,6 +27,7 @@ from app.matching.bindings import (
     profile_fingerprint,
 )
 from app.models.entities import (
+    Alert,
     Application,
     AuditEvent,
     BatchScanRun,
@@ -471,6 +472,16 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
                 health_status=SourceHealth.UNKNOWN,
             )
         )
+        session.add(
+            Alert(
+                severity="warning",
+                code="adapter_degradation",
+                message="Historical UI fixture",
+                safe_diagnostics={"source": "fixture"},
+                acknowledged=False,
+                created_at=datetime.now(UTC) - timedelta(days=2),
+            )
+        )
         await session.commit()
     transport = httpx.ASGITransport(app=application)
     async with httpx.AsyncClient(
@@ -524,6 +535,8 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert "Требует вашего внимания" in dashboard.text
         assert "Google OAuth не настроен" in dashboard.text
         assert 'href="javascript:' not in dashboard.text.casefold()
+        assert "data-confirm-dialog" in dashboard.text
+        assert ".confirm-reason[hidden]{display:none}" in dashboard.text
         for view, heading in {
             "decisions": "Требуют решения",
             "history": "История",
@@ -534,6 +547,13 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
             assert page.status_code == 200
             assert heading in page.text
             assert page.text.count('class="admin-section"') == 1
+            if view == "diagnostics":
+                assert len(HTMLParser(page.text).css(".archive-item")) == 1
+                assert "Отметить просмотренным" in page.text
+                assert "white-space:normal!important" in page.text
+        feedback_page = await client.get("/", params={"notice": "preferences_saved"})
+        assert "Настройки сохранены" in feedback_page.text
+        assert "data-notice-dismiss" in feedback_page.text
         dashboard_csrf = _csrf_token(dashboard.text)
 
         wrong_binding = await client.post("/admin/pause/true", data={"csrf_token": login_csrf})

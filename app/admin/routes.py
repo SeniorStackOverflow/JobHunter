@@ -157,6 +157,60 @@ _ALERT_CODE_LABELS = {
     "mass_absence_suppressed": "Защитная проверка массового исчезновения вакансий",
 }
 
+_FEEDBACK_NOTICES = {
+    "google_connected": (
+        "Google подключён",
+        "Вход подтверждён, доступ к Gmail сохранён на сервере.",
+    ),
+    "profile_saved": ("Профиль сохранён", "Изменения данных профиля применены."),
+    "profile_created": ("Профиль создан", "Новый профиль готов к настройке."),
+    "profile_default": ("Основной профиль изменён", "Он будет выбран по умолчанию."),
+    "preferences_saved": (
+        "Настройки сохранены",
+        "Критерии поиска и ограничения обновлены.",
+    ),
+    "auto_send_paused": (
+        "Автоотправка приостановлена",
+        "Новые письма не будут отправляться до возобновления.",
+    ),
+    "auto_send_resumed": (
+        "Автоотправка возобновлена",
+        "JobHunter снова применяет заданные правила и дневной лимит.",
+    ),
+    "resume_uploaded": (
+        "Резюме загружено",
+        "Проверьте его перед использованием в автоматических откликах.",
+    ),
+    "resume_verified": ("Резюме подтверждено", "Оно доступно для подготовки откликов."),
+    "google_disconnected": (
+        "Google отключён",
+        "Отправка через Gmail остановлена до повторного подключения.",
+    ),
+    "alert_acknowledged": (
+        "Уведомление просмотрено",
+        "Оно сохранено в архиве диагностики.",
+    ),
+    "source_enabled": ("Источник включён", "Новые обходы снова разрешены."),
+    "source_disabled": (
+        "Источник выключен",
+        "Новые обходы остановлены, собранные вакансии сохранены.",
+    ),
+    "scan_started": ("Проверка запущена", "Результат появится в истории обходов."),
+    "application_approved": (
+        "Отклик одобрен",
+        "Он прошёл ручную проверку и готов к следующему этапу.",
+    ),
+    "application_rejected": (
+        "Отклик отклонён",
+        "Он отменён и не попадёт в отправку.",
+    ),
+    "application_sent": ("Письмо отправлено", "Состояние доставки сохранено в журнале."),
+    "delivery_reconciled": (
+        "Состояние зафиксировано",
+        "Повторная отправка не выполнялась.",
+    ),
+}
+
 
 def _enum_value(value: Any) -> str:
     return str(getattr(value, "value", value) or "unknown")
@@ -463,6 +517,8 @@ async def dashboard(
     q: str = "",
     status_filter: str = "pending_review",
     history_kind: str = "sent",
+    notice: str | None = None,
+    google: str | None = None,
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
 ) -> HTMLResponse:
@@ -1011,6 +1067,9 @@ async def dashboard(
             "overall_title": overall_title,
             "now_local": now_local,
             "settings": get_settings(),
+            "feedback_notice": _FEEDBACK_NOTICES.get(
+                "google_connected" if google == "connected" else notice or ""
+            ),
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -1053,7 +1112,9 @@ async def save_profile(
     profile = await ProfileService().upsert_profile(session, payload, profile_id)
     await _audit_admin(session, "profile.updated", "user_profile", str(profile.id))
     await session.commit()
-    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={profile.id}&notice=profile_saved", status_code=303
+    )
 
 
 @router.post("/admin/profiles")
@@ -1072,7 +1133,9 @@ async def create_profile(
     )
     await _audit_admin(session, "profile.created", "user_profile", str(profile.id))
     await session.commit()
-    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={profile.id}&notice=profile_created", status_code=303
+    )
 
 
 @router.post("/admin/profiles/{profile_id}/default")
@@ -1090,7 +1153,9 @@ async def make_default_profile(
         raise HTTPException(status_code=404, detail="profile not found") from exc
     await _audit_admin(session, "profile.default_changed", "user_profile", str(profile.id))
     await session.commit()
-    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={profile.id}&notice=profile_default", status_code=303
+    )
 
 
 @router.post("/admin/preferences")
@@ -1134,7 +1199,10 @@ async def save_preferences(
         },
     )
     await session.commit()
-    return RedirectResponse(f"/?view=settings&profile_id={preferences.profile_id}", status_code=303)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={preferences.profile_id}&notice=preferences_saved",
+        status_code=303,
+    )
 
 
 @router.post("/admin/pause/{paused}")
@@ -1165,7 +1233,10 @@ async def set_pause(
         },
     )
     await session.commit()
-    return RedirectResponse(f"/?view=overview&profile_id={preferences.profile_id}", status_code=303)
+    notice = "auto_send_paused" if paused else "auto_send_resumed"
+    return RedirectResponse(
+        f"/?view=overview&profile_id={preferences.profile_id}&notice={notice}", status_code=303
+    )
 
 
 @router.post("/admin/resumes")
@@ -1204,7 +1275,9 @@ async def admin_upload_resume(
         details={"mime_type": resume.mime_type, "sha256": resume.sha256},
     )
     await session.commit()
-    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={profile.id}&notice=resume_uploaded", status_code=303
+    )
 
 
 @router.post("/admin/oauth/gmail/disconnect")
@@ -1225,7 +1298,7 @@ async def admin_disconnect_gmail(
         details={"pending_authorizations_invalidated": True, "remote_grant_revoked": False},
     )
     await session.commit()
-    return RedirectResponse("/?view=settings", status_code=303)
+    return RedirectResponse("/?view=settings&notice=google_disconnected", status_code=303)
 
 
 @router.post("/admin/alerts/{alert_id}/acknowledge")
@@ -1249,7 +1322,7 @@ async def acknowledge_alert(
         decision="acknowledged",
     )
     await session.commit()
-    return RedirectResponse("/?view=diagnostics", status_code=303)
+    return RedirectResponse("/?view=diagnostics&notice=alert_acknowledged", status_code=303)
 
 
 @router.post("/admin/resumes/{resume_id}/verify")
@@ -1270,7 +1343,10 @@ async def verify_resume(
     resume.active = True
     await _audit_admin(session, "resume.verified", "resume", str(resume.id))
     await session.commit()
-    return RedirectResponse(f"/?view=settings&profile_id={selected_profile.id}", status_code=303)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_verified",
+        status_code=303,
+    )
 
 
 @router.post("/admin/sources/{source_id}/toggle")
@@ -1301,7 +1377,8 @@ async def toggle_source(
         decision="enabled" if enabling else "disabled",
     )
     await session.commit()
-    return RedirectResponse("/?view=settings", status_code=303)
+    notice = "source_enabled" if enabling else "source_disabled"
+    return RedirectResponse(f"/?view=settings&notice={notice}", status_code=303)
 
 
 @router.post("/admin/sources/{source_id}/scan/{scan_type}")
@@ -1329,13 +1406,14 @@ async def admin_start_scan(
                 stored.diagnostics = {"queue_error": type(exc).__name__}
                 await session.commit()
         raise HTTPException(status_code=503, detail="task queue unavailable") from exc
-    return RedirectResponse("/?view=diagnostics", status_code=303)
+    return RedirectResponse("/?view=diagnostics&notice=scan_started", status_code=303)
 
 
 @router.get("/admin/applications/{application_id}", response_class=HTMLResponse)
 async def admin_application_detail(
     application_id: UUID,
     request: Request,
+    notice: str | None = None,
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
 ) -> HTMLResponse:
@@ -1347,7 +1425,11 @@ async def admin_application_detail(
     response = templates.TemplateResponse(
         request=request,
         name="application_detail.html",
-        context={"application": detail, "csrf_token": _csrf().issue(token)},
+        context={
+            "application": detail,
+            "csrf_token": _csrf().issue(token),
+            "feedback_notice": _FEEDBACK_NOTICES.get(notice or ""),
+        },
     )
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -1379,9 +1461,12 @@ async def admin_approve_application(
     await session.commit()
     if return_to == "decisions":
         return RedirectResponse(
-            f"/?view=decisions&profile_id={application.profile_id}", status_code=303
+            f"/?view=decisions&profile_id={application.profile_id}&notice=application_approved",
+            status_code=303,
         )
-    return RedirectResponse(f"/admin/applications/{application_id}", status_code=303)
+    return RedirectResponse(
+        f"/admin/applications/{application_id}?notice=application_approved", status_code=303
+    )
 
 
 @router.post("/admin/applications/{application_id}/reject")
@@ -1413,9 +1498,12 @@ async def admin_reject_application(
     await session.commit()
     if return_to == "decisions":
         return RedirectResponse(
-            f"/?view=decisions&profile_id={application.profile_id}", status_code=303
+            f"/?view=decisions&profile_id={application.profile_id}&notice=application_rejected",
+            status_code=303,
         )
-    return RedirectResponse(f"/admin/applications/{application_id}", status_code=303)
+    return RedirectResponse(
+        f"/admin/applications/{application_id}?notice=application_rejected", status_code=303
+    )
 
 
 @router.post("/admin/applications/{application_id}/send")
@@ -1464,7 +1552,9 @@ async def admin_send_application(
         decision=delivery.status.value,
     )
     await session.commit()
-    return RedirectResponse(f"/admin/applications/{application_id}", status_code=303)
+    return RedirectResponse(
+        f"/admin/applications/{application_id}?notice=application_sent", status_code=303
+    )
 
 
 @router.post("/admin/applications/{application_id}/reconcile-delivery-unknown")
@@ -1483,4 +1573,6 @@ async def admin_reconcile_application_delivery(
     except DeliveryReconciliationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.commit()
-    return RedirectResponse(f"/admin/applications/{application_id}", status_code=303)
+    return RedirectResponse(
+        f"/admin/applications/{application_id}?notice=delivery_reconciled", status_code=303
+    )
