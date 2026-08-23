@@ -58,6 +58,16 @@ def test_admin_javascript_disables_dormant_daily_minimum() -> None:
     assert "syncMinimumAvailability();" in script
 
 
+def test_admin_preferences_use_independent_columns() -> None:
+    markup = Path("app/admin/templates/dashboard_settings.html").read_text(encoding="utf-8")
+    styles = Path("app/admin/templates/base.html").read_text(encoding="utf-8")
+
+    assert 'class="preference-columns full"' in markup
+    assert markup.count('class="preference-column"') == 2
+    assert ".preference-column{display:grid;gap:15px;align-content:start}" in styles
+    assert ".form-grid,.preference-columns{grid-template-columns:1fr}" in styles
+
+
 def test_admin_templates_do_not_use_inline_event_handlers() -> None:
     templates = Path("app/admin/templates")
 
