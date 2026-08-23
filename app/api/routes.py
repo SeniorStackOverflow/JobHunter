@@ -38,6 +38,7 @@ from app.models.entities import (
 from app.models.enums import RunStatus, ScanType, SourceHealth
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
+from app.security.auth import SessionSigner
 from app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
@@ -741,7 +742,9 @@ async def gmail_oauth_callback(
 
     from app.email.oauth import GMAIL_OAUTH_BINDING_COOKIE, GmailOAuthError
 
-    service = GmailOAuthService(get_settings())
+    settings = get_settings()
+    service = GmailOAuthService(settings)
+    admin_login = bool(state and await service.is_admin_login_request(session, state=state))
     binding_token = request.cookies.get(GMAIL_OAUTH_BINDING_COOKIE)
     try:
         if not state or not binding_token:
@@ -752,9 +755,12 @@ async def gmail_oauth_callback(
             state=state,
             binding_token=binding_token,
         )
+        audit_actor = (
+            f"google:{exchange.identity.email}" if exchange.identity is not None else exchange.actor
+        )
         await record_audit_event(
             session,
-            actor=exchange.actor,
+            actor=audit_actor,
             action="oauth.gmail.connected",
             entity_type="oauth_credential",
             entity_id=str(exchange.credential.id),
@@ -762,10 +768,21 @@ async def gmail_oauth_callback(
             decision="connected",
             details={
                 "provider": "gmail",
-                "scopes": ["https://www.googleapis.com/auth/gmail.send"],
-                "identity_verified": False,
+                "scopes": list(exchange.credential.scopes),
+                "identity_verified": exchange.identity is not None,
             },
         )
+        if exchange.identity is not None:
+            await record_audit_event(
+                session,
+                actor=audit_actor,
+                action="admin.login.google",
+                entity_type="admin_session",
+                entity_id=exchange.identity.subject,
+                correlation_id=str(exchange.request_id),
+                decision="authenticated",
+                details={"provider": "google"},
+            )
         await session.commit()
     except GmailOAuthError as exc:
         await session.rollback()
@@ -780,21 +797,50 @@ async def gmail_oauth_callback(
             decision="failed",
             details={"provider": "gmail", "error_code": exc.code},
         )
+        if admin_login:
+            await record_audit_event(
+                session,
+                actor="google-login",
+                action="admin.login.google_failed",
+                entity_type="admin_session",
+                entity_id="google",
+                correlation_id=str(correlation_id),
+                decision="failed",
+                details={"provider": "google", "error_code": exc.code},
+            )
         await session.commit()
-        response = JSONResponse(
-            status_code=400,
-            content={"status": "failed", "error": exc.code},
+        response = (
+            RedirectResponse("/login?oauth_error=1", status_code=303)
+            if admin_login
+            else JSONResponse(
+                status_code=400,
+                content={"status": "failed", "error": exc.code},
+            )
         )
     else:
-        response = JSONResponse(
-            content={
-                "status": "authorized",
-                "identity_verified": False,
-                "identity_verification_reason": (
-                    "gmail.send cannot independently identify the connected mailbox"
+        if exchange.identity is not None:
+            response = RedirectResponse("/?google=connected#overview", status_code=303)
+            response.set_cookie(
+                settings.session_cookie_name,
+                SessionSigner(settings.secret_key.get_secret_value()).issue(
+                    settings.admin_username
                 ),
-            }
-        )
+                max_age=settings.session_ttl_seconds,
+                secure=service.secure_cookie,
+                httponly=True,
+                samesite="strict",
+                path="/",
+            )
+        else:
+            response = JSONResponse(
+                content={
+                    "status": "authorized",
+                    "identity_verified": False,
+                    "identity_verification_reason": (
+                        "gmail.send cannot independently identify the connected mailbox"
+                    ),
+                }
+            )
     response.delete_cookie(
         GMAIL_OAUTH_BINDING_COOKIE,
         path="/api/v1/oauth/gmail/callback",

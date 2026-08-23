@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 from google_auth_oauthlib.flow import Flow
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +23,11 @@ from app.settings import Settings
 
 GMAIL_PROVIDER = "gmail"
 GMAIL_OAUTH_BINDING_COOKIE = "job_agent_gmail_oauth_binding"
+GOOGLE_ADMIN_OAUTH_ACTOR = "google-admin-login"
+GOOGLE_OPENID_SCOPE = "openid"
+GOOGLE_EMAIL_SCOPE = "email"
+GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
+GOOGLE_ADMIN_SCOPES = (GOOGLE_OPENID_SCOPE, GOOGLE_EMAIL_SCOPE, GMAIL_SEND_SCOPE)
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 OAUTH_REQUEST_RETENTION = timedelta(days=1)
 IDENTITY_UNVERIFIED_REASON = (
@@ -54,10 +61,17 @@ class OAuthAuthorizationStart:
 
 
 @dataclass(frozen=True, slots=True)
+class GoogleAdminIdentity:
+    subject: str
+    email: str
+
+
+@dataclass(frozen=True, slots=True)
 class OAuthExchangeResult:
     credential: OAuthCredential
     actor: str
     request_id: UUID
+    identity: GoogleAdminIdentity | None = None
 
 
 def _hash_token(value: str) -> str:
@@ -101,6 +115,7 @@ class GmailOAuthService:
         state: str | None = None,
         *,
         code_verifier: str | None = None,
+        scopes: tuple[str, ...] | None = None,
     ) -> Flow:
         if self._client_id is None or self._client_secret is None:
             raise GmailOAuthError(
@@ -117,7 +132,7 @@ class GmailOAuthService:
         }
         flow = Flow.from_client_config(
             config,
-            scopes=[GMAIL_SEND_SCOPE],
+            scopes=list(scopes or (GMAIL_SEND_SCOPE,)),
             state=state,
             code_verifier=code_verifier,
             autogenerate_code_verifier=code_verifier is None,
@@ -126,7 +141,11 @@ class GmailOAuthService:
         return flow
 
     async def create_authorization_request(
-        self, session: AsyncSession, *, actor: str
+        self,
+        session: AsyncSession,
+        *,
+        actor: str,
+        force_consent: bool = False,
     ) -> OAuthAuthorizationStart:
         normalized_actor = actor.strip()
         if not normalized_actor or len(normalized_actor) > 255:
@@ -160,12 +179,25 @@ class GmailOAuthService:
         await session.flush()
 
         try:
-            flow = self._flow(state=state, code_verifier=code_verifier)
-            url, _ = flow.authorization_url(
-                access_type="offline",
-                prompt="consent",
-                state=state,
-            )
+            if normalized_actor == GOOGLE_ADMIN_OAUTH_ACTOR:
+                flow = self._flow(
+                    state=state,
+                    code_verifier=code_verifier,
+                    scopes=GOOGLE_ADMIN_SCOPES,
+                )
+                url, _ = flow.authorization_url(
+                    access_type="offline",
+                    prompt="consent select_account" if force_consent else "select_account",
+                    state=state,
+                    nonce=_hash_token(binding_token),
+                )
+            else:
+                flow = self._flow(state=state, code_verifier=code_verifier)
+                url, _ = flow.authorization_url(
+                    access_type="offline",
+                    prompt="consent",
+                    state=state,
+                )
         except GmailOAuthError as exc:
             raise GmailOAuthError(
                 "Gmail OAuth client is not configured",
@@ -193,6 +225,38 @@ class GmailOAuthService:
             request_id=authorization_request.id,
             expires_at=expires_at,
         )
+
+    async def is_admin_login_request(self, session: AsyncSession, *, state: str) -> bool:
+        now = datetime.now(UTC)
+        request_id = await session.scalar(
+            select(OAuthAuthorizationRequest.id).where(
+                OAuthAuthorizationRequest.provider == GMAIL_PROVIDER,
+                OAuthAuthorizationRequest.state_hash == _hash_token(state),
+                OAuthAuthorizationRequest.actor == GOOGLE_ADMIN_OAUTH_ACTOR,
+                OAuthAuthorizationRequest.expires_at > now,
+                OAuthAuthorizationRequest.consumed_at.is_(None),
+            )
+        )
+        return request_id is not None
+
+    async def _verify_admin_id_token(self, raw_id_token: str) -> dict[str, Any]:
+        if self._client_id is None:
+            raise GmailOAuthError(
+                "Google OAuth client is not configured", code="oauth_not_configured"
+            )
+        audience = self._client_id.get_secret_value()
+        try:
+            claims = await asyncio.to_thread(
+                google_id_token.verify_oauth2_token,
+                raw_id_token,
+                GoogleAuthRequest(),
+                audience,
+            )
+        except Exception as exc:
+            raise GmailOAuthError(
+                "Google identity token validation failed", code="invalid_google_identity"
+            ) from exc
+        return dict(claims)
 
     async def _consume_authorization_request(
         self,
@@ -306,9 +370,11 @@ class GmailOAuthService:
                 "OAuth callback state is missing or ambiguous", code="invalid_oauth_state"
             )
 
+        expected_nonce = _hash_token(binding_token)
         request_id, actor, code_verifier = await self._consume_authorization_request(
             session, state=state, binding_token=binding_token
         )
+        admin_login = actor == GOOGLE_ADMIN_OAUTH_ACTOR
         callback_query = parse_qs(urlsplit(authorization_response).query)
         if callback_query.get("error") or len(callback_query.get("code", [])) != 1:
             raise GmailOAuthError(
@@ -320,7 +386,15 @@ class GmailOAuthService:
 
         authorization_code = callback_query["code"][0]
         try:
-            flow = self._flow(state=state, code_verifier=code_verifier)
+            flow = (
+                self._flow(
+                    state=state,
+                    code_verifier=code_verifier,
+                    scopes=GOOGLE_ADMIN_SCOPES,
+                )
+                if admin_login
+                else self._flow(state=state, code_verifier=code_verifier)
+            )
             await asyncio.to_thread(
                 flow.fetch_token,
                 code=authorization_code,
@@ -356,15 +430,59 @@ class GmailOAuthService:
                 actor=actor,
                 correlation_id=request_id,
             )
-        if normalized_scopes - {GMAIL_SEND_SCOPE}:
+        allowed_scopes = {GMAIL_SEND_SCOPE}
+        if admin_login:
+            allowed_scopes.update(
+                {GOOGLE_OPENID_SCOPE, GOOGLE_EMAIL_SCOPE, GOOGLE_USERINFO_EMAIL_SCOPE}
+            )
+        if normalized_scopes - allowed_scopes:
             raise GmailOAuthError(
                 "Google returned scopes that were not requested",
                 code="unexpected_scope_grant",
                 actor=actor,
                 correlation_id=request_id,
             )
+        identity: GoogleAdminIdentity | None = None
+        if admin_login:
+            raw_id_token = getattr(credentials, "id_token", None)
+            if not isinstance(raw_id_token, str) or not raw_id_token:
+                raise GmailOAuthError(
+                    "Google did not return an identity token",
+                    code="invalid_google_identity",
+                    actor=actor,
+                    correlation_id=request_id,
+                )
+            claims = await self._verify_admin_id_token(raw_id_token)
+            subject = claims.get("sub")
+            email = claims.get("email")
+            nonce = claims.get("nonce")
+            if (
+                not isinstance(subject, str)
+                or not subject
+                or not isinstance(email, str)
+                or not email
+                or claims.get("email_verified") is not True
+                or not isinstance(nonce, str)
+                or not secrets.compare_digest(nonce, expected_nonce)
+            ):
+                raise GmailOAuthError(
+                    "Google identity claims are invalid",
+                    code="invalid_google_identity",
+                    actor=actor,
+                    correlation_id=request_id,
+                )
+            normalized_email = email.strip().casefold()
+            if normalized_email not in self.settings.google_admin_emails:
+                raise GmailOAuthError(
+                    "Google account is not allowed to administer this deployment",
+                    code="admin_identity_not_allowed",
+                    actor=actor,
+                    correlation_id=request_id,
+                )
+            identity = GoogleAdminIdentity(subject=subject, email=normalized_email)
         refresh_token = credentials.refresh_token
-        if not isinstance(refresh_token, str) or not refresh_token:
+        has_refresh_token = isinstance(refresh_token, str) and bool(refresh_token)
+        if not has_refresh_token and not admin_login:
             raise GmailOAuthError(
                 "Google did not issue a refresh token",
                 code="refresh_token_missing",
@@ -372,10 +490,18 @@ class GmailOAuthService:
                 correlation_id=request_id,
             )
 
-        token_metadata = {
-            "identity_verified": False,
-            "identity_verification_reason": IDENTITY_UNVERIFIED_REASON,
-        }
+        token_metadata = (
+            {
+                "identity_verified": True,
+                "identity_email": identity.email,
+                "identity_provider": "google",
+            }
+            if identity is not None
+            else {
+                "identity_verified": False,
+                "identity_verification_reason": IDENTITY_UNVERIFIED_REASON,
+            }
+        )
         # Serializes local disconnect against credential persistence. Disconnect deletes
         # authorization rows first and credentials second, so it wins safely even when a
         # Google token exchange was already in flight.
@@ -386,10 +512,18 @@ class GmailOAuthService:
             .with_for_update()
         )
         if credential is None:
+            if not has_refresh_token:
+                raise GmailOAuthError(
+                    "Google did not issue a refresh token",
+                    code="refresh_token_missing",
+                    actor=actor,
+                    correlation_id=request_id,
+                )
+            assert isinstance(refresh_token, str)
             credential = OAuthCredential(
                 provider=GMAIL_PROVIDER,
                 encrypted_refresh_token=self._require_box().encrypt(refresh_token),
-                scopes=[GMAIL_SEND_SCOPE],
+                scopes=sorted(normalized_scopes),
                 token_metadata=token_metadata,
             )
             session.add(credential)
@@ -410,14 +544,17 @@ class GmailOAuthService:
                         actor=actor,
                         correlation_id=request_id,
                     ) from exc
-        credential.encrypted_refresh_token = self._require_box().encrypt(refresh_token)
-        credential.scopes = [GMAIL_SEND_SCOPE]
+        if has_refresh_token:
+            assert isinstance(refresh_token, str)
+            credential.encrypted_refresh_token = self._require_box().encrypt(refresh_token)
+        credential.scopes = sorted(normalized_scopes)
         credential.token_metadata = token_metadata
         await session.flush()
         return OAuthExchangeResult(
             credential=credential,
             actor=actor,
             request_id=request_id,
+            identity=identity,
         )
 
     async def get_status(self, session: AsyncSession) -> dict[str, Any]:
@@ -431,13 +568,19 @@ class GmailOAuthService:
                 OAuthAuthorizationRequest.consumed_at.is_(None),
             )
         )
+        metadata = dict(credential.token_metadata) if credential is not None else {}
+        identity_verified = metadata.get("identity_verified") is True
+        identity_email = metadata.get("identity_email")
         return {
             "provider": GMAIL_PROVIDER,
             "configured": self.configured,
             "connected": credential is not None,
             "scopes": list(credential.scopes) if credential is not None else [],
-            "identity_verified": False,
-            "identity_verification_reason": IDENTITY_UNVERIFIED_REASON,
+            "identity_verified": identity_verified,
+            "identity_email": identity_email if isinstance(identity_email, str) else None,
+            "identity_verification_reason": (
+                None if identity_verified else IDENTITY_UNVERIFIED_REASON
+            ),
             "connected_at": credential.created_at if credential is not None else None,
             "updated_at": credential.updated_at if credential is not None else None,
             "pending_authorizations": int(pending_count or 0),

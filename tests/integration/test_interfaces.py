@@ -513,6 +513,8 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert dashboard.headers["cache-control"] == "no-store"
         assert 'name="viewport"' in dashboard.text
         assert "Unsafe legacy source" in dashboard.text
+        assert "Требует вашего внимания" in dashboard.text
+        assert "Google OAuth не настроен" in dashboard.text
         assert 'href="javascript:' not in dashboard.text.casefold()
         dashboard_csrf = _csrf_token(dashboard.text)
 
@@ -607,6 +609,17 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
         )
         assert profile_saved.status_code == 303
         assert preferences_saved.status_code == 303
+        resume_uploaded = await client.post(
+            "/admin/resumes",
+            data={
+                "profile_id": str(profile_id),
+                "name": "Admin upload",
+                "category": "operations",
+                "csrf_token": csrf_token,
+            },
+            files={"file": ("admin.pdf", b"%PDF-1.7\nadmin upload\n%%EOF", "application/pdf")},
+        )
+        assert resume_uploaded.status_code == 303
 
         async with sqlite_session_factory() as session:
             profile = await session.scalar(select(UserProfile))
@@ -628,6 +641,11 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
             assert preferences.additional_rules == {"verified_only": True}
             assert preferences.auto_send_enabled is False
             assert preferences.global_pause is True
+            uploaded_resume = await session.scalar(
+                select(Resume).where(Resume.name == "Admin upload")
+            )
+            assert uploaded_resume is not None
+            assert uploaded_resume.profile_id == profile_id
 
         resumed = await client.post(
             "/admin/pause/false",

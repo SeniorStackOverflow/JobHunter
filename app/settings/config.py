@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     email_provider: Literal["fake", "gmail"] = "fake"
     gmail_client_id: SecretStr | None = None
     gmail_client_secret: SecretStr | None = None
+    google_admin_emails: list[str] = Field(default_factory=list)
 
     llm_provider: Literal["mock", "openai", "gemini", "llmrouter"] = "mock"
     openai_api_key: SecretStr | None = None
@@ -77,6 +78,14 @@ class Settings(BaseSettings):
         raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
         return None if not raw.strip() else value
 
+    @field_validator("google_admin_emails")
+    @classmethod
+    def normalize_google_admin_emails(cls, value: list[str]) -> list[str]:
+        normalized = sorted({item.strip().casefold() for item in value if item.strip()})
+        if any("@" not in item or len(item) > 320 for item in normalized):
+            raise ValueError("GOOGLE_ADMIN_EMAILS must contain valid email addresses")
+        return normalized
+
     @model_validator(mode="after")
     def validate_secure_production(self) -> "Settings":
         if self.environment != "production":
@@ -96,6 +105,15 @@ class Settings(BaseSettings):
             raise ValueError("production DATABASE_URL must not contain an example password")
         if self.admin_password_hash is None:
             raise ValueError("ADMIN_PASSWORD_HASH is required in production")
+        if self.google_admin_emails and any(
+            value is None
+            for value in (
+                self.token_encryption_key,
+                self.gmail_client_id,
+                self.gmail_client_secret,
+            )
+        ):
+            raise ValueError("Google admin login requires Gmail credentials and token encryption")
         if self.llm_provider == "mock":
             raise ValueError("LLM_PROVIDER=mock is forbidden in production")
         if not self.openai_model:

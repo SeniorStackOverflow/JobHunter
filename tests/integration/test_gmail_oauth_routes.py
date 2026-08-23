@@ -12,13 +12,18 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.admin import routes as admin_routes
 from app.api import dependencies as api_dependencies
 from app.api import routes as api_routes
 from app.database.session import get_session
-from app.email.oauth import GMAIL_OAUTH_BINDING_COOKIE, GmailOAuthService
+from app.email.oauth import (
+    GMAIL_OAUTH_BINDING_COOKIE,
+    GOOGLE_ADMIN_SCOPES,
+    GmailOAuthService,
+)
 from app.email.providers import GMAIL_SEND_SCOPE
 from app.models.entities import AuditEvent, OAuthAuthorizationRequest, OAuthCredential
-from app.security.auth import hash_api_key
+from app.security.auth import SessionSigner, hash_api_key
 from app.settings import Settings
 
 pytestmark = pytest.mark.integration
@@ -48,6 +53,20 @@ class RouteFakeFlow:
         type(self).fetch_count += 1
 
 
+class AdminRouteFakeFlow:
+    def __init__(self, scopes: list[str] | tuple[str, ...] | None = None) -> None:
+        granted = list(scopes or GOOGLE_ADMIN_SCOPES)
+        self.credentials = SimpleNamespace(
+            refresh_token="admin-route-private-refresh-token",
+            scopes=granted,
+            granted_scopes=granted,
+            id_token="signed-google-id-token",
+        )
+
+    def fetch_token(self, *, code: str) -> None:
+        assert code == "admin-route-code"
+
+
 @pytest_asyncio.fixture
 async def oauth_api(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
@@ -61,13 +80,17 @@ async def oauth_api(
         token_encryption_key="gmail-oauth-route-token-encryption-key",
         gmail_client_id="route-client-id",
         gmail_client_secret="route-client-secret",
+        google_admin_emails=["owner@example.test"],
+        admin_username="operator",
         mcp_api_keys_hashed=[hash_api_key(API_KEY)],
     )
     monkeypatch.setattr(api_dependencies, "get_settings", lambda: settings)
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
 
     application = FastAPI()
     application.include_router(api_routes.router)
+    application.include_router(admin_routes.router)
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         async with sqlite_session_factory() as session:
@@ -176,3 +199,101 @@ async def test_gmail_oauth_rest_lifecycle_is_bound_audited_and_disconnectable(
             "oauth.gmail.connect_failed",
             "oauth.gmail.disconnected",
         } <= actions
+
+
+@pytest.mark.asyncio
+async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
+    oauth_api: OAuthApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = await oauth_api.client.get("/auth/google/start")
+    assert started.status_code == 302
+    location_query = parse_qs(urlsplit(started.headers["location"]).query)
+    assert set(location_query["scope"][0].split()) == set(GOOGLE_ADMIN_SCOPES)
+    assert location_query["prompt"] == ["consent select_account"]
+    state = location_query["state"][0]
+    nonce = location_query["nonce"][0]
+
+    monkeypatch.setattr(
+        GmailOAuthService,
+        "_flow",
+        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteFakeFlow(scopes),
+    )
+
+    async def verify_identity(_service: GmailOAuthService, raw_id_token: str) -> dict[str, object]:
+        assert raw_id_token == "signed-google-id-token"
+        return {
+            "sub": "google-subject-123",
+            "email": "Owner@Example.Test",
+            "email_verified": True,
+            "nonce": nonce,
+        }
+
+    monkeypatch.setattr(GmailOAuthService, "_verify_admin_id_token", verify_identity)
+    callback = await oauth_api.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "admin-route-code", "state": state},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/?google=connected#overview"
+    session_cookie = oauth_api.client.cookies.get("job_agent_session")
+    assert session_cookie is not None
+    assert (
+        SessionSigner("gmail-oauth-route-test-secret-over-32-characters").verify(session_cookie, 60)
+        == "operator"
+    )
+    set_cookie = callback.headers["set-cookie"]
+    assert "HttpOnly" in set_cookie
+    assert "Secure" in set_cookie
+    assert "SameSite=strict" in set_cookie
+
+    async with oauth_api.session_factory() as session:
+        credential = await session.scalar(select(OAuthCredential))
+        assert credential is not None
+        assert credential.token_metadata == {
+            "identity_verified": True,
+            "identity_email": "owner@example.test",
+            "identity_provider": "google",
+        }
+        actions = set((await session.scalars(select(AuditEvent.action))).all())
+        assert "admin.login.google_started" in actions
+        assert "admin.login.google" in actions
+
+
+@pytest.mark.asyncio
+async def test_google_admin_login_rejects_account_outside_allowlist(
+    oauth_api: OAuthApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = await oauth_api.client.get("/auth/google/start")
+    location_query = parse_qs(urlsplit(started.headers["location"]).query)
+    state = location_query["state"][0]
+    nonce = location_query["nonce"][0]
+    monkeypatch.setattr(
+        GmailOAuthService,
+        "_flow",
+        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteFakeFlow(scopes),
+    )
+
+    async def verify_identity(_service: GmailOAuthService, _raw_id_token: str) -> dict[str, object]:
+        return {
+            "sub": "attacker-subject",
+            "email": "attacker@example.test",
+            "email_verified": True,
+            "nonce": nonce,
+        }
+
+    monkeypatch.setattr(GmailOAuthService, "_verify_admin_id_token", verify_identity)
+    callback = await oauth_api.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "admin-route-code", "state": state},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/login?oauth_error=1"
+    assert oauth_api.client.cookies.get("job_agent_session") is None
+    async with oauth_api.session_factory() as session:
+        assert await session.scalar(select(OAuthCredential)) is None
+        failed = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "admin.login.google_failed")
+        )
+        assert failed is not None

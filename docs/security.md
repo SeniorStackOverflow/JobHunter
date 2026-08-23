@@ -44,7 +44,10 @@ MFA и короткий список операторов.
 MCP и REST API используют один настроенный allowlist SHA-256 hash bearer keys.
 Каждый валидный key имеет доступ ко всем опубликованным API/MCP операциям: в
 текущей реализации нет owner, read/write roles, scopes или записи отзыва в БД.
-HTML-панель использует отдельную подписанную admin session. Если deployment требует
+HTML-панель использует отдельную подписанную admin session. Основной login получает
+её после server-side проверки Google ID token, одноразового nonce и точного email
+allowlist; password login сохранён как аварийный fallback. Google access/refresh
+token никогда не становится значением admin session. Если deployment требует
 разделения read/write/autosend, его необходимо реализовать в приложении либо
 обеспечить проверенным identity gateway перед endpoint; имя или отдельное значение
 встроенного bearer не делает его менее привилегированным.
@@ -58,8 +61,9 @@ HTML-панель использует отдельную подписанную
 ## CSRF и browser security
 
 Все state-changing HTML формы используют непредсказуемый CSRF token, привязанный к
-сессии и сроку. GET не изменяет состояние. Проверяются `Origin`/`Referer` там, где
-это безопасно, но они не заменяют token.
+сессии и сроку. Обычные GET не меняют доменные настройки; OAuth start создаёт только
+короткоживущую одноразовую authorization-запись с state/PKCE/browser binding.
+Проверяются `Origin`/`Referer` там, где это безопасно, но они не заменяют token.
 
 Security headers через приложение/proxy:
 

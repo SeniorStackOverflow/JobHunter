@@ -107,7 +107,10 @@ Worker и Beat запускаются отдельными процессами;
 Условные переменные:
 
 - `LLM_PROVIDER=mock|openai|gemini`, соответствующий API key и явный model;
-- `TOKEN_ENCRYPTION_KEY`, `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` — для Gmail;
+- `TOKEN_ENCRYPTION_KEY`, `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` — для Gmail и
+  Google OIDC-входа;
+- `GOOGLE_ADMIN_EMAILS=["operator@example.com"]` — точный allowlist Google-аккаунтов,
+  которым разрешён вход в панель;
 - `EMAIL_PROVIDER=gmail` и `REAL_EMAIL_DELIVERY_ENABLED=true` — только после
   отдельной приёмки;
 - `EMERGENCY_EMAIL_KILL_SWITCH=true` немедленно блокирует provider path после
@@ -202,16 +205,15 @@ sitemap и employer careers используйте зарегистрирова�
 
 1. Создайте Google OAuth Web client и разрешите точный callback
    `https://DOMAIN/api/v1/oauth/gmail/callback`.
-2. Настройте client ID/secret и отдельный случайный `TOKEN_ENCRYPTION_KEY`.
+2. Настройте client ID/secret, отдельный случайный `TOKEN_ENCRYPTION_KEY` и точный
+   `GOOGLE_ADMIN_EMAILS` allowlist.
 3. Оставьте `REAL_EMAIL_DELIVERY_ENABLED=false` и глобальную паузу включённой.
-4. Авторизованным запросом откройте `GET /api/v1/oauth/gmail/start`; получите
-   `302 Location` и откройте его в браузере. Не используйте `curl -L` с bearer
-   header при переходе на внешний домен.
-5. После consent callback проверяет подписанный короткоживущий state и PKCE,
-   обменивает одноразовый code server-to-server и сохраняет refresh token только
-   в зашифрованном виде.
+4. Откройте панель и нажмите `Войти через Google`. Один server-side callback
+   проверит ID token, email allowlist, state и PKCE, сохранит refresh token только
+   зашифрованно и выдаст отдельную admin-session cookie.
+5. Проверьте Google identity и Gmail token в разделах `Обзор` и `Система`.
 
-Запрашивается минимальный scope `gmail.send`. Sender принимает только
+Запрашиваются OIDC `openid email` и единственный Gmail scope `gmail.send`. Sender принимает только
 `application_id`; recipient, MIME, текст и verified resume выбирает сервер.
 Подробности и процедура revoke: `docs/gmail-oauth.md`.
 

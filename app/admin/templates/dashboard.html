@@ -31,6 +31,7 @@
     <div class="sidebar-status">
       <span class="badge {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Auto-send на паузе' if preferences.global_pause else ('Auto-send активен' if preferences.auto_send_enabled else 'Auto-send выключен') }}</span>
       <div class="sidebar-status-row"><span>Источник</span><strong>{{ counts.healthy_sources }}/{{ counts.enabled_sources }} healthy</strong></div>
+      <div class="sidebar-status-row"><span>Google</span><strong>{{ 'подключён' if gmail_oauth.connected else 'нужен вход' }}</strong></div>
       <div class="sidebar-status-row"><span>Matcher</span><strong>{{ overview.rules_version }}</strong></div>
     </div>
     <div class="sidebar-footer">
@@ -67,6 +68,37 @@
           <span class="status-dot {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'danger') }}"></span>
           <div><strong>{{ 'Автоотправка временно приостановлена' if preferences.global_pause else ('Автоотправка работает' if preferences.auto_send_enabled else 'Автоотправка выключена') }}</strong><br><span>{% if preferences.global_pause %}Новые отклики не будут отправлены автоматически, пока пауза не снята.{% elif preferences.auto_send_enabled %}Policy и дневной лимит продолжают применяться перед каждой отправкой.{% else %}Автоматическая отправка отключена настройками.{% endif %}</span></div>
           <span class="badge {{ 'success' if counts.healthy_sources == counts.enabled_sources and counts.enabled_sources else 'warning' }} push">Источники {{ counts.healthy_sources }}/{{ counts.enabled_sources }}</span>
+        </div>
+
+        <div class="control-grid">
+          <div class="panel">
+            <div class="panel-head">
+              <div><div class="panel-title">Требует вашего внимания</div><div class="panel-subtitle">Только решения и сбои, где нужен человек</div></div>
+              <span class="badge {{ attention_tone }}">{{ attention_items|length if attention_items else 'Всё спокойно' }}</span>
+            </div>
+            <div class="panel-pad" style="padding-top:4px;padding-bottom:4px">
+              <div class="attention-list">
+                {% for item in attention_items %}
+                <a class="attention-item" href="{{ item.href }}">
+                  <span class="attention-signal {{ item.tone }}"></span>
+                  <span class="attention-copy"><strong>{{ item.title }}</strong><span>{{ item.detail }}</span></span>
+                  <span class="btn btn-sm">{{ item.action }}</span>
+                </a>
+                {% else %}
+                <div class="attention-item"><span class="attention-signal success"></span><span class="attention-copy"><strong>Вмешательство не требуется</strong><span>Google, источники и автоматизация работают в заданных границах.</span></span><span class="badge success">OK</span></div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+          <div class="panel panel-pad">
+            <div class="panel-title" style="margin-bottom:14px">Контур автономии</div>
+            <div class="control-rows">
+              <div class="control-row"><span>Google identity</span><span class="badge {{ 'success' if gmail_oauth.identity_verified else 'warning' }}">{{ gmail_oauth.identity_email or ('проверена' if gmail_oauth.identity_verified else 'не проверена') }}</span></div>
+              <div class="control-row"><span>Gmail token</span><span class="badge {{ 'success' if gmail_oauth.connected else 'danger' }}">{{ 'зашифрован · active' if gmail_oauth.connected else 'не подключён' }}</span></div>
+              <div class="control-row"><span>Доставка</span><span class="badge {{ 'success' if settings.real_email_delivery_enabled else 'muted' }}">{{ 'real' if settings.real_email_delivery_enabled else 'dry run' }}</span></div>
+              <div class="control-row"><span>Ручной gate</span><span class="badge {{ 'warning' if counts.pending_review else 'success' }}">{{ counts.pending_review }} в очереди</span></div>
+            </div>
+          </div>
         </div>
 
         <div class="grid grid-6" style="margin-bottom:16px">
@@ -253,6 +285,18 @@
 
       <section id="health" class="admin-section">
         <div class="section-heading"><div><h1>Система</h1><p>Alerts, audit trail и ключевые признаки здоровья JobHunter.</p></div></div>
+        <div class="panel panel-pad" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap">
+            <div class="identity-line">
+              <div class="identity-avatar">G</div>
+              <div class="identity-copy"><strong>{{ gmail_oauth.identity_email or 'Google OAuth' }}</strong><span>{{ 'Личность подтверждена, Gmail token хранится зашифрованно' if gmail_oauth.identity_verified else ('Gmail подключён без подтверждённой identity' if gmail_oauth.connected else 'Требуется вход через разрешённый Google-аккаунт') }}</span></div>
+            </div>
+            <div class="section-actions">
+              <a class="btn {{ 'btn-primary' if not gmail_oauth.connected else '' }}" href="/auth/google/start{% if gmail_oauth.connected %}?consent=1{% endif %}">{{ 'Переподключить Google' if gmail_oauth.connected else 'Подключить Google' }}</a>
+              {% if gmail_oauth.connected %}<form method="post" action="/admin/oauth/gmail/disconnect" data-confirm="Отключить локальный Gmail token? Автоматическая отправка остановится до нового входа через Google."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отключить token</button></form>{% endif %}
+            </div>
+          </div>
+        </div>
         <div class="grid grid-4" style="margin-bottom:16px">
           <div class="metric-card"><div class="metric-label">Healthy sources</div><div class="metric-value">{{ counts.healthy_sources }}/{{ counts.enabled_sources }}</div><div class="metric-note">{{ sources|length }} всего настроено</div></div>
           <div class="metric-card"><div class="metric-label">Активные сканы</div><div class="metric-value">{{ counts.running_scans }}</div><div class="metric-note">queued + running</div></div>
@@ -261,7 +305,7 @@
         </div>
         <div class="grid grid-2">
           <div class="panel"><div class="panel-head"><div><div class="panel-title">Последние alerts</div><div class="panel-subtitle">Сохранённые диагностические события</div></div></div><div class="panel-pad">
-            {% for item in alerts %}<div class="alert-card {{ 'danger' if item.severity in ['high','critical'] else '' }}"><strong>{{ item.code }}</strong> <span class="badge {{ 'danger' if item.severity in ['high','critical'] else 'warning' }}">{{ item.severity }}</span><p>{{ item.message }} · {{ format_dt(item.created_at) }}</p></div>{% else %}<div class="empty-state">Alerts отсутствуют.</div>{% endfor %}
+            {% for item in alerts %}<div class="alert-card {{ 'danger' if item.severity in ['high','critical'] else '' }}"><div style="display:flex;align-items:center;justify-content:space-between;gap:10px"><div><strong>{{ item.code }}</strong> <span class="badge {{ 'danger' if item.severity in ['high','critical'] else 'warning' }}">{{ item.severity }}</span></div>{% if not item.acknowledged %}<form method="post" action="/admin/alerts/{{ item.id }}/acknowledge"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Просмотрено</button></form>{% else %}<span class="badge muted">подтверждено</span>{% endif %}</div><p>{{ item.message }} · {{ format_dt(item.created_at) }}</p></div>{% else %}<div class="empty-state">Alerts отсутствуют.</div>{% endfor %}
           </div></div>
           <div class="panel"><div class="panel-head"><div><div class="panel-title">Audit trail</div><div class="panel-subtitle">Последние административные и автоматические действия</div></div></div><div class="table-wrap"><table style="min-width:560px"><thead><tr><th>Время</th><th>Actor</th><th>Действие</th><th>Решение</th></tr></thead><tbody>{% for item in audits %}<tr><td class="cell-muted">{{ format_dt(item.timestamp) }}</td><td><span class="badge muted">{{ item.actor }}</span></td><td><div class="cell-title">{{ item.action }}</div></td><td class="cell-muted">{{ item.decision or '—' }}</td></tr>{% endfor %}</tbody></table></div></div>
         </div>

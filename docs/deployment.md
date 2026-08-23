@@ -147,7 +147,8 @@ worker, locks или Gmail.
 3. проверьте fixture source или единичную opt-in smoke-проверку;
 4. убедитесь, что scan run, source health и audit event появились;
 5. проверьте fake Gmail в staging, не реальный аккаунт;
-6. отдельно подключите OAuth по инструкции `gmail-oauth.md`;
+6. выполните вход через разрешённый `GOOGLE_ADMIN_EMAILS` аккаунт и проверьте в
+   панели подтверждённую Google identity и Gmail token по инструкции `gmail-oauth.md`;
 7. снимайте глобальную паузу только после проверки политики.
 
 ## Постоянные данные

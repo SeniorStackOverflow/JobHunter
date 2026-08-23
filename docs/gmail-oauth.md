@@ -44,20 +44,19 @@ Redirect URI должен полностью совпадать по scheme/host
 Для локальной разработки используйте отдельный OAuth client и только разрешённый
 localhost callback; production client не должен разрешать лишние origins/redirects.
 
-## Минимальный scope
+## Минимальные scopes
 
-Для отправки нужен узкий scope:
+Для отправки нужен единственный Gmail scope:
 
 ```text
 https://www.googleapis.com/auth/gmail.send
 ```
 
-Не запрашивайте чтение, изменение или полный доступ к почте. Если проекту для
-идентификации подключённого аккаунта требуется дополнительный OIDC scope,
-документируйте необходимость отдельно; не расширяйте Gmail scope «на будущее».
-Повторная аутентификация может потребоваться после изменения scope.
-Callback требует наличие `gmail.send` и отклоняет ответ провайдера с любым
-неожиданным дополнительным scope, не сохраняя выданный refresh token.
+Не запрашивайте чтение, изменение или полный доступ к почте. Вход в admin panel
+дополнительно использует стандартные OIDC scopes `openid email`: они нужны только
+для подписанного ID token и точной проверки `GOOGLE_ADMIN_EMAILS`, а не для чтения
+Google-профиля или почты. Callback требует `gmail.send`, допускает только эти
+identity scopes и отклоняет любой неожиданный scope до сохранения refresh token.
 
 Следуйте актуальным требованиям Google к OAuth consent/verification для выбранного
 типа пользователей. Этот документ не утверждает, что конкретная конфигурация
@@ -70,6 +69,7 @@ Callback требует наличие `gmail.send` и отклоняет отв
 
 - OAuth client ID;
 - OAuth client secret;
+- точный JSON allowlist `GOOGLE_ADMIN_EMAILS`;
 - точный redirect/public base URL;
 - ключ шифрования token storage;
 - provider mode (`fake` в тестах, Gmail только при явном production выборе);
@@ -83,7 +83,8 @@ OAuth callback, проверяется и сохраняется зашифро�
 
 Ожидаемый безопасный flow:
 
-1. аутентифицированный администратор вызывает защищённый endpoint подключения;
+1. оператор начинает вход через `/auth/google/start` либо аутентифицированный API
+   actor вызывает отдельный endpoint подключения;
 2. сервер создаёт случайный непрозрачный `state`, отдельный browser-binding cookie
    и PKCE code-verifier/challenge; в БД остаются только SHA-256 хеши `state`/binding,
    actor, срок и зашифрованный verifier;
@@ -94,20 +95,19 @@ OAuth callback, проверяется и сохраняется зашифро�
    затем расшифровывает и удаляет server-side PKCE verifier;
 6. только после commit одноразового перехода сервер обменивает authorization code
    server-to-server; timeout/ошибка провайдера не разрешает повторное использование;
-7. проверяет наличие выданного refresh token, не раскрывая его браузеру;
-8. шифрует refresh token Fernet с текущим единственным encryption key;
-9. access token остаётся короткоживущим и не логируется;
-10. AuditEvent фиксирует start, success или безопасный error code без state, binding,
+7. для admin login проверяет подпись, issuer, audience, expiry и одноразовый nonce
+   ID token, затем `email_verified=true` и точное совпадение email с allowlist;
+8. проверяет наличие выданного refresh token, не раскрывая его браузеру;
+9. шифрует refresh token Fernet с текущим единственным encryption key;
+10. выдаёт отдельную `Secure`/`HttpOnly` admin-session cookie; access token остаётся
+    короткоживущим и не логируется;
+11. AuditEvent фиксирует start, success или безопасный error code без state, binding,
     verifier, authorization code и token.
 
-При одном scope `gmail.send` текущая реализация не запрашивает OIDC identity или
-Gmail profile, не сохраняет email подключённого Google account и не сверяет его с
-ожидаемым адресом/tenant. Ошибочно выбранный аккаунт поэтому не будет обнаружен
-сервером до отправки от `userId="me"`. Оператор обязан проверить выбранный аккаунт
-на экране Google consent и выполнить контролируемую staging-проверку. Для
-server-side identity enforcement сначала добавьте обоснованные `openid`/`email`
-claims либо разрешённый userinfo-механизм, настройте allowlist и проверку claims,
-затем заново проведите OAuth/security review; такая проверка сейчас не реализована.
+Admin login проверяет identity server-side и сохраняет подтверждённый email как
+несекретную metadata токена для operator console. API-only подключение с одним
+`gmail.send` по-прежнему не может независимо определить mailbox и явно возвращает
+`identity_verified=false`; для production предпочтителен вход через Google.
 
 Для получения refresh token обычно требуется offline access; поведение выдачи
 refresh token зависит от уже выданного consent. Не пытайтесь извлекать его из
@@ -133,8 +133,9 @@ API credential:
   binding cookie и возвращает redirect на Google;
 - `GET /api/v1/oauth/gmail/callback` — browser callback Google; самостоятельно не
   принимает recipient, письмо, вложение или refresh token;
-- `GET /api/v1/oauth/gmail/status` — возвращает только configured/connected, точный
-  scope, timestamps, число незавершённых flow и явный `identity_verified=false`;
+- `GET /api/v1/oauth/gmail/status` — возвращает configured/connected, точный scope,
+  timestamps, число незавершённых flow и подтверждённую Google identity, если token
+  был получен через admin login;
 - `DELETE /api/v1/oauth/gmail` — удаляет локальный encrypted refresh token и
   инвалидирует все незавершённые authorization requests.
 
@@ -142,6 +143,14 @@ API credential:
 ответ явно содержит `remote_grant_revoked=false`. Для полного отзыва оператор также
 удаляет доступ приложения в Google Account security controls. Endpoint и callback не
 возвращают client secret, ciphertext, OAuth code, `state`, verifier или binding.
+
+Для browser operator flow:
+
+- `GET /auth/google/start` — создаёт PKCE/state/binding и направляет в Google;
+- тот же `/api/v1/oauth/gmail/callback` завершает OIDC + Gmail consent, сверяет
+  allowlist и создаёт admin session;
+- `POST /admin/oauth/gmail/disconnect` с session-bound CSRF удаляет локальный token;
+- пароль остаётся аварийным fallback и не используется для получения Google token.
 
 ## Хранение токенов
 

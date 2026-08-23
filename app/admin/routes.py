@@ -30,6 +30,13 @@ from app.crawlers.source_control import (
     enable_source_record,
 )
 from app.database import get_session
+from app.email.oauth import (
+    GMAIL_OAUTH_BINDING_COOKIE,
+    GOOGLE_ADMIN_OAUTH_ACTOR,
+    OAUTH_STATE_TTL_SECONDS,
+    GmailOAuthError,
+    GmailOAuthService,
+)
 from app.email.service import EmailSendBlocked, EmailService
 from app.matching.providers import MATCHING_RULES_VERSION
 from app.models.entities import (
@@ -41,7 +48,6 @@ from app.models.entities import (
     Resume,
     ScanRun,
     SourceJob,
-    UserProfile,
 )
 from app.models.enums import (
     ApplicationStatus,
@@ -225,11 +231,80 @@ async def _audit_admin(
 
 
 @router.get("/login", response_class=HTMLResponse)
-async def login_form(request: Request) -> HTMLResponse:
+async def login_form(request: Request, oauth_error: str | None = None) -> HTMLResponse:
+    settings = get_settings()
+    google_oauth = GmailOAuthService(settings)
     response = templates.TemplateResponse(
         request=request,
         name="login.html",
-        context={"csrf_token": _csrf().issue("login"), "error": None},
+        context={
+            "csrf_token": _csrf().issue("login"),
+            "error": (
+                "Вход через Google не завершён. Проверьте выбранный аккаунт и повторите."
+                if oauth_error
+                else None
+            ),
+            "google_login_available": (
+                google_oauth.configured and bool(settings.google_admin_emails)
+            ),
+            "password_login_available": settings.admin_password_hash is not None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/auth/google/start")
+async def google_admin_login_start(
+    consent: bool = False,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    settings = get_settings()
+    service = GmailOAuthService(settings)
+    if not service.configured or not settings.google_admin_emails:
+        return RedirectResponse("/login?oauth_error=configuration", status_code=303)
+    try:
+        oauth_status = await service.get_status(session)
+        authorization = await service.create_authorization_request(
+            session,
+            actor=GOOGLE_ADMIN_OAUTH_ACTOR,
+            force_consent=consent or not oauth_status["connected"],
+        )
+    except GmailOAuthError as exc:
+        await session.rollback()
+        await record_audit_event(
+            session,
+            actor="google-login",
+            action="admin.login.google_start_failed",
+            entity_type="admin_session",
+            entity_id="google",
+            correlation_id=str(exc.correlation_id or "google"),
+            decision="failed",
+            details={"provider": "google", "error_code": exc.code},
+        )
+        await session.commit()
+        return RedirectResponse("/login?oauth_error=start", status_code=303)
+
+    await record_audit_event(
+        session,
+        actor="google-login",
+        action="admin.login.google_started",
+        entity_type="oauth_authorization_request",
+        entity_id=str(authorization.request_id),
+        correlation_id=str(authorization.request_id),
+        decision="redirected",
+        details={"provider": "google", "expires_at": authorization.expires_at.isoformat()},
+    )
+    await session.commit()
+    response = RedirectResponse(authorization.authorization_url, status_code=302)
+    response.set_cookie(
+        GMAIL_OAUTH_BINDING_COOKIE,
+        authorization.binding_token,
+        max_age=OAUTH_STATE_TTL_SECONDS,
+        path="/api/v1/oauth/gmail/callback",
+        secure=service.secure_cookie,
+        httponly=True,
+        samesite="lax",
     )
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -249,10 +324,18 @@ async def login(
         and verify_password(password, settings.admin_password_hash.get_secret_value())
     )
     if not csrf_valid or username != settings.admin_username or not password_valid:
+        google_oauth = GmailOAuthService(settings)
         error_response = templates.TemplateResponse(
             request=request,
             name="login.html",
-            context={"csrf_token": _csrf().issue("login"), "error": "Неверные данные"},
+            context={
+                "csrf_token": _csrf().issue("login"),
+                "error": "Неверные данные",
+                "google_login_available": (
+                    google_oauth.configured and bool(settings.google_admin_emails)
+                ),
+                "password_login_available": settings.admin_password_hash is not None,
+            },
             status_code=401,
         )
         error_response.headers["Cache-Control"] = "no-store"
@@ -263,7 +346,7 @@ async def login(
         settings.session_cookie_name,
         token,
         max_age=settings.session_ttl_seconds,
-        secure=settings.environment == "production",
+        secure=settings.public_base_url.casefold().startswith("https://"),
         httponly=True,
         samesite="strict",
         path="/",
@@ -295,7 +378,15 @@ async def dashboard(
     selected_profile_id = profile.id
     preferences = await profile_service.get_preferences(session, selected_profile_id)
     sources = list((await session.scalars(select(JobSource).order_by(JobSource.name))).all())
-    resumes = list((await session.scalars(select(Resume).where(Resume.profile_id == selected_profile_id).order_by(desc(Resume.created_at)))).all())
+    resumes = list(
+        (
+            await session.scalars(
+                select(Resume)
+                .where(Resume.profile_id == selected_profile_id)
+                .order_by(desc(Resume.created_at))
+            )
+        ).all()
+    )
     jobs = list(
         (
             await session.scalars(
@@ -306,14 +397,20 @@ async def dashboard(
     matches = list(
         (
             await session.scalars(
-                select(MatchEvaluation).where(MatchEvaluation.profile_id == selected_profile_id).order_by(desc(MatchEvaluation.created_at)).limit(30)
+                select(MatchEvaluation)
+                .where(MatchEvaluation.profile_id == selected_profile_id)
+                .order_by(desc(MatchEvaluation.created_at))
+                .limit(30)
             )
         ).all()
     )
     applications = list(
         (
             await session.scalars(
-                select(Application).where(Application.profile_id == selected_profile_id).order_by(desc(Application.created_at)).limit(40)
+                select(Application)
+                .where(Application.profile_id == selected_profile_id)
+                .order_by(desc(Application.created_at))
+                .limit(40)
             )
         ).all()
     )
@@ -364,7 +461,11 @@ async def dashboard(
     decision_rows = (
         await session.execute(
             select(MatchEvaluation.decision, func.count(MatchEvaluation.id))
-            .where(MatchEvaluation.profile_id == selected_profile_id, MatchEvaluation.created_at >= start, MatchEvaluation.created_at < end)
+            .where(
+                MatchEvaluation.profile_id == selected_profile_id,
+                MatchEvaluation.created_at >= start,
+                MatchEvaluation.created_at < end,
+            )
             .group_by(MatchEvaluation.decision)
         )
     ).all()
@@ -389,12 +490,19 @@ async def dashboard(
             )
             or 0
         ),
-        "applications": int(await session.scalar(select(func.count(Application.id)).where(Application.profile_id == selected_profile_id)) or 0),
+        "applications": int(
+            await session.scalar(
+                select(func.count(Application.id)).where(
+                    Application.profile_id == selected_profile_id
+                )
+            )
+            or 0
+        ),
         "pending_review": int(
             await session.scalar(
                 select(func.count(Application.id)).where(
                     Application.profile_id == selected_profile_id,
-                    Application.status == ApplicationStatus.PENDING_REVIEW
+                    Application.status == ApplicationStatus.PENDING_REVIEW,
                 )
             )
             or 0
@@ -451,6 +559,86 @@ async def dashboard(
         "matching_backlog": matching_backlog,
         "rules_version": MATCHING_RULES_VERSION,
     }
+    gmail_oauth = await GmailOAuthService(get_settings()).get_status(session)
+    attention_items: list[dict[str, str]] = []
+    if not gmail_oauth["configured"]:
+        attention_items.append(
+            {
+                "tone": "danger",
+                "title": "Google OAuth не настроен",
+                "detail": "Вход через Google и автономная отправка Gmail недоступны.",
+                "href": "#health",
+                "action": "Открыть систему",
+            }
+        )
+    elif not gmail_oauth["connected"]:
+        attention_items.append(
+            {
+                "tone": "danger",
+                "title": "Google-аккаунт не подключён",
+                "detail": "Письма не смогут отправляться до повторного входа через Google.",
+                "href": "/auth/google/start",
+                "action": "Подключить",
+            }
+        )
+    elif not gmail_oauth["identity_verified"]:
+        attention_items.append(
+            {
+                "tone": "warning",
+                "title": "Подтвердите Google identity",
+                "detail": "Gmail token есть, но вход через разрешённый аккаунт ещё не завершён.",
+                "href": "/auth/google/start",
+                "action": "Войти через Google",
+            }
+        )
+    if counts["unacknowledged_alerts"]:
+        attention_items.append(
+            {
+                "tone": "danger",
+                "title": f"{counts['unacknowledged_alerts']} системных предупреждений",
+                "detail": "Проверьте свежие alerts и подтвердите просмотр.",
+                "href": "#health",
+                "action": "Проверить",
+            }
+        )
+    unhealthy_sources = counts["enabled_sources"] - counts["healthy_sources"]
+    if unhealthy_sources:
+        attention_items.append(
+            {
+                "tone": "danger",
+                "title": f"{unhealthy_sources} источников требуют проверки",
+                "detail": "Один или несколько включённых crawler не находятся в healthy.",
+                "href": "#sources",
+                "action": "Источники",
+            }
+        )
+    if counts["pending_review"]:
+        attention_items.append(
+            {
+                "tone": "warning",
+                "title": f"{counts['pending_review']} откликов ждут решения",
+                "detail": "Нейросеть подготовила их, но финальное действие остаётся за вами.",
+                "href": "#applications",
+                "action": "Открыть очередь",
+            }
+        )
+    if preferences.global_pause:
+        attention_items.append(
+            {
+                "tone": "warning",
+                "title": "Автоотправка на паузе",
+                "detail": "Автоматизация продолжит анализ, но не отправит новые отклики.",
+                "href": "#preferences",
+                "action": "Управление",
+            }
+        )
+    attention_tone = (
+        "danger"
+        if any(item["tone"] == "danger" for item in attention_items)
+        else "warning"
+        if attention_items
+        else "success"
+    )
     source_names = {item.id: item.name for item in sources}
 
     response = templates.TemplateResponse(
@@ -475,6 +663,9 @@ async def dashboard(
             "audits": audits,
             "counts": counts,
             "overview": overview,
+            "gmail_oauth": gmail_oauth,
+            "attention_items": attention_items,
+            "attention_tone": attention_tone,
             "now_local": now_local,
             "settings": get_settings(),
         },
@@ -637,6 +828,7 @@ async def set_pause(
 @router.post("/admin/resumes")
 async def admin_upload_resume(
     request: Request,
+    profile_id: UUID | None = Form(None),
     name: str = Form(...),
     category: str = Form(...),
     file: UploadFile = File(...),
@@ -670,6 +862,51 @@ async def admin_upload_resume(
     )
     await session.commit()
     return RedirectResponse(f"/?profile_id={profile.id}#resumes", status_code=303)
+
+
+@router.post("/admin/oauth/gmail/disconnect")
+async def admin_disconnect_gmail(
+    request: Request,
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    was_connected = await GmailOAuthService(get_settings()).disconnect(session)
+    await _audit_admin(
+        session,
+        "oauth.gmail.disconnected",
+        "oauth_credential",
+        "gmail",
+        decision="disconnected" if was_connected else "already_disconnected",
+        details={"pending_authorizations_invalidated": True, "remote_grant_revoked": False},
+    )
+    await session.commit()
+    return RedirectResponse("/#health", status_code=303)
+
+
+@router.post("/admin/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(
+    alert_id: UUID,
+    request: Request,
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    alert = await session.get(Alert, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="alert not found")
+    alert.acknowledged = True
+    await _audit_admin(
+        session,
+        "alert.acknowledged",
+        "alert",
+        str(alert.id),
+        decision="acknowledged",
+    )
+    await session.commit()
+    return RedirectResponse("/#health", status_code=303)
 
 
 @router.post("/admin/resumes/{resume_id}/verify")
