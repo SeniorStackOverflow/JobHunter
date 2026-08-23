@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
-  <link rel="icon" href="/admin-assets/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="{{ admin_asset_url('favicon.svg') }}" type="image/svg+xml">
   <title>{% block title %}JobHunter{% endblock %}</title>
   <style>
     *,*::before,*::after{box-sizing:border-box}
@@ -138,7 +138,7 @@
     }
     @media(max-width:620px){.grid-6,.grid-4{grid-template-columns:repeat(2,minmax(0,1fr))}.form-grid{grid-template-columns:1fr}.section-heading{display:block}.section-actions{margin-top:12px}.metric-card{min-height:104px}.metric-value{font-size:23px}.status-strip{align-items:flex-start;flex-wrap:wrap}.status-strip .push{margin-left:22px}.activity-item{grid-template-columns:64px minmax(0,1fr)}.activity-item>.badge{grid-column:2}.login-card{padding:24px 20px}.detail-content{padding:20px 12px}.topbar-title span,.topbar-actions>.badge{display:none}.owner-status,.detail-decision-bar,.issue-row{align-items:stretch;flex-direction:column}.owner-status form .btn,.detail-decision-bar form .btn,.issue-row form,.issue-row form .btn{width:100%}.attention-item{grid-template-columns:10px minmax(0,1fr)}.attention-item>.btn{grid-column:2;justify-self:start}.queue-actions{display:grid;grid-template-columns:1fr 1fr}.queue-actions>a{grid-column:1/-1}.queue-actions .btn{width:100%}.history-row,.compact-row,.settings-summary{align-items:flex-start}.settings-summary{flex-direction:column}.settings-summary .section-actions{margin-top:0}.archive-item{grid-template-columns:1fr}.archive-item form .btn{width:100%}.pagination{justify-content:space-between}.pagination span{font-size:11px;text-align:center}.tabs{width:100%}.confirm-actions{display:grid;grid-template-columns:1fr 1fr}.confirm-actions .btn{width:100%}}
   </style>
-  <script src="/admin-assets/admin.js" defer></script>
+  <script src="{{ admin_asset_url('admin.js') }}" defer></script>
   {% block head %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}">

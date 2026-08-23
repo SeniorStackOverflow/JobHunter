@@ -81,6 +81,12 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             "default-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; "
             "frame-ancestors 'none'; base-uri 'none'"
         )
+        if request.url.path.startswith("/admin-assets/") and response.status_code == 200:
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+                if request.query_params.get("v")
+                else "no-cache, max-age=0, must-revalidate"
+            )
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response

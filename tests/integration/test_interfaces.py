@@ -494,6 +494,8 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert login_page.headers["cache-control"] == "no-store"
         assert 'name="viewport"' in login_page.text
         assert "Вход в панель управления" in login_page.text
+        assert 'src="/admin-assets/admin.js?v=' in login_page.text
+        assert "data-password-toggle" in login_page.text
         assert 'name="username"' not in login_page.text
         assert "Аварийный вход" not in login_page.text
         oauth_error_page = await client.get(
@@ -536,6 +538,9 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert "Google OAuth не настроен" in dashboard.text
         assert 'href="javascript:' not in dashboard.text.casefold()
         assert "data-confirm-dialog" in dashboard.text
+        assert 'src="/admin-assets/admin.js?v=' in dashboard.text
+        assert "data-profile-select" in dashboard.text
+        assert " onchange=" not in dashboard.text.casefold()
         assert ".confirm-reason[hidden]{display:none}" in dashboard.text
         for view, heading in {
             "decisions": "Требуют решения",

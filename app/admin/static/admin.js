@@ -1,13 +1,22 @@
 (() => {
   const root = document.documentElement;
-  const savedTheme = localStorage.getItem('jh-theme');
+  let savedTheme = null;
+  try {
+    savedTheme = localStorage.getItem('jh-theme');
+  } catch {
+    // Storage may be unavailable in hardened/private browser contexts.
+  }
   if (savedTheme === 'light' || savedTheme === 'dark') root.dataset.theme = savedTheme;
 
   document.querySelectorAll('[data-theme-toggle]').forEach((button) => {
     button.addEventListener('click', () => {
       const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
       root.dataset.theme = next;
-      localStorage.setItem('jh-theme', next);
+      try {
+        localStorage.setItem('jh-theme', next);
+      } catch {
+        // The visual toggle must continue to work even when storage is unavailable.
+      }
     });
   });
 
@@ -26,6 +35,10 @@
       !sidebar?.contains(event.target) &&
       !event.target.closest('[data-menu-toggle]')
     ) setSidebar(false);
+  });
+
+  document.querySelectorAll('[data-profile-select]').forEach((select) => {
+    select.addEventListener('change', () => select.form?.requestSubmit());
   });
 
   document.querySelectorAll('[data-password-toggle]').forEach((button) => {

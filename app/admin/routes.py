@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
+from functools import lru_cache
+from hashlib import sha256
+from pathlib import Path
 
 # FastAPI's declarative dependency/form parameters intentionally call Depends/File.
 # ruff: noqa: B008
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -66,6 +69,17 @@ from app.settings import get_settings
 
 router = APIRouter(tags=["admin"])
 templates = Jinja2Templates(directory="app/admin/templates")
+_ADMIN_STATIC_ROOT = Path(__file__).with_name("static")
+
+
+@lru_cache
+def _admin_asset_url(filename: str) -> str:
+    """Return a content-versioned URL so a deploy cannot reuse stale browser JavaScript."""
+    if Path(filename).name != filename:
+        raise ValueError("admin asset filename must not contain a path")
+    content = (_ADMIN_STATIC_ROOT / filename).read_bytes()
+    version = sha256(content).hexdigest()[:16]
+    return f"/admin-assets/{quote(filename)}?v={version}"
 
 
 def _safe_external_link(value: str | None) -> str | None:
@@ -82,6 +96,7 @@ def _safe_external_link(value: str | None) -> str | None:
 
 
 templates.env.globals["safe_external_link"] = _safe_external_link
+templates.env.globals["admin_asset_url"] = _admin_asset_url
 
 
 _LOCAL_TZ = ZoneInfo("Europe/Chisinau")
