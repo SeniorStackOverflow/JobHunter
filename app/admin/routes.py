@@ -254,7 +254,7 @@ async def login_form(request: Request, oauth_error: str | None = None) -> HTMLRe
     return response
 
 
-@router.get("/auth/google/start")
+@router.get("/admin/auth/google")
 async def google_admin_login_start(
     consent: bool = False,
     session: AsyncSession = Depends(get_session),
@@ -577,7 +577,7 @@ async def dashboard(
                 "tone": "danger",
                 "title": "Google-аккаунт не подключён",
                 "detail": "Письма не смогут отправляться до повторного входа через Google.",
-                "href": "/auth/google/start",
+                "href": "/admin/auth/google",
                 "action": "Подключить",
             }
         )
@@ -587,7 +587,7 @@ async def dashboard(
                 "tone": "warning",
                 "title": "Подтвердите Google identity",
                 "detail": "Gmail token есть, но вход через разрешённый аккаунт ещё не завершён.",
-                "href": "/auth/google/start",
+                "href": "/admin/auth/google",
                 "action": "Войти через Google",
             }
         )

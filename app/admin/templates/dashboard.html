@@ -292,7 +292,7 @@
               <div class="identity-copy"><strong>{{ gmail_oauth.identity_email or 'Google OAuth' }}</strong><span>{{ 'Личность подтверждена, Gmail token хранится зашифрованно' if gmail_oauth.identity_verified else ('Gmail подключён без подтверждённой identity' if gmail_oauth.connected else 'Требуется вход через разрешённый Google-аккаунт') }}</span></div>
             </div>
             <div class="section-actions">
-              <a class="btn {{ 'btn-primary' if not gmail_oauth.connected else '' }}" href="/auth/google/start{% if gmail_oauth.connected %}?consent=1{% endif %}">{{ 'Переподключить Google' if gmail_oauth.connected else 'Подключить Google' }}</a>
+              <a class="btn {{ 'btn-primary' if not gmail_oauth.connected else '' }}" href="/admin/auth/google{% if gmail_oauth.connected %}?consent=1{% endif %}">{{ 'Переподключить Google' if gmail_oauth.connected else 'Подключить Google' }}</a>
               {% if gmail_oauth.connected %}<form method="post" action="/admin/oauth/gmail/disconnect" data-confirm="Отключить локальный Gmail token? Автоматическая отправка остановится до нового входа через Google."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отключить token</button></form>{% endif %}
             </div>
           </div>

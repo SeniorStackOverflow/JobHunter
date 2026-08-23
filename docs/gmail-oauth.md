@@ -83,7 +83,7 @@ OAuth callback, проверяется и сохраняется зашифро�
 
 Ожидаемый безопасный flow:
 
-1. оператор начинает вход через `/auth/google/start` либо аутентифицированный API
+1. оператор начинает вход через `/admin/auth/google` либо аутентифицированный API
    actor вызывает отдельный endpoint подключения;
 2. сервер создаёт случайный непрозрачный `state`, отдельный browser-binding cookie
    и PKCE code-verifier/challenge; в БД остаются только SHA-256 хеши `state`/binding,
@@ -146,7 +146,7 @@ API credential:
 
 Для browser operator flow:
 
-- `GET /auth/google/start` — создаёт PKCE/state/binding и направляет в Google;
+- `GET /admin/auth/google` — создаёт PKCE/state/binding и направляет в Google;
 - тот же `/api/v1/oauth/gmail/callback` завершает OIDC + Gmail consent, сверяет
   allowlist и создаёт admin session;
 - `POST /admin/oauth/gmail/disconnect` с session-bound CSRF удаляет локальный token;

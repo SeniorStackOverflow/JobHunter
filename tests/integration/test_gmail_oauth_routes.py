@@ -206,7 +206,7 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
     oauth_api: OAuthApiContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    started = await oauth_api.client.get("/auth/google/start")
+    started = await oauth_api.client.get("/admin/auth/google")
     assert started.status_code == 302
     location_query = parse_qs(urlsplit(started.headers["location"]).query)
     assert set(location_query["scope"][0].split()) == set(GOOGLE_ADMIN_SCOPES)
@@ -265,7 +265,7 @@ async def test_google_admin_login_rejects_account_outside_allowlist(
     oauth_api: OAuthApiContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    started = await oauth_api.client.get("/auth/google/start")
+    started = await oauth_api.client.get("/admin/auth/google")
     location_query = parse_qs(urlsplit(started.headers["location"]).query)
     state = location_query["state"][0]
     nonce = location_query["nonce"][0]
