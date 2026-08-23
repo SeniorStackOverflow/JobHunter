@@ -3,7 +3,7 @@ from pathlib import Path
 
 import httpx
 
-from app.admin.routes import _admin_asset_url
+from app.admin.routes import _admin_asset_url, _daily_application_rules
 from app.main import app
 
 
@@ -17,6 +17,22 @@ def test_admin_javascript_uses_in_app_confirmation_dialog() -> None:
     assert "dialog.returnValue = '';" in script
 
 
+def test_admin_daily_application_rules_preserve_advanced_settings() -> None:
+    existing = {"verified_only": True, "minimum_daily_applications": 9}
+
+    enabled = _daily_application_rules(existing, minimum=2, force_minimum=True)
+    disabled = _daily_application_rules(existing, minimum=0, force_minimum=True)
+
+    assert enabled == {
+        "verified_only": True,
+        "minimum_daily_applications": 2,
+        "force_minimum_daily_applications": True,
+    }
+    assert disabled["verified_only"] is True
+    assert disabled["force_minimum_daily_applications"] is False
+    assert existing == {"verified_only": True, "minimum_daily_applications": 9}
+
+
 def test_admin_javascript_initializes_every_custom_control() -> None:
     script = Path("app/admin/static/admin.js").read_text(encoding="utf-8")
 
@@ -24,6 +40,7 @@ def test_admin_javascript_initializes_every_custom_control() -> None:
         "data-theme-toggle",
         "data-menu-toggle",
         "data-profile-select",
+        "data-daily-limit-range",
         "data-password-toggle",
         "data-notice-dismiss",
         "data-confirm-dialog",

@@ -8,13 +8,21 @@
     <div class="panel">
       <div class="panel-head"><div><div class="panel-title">Критерии и лимиты</div><div class="panel-subtitle">Главные правила, которыми руководствуется нейросеть</div></div></div>
       <form method="post" action="/admin/preferences" class="panel-pad">
-        <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="daily_application_rules_present" value="true">
+        {% set daily_rules = preferences.additional_rules or {} %}
         <div class="form-grid">
           <label class="field full">Категории для поиска<input type="text" name="allowed_categories" value="{{ preferences.allowed_categories|join(', ') }}"><span class="field-help">Через запятую</span></label>
           <label class="field">Категории для автоматической отправки<input type="text" name="auto_send_categories" value="{{ preferences.auto_send_categories|join(', ') }}"></label>
           <label class="field">Исключить категории<input type="text" name="forbidden_categories" value="{{ preferences.forbidden_categories|join(', ') }}"></label>
           <label class="field">Разрешённые города<input type="text" name="allowed_cities" value="{{ preferences.allowed_cities|join(', ') }}"></label>
-          <label class="field">Откликов в день, максимум<input type="number" min="0" max="100" name="maximum_daily_applications" value="{{ preferences.maximum_daily_applications }}"></label>
+          <fieldset class="daily-limit-field" data-daily-limit-range>
+            <legend>Отклики в день</legend>
+            <div class="daily-limit-inputs">
+              <label><span>Минимум</span><input type="number" min="0" max="100" name="minimum_daily_applications" value="{{ daily_rules.get('minimum_daily_applications', 0) }}" data-daily-minimum></label>
+              <label><span>Максимум</span><input type="number" min="0" max="100" name="maximum_daily_applications" value="{{ preferences.maximum_daily_applications }}" data-daily-maximum></label>
+            </div>
+            <label class="daily-catchup"><span class="daily-catchup-copy"><strong>Принудительный добор</strong><span>До минимума допускает вакансии ниже порога; требования безопасности сохраняются.</span></span><span class="switch"><input type="checkbox" name="force_minimum_daily_applications" data-daily-force {% if daily_rules.get('force_minimum_daily_applications') is sameas true %}checked{% endif %}><span class="switch-ui"></span></span></label>
+          </fieldset>
           <label class="field">Минимальная оценка для автоотправки<input type="number" min="0" max="100" name="minimum_auto_send_score" value="{{ preferences.minimum_auto_send_score }}"></label>
           <div class="switch-row"><div class="switch-copy"><strong>Удалённая работа</strong><span>Рассматривать удалённые вакансии</span></div><label class="switch"><input type="checkbox" name="remote_allowed" {% if preferences.remote_allowed %}checked{% endif %}><span class="switch-ui"></span></label></div>
           <div class="switch-row"><div class="switch-copy"><strong>Без опыта</strong><span>Рассматривать начальные позиции</span></div><label class="switch"><input type="checkbox" name="willing_without_experience" {% if preferences.willing_without_experience %}checked{% endif %}><span class="switch-ui"></span></label></div>

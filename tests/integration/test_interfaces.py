@@ -611,7 +611,11 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
                     allowed_schedules=["day"],
                     forbidden_schedules=["night"],
                     language_constraints=[{"code": "ro"}],
-                    additional_rules={"verified_only": True},
+                    additional_rules={
+                        "verified_only": True,
+                        "minimum_daily_applications": 3,
+                        "force_minimum_daily_applications": False,
+                    },
                     auto_send_enabled=False,
                     global_pause=True,
                 ),
@@ -626,6 +630,42 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
         follow_redirects=False,
     ) as client:
         csrf_token = await _login_admin(client, settings)
+        settings_page = await client.get("/?view=settings")
+        assert settings_page.status_code == 200
+        assert 'name="minimum_daily_applications" value="3"' in settings_page.text
+        assert "Принудительный добор" in settings_page.text
+
+        legacy_preferences_form = await client.post(
+            "/admin/preferences",
+            data={
+                "maximum_daily_applications": "4",
+                "minimum_auto_send_score": "88",
+                "csrf_token": csrf_token,
+            },
+        )
+        assert legacy_preferences_form.status_code == 303
+        async with sqlite_session_factory() as session:
+            legacy_safe_preferences = await session.scalar(select(JobPreference))
+            assert legacy_safe_preferences is not None
+            assert legacy_safe_preferences.additional_rules["minimum_daily_applications"] == 3
+            assert legacy_safe_preferences.additional_rules["verified_only"] is True
+
+        invalid_daily_range = await client.post(
+            "/admin/preferences",
+            data={
+                "minimum_daily_applications": "5",
+                "maximum_daily_applications": "4",
+                "minimum_auto_send_score": "88",
+                "daily_application_rules_present": "true",
+                "csrf_token": csrf_token,
+            },
+        )
+        assert invalid_daily_range.status_code == 422
+        async with sqlite_session_factory() as session:
+            unchanged_preferences = await session.scalar(select(JobPreference))
+            assert unchanged_preferences is not None
+            assert unchanged_preferences.additional_rules["minimum_daily_applications"] == 3
+
         profile_saved = await client.post(
             "/admin/profile",
             data={
@@ -643,8 +683,11 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
             data={
                 "allowed_categories": "operations",
                 "auto_send_categories": "operations",
+                "minimum_daily_applications": "2",
                 "maximum_daily_applications": "4",
                 "minimum_auto_send_score": "88",
+                "force_minimum_daily_applications": "on",
+                "daily_application_rules_present": "true",
                 "auto_send_enabled": "on",
                 "global_pause": "false",
                 "csrf_token": csrf_token,
@@ -681,9 +724,22 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
             assert preferences.allowed_schedules == ["day"]
             assert preferences.forbidden_schedules == ["night"]
             assert preferences.language_constraints == [{"code": "ro"}]
-            assert preferences.additional_rules == {"verified_only": True}
+            assert preferences.additional_rules == {
+                "verified_only": True,
+                "minimum_daily_applications": 2,
+                "force_minimum_daily_applications": True,
+            }
             assert preferences.auto_send_enabled is False
             assert preferences.global_pause is True
+            preferences_audit = await session.scalar(
+                select(AuditEvent)
+                .where(AuditEvent.action == "preferences.updated")
+                .order_by(AuditEvent.timestamp.desc())
+            )
+            assert preferences_audit is not None
+            assert preferences_audit.sanitized_details["minimum_daily_applications"] == 2
+            assert preferences_audit.sanitized_details["maximum_daily_applications"] == 4
+            assert preferences_audit.sanitized_details["force_minimum_daily_applications"] is True
             uploaded_resume = await session.scalar(
                 select(Resume).where(Resume.name == "Admin upload")
             )

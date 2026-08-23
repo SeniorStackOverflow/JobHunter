@@ -41,6 +41,26 @@
     select.addEventListener('change', () => select.form?.requestSubmit());
   });
 
+  document.querySelectorAll('[data-daily-limit-range]').forEach((control) => {
+    const minimumInput = control.querySelector('[data-daily-minimum]');
+    const maximumInput = control.querySelector('[data-daily-maximum]');
+    if (!minimumInput || !maximumInput) return;
+
+    const validateRange = () => {
+      const minimum = Number.parseInt(minimumInput.value, 10);
+      const maximum = Number.parseInt(maximumInput.value, 10);
+      if (Number.isFinite(maximum)) minimumInput.max = String(maximum);
+      const invalid = Number.isFinite(minimum) && Number.isFinite(maximum) && minimum > maximum;
+      minimumInput.setCustomValidity(
+        invalid ? 'Минимум откликов не может превышать максимум.' : '',
+      );
+    };
+
+    minimumInput.addEventListener('input', validateRange);
+    maximumInput.addEventListener('input', validateRange);
+    validateRange();
+  });
+
   document.querySelectorAll('[data-password-toggle]').forEach((button) => {
     button.addEventListener('click', () => {
       const input = button.closest('.password-input')?.querySelector('input');

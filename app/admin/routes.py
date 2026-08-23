@@ -1095,6 +1095,20 @@ def _items(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _daily_application_rules(
+    existing: dict[str, Any] | None,
+    *,
+    minimum: int,
+    force_minimum: bool,
+) -> dict[str, Any]:
+    """Merge admin-owned daily targets without discarding other advanced rules."""
+
+    rules = dict(existing or {})
+    rules["minimum_daily_applications"] = minimum
+    rules["force_minimum_daily_applications"] = force_minimum and minimum > 0
+    return rules
+
+
 @router.post("/admin/profile")
 async def save_profile(
     request: Request,
@@ -1180,8 +1194,11 @@ async def save_preferences(
     auto_send_categories: str = Form(""),
     forbidden_categories: str = Form(""),
     allowed_cities: str = Form(""),
-    maximum_daily_applications: int = Form(3),
-    minimum_auto_send_score: int = Form(85),
+    minimum_daily_applications: int = Form(0, ge=0, le=100),
+    maximum_daily_applications: int = Form(3, ge=0, le=100),
+    minimum_auto_send_score: int = Form(85, ge=0, le=100),
+    force_minimum_daily_applications: bool = Form(False),
+    daily_application_rules_present: bool = Form(False),
     remote_allowed: bool = Form(False),
     consider_outside_primary_resume: bool = Form(False),
     willing_without_experience: bool = Form(False),
@@ -1191,6 +1208,11 @@ async def save_preferences(
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
+    if daily_application_rules_present and minimum_daily_applications > maximum_daily_applications:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="minimum daily applications cannot exceed the maximum",
+        )
     payload = JobPreferenceUpdateInput(
         allowed_categories=_items(allowed_categories),
         auto_send_categories=_items(auto_send_categories),
@@ -1203,6 +1225,13 @@ async def save_preferences(
         willing_without_experience=willing_without_experience,
     )
     preferences = await ProfileService().update_preferences(session, payload, profile_id)
+    if daily_application_rules_present:
+        preferences.additional_rules = _daily_application_rules(
+            preferences.additional_rules,
+            minimum=minimum_daily_applications,
+            force_minimum=force_minimum_daily_applications,
+        )
+    daily_rules = preferences.additional_rules or {}
     await _audit_admin(
         session,
         "preferences.updated",
@@ -1211,6 +1240,11 @@ async def save_preferences(
         details={
             "auto_send_enabled": preferences.auto_send_enabled,
             "global_pause": preferences.global_pause,
+            "minimum_daily_applications": daily_rules.get("minimum_daily_applications", 0),
+            "maximum_daily_applications": preferences.maximum_daily_applications,
+            "force_minimum_daily_applications": daily_rules.get(
+                "force_minimum_daily_applications", False
+            ),
         },
     )
     await session.commit()
