@@ -18,7 +18,7 @@
     <div><strong>Нужно ваше решение</strong><span>Проверьте вакансию и письмо, затем одобрите или отклоните отклик.</span></div>
     <div class="section-actions">
       <form method="post" action="/admin/applications/{{ application.id }}/approve" data-confirm-title="Одобрить отклик?" data-confirm="Вы проверили вакансию, получателя и письмо. После одобрения отклик сможет быть отправлен." data-confirm-action="Одобрить"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Одобрить</button></form>
-      <form method="post" action="/admin/applications/{{ application.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Причина сохранится в истории решений." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Например: не подходит вакансия, график или зарплата"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отклонить</button></form>
+      <form method="post" action="/admin/applications/{{ application.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Причина сохранится в истории решений." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Например: не подходит вакансия, график или зарплата"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="reason_code" value="other"><input type="hidden" name="learn_from_review" value="true"><button class="btn btn-danger">Отклонить</button></form>
     </div>
   </div>
   {% elif application.status == 'approved' %}

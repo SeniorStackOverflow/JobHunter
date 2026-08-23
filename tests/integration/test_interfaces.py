@@ -38,6 +38,8 @@ from app.models.entities import (
     JobSource,
     MatchEvaluation,
     Resume,
+    ReviewFeedbackEvent,
+    ReviewLearningSetting,
     ScanRun,
     SourceJob,
     UserProfile,
@@ -49,6 +51,8 @@ from app.models.enums import (
     JobStatus,
     MatchDecision,
     PolicyDecision,
+    ReviewOutcome,
+    ReviewReason,
     RunStatus,
     ScanType,
     SourceHealth,
@@ -845,11 +849,17 @@ async def test_admin_application_detail_approval_and_policy_gated_send(
         delivery = await session.scalar(
             select(EmailDelivery).where(EmailDelivery.application_id == application_id)
         )
+        feedback = await session.scalar(
+            select(ReviewFeedbackEvent).where(ReviewFeedbackEvent.application_id == application_id)
+        )
         assert stored is not None
         assert delivery is not None
         assert stored.status == ApplicationStatus.SENT
         assert delivery.status == DeliveryStatus.SENT
         assert delivery.provider_message_id == f"fake-{application_id}"
+        assert feedback is not None
+        assert feedback.outcome == ReviewOutcome.APPROVED
+        assert feedback.learning_eligible is True
         actions = set((await session.scalars(select(AuditEvent.action))).all())
         assert {"application.approved", "application.send_requested", "email.delivery"} <= actions
 
@@ -937,6 +947,9 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         assert queue.status_code == 200
         assert "Queue Engineer" in queue.text
         assert "Отклонить" in queue.text
+        assert "Обучение: собирает примеры" in queue.text
+        assert "data-review-reject" in queue.text
+        assert "Ещё 6 решений до первых подсказок" in queue.text
         assert "Критерии и лимиты" not in queue.text
         assert len(HTMLParser(queue.text).css(".queue-card")) == 10
         assert "Страница 1 из 2" in queue.text
@@ -968,10 +981,27 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
                 "csrf_token": csrf_token,
                 "return_to": "decisions",
                 "reason": "owner declined",
+                "reason_code": "location",
+                "learn_from_review": "true",
             },
         )
         assert rejected.status_code == 303
         assert rejected.headers["location"].startswith("/?view=decisions")
+
+        paused_learning = await client.post(
+            "/admin/review-learning/influence",
+            data={
+                "csrf_token": csrf_token,
+                "profile_id": str(profile_id),
+                "enabled": "false",
+            },
+        )
+        assert paused_learning.status_code == 303
+        paused_queue = await client.get(
+            "/",
+            params={"view": "decisions", "profile_id": str(profile_id)},
+        )
+        assert "Обучение: приостановлено" in paused_queue.text
 
         rejected_queue = await client.get(
             "/",
@@ -989,11 +1019,397 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         audit = await session.scalar(
             select(AuditEvent).where(AuditEvent.action == "application.rejected_by_owner")
         )
+        feedback = await session.scalar(
+            select(ReviewFeedbackEvent).where(ReviewFeedbackEvent.application_id == application_id)
+        )
+        learning_setting = await session.scalar(
+            select(ReviewLearningSetting).where(ReviewLearningSetting.profile_id == profile_id)
+        )
         assert stored is not None
         assert stored.status == ApplicationStatus.CANCELLED
         assert audit is not None
         assert audit.decision == ApplicationStatus.CANCELLED.value
         assert audit.sanitized_details["reason"] == "owner declined"
+        assert audit.sanitized_details["reason_code"] == "location"
+        assert feedback is not None
+        assert feedback.outcome == ReviewOutcome.REJECTED
+        assert feedback.reason_code == ReviewReason.LOCATION
+        assert feedback.learning_eligible is True
+        assert feedback.feature_snapshot["learning_dimensions"] == ["city", "workplace"]
+        assert learning_setting is not None
+        assert learning_setting.influence_enabled is False
+
+
+async def test_mcp_review_workflow_records_structured_learning_feedback(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+    from app.mcp import server as mcp_server
+
+    _application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="mcp-review-learning",
+    )
+    application_id = seeded["application_id"]
+    profile_id = seeded["profile_id"]
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+
+    queue = await mcp_server.get_review_queue(profile_id=str(profile_id))
+    result = await mcp_server.decide_review(
+        str(application_id),
+        "reject",
+        reason_code="role",
+        reason="Not my direction",
+    )
+    learning = await mcp_server.get_review_learning_status(profile_id=str(profile_id))
+
+    assert queue["applications"][0]["application_id"] == str(application_id)
+    assert queue["learning"]["status"] == "собирает примеры"
+    assert result["status"] == "cancelled"
+    assert result["review_outcome"] == "rejected"
+    assert result["reason_code"] == "role"
+    assert result["learning_eligible"] is True
+    assert learning["rejected"] == 1
+
+    async with sqlite_session_factory() as session:
+        feedback = await session.scalar(
+            select(ReviewFeedbackEvent).where(ReviewFeedbackEvent.application_id == application_id)
+        )
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "application.rejected_by_owner")
+        )
+        assert feedback is not None
+        assert feedback.actor == "mcp"
+        assert feedback.reason_text == "Not my direction"
+        assert audit is not None
+        assert audit.actor == "mcp"
+
+
+async def test_admin_review_queue_uses_learned_order_and_explanations(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    from app.learning import ReviewLearningService
+
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="learned-review-order",
+    )
+    profile_id = seeded["profile_id"]
+    learning_service = ReviewLearningService()
+    async with sqlite_session_factory() as session:
+        profile = await session.get(UserProfile, profile_id)
+        preferences = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == profile_id)
+        )
+        resume = await session.get(Resume, seeded["resume_id"])
+        assert profile is not None
+        assert preferences is not None
+        assert resume is not None
+
+        async def add_review(
+            *,
+            suffix: str,
+            title: str,
+            category: str,
+            status: ApplicationStatus,
+            outcome: ReviewOutcome | None,
+        ) -> Application:
+            canonical = CanonicalJob(
+                normalized_company=f"learning company {suffix}",
+                normalized_title=title.casefold(),
+                normalized_location="chisinau",
+                canonical_fingerprint=hashlib.sha256(
+                    f"learning-canonical-{suffix}".encode()
+                ).hexdigest(),
+                status=JobStatus.ACTIVE,
+            )
+            session.add(canonical)
+            await session.flush()
+            job = SourceJob(
+                source_id=seeded["source_id"],
+                canonical_job_id=canonical.id,
+                external_job_id=f"learning-{suffix}",
+                canonical_url=f"https://jobs.example.test/learning/{suffix}",
+                localized_urls={"en": f"https://jobs.example.test/learning/{suffix}"},
+                title=title,
+                company=f"Learning Company {suffix}",
+                categories_seen=[category],
+                category=category,
+                description="Safe learned ordering fixture.",
+                location="Chisinau",
+                cities=["Chisinau"],
+                schedule="full-time",
+                public_email="jobs@example.test",
+                page_locale="en",
+                content_hash=hashlib.sha256(f"learning-content-{suffix}".encode()).hexdigest(),
+                source_fingerprint=hashlib.sha256(f"learning-source-{suffix}".encode()).hexdigest(),
+                status=JobStatus.ACTIVE,
+                raw_metadata={},
+            )
+            session.add(job)
+            await session.flush()
+            evaluation = MatchEvaluation(
+                profile_id=profile_id,
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                resume_fit=80,
+                preference_fit=80,
+                overall_fit=80,
+                requirements_met=[],
+                missing_requirements=[],
+                risks=["manual_review_requested"],
+                scam_indicators=[],
+                explanation="Learned ordering fixture.",
+                decision=MatchDecision.PREPARE_FOR_REVIEW,
+                model="mock",
+                prompt_rules_version="learning-test-v1",
+                source_content_hash=job.content_hash,
+                resume_id=resume.id,
+                resume_sha256=resume.sha256,
+                profile_fingerprint=profile_fingerprint(profile),
+                preference_fingerprint=preference_fingerprint(preferences),
+                confirmed_fact_hashes=confirmed_fact_hashes(profile),
+            )
+            contact = EmployerContact(
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                value="jobs@example.test",
+                contact_type=ContactType.EMAIL,
+                discovery_source="vacancy",
+                official_domain="example.test",
+                verification_status=VerificationStatus.VERIFIED,
+                confidence=1.0,
+                evidence_url=job.canonical_url,
+            )
+            session.add_all([evaluation, contact])
+            await session.flush()
+            review = Application(
+                profile_id=profile_id,
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                match_evaluation_id=evaluation.id,
+                resume_id=resume.id,
+                recipient_contact_id=contact.id,
+                subject=f"Application for {title}",
+                body="Safe learned ordering fixture body.",
+                language="en",
+                status=status,
+                policy_decision=PolicyDecision.PENDING_REVIEW,
+                policy_result={"rules_failed": ["manual_review_requested"]},
+                content_validated=True,
+                idempotency_key=hashlib.sha256(
+                    f"learning-application-{suffix}".encode()
+                ).hexdigest(),
+            )
+            session.add(review)
+            await session.flush()
+            if outcome is not None:
+                await learning_service.record_decision(
+                    session,
+                    review,
+                    outcome=outcome,
+                    actor="test",
+                    reason=(ReviewReason.ROLE if outcome == ReviewOutcome.REJECTED else None),
+                )
+            return review
+
+        for index in range(3):
+            await add_review(
+                suffix=f"accepted-{index}",
+                title=f"Warehouse Picker {index}",
+                category="warehouses",
+                status=ApplicationStatus.APPROVED,
+                outcome=ReviewOutcome.APPROVED,
+            )
+            await add_review(
+                suffix=f"rejected-{index}",
+                title=f"Sales Agent {index}",
+                category="sales",
+                status=ApplicationStatus.CANCELLED,
+                outcome=ReviewOutcome.REJECTED,
+            )
+        await add_review(
+            suffix="pending-warehouse",
+            title="Learned Warehouse Picker",
+            category="warehouses",
+            status=ApplicationStatus.PENDING_REVIEW,
+            outcome=None,
+        )
+        await add_review(
+            suffix="pending-sales",
+            title="Learned Sales Agent",
+            category="sales",
+            status=ApplicationStatus.PENDING_REVIEW,
+            outcome=None,
+        )
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        await _login_admin(client, settings)
+        queue = await client.get(
+            "/",
+            params={"view": "decisions", "profile_id": str(profile_id)},
+        )
+
+    parsed = HTMLParser(queue.text)
+    titles = [node.text(strip=True) for node in parsed.css(".queue-title a")]
+    assert queue.status_code == 200
+    assert titles.index("Learned Warehouse Picker") < titles.index("Learned Sales Agent")
+    assert "Обучение: учитывает решения" in queue.text
+    assert "Раньше вы чаще принимали" in queue.text
+    assert "Раньше вы чаще отклоняли" in queue.text
+    assert "чаще принимаете" in queue.text
+    assert "чаще отклоняете" in queue.text
+
+
+async def test_admin_vacancy_problem_is_excluded_from_preference_learning(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="broken-vacancy-feedback",
+    )
+    application_id = seeded["application_id"]
+    transport = httpx.ASGITransport(app=application)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        response = await client.post(
+            f"/admin/applications/{application_id}/reject",
+            data={
+                "csrf_token": csrf_token,
+                "reason_code": "vacancy_problem",
+                "learn_from_review": "true",
+            },
+        )
+        assert response.status_code == 303
+
+    async with sqlite_session_factory() as session:
+        feedback = await session.scalar(
+            select(ReviewFeedbackEvent).where(ReviewFeedbackEvent.application_id == application_id)
+        )
+        assert feedback is not None
+        assert feedback.learning_eligible is False
+        assert feedback.exclusion_reason == "vacancy_problem"
+
+
+@pytest.mark.e2e
+async def test_admin_review_learning_browser_flow_three_clean_contexts(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    import asyncio
+    import socket
+
+    import uvicorn
+    from fastapi.staticfiles import StaticFiles
+
+    playwright_module = pytest.importorskip("playwright.async_api")
+    async_playwright = playwright_module.async_playwright
+    expect = playwright_module.expect
+
+    application, settings = interface_app
+    application.mount(
+        "/admin-assets",
+        StaticFiles(directory="app/admin/static"),
+        name="browser-test-admin-assets",
+    )
+    seeded_reviews = [
+        await _seed_review_application(
+            sqlite_session_factory,
+            settings,
+            suffix=f"browser-learning-{index}",
+        )
+        for index in range(3)
+    ]
+    with socket.socket() as port_socket:
+        port_socket.bind(("127.0.0.1", 0))
+        port = int(port_socket.getsockname()[1])
+    base_url = f"http://127.0.0.1:{port}"
+    settings.public_base_url = base_url
+    server = uvicorn.Server(
+        uvicorn.Config(application, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as readiness_client:
+            for _attempt in range(100):
+                try:
+                    response = await readiness_client.get("/login")
+                    if response.status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("local browser test server did not start")
+
+        async with async_playwright() as playwright:
+            try:
+                browser = await playwright.chromium.launch(headless=True)
+            except Exception as exc:  # pragma: no cover - depends on optional browser install
+                pytest.skip(f"Playwright Chromium is unavailable: {type(exc).__name__}")
+            try:
+                for index, seeded in enumerate(seeded_reviews):
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    await page.goto(f"{base_url}/login")
+                    await page.get_by_label("Пароль администратора").fill(ADMIN_PASSWORD)
+                    await page.get_by_role("button", name="Войти", exact=True).click()
+                    await page.goto(f"{base_url}/?view=decisions&profile_id={seeded['profile_id']}")
+                    await expect(
+                        page.get_by_role("heading", name="Требуют решения")
+                    ).to_be_visible()
+                    await page.locator("details.learning-control > summary").click()
+                    await expect(page.locator(".learning-popover")).to_be_visible()
+                    await expect(page.locator(".learning-popover")).to_contain_text(
+                        "0 принято · 0 отклонено"
+                    )
+                    await (
+                        page.locator(".queue-card").get_by_role("button", name="Отклонить").click()
+                    )
+                    dialog = page.locator("dialog[data-confirm-dialog]")
+                    await expect(dialog).to_be_visible()
+                    await dialog.get_by_text("Место", exact=True).click()
+                    if index == 2:
+                        await dialog.locator("[data-review-learn]").uncheck()
+                    await dialog.get_by_role("button", name="Отклонить", exact=True).click()
+                    await expect(page.locator(".queue-card")).to_have_count(0)
+                    await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await server_task
+
+    async with sqlite_session_factory() as session:
+        events = list((await session.scalars(select(ReviewFeedbackEvent))).all())
+        browser_events = [event for event in events if event.actor == "admin"]
+        assert len(browser_events) == 3
+        assert all(event.reason_code == ReviewReason.LOCATION for event in browser_events)
+        assert sum(event.learning_eligible for event in browser_events) == 2
+        excluded = next(event for event in browser_events if not event.learning_eligible)
+        assert excluded.exclusion_reason == "operator_opt_out"
 
 
 async def test_rest_application_detail_and_audited_stale_delivery_reconciliation(
@@ -1340,8 +1756,12 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "analyze_job",
             "prepare_application",
             "approve_application",
+            "decide_review",
             "send_application",
             "list_applications",
+            "get_review_queue",
+            "get_review_learning_status",
+            "set_review_learning_influence",
             "get_application_status",
             "reconcile_stale_application_delivery",
             "get_run_summary",
@@ -1351,6 +1771,12 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
         }
         send_tool = next(tool for tool in tools if tool["name"] == "send_application")
         assert set(send_tool["inputSchema"]["properties"]) == {"application_id"}
+        decide_tool = next(tool for tool in tools if tool["name"] == "decide_review")
+        reason_schema = decide_tool["inputSchema"]
+        assert reason_schema["properties"]["reason_code"]["$ref"] == "#/$defs/ReviewReason"
+        assert set(reason_schema["$defs"]["ReviewReason"]["enum"]) == {
+            reason.value for reason in ReviewReason
+        }
 
         source_response = await client.post(
             "/mcp",

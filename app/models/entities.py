@@ -31,6 +31,8 @@ from app.models.enums import (
     JobStatus,
     MatchDecision,
     PolicyDecision,
+    ReviewOutcome,
+    ReviewReason,
     RunStatus,
     ScanType,
     SourceHealth,
@@ -381,6 +383,57 @@ class Application(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), default=utcnow, nullable=False
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReviewFeedbackEvent(UUIDPrimaryKeyMixin, Base):
+    """An explicit owner label with the immutable features visible at decision time."""
+
+    __tablename__ = "review_feedback_events"
+    __table_args__ = (
+        UniqueConstraint("application_id", name="uq_review_feedback_application"),
+        Index("ix_review_feedback_profile_created", "profile_id", "created_at"),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    application_id: Mapped[UUID] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), nullable=False
+    )
+    match_evaluation_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("match_evaluations.id", ondelete="SET NULL")
+    )
+    canonical_job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("canonical_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    source_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("source_jobs.id", ondelete="SET NULL")
+    )
+    outcome: Mapped[ReviewOutcome] = mapped_column(enum_column(ReviewOutcome), nullable=False)
+    reason_code: Mapped[ReviewReason | None] = mapped_column(enum_column(ReviewReason))
+    reason_text: Mapped[str | None] = mapped_column(String(500))
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    learning_eligible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(128))
+    source_content_hash: Mapped[str | None] = mapped_column(String(64))
+    profile_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    preference_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    resume_sha256: Mapped[str | None] = mapped_column(String(64))
+    feature_schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    feature_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class ReviewLearningSetting(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "review_learning_settings"
+    __table_args__ = (UniqueConstraint("profile_id", name="uq_review_learning_profile"),)
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    influence_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
 class EmailDelivery(UUIDPrimaryKeyMixin, Base):

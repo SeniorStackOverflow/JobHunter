@@ -42,6 +42,11 @@ from app.email.oauth import (
     GmailOAuthService,
 )
 from app.email.service import EmailSendBlocked, EmailService
+from app.learning import (
+    LearnedReviewScore,
+    ReviewJobInput,
+    ReviewLearningService,
+)
 from app.matching.providers import MATCHING_RULES_VERSION
 from app.models.entities import (
     Alert,
@@ -57,6 +62,8 @@ from app.models.enums import (
     ApplicationStatus,
     JobStatus,
     MatchDecision,
+    ReviewOutcome,
+    ReviewReason,
     RunStatus,
     ScanType,
     SourceHealth,
@@ -220,6 +227,14 @@ _FEEDBACK_NOTICES = {
         "Он отменён и не попадёт в отправку.",
     ),
     "application_sent": ("Письмо отправлено", "Состояние доставки сохранено в журнале."),
+    "review_learning_enabled": (
+        "Обучение включено",
+        "Новые решения снова влияют на подсказки и порядок очереди.",
+    ),
+    "review_learning_paused": (
+        "Влияние обучения приостановлено",
+        "Решения сохраняются, но не меняют подсказки и порядок очереди.",
+    ),
     "delivery_reconciled": (
         "Состояние зафиксировано",
         "Повторная отправка не выполнялась.",
@@ -768,6 +783,8 @@ async def dashboard(
     audits: list[AuditEvent] = []
     active_alerts: list[Alert] = []
     historical_alerts: list[Alert] = []
+    learning_summary = None
+    learning_scores: dict[UUID, LearnedReviewScore] = {}
     pagination = _pagination(0, 1, 10)
 
     if view == "overview":
@@ -792,6 +809,8 @@ async def dashboard(
             ).all()
         )
     elif view == "decisions":
+        learning_service = ReviewLearningService()
+        learning_summary = await learning_service.summary(session, selected_profile_id)
         decision_statuses = {
             "pending_review": [ApplicationStatus.PENDING_REVIEW, ApplicationStatus.PREPARED],
             "approved": [ApplicationStatus.APPROVED, ApplicationStatus.AUTO_APPROVED],
@@ -827,18 +846,90 @@ async def dashboard(
             or 0
         )
         pagination = _pagination(total, page, 10)
-        applications = list(
-            (
-                await session.scalars(
-                    select(Application)
+        if (
+            status_filter == "pending_review"
+            and learning_summary.ready
+            and learning_summary.influence_enabled
+        ):
+            feature_rows = (
+                await session.execute(
+                    select(
+                        Application.id,
+                        Application.created_at,
+                        SourceJob.title,
+                        SourceJob.company,
+                        SourceJob.category,
+                        SourceJob.categories_seen,
+                        SourceJob.cities,
+                        SourceJob.location,
+                        SourceJob.schedule,
+                        SourceJob.workplace_type,
+                        SourceJob.employment_type,
+                        SourceJob.required_experience,
+                        SourceJob.no_experience,
+                        SourceJob.salary_min,
+                        SourceJob.salary_max,
+                        SourceJob.salary_text,
+                    )
                     .join(SourceJob, SourceJob.id == Application.source_job_id)
                     .where(*conditions)
                     .order_by(desc(Application.created_at))
-                    .offset((int(pagination["page"]) - 1) * 10)
-                    .limit(10)
                 )
             ).all()
-        )
+            ranked_ids: list[tuple[UUID, int, int]] = []
+            for original_order, row in enumerate(feature_rows):
+                score = learning_service.score(
+                    learning_summary,
+                    ReviewJobInput(
+                        title=row.title,
+                        company=row.company,
+                        category=row.category,
+                        categories_seen=tuple(row.categories_seen or ()),
+                        cities=tuple(row.cities or ()),
+                        location=row.location,
+                        schedule=row.schedule,
+                        workplace_type=row.workplace_type,
+                        employment_type=row.employment_type,
+                        required_experience=row.required_experience,
+                        no_experience=row.no_experience,
+                        salary_present=(
+                            row.salary_min is not None
+                            or row.salary_max is not None
+                            or bool(row.salary_text)
+                        ),
+                    ),
+                )
+                if score is not None:
+                    learning_scores[row.id] = score
+                ranked_ids.append(
+                    (row.id, score.value if score is not None else 50, original_order)
+                )
+            ranked_ids.sort(key=lambda item: (-item[1], item[2]))
+            offset = (int(pagination["page"]) - 1) * 10
+            page_ids = [item[0] for item in ranked_ids[offset : offset + 10]]
+            if page_ids:
+                page_items = {
+                    item.id: item
+                    for item in (
+                        await session.scalars(
+                            select(Application).where(Application.id.in_(page_ids))
+                        )
+                    ).all()
+                }
+                applications = [page_items[item_id] for item_id in page_ids]
+        else:
+            applications = list(
+                (
+                    await session.scalars(
+                        select(Application)
+                        .join(SourceJob, SourceJob.id == Application.source_job_id)
+                        .where(*conditions)
+                        .order_by(desc(Application.created_at))
+                        .offset((int(pagination["page"]) - 1) * 10)
+                        .limit(10)
+                    )
+                ).all()
+            )
     elif view == "history":
         valid_history_kinds = {"sent", "rejected", "jobs", "matches", "scans"}
         history_kind = history_kind if history_kind in valid_history_kinds else "sent"
@@ -1069,6 +1160,8 @@ async def dashboard(
             "applications": applications,
             "recent_applications": recent_applications,
             "application_jobs": application_jobs,
+            "learning_summary": learning_summary,
+            "learning_scores": learning_scores,
             "scans": scans,
             "active_alerts": active_alerts,
             "historical_alerts": historical_alerts,
@@ -1504,12 +1597,19 @@ async def admin_approve_application(
         raise HTTPException(status_code=404, detail="application not found") from exc
     except ApplicationPreparationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    feedback = await ReviewLearningService().record_decision(
+        session,
+        application,
+        outcome=ReviewOutcome.APPROVED,
+        actor="admin",
+    )
     await _audit_admin(
         session,
         "application.approved",
         "application",
         str(application.id),
         decision=application.status.value,
+        details={"learning_eligible": feedback.learning_eligible},
     )
     await session.commit()
     if return_to == "decisions":
@@ -1528,11 +1628,17 @@ async def admin_reject_application(
     request: Request,
     csrf_token: str = Form(...),
     reason: str = Form(""),
+    reason_code: str = Form(ReviewReason.OTHER.value),
+    learn_from_review: bool = Form(True),
     return_to: str = Form("detail"),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
+    try:
+        structured_reason = ReviewReason(reason_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid review reason") from exc
     try:
         application = await ApplicationService(get_settings()).reject(session, application_id)
     except LookupError as exc:
@@ -1540,13 +1646,26 @@ async def admin_reject_application(
     except ApplicationPreparationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     clean_reason = reason.strip()[:500]
+    feedback = await ReviewLearningService().record_decision(
+        session,
+        application,
+        outcome=ReviewOutcome.REJECTED,
+        actor="admin",
+        reason=structured_reason,
+        reason_text=clean_reason,
+        learn=learn_from_review,
+    )
     await _audit_admin(
         session,
         "application.rejected_by_owner",
         "application",
         str(application.id),
         decision=application.status.value,
-        details={"reason": clean_reason} if clean_reason else None,
+        details={
+            "reason_code": structured_reason.value,
+            "reason": clean_reason,
+            "learning_eligible": feedback.learning_eligible,
+        },
     )
     await session.commit()
     if return_to == "decisions":
@@ -1556,6 +1675,34 @@ async def admin_reject_application(
         )
     return RedirectResponse(
         f"/admin/applications/{application_id}?notice=application_rejected", status_code=303
+    )
+
+
+@router.post("/admin/review-learning/influence")
+async def admin_set_review_learning_influence(
+    request: Request,
+    profile_id: UUID = Form(...),
+    enabled: bool = Form(...),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    profile = await ProfileService().get_profile(session, profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    await ReviewLearningService().set_influence(session, profile.id, enabled=enabled)
+    await _audit_admin(
+        session,
+        "review_learning.influence_changed",
+        "profile",
+        str(profile.id),
+        decision="enabled" if enabled else "paused",
+    )
+    await session.commit()
+    notice = "review_learning_enabled" if enabled else "review_learning_paused"
+    return RedirectResponse(
+        f"/?view=decisions&profile_id={profile.id}&notice={notice}", status_code=303
     )
 
 

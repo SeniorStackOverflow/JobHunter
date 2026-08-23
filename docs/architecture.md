@@ -15,6 +15,8 @@ profile + resumes -> deterministic filters -> LLM matcher -> MatchEvaluation
 verified contact -> application generator -> policy engine -> email sender
                                                         |
                       REST / admin / MCP <- audit + reports + metrics
+                                                        |
+                  explicit review -> personal review ranking
 ```
 
 Celery Beat инициирует работу независимо от любого AI-клиента. MCP является только
@@ -33,6 +35,8 @@ Celery Beat инициирует работу независимо от любо
 - `app/applications`: выбирает верифицированное резюме и строит письмо только из
   подтверждённых фактов.
 - `app/policies`: полностью детерминированный fail-closed policy engine.
+- `app/learning`: сохраняет только явные решения владельца, строит объяснимые
+  персональные подсказки и меняет порядок review без права отправлять или блокировать.
 - `app/email`: sender принимает только `application_id`, повторно загружает все данные из
   БД и повторно проверяет policy/idempotency. LLM и MCP не формируют MIME.
 - `app/scheduler`: задачи Celery и Redis locks; сбой источника не прерывает другие.
@@ -84,4 +88,3 @@ HTML, JSON-LD, URL, email, текст вакансии и результат LLM
 2. пользовательские `auto_send_enabled`, `global_pause`, категории и дневной лимит.
 
 Аварийный `EMERGENCY_EMAIL_KILL_SWITCH` имеет приоритет над обоими.
-

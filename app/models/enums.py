@@ -58,6 +58,22 @@ class ApplicationStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ReviewOutcome(StrEnum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ReviewReason(StrEnum):
+    ROLE = "role"
+    SALARY = "salary"
+    SCHEDULE = "schedule"
+    LOCATION = "location"
+    COMPANY = "company"
+    REQUIREMENTS = "requirements"
+    VACANCY_PROBLEM = "vacancy_problem"
+    OTHER = "other"
+
+
 class DeliveryStatus(StrEnum):
     SENDING = "sending"
     SENT = "sent"

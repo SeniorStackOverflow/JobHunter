@@ -146,13 +146,24 @@ Source configuration проходит Pydantic/SSRF/domain validation. MCP не 
 
 - `prepare_application`
 - `approve_application`
+- `decide_review`
 - `send_application`
 - `list_applications`
+- `get_review_queue`
+- `get_review_learning_status`
+- `set_review_learning_influence`
 - `get_application_status`
 
 Approval не обходит hard safety rules. `send_application(application_id)` не
 может отправить `blocked`, непроверенный или уже отправленный Application. Статус
 `delivery_unknown` запрещает автоматический повтор.
+
+`decide_review` — основной AI-first интерфейс для явного `approve`/`reject`.
+Для отказа передаётся структурированный `reason_code`; `learn=false` исключает
+конкретное решение из персональных подсказок. `get_review_queue` возвращает контекст
+вакансии, причины policy review и, когда данных достаточно, объяснение похожих прошлых
+решений. Обучение влияет только на сортировку и подсказки. Оно не меняет профиль,
+подтверждённые факты, hard safety rules или состояние доставки.
 
 ### Отчёты
 

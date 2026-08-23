@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -21,6 +21,7 @@ from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
 from app.crawlers.source_control import disable_source_record, enable_source_record
 from app.email.service import EmailService
+from app.learning import ReviewLearningService, review_reason_labels
 from app.models.entities import (
     Application,
     BatchScanRun,
@@ -30,7 +31,16 @@ from app.models.entities import (
     ScanRun,
     SourceJob,
 )
-from app.models.enums import JobStatus, MatchDecision, RunStatus, ScanType, SourceHealth
+from app.models.enums import (
+    ApplicationStatus,
+    JobStatus,
+    MatchDecision,
+    ReviewOutcome,
+    ReviewReason,
+    RunStatus,
+    ScanType,
+    SourceHealth,
+)
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import (
     JobPreferenceUpdateInput,
@@ -972,9 +982,84 @@ async def approve_application(application_id: str) -> dict[str, Any]:
 
     async with async_session_factory() as session:
         item = await ApplicationService(get_settings()).approve(session, UUID(application_id))
+        feedback = await ReviewLearningService().record_decision(
+            session,
+            item,
+            outcome=ReviewOutcome.APPROVED,
+            actor="mcp",
+        )
         await _audit_write(session, "application.approved", "application", str(item.id))
         await session.commit()
-        return {"application_id": str(item.id), "status": item.status.value}
+        return {
+            "application_id": str(item.id),
+            "status": item.status.value,
+            "learning_eligible": feedback.learning_eligible,
+        }
+
+
+@mcp.tool()
+async def decide_review(
+    application_id: str,
+    outcome: Literal["approve", "reject"],
+    reason_code: ReviewReason = ReviewReason.OTHER,
+    reason: str = "",
+    learn: bool = True,
+) -> dict[str, Any]:
+    """Approve or reject one review and store an explicit personal-learning signal."""
+    from app.database.session import async_session_factory
+
+    try:
+        structured_reason = ReviewReason(reason_code)
+    except ValueError as exc:
+        valid = ", ".join(item.value for item in ReviewReason)
+        raise ValueError(f"reason_code must be one of: {valid}") from exc
+    async with async_session_factory() as session:
+        service = ApplicationService(get_settings())
+        learning = ReviewLearningService()
+        if outcome == "approve":
+            item = await service.approve(session, UUID(application_id))
+            feedback = await learning.record_decision(
+                session,
+                item,
+                outcome=ReviewOutcome.APPROVED,
+                actor="mcp",
+            )
+            action = "application.approved"
+        else:
+            item = await service.reject(session, UUID(application_id))
+            feedback = await learning.record_decision(
+                session,
+                item,
+                outcome=ReviewOutcome.REJECTED,
+                actor="mcp",
+                reason=structured_reason,
+                reason_text=reason,
+                learn=learn,
+            )
+            action = "application.rejected_by_owner"
+        await record_audit_event(
+            session,
+            actor="mcp",
+            action=action,
+            entity_type="application",
+            entity_id=str(item.id),
+            correlation_id=str(item.id),
+            decision=item.status.value,
+            details={
+                "review_outcome": feedback.outcome.value,
+                "reason_code": feedback.reason_code.value if feedback.reason_code else None,
+                "learning_eligible": feedback.learning_eligible,
+            },
+        )
+        await session.commit()
+        return {
+            "application_id": str(item.id),
+            "status": item.status.value,
+            "review_outcome": feedback.outcome.value,
+            "reason_code": feedback.reason_code.value if feedback.reason_code else None,
+            "learning_eligible": feedback.learning_eligible,
+            "learning_exclusion_reason": feedback.exclusion_reason,
+        }
 
 
 @mcp.tool()
@@ -1055,6 +1140,125 @@ async def list_applications(limit: int = 50, profile_id: str | None = None) -> l
             )
             for item in values
         ]
+
+
+@mcp.tool()
+async def get_review_queue(limit: int = 50, profile_id: str | None = None) -> dict[str, Any]:
+    """Return pending reviews, job context and explainable personal-learning hints."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        rows = list(
+            (
+                await session.execute(
+                    select(Application, SourceJob)
+                    .join(SourceJob, SourceJob.id == Application.source_job_id)
+                    .where(
+                        Application.profile_id == profile.id,
+                        Application.status.in_(
+                            [ApplicationStatus.PENDING_REVIEW, ApplicationStatus.PREPARED]
+                        ),
+                    )
+                    .order_by(desc(Application.created_at))
+                    .limit(200)
+                )
+            ).all()
+        )
+        learning_service = ReviewLearningService()
+        learning_summary = await learning_service.summary(session, profile.id)
+        ranked: list[tuple[int, int, dict[str, Any]]] = []
+        for original_order, (application, job) in enumerate(rows):
+            score = learning_service.score(learning_summary, job)
+            ranked.append(
+                (
+                    score.value if score is not None else 50,
+                    original_order,
+                    {
+                        "application_id": str(application.id),
+                        "status": application.status.value,
+                        "job": {
+                            "source_job_id": str(job.id),
+                            "canonical_job_id": str(application.canonical_job_id),
+                            "title": job.title,
+                            "company": job.company,
+                            "category": job.category,
+                            "location": job.location,
+                            "schedule": job.schedule,
+                            "salary": job.salary_text,
+                            "url": job.canonical_url,
+                        },
+                        "subject": application.subject,
+                        "failed_policy_rules": (application.policy_result or {}).get(
+                            "rules_failed", []
+                        ),
+                        "learning": score.as_dict() if score is not None else None,
+                        "created_at": application.created_at.isoformat(),
+                    },
+                )
+            )
+        if learning_summary.ready and learning_summary.influence_enabled:
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+        return {
+            "profile_id": str(profile.id),
+            "learning": learning_summary.as_dict(),
+            "reason_codes": [
+                {"code": code, "label": label} for code, label in review_reason_labels()
+            ],
+            "applications": [item[2] for item in ranked[: min(max(limit, 1), 200)]],
+        }
+
+
+@mcp.tool()
+async def get_review_learning_status(profile_id: str | None = None) -> dict[str, Any]:
+    """Show how many explicit labels are usable and which patterns were learned."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        summary = await ReviewLearningService().summary(session, profile.id)
+        return {
+            "profile_id": str(profile.id),
+            **summary.as_dict(),
+            "reason_codes": [
+                {"code": code, "label": label} for code, label in review_reason_labels()
+            ],
+        }
+
+
+@mcp.tool()
+async def set_review_learning_influence(
+    enabled: bool, profile_id: str | None = None
+) -> dict[str, Any]:
+    """Enable or pause learned hints and sorting; feedback collection remains explicit."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        summary = await ReviewLearningService().set_influence(session, profile.id, enabled=enabled)
+        await record_audit_event(
+            session,
+            actor="mcp",
+            action="review_learning.influence_changed",
+            entity_type="profile",
+            entity_id=str(profile.id),
+            correlation_id=str(profile.id),
+            decision="enabled" if enabled else "paused",
+        )
+        await session.commit()
+        return {"profile_id": str(profile.id), **summary.as_dict()}
 
 
 @mcp.tool()

@@ -1,5 +1,12 @@
 <section class="admin-section">
-  <div class="section-heading"><div><h1>Требуют решения</h1><p>Очередь по всей базе. Одобрите отклик, отклоните его или откройте письмо для проверки.</p></div><span class="badge warning">{{ pagination.total }} найдено</span></div>
+  <div class="section-heading"><div><h1>Требуют решения</h1><p>Очередь по всей базе. Одобрите отклик, отклоните его или откройте письмо для проверки.</p></div><div class="section-actions">
+    {% if learning_summary %}<details class="learning-control"><summary>Обучение: {{ learning_summary.status_label }}</summary><div class="learning-popover">
+      <div class="learning-counts"><strong>{{ learning_summary.approved }} принято · {{ learning_summary.rejected }} отклонено</strong>{% if learning_summary.ready %}<span>Очередь учитывает похожие решения.</span>{% else %}<span>Ещё {{ learning_summary.labels_needed }} решений до первых подсказок.</span>{% endif %}</div>
+      {% if learning_summary.proposals %}<div class="learning-patterns">{% for proposal in learning_summary.proposals %}<div><span>{{ proposal.direction }}</span><strong>{{ proposal.label }}</strong><small>{{ proposal.support }} решений</small></div>{% endfor %}</div>{% endif %}
+      <form method="post" action="/admin/review-learning/influence"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="enabled" value="{{ 'false' if learning_summary.influence_enabled else 'true' }}"><button class="btn btn-sm">{{ 'Приостановить влияние' if learning_summary.influence_enabled else 'Возобновить влияние' }}</button></form>
+    </div></details>{% endif %}
+    <span class="badge warning">{{ pagination.total }} найдено</span>
+  </div></div>
   <div class="filter-panel">
     <div class="tabs" aria-label="Фильтр статуса">
       <a class="tab {% if status_filter == 'pending_review' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=pending_review">Ждут решения</a>
@@ -13,12 +20,12 @@
   <div class="queue-list">
     {% for item in applications %}{% set job = application_jobs.get(item.source_job_id) %}
     <article class="queue-card">
-      <div class="queue-main"><div class="queue-title"><a href="/admin/applications/{{ item.id }}">{{ job.title if job else item.subject }}</a><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></div><div class="queue-company">{{ job.company if job and job.company else 'Компания не указана' }}{% if job and job.location %} · {{ job.location }}{% endif %}</div><p>{{ item.subject }}</p><div class="queue-meta">Подготовлен {{ format_dt(item.created_at) }} · язык {{ item.language|upper }}</div></div>
+      {% set learned = learning_scores.get(item.id) %}<div class="queue-main"><div class="queue-title"><a href="/admin/applications/{{ item.id }}">{{ job.title if job else item.subject }}</a><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></div><div class="queue-company">{{ job.company if job and job.company else 'Компания не указана' }}{% if job and job.location %} · {{ job.location }}{% endif %}</div><p>{{ item.subject }}</p><div class="queue-meta">Подготовлен {{ format_dt(item.created_at) }} · язык {{ item.language|upper }}</div>{% if learned and learned.hint %}<div class="queue-learning-hint">{{ learned.hint }} · {{ learned.evidence }} похожих решений</div>{% endif %}</div>
       <div class="queue-actions">
         <a class="btn" href="/admin/applications/{{ item.id }}">Проверить письмо</a>
         {% if item.status == 'pending_review' or item.status == 'prepared' %}
         <form method="post" action="/admin/applications/{{ item.id }}/approve" data-confirm-title="Одобрить отклик?" data-confirm="После одобрения письмо сможет быть отправлено работодателю по правилам профиля." data-confirm-action="Одобрить"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-primary">Одобрить</button></form>
-        <form method="post" action="/admin/applications/{{ item.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Причина сохранится в истории решений." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Например: не подходит вакансия, график или зарплата"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-danger">Отклонить</button></form>
+        <form method="post" action="/admin/applications/{{ item.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Выбор причины поможет точнее разбирать следующие вакансии." data-confirm-action="Отклонить" data-confirm-tone="danger" data-review-reject><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><input type="hidden" name="reason_code" value="other"><input type="hidden" name="reason"><input type="hidden" name="learn_from_review" value="true"><button class="btn btn-danger">Отклонить</button></form>
         {% endif %}
       </div>
     </article>

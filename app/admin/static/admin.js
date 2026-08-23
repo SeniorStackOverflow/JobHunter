@@ -104,6 +104,9 @@
   const dialogCancel = dialog?.querySelector('[data-confirm-cancel]');
   const reasonField = dialog?.querySelector('[data-confirm-reason-field]');
   const reasonInput = dialog?.querySelector('[data-confirm-reason-input]');
+  const reviewReasonField = dialog?.querySelector('[data-review-reason-field]');
+  const reviewReasonInputs = dialog?.querySelectorAll('input[name="dialog-review-reason"]') || [];
+  const reviewLearnInput = dialog?.querySelector('[data-review-learn]');
   let pendingConfirmation = null;
   let confirmedForm = null;
 
@@ -152,6 +155,17 @@
         reasonInput.value = '';
         reasonInput.placeholder = form.dataset.confirmReason || 'Коротко укажите причину';
       }
+      const asksForReviewReason = Object.prototype.hasOwnProperty.call(
+        form.dataset,
+        'reviewReject',
+      );
+      if (reviewReasonField) reviewReasonField.hidden = !asksForReviewReason;
+      if (asksForReviewReason) {
+        reviewReasonInputs.forEach((input) => {
+          input.checked = input.value === 'other';
+        });
+        if (reviewLearnInput) reviewLearnInput.checked = true;
+      }
       dialog.returnValue = '';
       dialog.showModal();
       (reasonField && !reasonField.hidden ? reasonInput : dialogCancel)?.focus();
@@ -176,6 +190,13 @@
         pending.form.append(target);
       }
       target.value = reasonInput.value.trim();
+    }
+    if (reviewReasonField && !reviewReasonField.hidden) {
+      const selectedReason = Array.from(reviewReasonInputs).find((input) => input.checked);
+      const reasonTarget = pending.form.querySelector('input[name="reason_code"]');
+      const learnTarget = pending.form.querySelector('input[name="learn_from_review"]');
+      if (reasonTarget) reasonTarget.value = selectedReason?.value || 'other';
+      if (learnTarget) learnTarget.value = String(reviewLearnInput?.checked !== false);
     }
     confirmedForm = pending.form;
     pending.form.requestSubmit(pending.submitter || undefined);

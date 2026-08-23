@@ -337,6 +337,7 @@ restore находятся в `docs/operations.md`.
 - [Политика auto-send](docs/auto-send-policy.md)
 - [Gmail OAuth](docs/gmail-oauth.md)
 - [MCP](docs/mcp.md)
+- [Обучение на решениях review](docs/review-learning.md)
 - [Развёртывание](docs/deployment.md) и [операции](docs/operations.md)
 
 ## Правовые и технические границы
