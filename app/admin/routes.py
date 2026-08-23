@@ -1208,7 +1208,11 @@ async def save_preferences(
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    if daily_application_rules_present and minimum_daily_applications > maximum_daily_applications:
+    if (
+        daily_application_rules_present
+        and force_minimum_daily_applications
+        and minimum_daily_applications > maximum_daily_applications
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="minimum daily applications cannot exceed the maximum",

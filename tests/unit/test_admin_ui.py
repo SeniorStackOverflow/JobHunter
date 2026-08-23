@@ -48,6 +48,16 @@ def test_admin_javascript_initializes_every_custom_control() -> None:
         assert hook in script
 
 
+def test_admin_javascript_disables_dormant_daily_minimum() -> None:
+    script = Path("app/admin/static/admin.js").read_text(encoding="utf-8")
+
+    assert "minimumInput.readOnly = !enabled;" in script
+    assert "minimumInput.setAttribute('aria-disabled', String(!enabled));" in script
+    assert "forceInput.checked &&" in script
+    assert "forceInput.addEventListener('change', syncMinimumAvailability);" in script
+    assert "syncMinimumAvailability();" in script
+
+
 def test_admin_templates_do_not_use_inline_event_handlers() -> None:
     templates = Path("app/admin/templates")
 
