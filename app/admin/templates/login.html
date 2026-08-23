@@ -3,29 +3,37 @@
 {% block body_class %}login-page{% endblock %}
 {% block body %}
 <main class="login-card">
-  <div class="login-brand"><div class="brand-mark">JH</div><div><h1>JobHunter</h1><div class="panel-subtitle">Operator Console</div></div></div>
-  <p>Один защищённый вход для контроля автоматизации и подключения Gmail.</p>
-  {% if error %}<div class="notice danger" style="margin-bottom:14px">{{ error }}</div>{% endif %}
+  <div class="login-brand">
+    <div class="brand-mark">JH</div>
+    <div><h1>JobHunter</h1><div class="login-subtitle">Вход в панель управления</div></div>
+  </div>
+
+  {% if error %}<div class="notice danger login-error" role="alert">{{ error }}</div>{% endif %}
+
   {% if google_login_available %}
   <a class="btn google-button" href="/admin/auth/google">
     <span class="google-mark" aria-hidden="true">G</span>
     Войти через Google
   </a>
-  <div class="login-trust">JobHunter проверит разрешённый аккаунт и запросит только право отправки Gmail. Токены остаются на сервере.</div>
   {% else %}
-  <div class="notice warning" style="margin-bottom:14px">Google-вход ещё не настроен. Доступен аварийный вход по паролю.</div>
+  <div class="notice warning login-error">Вход через Google пока недоступен.</div>
   {% endif %}
+
+  {% if google_login_available and password_login_available %}
+  <div class="login-divider"><span>или</span></div>
+  {% endif %}
+
   {% if password_login_available %}
-  <details class="password-fallback" {% if not google_login_available %}open{% endif %}>
-    <summary>Аварийный вход по паролю</summary>
-    <form method="post" action="/login" class="details-body">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label class="field">Пользователь<input type="text" name="username" autocomplete="username" required></label>
-      <label class="field">Пароль<input type="password" name="password" autocomplete="current-password" required></label>
-      <button class="btn" type="submit">Войти по паролю</button>
-    </form>
-  </details>
+  <form method="post" action="/login" class="login-password-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="field">Пароль администратора
+      <span class="password-input">
+        <input type="password" name="password" autocomplete="current-password" required>
+        <button type="button" class="password-toggle" data-password-toggle aria-label="Показать пароль">Показать</button>
+      </span>
+    </label>
+    <button class="btn" type="submit">Войти</button>
+  </form>
   {% endif %}
-  <div style="display:flex;justify-content:center;margin-top:18px"><button class="btn btn-sm btn-ghost" type="button" data-theme-toggle>◐ Сменить тему</button></div>
 </main>
 {% endblock %}

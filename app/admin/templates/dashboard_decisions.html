@@ -1,0 +1,28 @@
+<section class="admin-section">
+  <div class="section-heading"><div><h1>Требуют решения</h1><p>Очередь по всей базе. Одобрите отклик, отклоните его или откройте письмо для проверки.</p></div><span class="badge warning">{{ pagination.total }} найдено</span></div>
+  <div class="filter-panel">
+    <div class="tabs" aria-label="Фильтр статуса">
+      <a class="tab {% if status_filter == 'pending_review' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=pending_review">Ждут решения</a>
+      <a class="tab {% if status_filter == 'approved' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=approved">Одобрены</a>
+      <a class="tab {% if status_filter == 'problems' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=problems">С проблемами</a>
+      <a class="tab {% if status_filter == 'cancelled' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=cancelled">Отклонены</a>
+      <a class="tab {% if status_filter == 'all' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=all">Все</a>
+    </div>
+    <form class="server-search" method="get" action="/"><input type="hidden" name="view" value="decisions"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="status_filter" value="{{ status_filter }}"><input type="search" name="q" value="{{ q }}" placeholder="Вакансия или компания"><button class="btn">Найти</button></form>
+  </div>
+  <div class="queue-list">
+    {% for item in applications %}{% set job = application_jobs.get(item.source_job_id) %}
+    <article class="queue-card">
+      <div class="queue-main"><div class="queue-title"><a href="/admin/applications/{{ item.id }}">{{ job.title if job else item.subject }}</a><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></div><div class="queue-company">{{ job.company if job and job.company else 'Компания не указана' }}{% if job and job.location %} · {{ job.location }}{% endif %}</div><p>{{ item.subject }}</p><div class="queue-meta">Подготовлен {{ format_dt(item.created_at) }} · язык {{ item.language|upper }}</div></div>
+      <div class="queue-actions">
+        <a class="btn" href="/admin/applications/{{ item.id }}">Проверить письмо</a>
+        {% if item.status == 'pending_review' or item.status == 'prepared' %}
+        <form method="post" action="/admin/applications/{{ item.id }}/approve" data-confirm="Одобрить этот отклик?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-primary">Одобрить</button></form>
+        <form method="post" action="/admin/applications/{{ item.id }}/reject" data-confirm="Отклонить этот отклик? Он не будет отправлен."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="decisions"><button class="btn btn-danger">Отклонить</button></form>
+        {% endif %}
+      </div>
+    </article>
+    {% else %}<div class="panel empty-state">По этому фильтру откликов нет.</div>{% endfor %}
+  </div>
+  {% if pagination.pages > 1 %}<div class="pagination"><form method="get"><input type="hidden" name="view" value="decisions"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="status_filter" value="{{ status_filter }}"><input type="hidden" name="q" value="{{ q }}"><input type="hidden" name="page" value="{{ pagination.page - 1 }}"><button class="btn" {% if not pagination.has_previous %}disabled{% endif %}>← Назад</button></form><span>Страница {{ pagination.page }} из {{ pagination.pages }}</span><form method="get"><input type="hidden" name="view" value="decisions"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="status_filter" value="{{ status_filter }}"><input type="hidden" name="q" value="{{ q }}"><input type="hidden" name="page" value="{{ pagination.page + 1 }}"><button class="btn" {% if not pagination.has_next %}disabled{% endif %}>Дальше →</button></form></div>{% endif %}
+</section>

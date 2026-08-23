@@ -810,7 +810,7 @@ async def gmail_oauth_callback(
             )
         await session.commit()
         response = (
-            RedirectResponse("/login?oauth_error=1", status_code=303)
+            RedirectResponse(f"/login?oauth_error={exc.code}", status_code=303)
             if admin_login
             else JSONResponse(
                 status_code=400,
@@ -819,7 +819,7 @@ async def gmail_oauth_callback(
         )
     else:
         if exchange.identity is not None:
-            response = RedirectResponse("/?google=connected#overview", status_code=303)
+            response = RedirectResponse("/?view=overview&google=connected", status_code=303)
             response.set_cookie(
                 settings.session_cookie_name,
                 SessionSigner(settings.secret_key.get_secret_value()).issue(

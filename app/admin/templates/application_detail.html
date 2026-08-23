@@ -3,83 +3,44 @@
 {% block body_class %}detail-page{% endblock %}
 {% block body %}
 <header class="detail-topbar">
-  <div class="brand" style="padding:0"><div class="brand-mark" style="width:34px;height:34px;border-radius:10px">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Отклик</span></div></div>
-  <div style="display:flex;gap:8px"><a class="btn" href="/#applications">← К откликам</a><button class="btn btn-icon btn-ghost" type="button" data-theme-toggle>◐</button></div>
+  <div class="brand" style="padding:0"><div class="brand-mark" style="width:34px;height:34px;border-radius:10px">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Проверка отклика</span></div></div>
+  <a class="btn" href="/?view=decisions">← К очереди</a>
 </header>
 <main class="detail-content">
   <div class="section-heading">
     <div><h1>{{ application.job.title if application.job else application.subject }}</h1><p>{{ application.job.company if application.job and application.job.company else application.subject }}</p></div>
-    <div class="section-actions"><span class="badge {{ status_tone(application.status) }}"><span class="badge-dot"></span>{{ status_label(application.status) }}</span>{% if application.policy_decision %}<span class="badge {{ status_tone(application.policy_decision) }}">{{ status_label(application.policy_decision) }}</span>{% endif %}</div>
+    <span class="badge {{ status_tone(application.status) }}"><span class="badge-dot"></span>{{ status_label(application.status) }}</span>
   </div>
 
-  <div class="grid grid-4" style="margin-bottom:16px">
-    <div class="metric-card"><div class="metric-label">Статус</div><div style="margin-top:15px"><span class="badge {{ status_tone(application.status) }}">{{ status_label(application.status) }}</span></div><div class="metric-note">application state</div></div>
-    <div class="metric-card"><div class="metric-label">Policy</div><div style="margin-top:15px"><span class="badge {{ status_tone(application.policy_decision) if application.policy_decision else 'muted' }}">{{ status_label(application.policy_decision) if application.policy_decision else '—' }}</span></div><div class="metric-note">deterministic send policy</div></div>
-    <div class="metric-card"><div class="metric-label">Язык письма</div><div class="metric-value" style="font-size:22px;text-transform:uppercase">{{ application.language }}</div><div class="metric-note">сохранённая версия</div></div>
-    <div class="metric-card"><div class="metric-label">Доставка</div><div style="margin-top:15px">{% if application.delivery %}<span class="badge {{ status_tone(application.delivery.status) }}">{{ status_label(application.delivery.status) }}</span>{% else %}<span class="badge muted">Не отправлялся</span>{% endif %}</div><div class="metric-note">{% if application.delivery %}{{ application.delivery.provider }} · {{ application.delivery.attempt_count }} попыток{% else %}delivery отсутствует{% endif %}</div></div>
+  {% if application.status == 'pending_review' or application.status == 'prepared' %}
+  <div class="detail-decision-bar">
+    <div><strong>Нужно ваше решение</strong><span>Проверьте вакансию и письмо, затем одобрите или отклоните отклик.</span></div>
+    <div class="section-actions">
+      <form method="post" action="/admin/applications/{{ application.id }}/approve" data-confirm="Одобрить этот отклик после проверки?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Одобрить</button></form>
+      <form method="post" action="/admin/applications/{{ application.id }}/reject" data-confirm="Отклонить этот отклик? Он не будет отправлен."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отклонить</button></form>
+    </div>
+  </div>
+  {% elif application.status == 'approved' %}
+  <div class="detail-decision-bar warning"><div><strong>Отклик одобрен</strong><span>Вы можете отправить его работодателю вручную.</span></div><form method="post" action="/admin/applications/{{ application.id }}/send" data-confirm="Отправить этот отклик работодателю прямо сейчас?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отправить работодателю</button></form></div>
+  {% endif %}
+
+  <div class="grid grid-3 detail-metrics">
+    <div class="metric-card"><div class="metric-label">Состояние</div><div style="margin-top:15px"><span class="badge {{ status_tone(application.status) }}">{{ status_label(application.status) }}</span></div><div class="metric-note">текущее состояние отклика</div></div>
+    <div class="metric-card"><div class="metric-label">Проверка безопасности</div><div style="margin-top:15px"><span class="badge {{ status_tone(application.policy_decision) if application.policy_decision else 'muted' }}">{{ status_label(application.policy_decision) if application.policy_decision else 'Нет решения' }}</span></div><div class="metric-note">правила перед отправкой</div></div>
+    <div class="metric-card"><div class="metric-label">Доставка</div><div style="margin-top:15px">{% if application.delivery %}<span class="badge {{ status_tone(application.delivery.status) }}">{{ status_label(application.delivery.status) }}</span>{% else %}<span class="badge muted">Не отправлялся</span>{% endif %}</div><div class="metric-note">{% if application.delivery %}{{ application.delivery.attempt_count }} попыток{% else %}попыток ещё не было{% endif %}</div></div>
   </div>
 
   <div class="grid grid-2">
     <div style="display:grid;gap:16px;align-content:start">
-      <div class="panel">
-        <div class="panel-head"><div><div class="panel-title">Вакансия</div><div class="panel-subtitle">Связанная публикация</div></div></div>
-        <div class="panel-pad">
-          {% if application.job %}{% set job_link = safe_external_link(application.job.canonical_url) %}
-          <div class="cell-title" style="font-size:15px">{{ application.job.title }}</div>
-          <div class="cell-meta" style="font-size:11px;margin-top:5px">{{ application.job.company or 'Компания не указана' }}{% if application.job.location %} · {{ application.job.location }}{% endif %}{% if application.job.category %} · {{ application.job.category }}{% endif %}</div>
-          {% if job_link %}<div style="margin-top:14px"><a class="btn btn-sm" href="{{ job_link }}" target="_blank" rel="noreferrer">Открыть вакансию ↗</a></div>{% endif %}
-          {% else %}<div class="notice danger">Связанная вакансия не найдена.</div>{% endif %}
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head"><div><div class="panel-title">Резюме и контакт</div><div class="panel-subtitle">Что будет использоваться при доставке</div></div></div>
-        <div class="panel-pad">
-          {% if application.resume %}
-          <div style="margin-bottom:15px"><div class="cell-title">{{ application.resume.name }}</div><div class="cell-meta">{{ application.resume.original_filename }} · {{ 'verified' if application.resume.verified else 'unverified' }} · {{ 'active' if application.resume.active else 'inactive' }}</div><details style="margin-top:9px"><summary>SHA-256</summary><pre>{{ application.resume.sha256 }}</pre></details></div>
-          {% else %}<div class="notice danger" style="margin-bottom:15px">Резюме не найдено.</div>{% endif %}
-          {% if application.contact %}{% set evidence_link = safe_external_link(application.contact.evidence_url) %}
-          <div class="cell-title">{{ application.contact.value }}</div><div class="cell-meta">{{ application.contact.contact_type }} · {{ application.contact.verification_status }} · confidence {{ application.contact.confidence }}</div><div class="cell-meta">{{ application.contact.discovery_source }}{% if application.contact.official_domain %} · {{ application.contact.official_domain }}{% endif %}</div>{% if evidence_link %}<div style="margin-top:10px"><a class="btn btn-sm" href="{{ evidence_link }}" target="_blank" rel="noreferrer">Evidence ↗</a></div>{% endif %}
-          {% else %}<div class="notice danger">Контакт не найден.</div>{% endif %}
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head"><div><div class="panel-title">Policy</div><div class="panel-subtitle">Причины разрешения или блокировки</div></div></div>
-        <div class="panel-pad">
-          {% if application.failed_policy_rules %}<div class="notice danger" style="margin-bottom:12px"><strong>Не пройдены:</strong> {{ application.failed_policy_rules|join(', ') }}</div>{% else %}<div class="notice success" style="margin-bottom:12px">Сохранённых непройденных правил нет.</div>{% endif %}
-          <details><summary>Полный policy result</summary><pre>{{ application.policy_result }}</pre></details>
-        </div>
-      </div>
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">Вакансия</div><div class="panel-subtitle">На что откликаемся</div></div></div><div class="panel-pad">{% if application.job %}{% set job_link = safe_external_link(application.job.canonical_url) %}<div class="cell-title" style="font-size:16px">{{ application.job.title }}</div><div class="cell-meta">{{ application.job.company or 'Компания не указана' }}{% if application.job.location %} · {{ application.job.location }}{% endif %}{% if application.job.category %} · {{ application.job.category }}{% endif %}</div>{% if job_link %}<a class="btn btn-sm" style="margin-top:14px" href="{{ job_link }}" target="_blank" rel="noreferrer">Открыть вакансию ↗</a>{% endif %}{% else %}<div class="notice danger">Связанная вакансия не найдена.</div>{% endif %}</div></div>
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">Резюме и получатель</div><div class="panel-subtitle">Что будет приложено и куда уйдёт письмо</div></div></div><div class="panel-pad">{% if application.resume %}<div class="cell-title">{{ application.resume.name }}</div><div class="cell-meta">{{ application.resume.original_filename }} · {{ 'подтверждено' if application.resume.verified else 'не подтверждено' }} · {{ 'активно' if application.resume.active else 'неактивно' }}</div>{% else %}<div class="notice danger">Резюме не найдено.</div>{% endif %}{% if application.contact %}<div class="cell-title" style="margin-top:16px">{{ application.contact.value }}</div><div class="cell-meta">Публичный контакт · уверенность {{ application.contact.confidence }}</div>{% else %}<div class="notice danger" style="margin-top:16px">Контакт не найден.</div>{% endif %}</div></div>
     </div>
-
     <div style="display:grid;gap:16px;align-content:start">
-      <div class="panel">
-        <div class="panel-head"><div><div class="panel-title">Письмо работодателю</div><div class="panel-subtitle">Сохранённый текст отклика</div></div></div>
-        <div class="panel-pad"><div class="cell-meta" style="margin-bottom:10px">Тема</div><div class="cell-title" style="margin-bottom:18px">{{ application.subject }}</div><div class="letter-preview">{{ application.body }}</div></div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head"><div><div class="panel-title">Доставка</div><div class="panel-subtitle">Provider metadata и состояние отправки</div></div></div>
-        <div class="panel-pad">
-          {% if application.delivery %}
-          <div class="grid grid-2"><div><div class="cell-meta">Provider</div><div class="cell-title">{{ application.delivery.provider }}</div></div><div><div class="cell-meta">Попыток</div><div class="cell-title">{{ application.delivery.attempt_count }}</div></div></div>
-          <div style="margin-top:14px"><span class="badge {{ status_tone(application.delivery.status) }}">{{ status_label(application.delivery.status) }}</span></div>
-          <details style="margin-top:12px"><summary>Delivery IDs</summary><pre>Message ID: {{ application.delivery.provider_message_id or '—' }}\nThread ID: {{ application.delivery.thread_id or '—' }}</pre></details>
-          {% if application.delivery.status == 'sending' %}<div class="notice warning" style="margin-top:12px">Ручная сверка доступна после {{ application.delivery.reconcile_available_at }}.</div>{% endif %}
-          {% else %}<div class="empty-state">Попыток доставки ещё нет.</div>{% endif %}
-        </div>
-      </div>
-
-      <div class="panel panel-pad">
-        <div class="panel-title">Действия</div><div class="panel-subtitle" style="margin-bottom:14px">Критические операции требуют отдельного подтверждения.</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          {% if application.status == 'pending_review' or application.status == 'prepared' %}<form method="post" action="/admin/applications/{{ application.id }}/approve" data-confirm="Одобрить этот отклик после проверки?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Одобрить отклик</button></form>{% endif %}
-          {% if application.status == 'approved' %}<form method="post" action="/admin/applications/{{ application.id }}/send" data-confirm="Отправить этот одобренный отклик работодателю прямо сейчас?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отправить работодателю</button></form>{% endif %}
-          {% if application.delivery and application.delivery.can_reconcile_unknown %}<form method="post" action="/admin/applications/{{ application.id }}/reconcile-delivery-unknown" data-confirm="Зафиксировать delivery_unknown без повторной отправки?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-warning">Зафиксировать delivery_unknown</button></form>{% endif %}
-        </div>
-      </div>
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">Письмо работодателю</div><div class="panel-subtitle">Язык: {{ application.language|upper }}</div></div></div><div class="panel-pad"><div class="cell-meta">Тема</div><div class="cell-title" style="margin:5px 0 18px">{{ application.subject }}</div><div class="letter-preview">{{ application.body }}</div></div></div>
+      {% if application.delivery and application.delivery.can_reconcile_unknown %}<div class="panel panel-pad"><div class="notice warning">Состояние доставки неизвестно. Повторно отправлять письмо нельзя.</div><form method="post" action="/admin/applications/{{ application.id }}/reconcile-delivery-unknown" data-confirm="Зафиксировать неизвестное состояние без повторной отправки?" style="margin-top:12px"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-warning">Зафиксировать без повтора</button></form></div>{% endif %}
     </div>
   </div>
+
+  <details class="diagnostic-details"><summary><span><strong>Технические подробности</strong><small>Правила, идентификаторы и данные доставки</small></span><span>Открыть</span></summary><div class="details-body settings-body"><p><strong>Непройденные правила:</strong> {{ application.failed_policy_rules|join(', ') if application.failed_policy_rules else 'нет' }}</p><pre>{{ application.policy_result }}</pre>{% if application.resume %}<pre>SHA-256: {{ application.resume.sha256 }}</pre>{% endif %}{% if application.delivery %}<pre>{{ application.delivery.provider }} | {{ application.delivery.provider_message_id or '—' }} | {{ application.delivery.thread_id or '—' }}</pre>{% endif %}</div></details>
 </main>
 {% endblock %}

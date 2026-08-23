@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.applications.states import ensure_transition
 from app.contacts import ContactDiscoveryService
 from app.crawlers.parsing.normalization import detect_prompt_injection, stable_hash
 from app.matching.bindings import evaluation_inputs_are_current
@@ -333,7 +334,21 @@ class ApplicationService:
             )
         if not application.content_validated:
             raise ApplicationPreparationError("application content has not passed validation")
+        ensure_transition(application.status, ApplicationStatus.APPROVED)
         application.status = ApplicationStatus.APPROVED
+        await session.flush()
+        return application
+
+    async def reject(self, session: AsyncSession, application_id: UUID) -> Application:
+        """Cancel an unsent application after an explicit owner decision."""
+        application = await session.get(Application, application_id)
+        if application is None:
+            raise LookupError(f"application {application_id} does not exist")
+        try:
+            ensure_transition(application.status, ApplicationStatus.CANCELLED)
+        except ValueError as exc:
+            raise ApplicationPreparationError("only an unsent application can be rejected") from exc
+        application.status = ApplicationStatus.CANCELLED
         await session.flush()
         return application
 
@@ -355,13 +370,15 @@ async def prepare_pending_applications() -> int:
                 MatchEvaluation.profile_id.label("profile_id"),
                 MatchEvaluation.canonical_job_id.label("canonical_job_id"),
                 MatchEvaluation.id.label("evaluation_id"),
-                func.row_number().over(
+                func.row_number()
+                .over(
                     partition_by=(
                         MatchEvaluation.profile_id,
                         MatchEvaluation.canonical_job_id,
                     ),
                     order_by=(MatchEvaluation.created_at.desc(), MatchEvaluation.id.desc()),
-                ).label("rank"),
+                )
+                .label("rank"),
             )
         ).subquery()
         rows = (
@@ -400,9 +417,9 @@ async def prepare_pending_applications() -> int:
 
         for application in policy_refresh:
             try:
-                before = application.policy_decision
+                before_policy = application.policy_decision
                 await service.reevaluate_policy(session, application)
-                if before != application.policy_decision:
+                if before_policy != application.policy_decision:
                     prepared += 1
             except ApplicationPreparationError:
                 continue
@@ -415,9 +432,12 @@ async def prepare_pending_applications() -> int:
                         Application.canonical_job_id == canonical_id,
                     )
                 )
-                before = existing.match_evaluation_id if existing is not None else None
+                before_evaluation = existing.match_evaluation_id if existing is not None else None
                 application = await service.prepare(session, canonical_id, profile_id)
-                if before is None or before != application.match_evaluation_id:
+                if (
+                    before_evaluation is None
+                    or before_evaluation != application.match_evaluation_id
+                ):
                     prepared += 1
             except ApplicationPreparationError:
                 continue

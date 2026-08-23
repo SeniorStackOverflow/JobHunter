@@ -269,7 +269,7 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
         params={"code": "admin-route-code", "state": state},
     )
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/?google=connected#overview"
+    assert callback.headers["location"] == "/?view=overview&google=connected"
     session_cookie = oauth_api.client.cookies.get("job_agent_session")
     assert session_cookie is not None
     assert (
@@ -325,7 +325,7 @@ async def test_google_admin_login_rejects_account_outside_allowlist(
         params={"code": "admin-route-code", "state": state},
     )
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/login?oauth_error=1"
+    assert callback.headers["location"] == "/login?oauth_error=admin_identity_not_allowed"
     assert oauth_api.client.cookies.get("job_agent_session") is None
     async with oauth_api.session_factory() as session:
         assert await session.scalar(select(OAuthCredential)) is None
@@ -357,7 +357,7 @@ async def test_google_admin_login_rejects_scope_change_beyond_email_alias(
     )
 
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/login?oauth_error=1"
+    assert callback.headers["location"] == "/login?oauth_error=token_exchange_failed"
     assert oauth_api.client.cookies.get("job_agent_session") is None
     async with oauth_api.session_factory() as session:
         assert await session.scalar(select(OAuthCredential)) is None

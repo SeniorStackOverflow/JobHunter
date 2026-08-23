@@ -125,7 +125,6 @@ async def _login_admin(
     logged_in = await client.post(
         "/login",
         data={
-            "username": settings.admin_username,
             "password": ADMIN_PASSWORD,
             "csrf_token": _csrf_token(login_page.text),
         },
@@ -285,6 +284,7 @@ async def _seed_review_application(
         await session.commit()
         return {
             "application_id": application.id,
+            "profile_id": profile.id,
             "contact_id": contact.id,
             "resume_id": resume.id,
             "source_id": source.id,
@@ -482,12 +482,18 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert login_page.status_code == 200
         assert login_page.headers["cache-control"] == "no-store"
         assert 'name="viewport"' in login_page.text
+        assert "Вход в панель управления" in login_page.text
+        assert 'name="username"' not in login_page.text
+        assert "Аварийный вход" not in login_page.text
+        oauth_error_page = await client.get(
+            "/login", params={"oauth_error": "admin_identity_not_allowed"}
+        )
+        assert "Этот Google-аккаунт не имеет доступа" in oauth_error_page.text
         login_csrf = _csrf_token(login_page.text)
 
         rejected = await client.post(
             "/login",
             data={
-                "username": settings.admin_username,
                 "password": ADMIN_PASSWORD,
                 "csrf_token": "invalid",
             },
@@ -497,7 +503,6 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         logged_in = await client.post(
             "/login",
             data={
-                "username": settings.admin_username,
                 "password": ADMIN_PASSWORD,
                 "csrf_token": login_csrf,
             },
@@ -507,6 +512,9 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert "httponly" in set_cookie
         assert "secure" in set_cookie
         assert "samesite=strict" in set_cookie
+        already_authenticated = await client.get("/login")
+        assert already_authenticated.status_code == 303
+        assert already_authenticated.headers["location"] == "/"
 
         dashboard = await client.get("/")
         assert dashboard.status_code == 200
@@ -516,6 +524,16 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert "Требует вашего внимания" in dashboard.text
         assert "Google OAuth не настроен" in dashboard.text
         assert 'href="javascript:' not in dashboard.text.casefold()
+        for view, heading in {
+            "decisions": "Требуют решения",
+            "history": "История",
+            "settings": "Критерии и лимиты",
+            "diagnostics": "Текущие проблемы",
+        }.items():
+            page = await client.get("/", params={"view": view})
+            assert page.status_code == 200
+            assert heading in page.text
+            assert page.text.count('class="admin-section"') == 1
         dashboard_csrf = _csrf_token(dashboard.text)
 
         wrong_binding = await client.post("/admin/pause/true", data={"csrf_token": login_csrf})
@@ -733,6 +751,148 @@ async def test_admin_application_detail_approval_and_policy_gated_send(
         assert delivery.provider_message_id == f"fake-{application_id}"
         actions = set((await session.scalars(select(AuditEvent.action))).all())
         assert {"application.approved", "application.send_requested", "email.delivery"} <= actions
+
+
+async def test_admin_decision_queue_filters_and_rejects_without_sending(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="admin-reject",
+    )
+    application_id = seeded["application_id"]
+    profile_id = seeded["profile_id"]
+    async with sqlite_session_factory() as session:
+        base_application = await session.get(Application, application_id)
+        assert base_application is not None
+        for index in range(11):
+            suffix = f"queue-{index}"
+            canonical = CanonicalJob(
+                normalized_company=f"queue company {index}",
+                normalized_title=f"queue engineer {index}",
+                normalized_location="chisinau",
+                canonical_fingerprint=hashlib.sha256(suffix.encode()).hexdigest(),
+                status=JobStatus.ACTIVE,
+            )
+            session.add(canonical)
+            await session.flush()
+            job = SourceJob(
+                source_id=seeded["source_id"],
+                canonical_job_id=canonical.id,
+                external_job_id=suffix,
+                canonical_url=f"https://jobs.example.test/jobs/{suffix}",
+                localized_urls={"en": f"https://jobs.example.test/jobs/{suffix}"},
+                title=f"Queue Engineer {index}",
+                company=f"Queue Company {index}",
+                categories_seen=["technology"],
+                category="technology",
+                description="Queue pagination fixture.",
+                location="Chisinau",
+                cities=["Chisinau"],
+                public_email="jobs@example.test",
+                page_locale="en",
+                content_hash=hashlib.sha256(f"content-{suffix}".encode()).hexdigest(),
+                source_fingerprint=hashlib.sha256(f"source-{suffix}".encode()).hexdigest(),
+                status=JobStatus.ACTIVE,
+                raw_metadata={},
+            )
+            session.add(job)
+            await session.flush()
+            session.add(
+                Application(
+                    profile_id=profile_id,
+                    canonical_job_id=canonical.id,
+                    source_job_id=job.id,
+                    match_evaluation_id=base_application.match_evaluation_id,
+                    resume_id=base_application.resume_id,
+                    recipient_contact_id=base_application.recipient_contact_id,
+                    subject=f"Application for Queue Engineer {index}",
+                    body="Queue pagination fixture body.",
+                    language="en",
+                    status=ApplicationStatus.PENDING_REVIEW,
+                    policy_decision=PolicyDecision.PENDING_REVIEW,
+                    policy_result={},
+                    used_confirmed_facts=[],
+                    content_validated=True,
+                    idempotency_key=hashlib.sha256(f"application-{suffix}".encode()).hexdigest(),
+                )
+            )
+        await session.commit()
+    transport = httpx.ASGITransport(app=application)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        queue = await client.get(
+            "/",
+            params={"view": "decisions", "profile_id": str(profile_id)},
+        )
+        assert queue.status_code == 200
+        assert "Queue Engineer" in queue.text
+        assert "Отклонить" in queue.text
+        assert "Критерии и лимиты" not in queue.text
+        assert len(HTMLParser(queue.text).css(".queue-card")) == 10
+        assert "Страница 1 из 2" in queue.text
+
+        second_page = await client.get(
+            "/",
+            params={
+                "view": "decisions",
+                "profile_id": str(profile_id),
+                "page": "2",
+            },
+        )
+        assert len(HTMLParser(second_page.text).css(".queue-card")) == 2
+        assert "Backend Engineer" in second_page.text
+
+        no_results = await client.get(
+            "/",
+            params={
+                "view": "decisions",
+                "profile_id": str(profile_id),
+                "q": "definitely-not-present",
+            },
+        )
+        assert "По этому фильтру откликов нет" in no_results.text
+
+        rejected = await client.post(
+            f"/admin/applications/{application_id}/reject",
+            data={
+                "csrf_token": csrf_token,
+                "return_to": "decisions",
+                "reason": "owner declined",
+            },
+        )
+        assert rejected.status_code == 303
+        assert rejected.headers["location"].startswith("/?view=decisions")
+
+        rejected_queue = await client.get(
+            "/",
+            params={
+                "view": "decisions",
+                "profile_id": str(profile_id),
+                "status_filter": "cancelled",
+            },
+        )
+        assert "Backend Engineer" in rejected_queue.text
+        assert "Отменено" in rejected_queue.text
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "application.rejected_by_owner")
+        )
+        assert stored is not None
+        assert stored.status == ApplicationStatus.CANCELLED
+        assert audit is not None
+        assert audit.decision == ApplicationStatus.CANCELLED.value
+        assert audit.sanitized_details["reason"] == "owner declined"
 
 
 async def test_rest_application_detail_and_audited_stale_delivery_reconciliation(

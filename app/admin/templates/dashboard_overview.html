@@ -1,0 +1,35 @@
+<section class="admin-section">
+  <div class="section-heading">
+    <div><h1>Главная</h1><p>Короткая сводка и только те действия, где нужен владелец.</p></div>
+    {% if counts.pending_review %}<a class="btn btn-primary" href="/?view=decisions&profile_id={{ selected_profile_id }}">Разобрать очередь</a>{% endif %}
+  </div>
+
+  <div class="owner-status {{ overall_tone }}">
+    <div class="owner-status-copy"><span class="status-dot {{ overall_tone }}"></span><div><strong>{{ overall_title }}</strong><p>{% if preferences.global_pause %}Автоматическая отправка остановлена владельцем.{% elif preferences.auto_send_enabled %}JobHunter может отправлять безопасные отклики в пределах лимита.{% else %}Автоотправка выключена, анализ вакансий продолжается.{% endif %}</p></div></div>
+    <form method="post" action="/admin/pause/{{ 'false' if preferences.global_pause else 'true' }}" data-confirm="{{ 'Возобновить автоматическую отправку?' if preferences.global_pause else 'Немедленно поставить автоматическую отправку на паузу?' }}">
+      <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn {{ 'btn-primary' if preferences.global_pause else 'btn-danger' }}">{{ 'Возобновить отправку' if preferences.global_pause else 'Поставить на паузу' }}</button>
+    </form>
+  </div>
+
+  <div class="grid grid-3 overview-metrics">
+    <div class="metric-card"><div class="metric-label">Ждут вашего решения</div><div class="metric-value">{{ counts.pending_review }}</div><div class="metric-note">подготовленных откликов</div></div>
+    <div class="metric-card"><div class="metric-label">Отправлено сегодня</div><div class="metric-value metric-split">{{ overview.sent_today }} <small>из {{ overview.daily_limit }}</small></div><div class="progress"><span style="width:{{ (overview.sent_today * 100 / overview.daily_limit) if overview.daily_limit else 0 }}%"></span></div></div>
+    <div class="metric-card"><div class="metric-label">Новых вакансий сегодня</div><div class="metric-value">{{ overview.today_new }}</div><div class="metric-note">найдено всего {{ overview.today_found }}</div></div>
+  </div>
+
+  <div class="daily-digest"><div class="digest-icon">✦</div><div><strong>Сводка нейросети за сегодня</strong><p>{% if overview.today_found or overview.today_matches or overview.sent_today %}Источники нашли {{ overview.today_found }} вакансий, оценено {{ overview.today_matches }}, отправлено {{ overview.sent_today }}. {% if overview.today_scan_errors %}При обходе возникло {{ overview.today_scan_errors }} ошибок — подробности есть в диагностике.{% else %}Новых ошибок при обходе источников нет.{% endif %}{% else %}Сегодня новых результатов пока нет. JobHunter продолжит работу по расписанию.{% endif %}</p></div></div>
+
+  <div class="grid grid-2 overview-columns">
+    <div class="panel">
+      <div class="panel-head"><div><div class="panel-title">Требует вашего внимания</div><div class="panel-subtitle">Только актуальные решения и сбои</div></div><span class="badge {{ attention_tone }}">{{ attention_items|length }}</span></div>
+      <div class="panel-pad attention-list">{% for item in attention_items %}<div class="attention-item"><span class="attention-signal {{ item.tone }}"></span><div class="attention-copy"><strong>{{ item.title }}</strong><span>{{ item.detail }}</span></div><a class="btn btn-sm" href="{{ item.href }}">{{ item.action }}</a></div>{% else %}<div class="empty-state compact">Сейчас от вас ничего не требуется.</div>{% endfor %}</div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><div><div class="panel-title">Последние важные события</div><div class="panel-subtitle">Успешная рутина скрыта</div></div><a class="btn btn-sm" href="/?view=history&profile_id={{ selected_profile_id }}">Вся история</a></div>
+      <div class="panel-pad activity-list">{% for item in audits %}<div class="activity-item"><div class="activity-time">{{ format_dt(item.timestamp) }}</div><div><div class="activity-title">{{ audit_action_label(item.action) }}</div><div class="activity-meta">{{ status_label(item.decision) if item.decision else 'Выполнено' }}</div></div></div>{% else %}<div class="empty-state compact">Важных событий пока нет.</div>{% endfor %}</div>
+    </div>
+  </div>
+
+  {% if recent_applications %}<div class="panel recent-panel"><div class="panel-head"><div><div class="panel-title">Недавние отклики</div><div class="panel-subtitle">Последние пять изменений</div></div><a class="btn btn-sm" href="/?view=history&profile_id={{ selected_profile_id }}">Открыть историю</a></div><div class="compact-list">{% for item in recent_applications %}{% set job = application_jobs.get(item.source_job_id) %}<a class="compact-row" href="/admin/applications/{{ item.id }}"><div><strong>{{ job.title if job else item.subject }}</strong><span>{{ job.company if job and job.company else 'Компания не указана' }}</span></div><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></a>{% endfor %}</div></div>{% endif %}
+</section>

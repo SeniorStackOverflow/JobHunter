@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications import (
@@ -21,6 +21,7 @@ from app.applications import (
     get_application_detail,
     reconcile_stale_delivery_unknown,
 )
+from app.applications.service import ApplicationPreparationError
 from app.audit import record_audit_event
 from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
@@ -100,15 +101,15 @@ _STATUS_LABELS = {
     "possibly_closed": "Возможно закрыта",
     "closed": "Закрыта",
     "incomplete": "Неполная",
-    "auto_apply": "AUTO_APPLY",
-    "prepare_for_review": "REVIEW",
-    "skip": "SKIP",
-    "block": "BLOCK",
+    "auto_apply": "Подходит для автоотправки",
+    "prepare_for_review": "Нужна проверка",
+    "skip": "Пропустить",
+    "block": "Заблокировано правилами",
     "prepared": "Подготовлен",
     "skipped": "Пропущен",
     "pending_review": "На проверке",
     "approved": "Одобрен",
-    "auto_approved": "Auto-approved",
+    "auto_approved": "Одобрен автоматически",
     "sending": "Отправляется",
     "sent": "Отправлен",
     "delivery_unknown": "Доставка неизвестна",
@@ -118,6 +119,42 @@ _STATUS_LABELS = {
     "incremental": "Инкрементальный",
     "full": "Полный",
     "recheck": "Перепроверка",
+    "authenticated": "Вход выполнен",
+    "connected": "Подключено",
+    "disconnected": "Отключено",
+    "enabled_and_resumed": "Включено и возобновлено",
+    "redirected": "Переход к Google",
+}
+
+_VIEW_TITLES = {
+    "overview": "Главная",
+    "decisions": "Требуют решения",
+    "history": "История",
+    "settings": "Настройки",
+    "diagnostics": "Диагностика",
+}
+
+_AUDIT_ACTION_LABELS = {
+    "admin.login.google": "Выполнен вход через Google",
+    "application.approved": "Отклик одобрен",
+    "application.rejected_by_owner": "Отклик отклонён",
+    "application.send_requested": "Запрошена отправка отклика",
+    "auto_send.paused": "Автоотправка поставлена на паузу",
+    "auto_send.resumed": "Автоотправка возобновлена",
+    "email.delivery": "Обновлено состояние доставки",
+    "oauth.gmail.connected": "Google-аккаунт подключён",
+    "oauth.gmail.disconnected": "Google-аккаунт отключён",
+    "preferences.updated": "Настройки поиска обновлены",
+    "profile.updated": "Профиль обновлён",
+    "resume.uploaded": "Резюме загружено",
+    "resume.verified": "Резюме подтверждено",
+    "source.disabled": "Источник выключен",
+    "source.enabled": "Источник включён",
+}
+
+_ALERT_CODE_LABELS = {
+    "adapter_degradation": "Источник работает нестабильно",
+    "mass_absence_suppressed": "Защитная проверка массового исчезновения вакансий",
 }
 
 
@@ -163,9 +200,32 @@ def _format_dt(value: datetime | None, include_date: bool = True) -> str:
     return local.strftime("%d.%m.%Y %H:%M" if include_date else "%H:%M")
 
 
+def _audit_action_label(value: str) -> str:
+    return _AUDIT_ACTION_LABELS.get(value, value.replace("_", " ").replace(".", " · "))
+
+
+def _alert_code_label(value: str) -> str:
+    return _ALERT_CODE_LABELS.get(value, "Системное уведомление")
+
+
+def _pagination(total: int, requested_page: int, per_page: int) -> dict[str, int | bool]:
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(max(1, requested_page), pages)
+    return {
+        "page": page,
+        "pages": pages,
+        "per_page": per_page,
+        "total": total,
+        "has_previous": page > 1,
+        "has_next": page < pages,
+    }
+
+
 templates.env.globals["status_label"] = _status_label
 templates.env.globals["status_tone"] = _status_tone
 templates.env.globals["format_dt"] = _format_dt
+templates.env.globals["audit_action_label"] = _audit_action_label
+templates.env.globals["alert_code_label"] = _alert_code_label
 
 
 def _signer() -> SessionSigner:
@@ -231,16 +291,45 @@ async def _audit_admin(
 
 
 @router.get("/login", response_class=HTMLResponse)
-async def login_form(request: Request, oauth_error: str | None = None) -> HTMLResponse:
+async def login_form(request: Request, oauth_error: str | None = None) -> Response:
     settings = get_settings()
+    token = request.cookies.get(settings.session_cookie_name)
+    if token and _signer().verify(token, settings.session_ttl_seconds) == settings.admin_username:
+        return RedirectResponse("/", status_code=303)
     google_oauth = GmailOAuthService(settings)
+    oauth_errors = {
+        "configuration": "Вход через Google пока не настроен. Используйте пароль администратора.",
+        "start": "Google временно не ответил. Попробуйте начать вход ещё раз.",
+        "authorization_cancelled": (
+            "Вход через Google отменён. Попробуйте ещё раз, когда будете готовы."
+        ),
+        "authorization_denied": (
+            "Google не разрешил вход. Проверьте выбранный аккаунт и разрешения."
+        ),
+        "admin_identity_not_allowed": "Этот Google-аккаунт не имеет доступа к JobHunter.",
+        "invalid_google_identity": "Google не подтвердил адрес выбранного аккаунта.",
+        "invalid_oauth_state": "Сессия входа устарела. Начните вход через Google заново.",
+        "invalid_pkce_verifier": "Сессия входа повреждена. Начните вход через Google заново.",
+        "required_scope_missing": "Google не предоставил нужное разрешение Gmail. Вход отменён.",
+        "unexpected_scope_grant": "Google вернул неожиданные разрешения. Вход отменён.",
+        "token_exchange_failed": "Google не завершил выдачу доступа. Попробуйте ещё раз.",
+        "credential_storage_failed": (
+            "Не удалось безопасно сохранить доступ Google. Попробуйте ещё раз."
+        ),
+        "oauth_not_configured": (
+            "Вход через Google пока не настроен. Используйте пароль администратора."
+        ),
+    }
     response = templates.TemplateResponse(
         request=request,
         name="login.html",
         context={
             "csrf_token": _csrf().issue("login"),
             "error": (
-                "Вход через Google не завершён. Проверьте выбранный аккаунт и повторите."
+                oauth_errors.get(
+                    oauth_error,
+                    "Вход через Google не завершён. Выберите разрешённый аккаунт и повторите.",
+                )
                 if oauth_error
                 else None
             ),
@@ -313,7 +402,6 @@ async def google_admin_login_start(
 @router.post("/login", response_class=HTMLResponse)
 async def login(
     request: Request,
-    username: str = Form(...),
     password: str = Form(...),
     csrf_token: str = Form(...),
 ) -> Response:
@@ -323,14 +411,18 @@ async def login(
         settings.admin_password_hash
         and verify_password(password, settings.admin_password_hash.get_secret_value())
     )
-    if not csrf_valid or username != settings.admin_username or not password_valid:
+    if not csrf_valid or not password_valid:
         google_oauth = GmailOAuthService(settings)
         error_response = templates.TemplateResponse(
             request=request,
             name="login.html",
             context={
                 "csrf_token": _csrf().issue("login"),
-                "error": "Неверные данные",
+                "error": (
+                    "Форма входа устарела. Обновите страницу и повторите."
+                    if not csrf_valid
+                    else "Неверный пароль администратора."
+                ),
                 "google_login_available": (
                     google_oauth.configured and bool(settings.google_admin_emails)
                 ),
@@ -340,7 +432,7 @@ async def login(
         )
         error_response.headers["Cache-Control"] = "no-store"
         return error_response
-    token = _signer().issue(username)
+    token = _signer().issue(settings.admin_username)
     response = RedirectResponse("/", status_code=303)
     response.set_cookie(
         settings.session_cookie_name,
@@ -366,10 +458,17 @@ async def logout(request: Request, csrf_token: str = Form(...)) -> RedirectRespo
 async def dashboard(
     request: Request,
     profile_id: UUID | None = None,
+    view: str = "overview",
+    page: int = 1,
+    q: str = "",
+    status_filter: str = "pending_review",
+    history_kind: str = "sent",
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
 ) -> HTMLResponse:
     token = _session_token(request)
+    view = view if view in _VIEW_TITLES else "overview"
+    q = q.strip()[:120]
     profile_service = ProfileService()
     profiles = await profile_service.list_profiles(session)
     profile = await profile_service.get_profile(session, profile_id)
@@ -378,74 +477,6 @@ async def dashboard(
     selected_profile_id = profile.id
     preferences = await profile_service.get_preferences(session, selected_profile_id)
     sources = list((await session.scalars(select(JobSource).order_by(JobSource.name))).all())
-    resumes = list(
-        (
-            await session.scalars(
-                select(Resume)
-                .where(Resume.profile_id == selected_profile_id)
-                .order_by(desc(Resume.created_at))
-            )
-        ).all()
-    )
-    jobs = list(
-        (
-            await session.scalars(
-                select(SourceJob).order_by(desc(SourceJob.last_seen_at)).limit(50)
-            )
-        ).all()
-    )
-    matches = list(
-        (
-            await session.scalars(
-                select(MatchEvaluation)
-                .where(MatchEvaluation.profile_id == selected_profile_id)
-                .order_by(desc(MatchEvaluation.created_at))
-                .limit(30)
-            )
-        ).all()
-    )
-    applications = list(
-        (
-            await session.scalars(
-                select(Application)
-                .where(Application.profile_id == selected_profile_id)
-                .order_by(desc(Application.created_at))
-                .limit(40)
-            )
-        ).all()
-    )
-    scans = list(
-        (await session.scalars(select(ScanRun).order_by(desc(ScanRun.started_at)).limit(30))).all()
-    )
-    alerts = list(
-        (await session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(30))).all()
-    )
-    audits = list(
-        (
-            await session.scalars(select(AuditEvent).order_by(desc(AuditEvent.timestamp)).limit(40))
-        ).all()
-    )
-
-    match_job_ids = {item.source_job_id for item in matches}
-    match_jobs = {}
-    if match_job_ids:
-        match_jobs = {
-            item.id: item
-            for item in (
-                await session.scalars(select(SourceJob).where(SourceJob.id.in_(match_job_ids)))
-            ).all()
-        }
-    application_job_ids = {item.source_job_id for item in applications}
-    application_jobs = {}
-    if application_job_ids:
-        application_jobs = {
-            item.id: item
-            for item in (
-                await session.scalars(
-                    select(SourceJob).where(SourceJob.id.in_(application_job_ids))
-                )
-            ).all()
-        }
 
     now_local = datetime.now(_LOCAL_TZ)
     start_local = datetime.combine(now_local.date(), time.min, _LOCAL_TZ)
@@ -524,6 +555,15 @@ async def dashboard(
             or 0
         ),
     }
+    active_alert_cutoff = datetime.now(UTC) - timedelta(hours=24)
+    counts["active_alerts"] = int(
+        await session.scalar(
+            select(func.count(Alert.id)).where(
+                Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff
+            )
+        )
+        or 0
+    )
     matching_backlog = int(
         await session.scalar(
             select(func.count(SourceJob.id)).where(
@@ -567,8 +607,8 @@ async def dashboard(
                 "tone": "danger",
                 "title": "Google OAuth не настроен",
                 "detail": "Вход через Google и автономная отправка Gmail недоступны.",
-                "href": "#health",
-                "action": "Открыть систему",
+                "href": "/?view=settings",
+                "action": "Открыть настройки",
             }
         )
     elif not gmail_oauth["connected"]:
@@ -585,31 +625,36 @@ async def dashboard(
         attention_items.append(
             {
                 "tone": "warning",
-                "title": "Подтвердите Google identity",
-                "detail": "Gmail token есть, но вход через разрешённый аккаунт ещё не завершён.",
+                "title": "Подтвердите Google-аккаунт",
+                "detail": "Доступ к Gmail есть, но личность владельца ещё не подтверждена.",
                 "href": "/admin/auth/google",
                 "action": "Войти через Google",
             }
         )
-    if counts["unacknowledged_alerts"]:
+    if counts["active_alerts"]:
         attention_items.append(
             {
                 "tone": "danger",
-                "title": f"{counts['unacknowledged_alerts']} системных предупреждений",
-                "detail": "Проверьте свежие alerts и подтвердите просмотр.",
-                "href": "#health",
+                "title": f"{counts['active_alerts']} свежих системных предупреждений",
+                "detail": "Появились за последние 24 часа и ещё не просмотрены.",
+                "href": "/?view=diagnostics",
                 "action": "Проверить",
             }
         )
     unhealthy_sources = counts["enabled_sources"] - counts["healthy_sources"]
     if unhealthy_sources:
+        unhealthy_names = ", ".join(
+            item.name
+            for item in sources
+            if item.enabled and item.health_status != SourceHealth.HEALTHY
+        )
         attention_items.append(
             {
                 "tone": "danger",
                 "title": f"{unhealthy_sources} источников требуют проверки",
-                "detail": "Один или несколько включённых crawler не находятся в healthy.",
-                "href": "#sources",
-                "action": "Источники",
+                "detail": unhealthy_names,
+                "href": "/?view=diagnostics",
+                "action": "Диагностика",
             }
         )
     if counts["pending_review"]:
@@ -618,7 +663,7 @@ async def dashboard(
                 "tone": "warning",
                 "title": f"{counts['pending_review']} откликов ждут решения",
                 "detail": "Нейросеть подготовила их, но финальное действие остаётся за вами.",
-                "href": "#applications",
+                "href": "/?view=decisions",
                 "action": "Открыть очередь",
             }
         )
@@ -628,7 +673,7 @@ async def dashboard(
                 "tone": "warning",
                 "title": "Автоотправка на паузе",
                 "detail": "Автоматизация продолжит анализ, но не отправит новые отклики.",
-                "href": "#preferences",
+                "href": "/?view=settings",
                 "action": "Управление",
             }
         )
@@ -641,6 +686,294 @@ async def dashboard(
     )
     source_names = {item.id: item.name for item in sources}
 
+    applications: list[Application] = []
+    recent_applications: list[Application] = []
+    application_jobs: dict[UUID, SourceJob] = {}
+    jobs: list[SourceJob] = []
+    matches: list[MatchEvaluation] = []
+    match_jobs: dict[UUID, SourceJob] = {}
+    scans: list[ScanRun] = []
+    resumes: list[Resume] = []
+    audits: list[AuditEvent] = []
+    active_alerts: list[Alert] = []
+    historical_alerts: list[Alert] = []
+    pagination = _pagination(0, 1, 10)
+
+    if view == "overview":
+        recent_applications = list(
+            (
+                await session.scalars(
+                    select(Application)
+                    .where(Application.profile_id == selected_profile_id)
+                    .order_by(desc(Application.created_at))
+                    .limit(5)
+                )
+            ).all()
+        )
+        audits = list(
+            (
+                await session.scalars(
+                    select(AuditEvent)
+                    .where(AuditEvent.action.in_(tuple(_AUDIT_ACTION_LABELS)))
+                    .order_by(desc(AuditEvent.timestamp))
+                    .limit(6)
+                )
+            ).all()
+        )
+    elif view == "decisions":
+        decision_statuses = {
+            "pending_review": [ApplicationStatus.PENDING_REVIEW, ApplicationStatus.PREPARED],
+            "approved": [ApplicationStatus.APPROVED, ApplicationStatus.AUTO_APPROVED],
+            "problems": [
+                ApplicationStatus.DELIVERY_UNKNOWN,
+                ApplicationStatus.FAILED,
+                ApplicationStatus.BLOCKED,
+            ],
+            "cancelled": [ApplicationStatus.CANCELLED],
+            "all": list(ApplicationStatus),
+        }
+        status_filter = status_filter if status_filter in decision_statuses else "pending_review"
+        conditions = [
+            Application.profile_id == selected_profile_id,
+            Application.status.in_(decision_statuses[status_filter]),
+        ]
+        if q:
+            pattern = f"%{q}%"
+            conditions.append(
+                or_(
+                    SourceJob.title.ilike(pattern),
+                    SourceJob.company.ilike(pattern),
+                    Application.subject.ilike(pattern),
+                )
+            )
+        total = int(
+            await session.scalar(
+                select(func.count(Application.id))
+                .select_from(Application)
+                .join(SourceJob, SourceJob.id == Application.source_job_id)
+                .where(*conditions)
+            )
+            or 0
+        )
+        pagination = _pagination(total, page, 10)
+        applications = list(
+            (
+                await session.scalars(
+                    select(Application)
+                    .join(SourceJob, SourceJob.id == Application.source_job_id)
+                    .where(*conditions)
+                    .order_by(desc(Application.created_at))
+                    .offset((int(pagination["page"]) - 1) * 10)
+                    .limit(10)
+                )
+            ).all()
+        )
+    elif view == "history":
+        valid_history_kinds = {"sent", "rejected", "jobs", "matches", "scans"}
+        history_kind = history_kind if history_kind in valid_history_kinds else "sent"
+        history_per_page = 20
+        pattern = f"%{q}%"
+        if history_kind in {"sent", "rejected"}:
+            history_statuses = (
+                [ApplicationStatus.SENT]
+                if history_kind == "sent"
+                else [ApplicationStatus.CANCELLED, ApplicationStatus.BLOCKED]
+            )
+            conditions = [
+                Application.profile_id == selected_profile_id,
+                Application.status.in_(history_statuses),
+            ]
+            if q:
+                conditions.append(
+                    or_(
+                        SourceJob.title.ilike(pattern),
+                        SourceJob.company.ilike(pattern),
+                        Application.subject.ilike(pattern),
+                    )
+                )
+            total = int(
+                await session.scalar(
+                    select(func.count(Application.id))
+                    .select_from(Application)
+                    .join(SourceJob, SourceJob.id == Application.source_job_id)
+                    .where(*conditions)
+                )
+                or 0
+            )
+            pagination = _pagination(total, page, history_per_page)
+            applications = list(
+                (
+                    await session.scalars(
+                        select(Application)
+                        .join(SourceJob, SourceJob.id == Application.source_job_id)
+                        .where(*conditions)
+                        .order_by(desc(Application.sent_at), desc(Application.created_at))
+                        .offset((int(pagination["page"]) - 1) * history_per_page)
+                        .limit(history_per_page)
+                    )
+                ).all()
+            )
+        elif history_kind == "jobs":
+            conditions = []
+            if q:
+                conditions.append(
+                    or_(
+                        SourceJob.title.ilike(pattern),
+                        SourceJob.company.ilike(pattern),
+                        SourceJob.location.ilike(pattern),
+                    )
+                )
+            total = int(
+                await session.scalar(select(func.count(SourceJob.id)).where(*conditions)) or 0
+            )
+            pagination = _pagination(total, page, history_per_page)
+            jobs = list(
+                (
+                    await session.scalars(
+                        select(SourceJob)
+                        .where(*conditions)
+                        .order_by(desc(SourceJob.last_seen_at))
+                        .offset((int(pagination["page"]) - 1) * history_per_page)
+                        .limit(history_per_page)
+                    )
+                ).all()
+            )
+        elif history_kind == "matches":
+            conditions = [MatchEvaluation.profile_id == selected_profile_id]
+            if q:
+                conditions.append(
+                    or_(SourceJob.title.ilike(pattern), SourceJob.company.ilike(pattern))
+                )
+            total = int(
+                await session.scalar(
+                    select(func.count(MatchEvaluation.id))
+                    .select_from(MatchEvaluation)
+                    .join(SourceJob, SourceJob.id == MatchEvaluation.source_job_id)
+                    .where(*conditions)
+                )
+                or 0
+            )
+            pagination = _pagination(total, page, history_per_page)
+            matches = list(
+                (
+                    await session.scalars(
+                        select(MatchEvaluation)
+                        .join(SourceJob, SourceJob.id == MatchEvaluation.source_job_id)
+                        .where(*conditions)
+                        .order_by(desc(MatchEvaluation.created_at))
+                        .offset((int(pagination["page"]) - 1) * history_per_page)
+                        .limit(history_per_page)
+                    )
+                ).all()
+            )
+        else:
+            conditions = []
+            if q:
+                conditions.append(JobSource.name.ilike(pattern))
+            total = int(
+                await session.scalar(
+                    select(func.count(ScanRun.id))
+                    .select_from(ScanRun)
+                    .join(JobSource, JobSource.id == ScanRun.source_id)
+                    .where(*conditions)
+                )
+                or 0
+            )
+            pagination = _pagination(total, page, history_per_page)
+            scans = list(
+                (
+                    await session.scalars(
+                        select(ScanRun)
+                        .join(JobSource, JobSource.id == ScanRun.source_id)
+                        .where(*conditions)
+                        .order_by(desc(ScanRun.started_at))
+                        .offset((int(pagination["page"]) - 1) * history_per_page)
+                        .limit(history_per_page)
+                    )
+                ).all()
+            )
+    elif view == "settings":
+        resumes = list(
+            (
+                await session.scalars(
+                    select(Resume)
+                    .where(Resume.profile_id == selected_profile_id)
+                    .order_by(desc(Resume.created_at))
+                )
+            ).all()
+        )
+    else:
+        active_alerts = list(
+            (
+                await session.scalars(
+                    select(Alert)
+                    .where(
+                        Alert.acknowledged.is_(False),
+                        Alert.created_at >= active_alert_cutoff,
+                    )
+                    .order_by(desc(Alert.created_at))
+                    .limit(20)
+                )
+            ).all()
+        )
+        historical_alerts = list(
+            (
+                await session.scalars(
+                    select(Alert)
+                    .where(
+                        or_(
+                            Alert.acknowledged.is_(True),
+                            Alert.created_at < active_alert_cutoff,
+                        )
+                    )
+                    .order_by(desc(Alert.created_at))
+                    .limit(20)
+                )
+            ).all()
+        )
+        total = int(await session.scalar(select(func.count(AuditEvent.id))) or 0)
+        pagination = _pagination(total, page, 20)
+        audits = list(
+            (
+                await session.scalars(
+                    select(AuditEvent)
+                    .order_by(desc(AuditEvent.timestamp))
+                    .offset((int(pagination["page"]) - 1) * 20)
+                    .limit(20)
+                )
+            ).all()
+        )
+
+    displayed_applications = applications or recent_applications
+    application_job_ids = {item.source_job_id for item in displayed_applications}
+    if application_job_ids:
+        application_jobs = {
+            item.id: item
+            for item in (
+                await session.scalars(
+                    select(SourceJob).where(SourceJob.id.in_(application_job_ids))
+                )
+            ).all()
+        }
+    match_job_ids = {item.source_job_id for item in matches}
+    if match_job_ids:
+        match_jobs = {
+            item.id: item
+            for item in (
+                await session.scalars(select(SourceJob).where(SourceJob.id.in_(match_job_ids)))
+            ).all()
+        }
+
+    if not gmail_oauth["configured"] or not gmail_oauth["connected"] or unhealthy_sources:
+        overall_tone = "danger"
+        overall_title = "Требуется ваше внимание"
+    elif counts["active_alerts"] or preferences.global_pause or counts["pending_review"]:
+        overall_tone = "warning"
+        overall_title = "Работает, но есть решения для вас"
+    else:
+        overall_tone = "success"
+        overall_title = "Всё работает штатно"
+
     response = templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -649,6 +982,12 @@ async def dashboard(
             "profile": profile,
             "profiles": profiles,
             "selected_profile_id": selected_profile_id,
+            "view": view,
+            "view_title": _VIEW_TITLES[view],
+            "q": q,
+            "status_filter": status_filter,
+            "history_kind": history_kind,
+            "pagination": pagination,
             "preferences": preferences,
             "sources": sources,
             "source_names": source_names,
@@ -657,15 +996,19 @@ async def dashboard(
             "matches": matches,
             "match_jobs": match_jobs,
             "applications": applications,
+            "recent_applications": recent_applications,
             "application_jobs": application_jobs,
             "scans": scans,
-            "alerts": alerts,
+            "active_alerts": active_alerts,
+            "historical_alerts": historical_alerts,
             "audits": audits,
             "counts": counts,
             "overview": overview,
             "gmail_oauth": gmail_oauth,
             "attention_items": attention_items,
             "attention_tone": attention_tone,
+            "overall_tone": overall_tone,
+            "overall_title": overall_title,
             "now_local": now_local,
             "settings": get_settings(),
         },
@@ -710,7 +1053,7 @@ async def save_profile(
     profile = await ProfileService().upsert_profile(session, payload, profile_id)
     await _audit_admin(session, "profile.updated", "user_profile", str(profile.id))
     await session.commit()
-    return RedirectResponse(f"/?profile_id={profile.id}#profile", status_code=303)
+    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
 
 
 @router.post("/admin/profiles")
@@ -729,7 +1072,7 @@ async def create_profile(
     )
     await _audit_admin(session, "profile.created", "user_profile", str(profile.id))
     await session.commit()
-    return RedirectResponse(f"/?profile_id={profile.id}#profile", status_code=303)
+    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
 
 
 @router.post("/admin/profiles/{profile_id}/default")
@@ -747,7 +1090,7 @@ async def make_default_profile(
         raise HTTPException(status_code=404, detail="profile not found") from exc
     await _audit_admin(session, "profile.default_changed", "user_profile", str(profile.id))
     await session.commit()
-    return RedirectResponse(f"/?profile_id={profile.id}#profile", status_code=303)
+    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
 
 
 @router.post("/admin/preferences")
@@ -791,7 +1134,7 @@ async def save_preferences(
         },
     )
     await session.commit()
-    return RedirectResponse(f"/?profile_id={preferences.profile_id}#preferences", status_code=303)
+    return RedirectResponse(f"/?view=settings&profile_id={preferences.profile_id}", status_code=303)
 
 
 @router.post("/admin/pause/{paused}")
@@ -822,7 +1165,7 @@ async def set_pause(
         },
     )
     await session.commit()
-    return RedirectResponse(f"/?profile_id={preferences.profile_id}#preferences", status_code=303)
+    return RedirectResponse(f"/?view=overview&profile_id={preferences.profile_id}", status_code=303)
 
 
 @router.post("/admin/resumes")
@@ -861,7 +1204,7 @@ async def admin_upload_resume(
         details={"mime_type": resume.mime_type, "sha256": resume.sha256},
     )
     await session.commit()
-    return RedirectResponse(f"/?profile_id={profile.id}#resumes", status_code=303)
+    return RedirectResponse(f"/?view=settings&profile_id={profile.id}", status_code=303)
 
 
 @router.post("/admin/oauth/gmail/disconnect")
@@ -882,7 +1225,7 @@ async def admin_disconnect_gmail(
         details={"pending_authorizations_invalidated": True, "remote_grant_revoked": False},
     )
     await session.commit()
-    return RedirectResponse("/#health", status_code=303)
+    return RedirectResponse("/?view=settings", status_code=303)
 
 
 @router.post("/admin/alerts/{alert_id}/acknowledge")
@@ -906,7 +1249,7 @@ async def acknowledge_alert(
         decision="acknowledged",
     )
     await session.commit()
-    return RedirectResponse("/#health", status_code=303)
+    return RedirectResponse("/?view=diagnostics", status_code=303)
 
 
 @router.post("/admin/resumes/{resume_id}/verify")
@@ -927,7 +1270,7 @@ async def verify_resume(
     resume.active = True
     await _audit_admin(session, "resume.verified", "resume", str(resume.id))
     await session.commit()
-    return RedirectResponse(f"/?profile_id={selected_profile.id}#resumes", status_code=303)
+    return RedirectResponse(f"/?view=settings&profile_id={selected_profile.id}", status_code=303)
 
 
 @router.post("/admin/sources/{source_id}/toggle")
@@ -958,7 +1301,7 @@ async def toggle_source(
         decision="enabled" if enabling else "disabled",
     )
     await session.commit()
-    return RedirectResponse("/#sources", status_code=303)
+    return RedirectResponse("/?view=settings", status_code=303)
 
 
 @router.post("/admin/sources/{source_id}/scan/{scan_type}")
@@ -986,7 +1329,7 @@ async def admin_start_scan(
                 stored.diagnostics = {"queue_error": type(exc).__name__}
                 await session.commit()
         raise HTTPException(status_code=503, detail="task queue unavailable") from exc
-    return RedirectResponse("/#scans", status_code=303)
+    return RedirectResponse("/?view=diagnostics", status_code=303)
 
 
 @router.get("/admin/applications/{application_id}", response_class=HTMLResponse)
@@ -1015,11 +1358,17 @@ async def admin_approve_application(
     application_id: UUID,
     request: Request,
     csrf_token: str = Form(...),
+    return_to: str = Form("detail"),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    application = await ApplicationService(get_settings()).approve(session, application_id)
+    try:
+        application = await ApplicationService(get_settings()).approve(session, application_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="application not found") from exc
+    except ApplicationPreparationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await _audit_admin(
         session,
         "application.approved",
@@ -1028,6 +1377,44 @@ async def admin_approve_application(
         decision=application.status.value,
     )
     await session.commit()
+    if return_to == "decisions":
+        return RedirectResponse(
+            f"/?view=decisions&profile_id={application.profile_id}", status_code=303
+        )
+    return RedirectResponse(f"/admin/applications/{application_id}", status_code=303)
+
+
+@router.post("/admin/applications/{application_id}/reject")
+async def admin_reject_application(
+    application_id: UUID,
+    request: Request,
+    csrf_token: str = Form(...),
+    reason: str = Form(""),
+    return_to: str = Form("detail"),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    try:
+        application = await ApplicationService(get_settings()).reject(session, application_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="application not found") from exc
+    except ApplicationPreparationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    clean_reason = reason.strip()[:500]
+    await _audit_admin(
+        session,
+        "application.rejected_by_owner",
+        "application",
+        str(application.id),
+        decision=application.status.value,
+        details={"reason": clean_reason} if clean_reason else None,
+    )
+    await session.commit()
+    if return_to == "decisions":
+        return RedirectResponse(
+            f"/?view=decisions&profile_id={application.profile_id}", status_code=303
+        )
     return RedirectResponse(f"/admin/applications/{application_id}", status_code=303)
 
 
