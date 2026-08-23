@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -76,6 +77,52 @@ class OAuthExchangeResult:
 
 def _hash_token(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _scope_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {item for item in value.split() if item}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {item for item in value if isinstance(item, str) and item}
+    return set()
+
+
+def _accept_google_email_scope_alias(flow: Flow, warning: Warning) -> bool:
+    """Recover only Google's documented email-scope alias expansion.
+
+    OAuthlib rejects the successful token response when Google returns both
+    ``email`` and its canonical ``userinfo.email`` alias. Keep scope checking
+    strict by accepting only that equivalence and preserving the parsed token
+    for google-auth-oauthlib's credentials adapter.
+    """
+    token = getattr(warning, "token", None)
+    if not isinstance(token, Mapping):
+        return False
+
+    expected = set(GOOGLE_ADMIN_SCOPES)
+    allowed = expected | {GOOGLE_USERINFO_EMAIL_SCOPE}
+    old_scopes = _scope_values(getattr(warning, "old_scope", None))
+    new_scopes = _scope_values(getattr(warning, "new_scope", None))
+    token_scopes = _scope_values(token.get("scope"))
+    canonical_scopes = {
+        GOOGLE_EMAIL_SCOPE if item == GOOGLE_USERINFO_EMAIL_SCOPE else item for item in token_scopes
+    }
+    access_token = token.get("access_token")
+    if (
+        old_scopes != expected
+        or new_scopes != token_scopes
+        or not token_scopes <= allowed
+        or canonical_scopes != expected
+        or not isinstance(access_token, str)
+        or not access_token
+    ):
+        return False
+
+    oauth_session = getattr(flow, "oauth2session", None)
+    if oauth_session is None:
+        return False
+    oauth_session.token = dict(token)
+    return True
 
 
 class GmailOAuthService:
@@ -399,6 +446,14 @@ class GmailOAuthService:
                 flow.fetch_token,
                 code=authorization_code,
             )
+        except Warning as exc:
+            if not admin_login or not _accept_google_email_scope_alias(flow, exc):
+                raise GmailOAuthError(
+                    "OAuth token exchange failed",
+                    code="token_exchange_failed",
+                    actor=actor,
+                    correlation_id=request_id,
+                ) from exc
         except GmailOAuthError as exc:
             raise GmailOAuthError(
                 "Gmail OAuth client is not configured",

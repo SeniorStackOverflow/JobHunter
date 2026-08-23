@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from oauthlib.oauth2 import WebApplicationClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,6 +21,7 @@ from app.database.session import get_session
 from app.email.oauth import (
     GMAIL_OAUTH_BINDING_COOKIE,
     GOOGLE_ADMIN_SCOPES,
+    GOOGLE_USERINFO_EMAIL_SCOPE,
     GmailOAuthService,
 )
 from app.email.providers import GMAIL_SEND_SCOPE
@@ -53,18 +56,49 @@ class RouteFakeFlow:
         type(self).fetch_count += 1
 
 
-class AdminRouteFakeFlow:
-    def __init__(self, scopes: list[str] | tuple[str, ...] | None = None) -> None:
-        granted = list(scopes or GOOGLE_ADMIN_SCOPES)
-        self.credentials = SimpleNamespace(
-            refresh_token="admin-route-private-refresh-token",
-            scopes=granted,
-            granted_scopes=granted,
-            id_token="signed-google-id-token",
-        )
+class AdminRouteOAuthlibFlow:
+    def __init__(
+        self,
+        scopes: list[str] | tuple[str, ...] | None = None,
+        *,
+        extra_scopes: tuple[str, ...] = (),
+    ) -> None:
+        self.requested_scopes = list(scopes or GOOGLE_ADMIN_SCOPES)
+        self.extra_scopes = extra_scopes
+        self.oauth2session = SimpleNamespace(token={})
+        self.oauth_client = WebApplicationClient("route-client-id")
 
     def fetch_token(self, *, code: str) -> None:
         assert code == "admin-route-code"
+        returned_scopes = [
+            *self.requested_scopes,
+            GOOGLE_USERINFO_EMAIL_SCOPE,
+            *self.extra_scopes,
+        ]
+        response_body = json.dumps(
+            {
+                "access_token": "admin-route-private-access-token",
+                "refresh_token": "admin-route-private-refresh-token",
+                "id_token": "signed-google-id-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": " ".join(returned_scopes),
+            }
+        )
+        self.oauth_client.parse_request_body_response(
+            response_body,
+            scope=self.requested_scopes,
+        )
+
+    @property
+    def credentials(self) -> SimpleNamespace:
+        token = self.oauth2session.token
+        return SimpleNamespace(
+            refresh_token=token.get("refresh_token"),
+            scopes=self.requested_scopes,
+            granted_scopes=token.get("scope"),
+            id_token=token.get("id_token"),
+        )
 
 
 @pytest_asyncio.fixture
@@ -217,7 +251,7 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
     monkeypatch.setattr(
         GmailOAuthService,
         "_flow",
-        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteFakeFlow(scopes),
+        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteOAuthlibFlow(scopes),
     )
 
     async def verify_identity(_service: GmailOAuthService, raw_id_token: str) -> dict[str, object]:
@@ -272,7 +306,7 @@ async def test_google_admin_login_rejects_account_outside_allowlist(
     monkeypatch.setattr(
         GmailOAuthService,
         "_flow",
-        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteFakeFlow(scopes),
+        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteOAuthlibFlow(scopes),
     )
 
     async def verify_identity(_service: GmailOAuthService, _raw_id_token: str) -> dict[str, object]:
@@ -297,3 +331,36 @@ async def test_google_admin_login_rejects_account_outside_allowlist(
             select(AuditEvent).where(AuditEvent.action == "admin.login.google_failed")
         )
         assert failed is not None
+
+
+@pytest.mark.asyncio
+async def test_google_admin_login_rejects_scope_change_beyond_email_alias(
+    oauth_api: OAuthApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = await oauth_api.client.get("/admin/auth/google")
+    state = parse_qs(urlsplit(started.headers["location"]).query)["state"][0]
+    monkeypatch.setattr(
+        GmailOAuthService,
+        "_flow",
+        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteOAuthlibFlow(
+            scopes,
+            extra_scopes=("https://www.googleapis.com/auth/drive.readonly",),
+        ),
+    )
+
+    callback = await oauth_api.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "admin-route-code", "state": state},
+    )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/login?oauth_error=1"
+    assert oauth_api.client.cookies.get("job_agent_session") is None
+    async with oauth_api.session_factory() as session:
+        assert await session.scalar(select(OAuthCredential)) is None
+        failed = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "oauth.gmail.connect_failed")
+        )
+        assert failed is not None
+        assert failed.sanitized_details["error_code"] == "token_exchange_failed"
