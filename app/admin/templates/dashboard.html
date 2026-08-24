@@ -26,7 +26,7 @@
       <div class="topbar-actions"><form method="get" action="/"><input type="hidden" name="view" value="{{ view }}"><select name="profile_id" class="btn" data-profile-select aria-label="Выбрать профиль">{% for item in profiles %}<option value="{{ item.id }}" {% if item.id == selected_profile_id %}selected{% endif %}>{{ item.name }}{% if item.is_default %} · основной{% endif %}</option>{% endfor %}</select></form><span class="badge {{ 'success' if settings.real_email_delivery_enabled else 'muted' }}">{{ 'Реальная отправка' if settings.real_email_delivery_enabled else 'Тестовый режим' }}</span></div>
     </header>
     <main class="content">
-      {% if feedback_notice %}<div class="action-notice success" role="status" data-action-notice><div class="action-notice-icon" aria-hidden="true">✓</div><div><strong>{{ feedback_notice[0] }}</strong><span>{{ feedback_notice[1] }}</span></div><button class="action-notice-close" type="button" data-notice-dismiss aria-label="Закрыть уведомление">×</button></div>{% endif %}
+      {% if feedback_notice %}<div class="action-notice {{ feedback_notice_tone }}" role="status" data-action-notice><div class="action-notice-icon" aria-hidden="true">{{ '✓' if feedback_notice_tone == 'success' else '!' }}</div><div><strong>{{ feedback_notice[0] }}</strong><span>{{ feedback_notice[1] }}</span></div><button class="action-notice-close" type="button" data-notice-dismiss aria-label="Закрыть уведомление">×</button></div>{% endif %}
       {% if view == 'overview' %}{% include "dashboard_overview.html" %}
       {% elif view == 'decisions' %}{% include "dashboard_decisions.html" %}
       {% elif view == 'history' %}{% include "dashboard_history.html" %}

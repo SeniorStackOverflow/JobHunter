@@ -912,13 +912,87 @@ async def test_admin_application_uses_saved_vacancy_when_source_is_unavailable(
             f"/admin/applications/{application_id}/approve",
             data={"csrf_token": csrf_token},
         )
-        assert direct_approval.status_code == 409
-        assert direct_approval.json()["detail"] == "vacancy is no longer active"
+        assert direct_approval.status_code == 303
+        assert direct_approval.headers["location"] == (
+            f"/admin/applications/{application_id}?notice=application_approval_inactive_vacancy"
+        )
+
+        approval_notice = await client.get(direct_approval.headers["location"])
+        assert approval_notice.status_code == 200
+        assert "Вакансия больше не активна" in approval_notice.text
 
     async with sqlite_session_factory() as session:
         stored = await session.get(Application, application_id)
         assert stored is not None
         assert stored.status == ApplicationStatus.PENDING_REVIEW
+
+
+async def test_admin_hides_approval_without_public_email_and_redirects_stale_post(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="admin-internal-apply",
+    )
+    application_id = seeded["application_id"]
+    profile_id = seeded["profile_id"]
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        contact = await session.get(EmployerContact, seeded["contact_id"])
+        assert stored is not None
+        assert contact is not None
+        contact.contact_type = ContactType.INTERNAL_JOB_BOARD
+        contact.value = "https://jobs.example.test/jobs/admin-internal-apply"
+        stored.content_validated = False
+        stored.policy_result = {
+            **stored.policy_result,
+            "rules_failed": ["verified_email_contact", "letter_validated"],
+        }
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        queue = await client.get(f"/?view=decisions&profile_id={profile_id}")
+        assert queue.status_code == 200
+        assert "нет публичного email" in queue.text
+        assert f'action="/admin/applications/{application_id}/approve"' not in queue.text
+
+        detail = await client.get(f"/admin/applications/{application_id}")
+        assert detail.status_code == 200
+        assert "Автоотправка недоступна" in detail.text
+        assert "нет публичного email" in detail.text
+        assert f'action="/admin/applications/{application_id}/approve"' not in detail.text
+
+        direct_approval = await client.post(
+            f"/admin/applications/{application_id}/approve",
+            data={"csrf_token": csrf_token, "return_to": "decisions"},
+        )
+        assert direct_approval.status_code == 303
+        assert direct_approval.headers["location"] == (
+            f"/?view=decisions&profile_id={profile_id}&notice=application_approval_no_email"
+        )
+
+        approval_notice = await client.get(direct_approval.headers["location"])
+        assert approval_notice.status_code == 200
+        assert "Одобрение недоступно" in approval_notice.text
+        assert "внутреннюю форму сайта" in approval_notice.text
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.PENDING_REVIEW
+        feedback = await session.scalar(
+            select(ReviewFeedbackEvent).where(ReviewFeedbackEvent.application_id == application_id)
+        )
+        assert feedback is None
 
 
 async def test_admin_decision_queue_filters_and_rejects_without_sending(
@@ -1399,6 +1473,11 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         )
         for index in range(3)
     ]
+    internal_review = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="browser-internal-apply",
+    )
     vacancy_statuses = [JobStatus.POSSIBLY_CLOSED, JobStatus.ACTIVE, JobStatus.CLOSED]
     async with sqlite_session_factory() as session:
         for index, seeded in enumerate(seeded_reviews):
@@ -1411,6 +1490,17 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             source_job.requirements = f"Browser requirement {index}."
             source_job.responsibilities = f"Browser responsibility {index}."
             canonical.status = vacancy_statuses[index]
+        internal_application = await session.get(Application, internal_review["application_id"])
+        internal_contact = await session.get(EmployerContact, internal_review["contact_id"])
+        assert internal_application is not None
+        assert internal_contact is not None
+        internal_contact.contact_type = ContactType.INTERNAL_JOB_BOARD
+        internal_contact.value = "https://jobs.example.test/jobs/browser-internal-apply"
+        internal_application.content_validated = False
+        internal_application.policy_result = {
+            **internal_application.policy_result,
+            "rules_failed": ["verified_email_contact", "letter_validated"],
+        }
         await session.commit()
     with socket.socket() as port_socket:
         port_socket.bind(("127.0.0.1", 0))
@@ -1485,6 +1575,49 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                         await dialog.locator("[data-review-learn]").uncheck()
                     await dialog.get_by_role("button", name="Отклонить", exact=True).click()
                     await expect(page.locator(".queue-card")).to_have_count(0)
+
+                    # Reproduce a stale approve form in each clean context. The current UI
+                    # must not offer approval without public email, and the server must
+                    # redirect the stale POST back to a readable warning instead of JSON.
+                    internal_detail_url = (
+                        f"{base_url}/admin/applications/{internal_review['application_id']}"
+                    )
+                    await page.goto(internal_detail_url)
+                    await expect(page.get_by_text("Автоотправка недоступна")).to_be_visible()
+                    await expect(page.get_by_text("нет публичного email")).to_be_visible()
+                    await expect(
+                        page.get_by_role("button", name="Одобрить", exact=True)
+                    ).to_have_count(0)
+                    csrf_token = await page.locator(
+                        'form[action$="/reject"] input[name="csrf_token"]'
+                    ).input_value()
+                    approval_action = (
+                        f"/admin/applications/{internal_review['application_id']}/approve"
+                    )
+                    await page.evaluate(
+                        """({ action, csrfToken }) => {
+                            const form = document.createElement('form');
+                            form.method = 'post';
+                            form.action = action;
+                            const csrf = document.createElement('input');
+                            csrf.type = 'hidden';
+                            csrf.name = 'csrf_token';
+                            csrf.value = csrfToken;
+                            form.appendChild(csrf);
+                            document.body.appendChild(form);
+                            form.submit();
+                        }""",
+                        {
+                            "action": approval_action,
+                            "csrfToken": csrf_token,
+                        },
+                    )
+                    await page.wait_for_url(
+                        f"{internal_detail_url}?notice=application_approval_no_email"
+                    )
+                    await expect(page.locator(".action-notice.warning")).to_contain_text(
+                        "Одобрение недоступно"
+                    )
                     await context.close()
             finally:
                 await browser.close()

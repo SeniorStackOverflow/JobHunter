@@ -223,6 +223,24 @@ _FEEDBACK_NOTICES = {
         "Отклик одобрен",
         "Он прошёл ручную проверку и готов к следующему этапу.",
     ),
+    "application_approval_no_email": (
+        "Одобрение недоступно",
+        "У вакансии нет публичного email. JobHunter не отправляет отклики "
+        "через внутреннюю форму сайта.",
+    ),
+    "application_approval_invalid_content": (
+        "Письмо не прошло проверку",
+        "Отклик остался в очереди и не будет отправлен. Проверьте его технические подробности.",
+    ),
+    "application_approval_inactive_vacancy": (
+        "Одобрение недоступно",
+        "Вакансия больше не активна. Отклик остался в безопасном состоянии.",
+    ),
+    "application_approval_unavailable": (
+        "Одобрение не выполнено",
+        "Состояние отклика изменилось или он не готов к одобрению. "
+        "Обновите карточку и проверьте его ещё раз.",
+    ),
     "application_rejected": (
         "Отклик отклонён",
         "Он отменён и не попадёт в отправку.",
@@ -240,6 +258,13 @@ _FEEDBACK_NOTICES = {
         "Состояние зафиксировано",
         "Повторная отправка не выполнялась.",
     ),
+}
+
+_FEEDBACK_NOTICE_TONES = {
+    "application_approval_no_email": "warning",
+    "application_approval_invalid_content": "danger",
+    "application_approval_inactive_vacancy": "warning",
+    "application_approval_unavailable": "danger",
 }
 
 
@@ -293,6 +318,49 @@ def _alert_code_label(value: str) -> str:
     return _ALERT_CODE_LABELS.get(value, "Системное уведомление")
 
 
+def _application_failed_policy_rules(application: Any) -> set[str]:
+    if isinstance(application, dict):
+        policy_result = application.get("policy_result")
+    else:
+        policy_result = getattr(application, "policy_result", None)
+    if not isinstance(policy_result, dict):
+        return set()
+    raw_rules = policy_result.get("rules_failed", [])
+    if not isinstance(raw_rules, list):
+        return set()
+    return {str(item) for item in raw_rules}
+
+
+def _application_content_validated(application: Any) -> bool:
+    if isinstance(application, dict):
+        return application.get("content_validated") is True
+    return getattr(application, "content_validated", False) is True
+
+
+def _application_approval_issue(application: Any) -> str | None:
+    """Explain why a review cannot currently become an approved email application."""
+
+    if _application_content_validated(application):
+        return None
+    if "verified_email_contact" in _application_failed_policy_rules(application):
+        return (
+            "У вакансии нет публичного email — JobHunter не отправляет отклики "
+            "через внутреннюю форму сайта."
+        )
+    return "Письмо или получатель не прошли проверку безопасности."
+
+
+def _approval_failure_notice(application: Application | None, error: Exception) -> str:
+    message = str(error)
+    if application is not None and not _application_content_validated(application):
+        if "verified_email_contact" in _application_failed_policy_rules(application):
+            return "application_approval_no_email"
+        return "application_approval_invalid_content"
+    if message == "vacancy is no longer active":
+        return "application_approval_inactive_vacancy"
+    return "application_approval_unavailable"
+
+
 def _pagination(total: int, requested_page: int, per_page: int) -> dict[str, int | bool]:
     pages = max(1, (total + per_page - 1) // per_page)
     page = min(max(1, requested_page), pages)
@@ -311,6 +379,7 @@ templates.env.globals["status_tone"] = _status_tone
 templates.env.globals["format_dt"] = _format_dt
 templates.env.globals["audit_action_label"] = _audit_action_label
 templates.env.globals["alert_code_label"] = _alert_code_label
+templates.env.globals["application_approval_issue"] = _application_approval_issue
 
 
 def _signer() -> SessionSigner:
@@ -1137,6 +1206,7 @@ async def dashboard(
         overall_tone = "success"
         overall_title = "Всё работает штатно"
 
+    feedback_key = "google_connected" if google == "connected" else notice or ""
     response = templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -1176,9 +1246,8 @@ async def dashboard(
             "overall_title": overall_title,
             "now_local": now_local,
             "settings": get_settings(),
-            "feedback_notice": _FEEDBACK_NOTICES.get(
-                "google_connected" if google == "connected" else notice or ""
-            ),
+            "feedback_notice": _FEEDBACK_NOTICES.get(feedback_key),
+            "feedback_notice_tone": _FEEDBACK_NOTICE_TONES.get(feedback_key, "success"),
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -1576,6 +1645,7 @@ async def admin_application_detail(
             "application": detail,
             "csrf_token": _csrf().issue(token),
             "feedback_notice": _FEEDBACK_NOTICES.get(notice or ""),
+            "feedback_notice_tone": _FEEDBACK_NOTICE_TONES.get(notice or "", "success"),
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -1597,7 +1667,16 @@ async def admin_approve_application(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="application not found") from exc
     except ApplicationPreparationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        failed_application = await session.get(Application, application_id)
+        notice = _approval_failure_notice(failed_application, exc)
+        if return_to == "decisions" and failed_application is not None:
+            return RedirectResponse(
+                f"/?view=decisions&profile_id={failed_application.profile_id}&notice={notice}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            f"/admin/applications/{application_id}?notice={notice}", status_code=303
+        )
     feedback = await ReviewLearningService().record_decision(
         session,
         application,
