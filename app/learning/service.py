@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -8,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.matching.prefilter import canonicalize_location
 from app.models.entities import (
     Application,
     MatchEvaluation,
@@ -76,6 +78,10 @@ _REASON_LABELS = {
     ReviewReason.REQUIREMENTS: "Требования",
     ReviewReason.VACANCY_PROBLEM: "Проблема вакансии",
     ReviewReason.OTHER: "Другое",
+}
+_CITY_LABELS = {
+    "balti": "Бельцы",
+    "chisinau": "Кишинёв",
 }
 
 
@@ -178,6 +184,15 @@ def _unique(values: list[str | None]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
+def fixed_preference_dimensions(allowed_cities: Iterable[str]) -> frozenset[str]:
+    """Dimensions fixed by explicit preferences must not be relearned as soft signals."""
+
+    canonical_cities = {
+        canonical for value in allowed_cities if (canonical := canonicalize_location(value))
+    }
+    return frozenset({"city"}) if len(canonical_cities) == 1 else frozenset()
+
+
 def review_job_input(job: SourceJob) -> ReviewJobInput:
     return ReviewJobInput(
         title=job.title,
@@ -208,7 +223,12 @@ def _feature_snapshot(job: ReviewJobInput) -> dict[str, list[str]]:
     categories = _unique(
         [_normalized(job.category), *(_normalized(item) for item in job.categories_seen)]
     )[:4]
-    cities = _unique([*(_normalized(item) for item in job.cities), _normalized(job.location)])[:4]
+    cities = _unique(
+        [
+            *(canonicalize_location(item) for item in job.cities),
+            canonicalize_location(job.location),
+        ]
+    )[:4]
     experience = _normalized(job.required_experience)
     if experience is None and job.no_experience is not None:
         experience = "без опыта" if job.no_experience else "опыт требуется"
@@ -226,11 +246,16 @@ def _feature_snapshot(job: ReviewJobInput) -> dict[str, list[str]]:
 
 
 def _feature_label(dimension: str, value: str) -> str:
+    if dimension == "city":
+        value = _CITY_LABELS.get(value, value)
     return f"{_DIMENSION_LABELS.get(dimension, dimension)}: {value}"
 
 
 def _summarize_events(
-    events: list[ReviewFeedbackEvent], *, influence_enabled: bool
+    events: list[ReviewFeedbackEvent],
+    *,
+    influence_enabled: bool,
+    ignored_dimensions: Iterable[str] = (),
 ) -> ReviewLearningSummary:
     approved = sum(
         event.learning_eligible and event.outcome == ReviewOutcome.APPROVED for event in events
@@ -239,6 +264,7 @@ def _summarize_events(
         event.learning_eligible and event.outcome == ReviewOutcome.REJECTED for event in events
     )
     excluded = sum(not event.learning_eligible for event in events)
+    ignored = set(ignored_dimensions)
     mutable_stats: dict[str, dict[str, Any]] = {}
     for event in events:
         if not event.learning_eligible:
@@ -247,12 +273,16 @@ def _summarize_events(
         raw_dimensions = event.feature_snapshot.get("learning_dimensions", [])
         if not isinstance(raw_features, dict) or not isinstance(raw_dimensions, list):
             continue
-        dimensions = {str(item) for item in raw_dimensions}
+        dimensions = {str(item) for item in raw_dimensions} - ignored
         for dimension, raw_values in raw_features.items():
             if dimension not in dimensions or not isinstance(raw_values, list):
                 continue
             for raw_value in raw_values:
-                value = str(raw_value)[:100]
+                value = (
+                    canonicalize_location(str(raw_value)) if dimension == "city" else str(raw_value)
+                )[:100]
+                if not value:
+                    continue
                 key = f"{dimension}\x00{value}"
                 entry = mutable_stats.setdefault(
                     key,
@@ -414,7 +444,13 @@ class ReviewLearningService:
         await session.flush()
         return event
 
-    async def summary(self, session: AsyncSession, profile_id: UUID) -> ReviewLearningSummary:
+    async def summary(
+        self,
+        session: AsyncSession,
+        profile_id: UUID,
+        *,
+        ignored_dimensions: Iterable[str] = (),
+    ) -> ReviewLearningSummary:
         setting = await session.scalar(
             select(ReviewLearningSetting).where(ReviewLearningSetting.profile_id == profile_id)
         )
@@ -430,10 +466,16 @@ class ReviewLearningService:
         return _summarize_events(
             events,
             influence_enabled=setting.influence_enabled if setting is not None else True,
+            ignored_dimensions=ignored_dimensions,
         )
 
     async def set_influence(
-        self, session: AsyncSession, profile_id: UUID, *, enabled: bool
+        self,
+        session: AsyncSession,
+        profile_id: UUID,
+        *,
+        enabled: bool,
+        ignored_dimensions: Iterable[str] = (),
     ) -> ReviewLearningSummary:
         setting = await session.scalar(
             select(ReviewLearningSetting).where(ReviewLearningSetting.profile_id == profile_id)
@@ -444,7 +486,11 @@ class ReviewLearningService:
         else:
             setting.influence_enabled = enabled
         await session.flush()
-        return await self.summary(session, profile_id)
+        return await self.summary(
+            session,
+            profile_id,
+            ignored_dimensions=ignored_dimensions,
+        )
 
     def score(
         self, summary: ReviewLearningSummary, job: SourceJob | ReviewJobInput

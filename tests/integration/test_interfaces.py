@@ -1244,6 +1244,7 @@ async def test_admin_review_queue_uses_learned_order_and_explanations(
         assert profile is not None
         assert preferences is not None
         assert resume is not None
+        preferences.allowed_cities = ["Chisinau"]
 
         async def add_review(
             *,
@@ -1404,6 +1405,7 @@ async def test_admin_review_queue_uses_learned_order_and_explanations(
     assert "Раньше вы чаще отклоняли" in queue.text
     assert "чаще принимаете" in queue.text
     assert "чаще отклоняете" in queue.text
+    assert "город:" not in queue.text
 
 
 async def test_admin_vacancy_problem_is_excluded_from_preference_learning(
@@ -1492,8 +1494,12 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             canonical.status = vacancy_statuses[index]
         internal_application = await session.get(Application, internal_review["application_id"])
         internal_contact = await session.get(EmployerContact, internal_review["contact_id"])
+        internal_preferences = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == internal_review["profile_id"])
+        )
         assert internal_application is not None
         assert internal_contact is not None
+        assert internal_preferences is not None
         internal_contact.contact_type = ContactType.INTERNAL_JOB_BOARD
         internal_contact.value = "https://jobs.example.test/jobs/browser-internal-apply"
         internal_application.content_validated = False
@@ -1501,6 +1507,43 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             **internal_application.policy_result,
             "rules_failed": ["verified_email_contact", "letter_validated"],
         }
+        internal_preferences.allowed_cities = ["Chisinau"]
+        for index in range(3):
+            session.add_all(
+                [
+                    ReviewFeedbackEvent(
+                        profile_id=internal_review["profile_id"],
+                        application_id=uuid4(),
+                        match_evaluation_id=internal_application.match_evaluation_id,
+                        canonical_job_id=internal_application.canonical_job_id,
+                        source_job_id=internal_application.source_job_id,
+                        outcome=ReviewOutcome.APPROVED,
+                        actor="browser-city-fixture",
+                        learning_eligible=True,
+                        feature_schema_version="review-v1",
+                        feature_snapshot={
+                            "features": {"city": ["Кишинев"]},
+                            "learning_dimensions": ["city"],
+                        },
+                    ),
+                    ReviewFeedbackEvent(
+                        profile_id=internal_review["profile_id"],
+                        application_id=uuid4(),
+                        match_evaluation_id=internal_application.match_evaluation_id,
+                        canonical_job_id=internal_application.canonical_job_id,
+                        source_job_id=internal_application.source_job_id,
+                        outcome=ReviewOutcome.REJECTED,
+                        reason_code=ReviewReason.ROLE,
+                        actor="browser-city-fixture",
+                        learning_eligible=True,
+                        feature_schema_version="review-v1",
+                        feature_snapshot={
+                            "features": {"title": [f"unrelated-{index}"]},
+                            "learning_dimensions": ["title"],
+                        },
+                    ),
+                ]
+            )
         await session.commit()
     with socket.socket() as port_socket:
         port_socket.bind(("127.0.0.1", 0))
@@ -1618,6 +1661,15 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     await expect(page.locator(".action-notice.warning")).to_contain_text(
                         "Одобрение недоступно"
                     )
+                    await page.goto(
+                        f"{base_url}/?view=decisions&profile_id={internal_review['profile_id']}"
+                    )
+                    await expect(
+                        page.locator("details.learning-control > summary")
+                    ).to_contain_text("Обучение: учитывает решения")
+                    await expect(page.locator(".queue-learning-hint")).to_have_count(0)
+                    await page.locator("details.learning-control > summary").click()
+                    await expect(page.locator(".learning-popover")).not_to_contain_text("город:")
                     await context.close()
             finally:
                 await browser.close()

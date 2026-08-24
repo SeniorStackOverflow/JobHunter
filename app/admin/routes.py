@@ -46,6 +46,7 @@ from app.learning import (
     LearnedReviewScore,
     ReviewJobInput,
     ReviewLearningService,
+    fixed_preference_dimensions,
 )
 from app.matching.providers import MATCHING_RULES_VERSION
 from app.models.entities import (
@@ -880,7 +881,11 @@ async def dashboard(
         )
     elif view == "decisions":
         learning_service = ReviewLearningService()
-        learning_summary = await learning_service.summary(session, selected_profile_id)
+        learning_summary = await learning_service.summary(
+            session,
+            selected_profile_id,
+            ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+        )
         decision_statuses = {
             "pending_review": [ApplicationStatus.PENDING_REVIEW, ApplicationStatus.PREPARED],
             "approved": [ApplicationStatus.APPROVED, ApplicationStatus.AUTO_APPROVED],
@@ -1771,7 +1776,13 @@ async def admin_set_review_learning_influence(
     profile = await ProfileService().get_profile(session, profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="profile not found")
-    await ReviewLearningService().set_influence(session, profile.id, enabled=enabled)
+    preferences = await ProfileService().get_preferences(session, profile.id)
+    await ReviewLearningService().set_influence(
+        session,
+        profile.id,
+        enabled=enabled,
+        ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+    )
     await _audit_admin(
         session,
         "review_learning.influence_changed",

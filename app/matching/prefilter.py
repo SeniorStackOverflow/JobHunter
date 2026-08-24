@@ -185,6 +185,13 @@ def _normalize(value: str | None) -> str:
     return normalize_for_fingerprint(value)
 
 
+def canonicalize_location(value: str | None) -> str:
+    """Return one stable value for supported location spellings and transliterations."""
+
+    normalized = _normalize(value)
+    return _LOCATION_CANONICAL.get(normalized, normalized)
+
+
 def _policy_matches(candidates: Iterable[str], policies: Iterable[str]) -> bool:
     normalized_candidates = [_normalize(item) for item in candidates if _normalize(item)]
     for policy in policies:
@@ -212,14 +219,10 @@ def _category_policy_matches(candidates: Iterable[str], policies: Iterable[str])
 
 def _location_policy_matches(candidates: Iterable[str], policies: Iterable[str]) -> bool:
     canonical_candidates = [
-        _LOCATION_CANONICAL.get(normalized, normalized)
-        for value in candidates
-        if (normalized := _normalize(value))
+        canonical for value in candidates if (canonical := canonicalize_location(value))
     ]
     canonical_policies = [
-        _LOCATION_CANONICAL.get(normalized, normalized)
-        for value in policies
-        if (normalized := _normalize(value))
+        canonical for value in policies if (canonical := canonicalize_location(value))
     ]
     return _policy_matches(canonical_candidates, canonical_policies)
 

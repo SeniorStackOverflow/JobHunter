@@ -21,7 +21,11 @@ from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
 from app.crawlers.source_control import disable_source_record, enable_source_record
 from app.email.service import EmailService
-from app.learning import ReviewLearningService, review_reason_labels
+from app.learning import (
+    ReviewLearningService,
+    fixed_preference_dimensions,
+    review_reason_labels,
+)
 from app.models.entities import (
     Application,
     BatchScanRun,
@@ -1169,8 +1173,14 @@ async def get_review_queue(limit: int = 50, profile_id: str | None = None) -> di
                 )
             ).all()
         )
+        profile_service = ProfileService()
+        preferences = await profile_service.get_preferences(session, profile.id)
         learning_service = ReviewLearningService()
-        learning_summary = await learning_service.summary(session, profile.id)
+        learning_summary = await learning_service.summary(
+            session,
+            profile.id,
+            ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+        )
         ranked: list[tuple[int, int, dict[str, Any]]] = []
         for original_order, (application, job) in enumerate(rows):
             score = learning_service.score(learning_summary, job)
@@ -1224,7 +1234,12 @@ async def get_review_learning_status(profile_id: str | None = None) -> dict[str,
         )
         if profile is None:
             raise ValueError("profile not found")
-        summary = await ReviewLearningService().summary(session, profile.id)
+        preferences = await ProfileService().get_preferences(session, profile.id)
+        summary = await ReviewLearningService().summary(
+            session,
+            profile.id,
+            ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+        )
         return {
             "profile_id": str(profile.id),
             **summary.as_dict(),
@@ -1247,7 +1262,13 @@ async def set_review_learning_influence(
         )
         if profile is None:
             raise ValueError("profile not found")
-        summary = await ReviewLearningService().set_influence(session, profile.id, enabled=enabled)
+        preferences = await ProfileService().get_preferences(session, profile.id)
+        summary = await ReviewLearningService().set_influence(
+            session,
+            profile.id,
+            enabled=enabled,
+            ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+        )
         await record_audit_event(
             session,
             actor="mcp",

@@ -6,6 +6,7 @@ from app.learning.service import (
     ReviewLearningError,
     ReviewLearningService,
     ReviewLearningSummary,
+    fixed_preference_dimensions,
     review_job_input,
     review_reason_labels,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ReviewLearningError",
     "ReviewLearningService",
     "ReviewLearningSummary",
+    "fixed_preference_dimensions",
     "review_job_input",
     "review_reason_labels",
 ]
