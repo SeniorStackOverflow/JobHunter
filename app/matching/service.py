@@ -90,6 +90,15 @@ async def _priority_rematch_source_ids(
     session: AsyncSession,
     profile_id: UUID,
 ) -> set[UUID]:
+    latest_relevant_snapshots = (
+        select(
+            JobSnapshot.source_job_id.label("source_job_id"),
+            func.max(JobSnapshot.timestamp).label("snapshot_at"),
+        )
+        .where(JobSnapshot.requires_rematch.is_(True))
+        .group_by(JobSnapshot.source_job_id)
+        .subquery()
+    )
     rows = (
         await session.execute(
             select(
@@ -97,7 +106,23 @@ async def _priority_rematch_source_ids(
                 Application.status,
                 Application.policy_decision,
                 Application.policy_result,
-            ).where(
+                MatchEvaluation,
+                SourceJob,
+                latest_relevant_snapshots.c.snapshot_at,
+            )
+            .outerjoin(
+                MatchEvaluation,
+                MatchEvaluation.id == Application.match_evaluation_id,
+            )
+            .outerjoin(
+                SourceJob,
+                SourceJob.id == Application.source_job_id,
+            )
+            .outerjoin(
+                latest_relevant_snapshots,
+                latest_relevant_snapshots.c.source_job_id == Application.source_job_id,
+            )
+            .where(
                 Application.profile_id == profile_id,
                 Application.status.in_(
                     {
@@ -109,14 +134,33 @@ async def _priority_rematch_source_ids(
         )
     ).all()
     priority: set[UUID] = set()
-    for source_job_id, status, policy_decision, policy_result in rows:
+    for (
+        source_job_id,
+        status,
+        policy_decision,
+        policy_result,
+        evaluation,
+        job,
+        snapshot_at,
+    ) in rows:
         safe_stop_reason = (
             policy_result.get("safe_stop_reason") if isinstance(policy_result, dict) else None
+        )
+        evaluation_is_stale = (
+            evaluation is None
+            or job is None
+            or evaluation.profile_id != profile_id
+            or evaluation.source_job_id != source_job_id
+            or evaluation.canonical_job_id != job.canonical_job_id
+            or evaluation.source_matching_hash is None
+            or evaluation.source_matching_hash != job.matching_content_hash
+            or (snapshot_at is not None and snapshot_at > evaluation.created_at)
         )
         if (
             status == ApplicationStatus.AUTO_APPROVED
             or policy_decision == PolicyDecision.AUTO_APPROVED
             or safe_stop_reason in _PRIORITY_REMATCH_SAFE_STOPS
+            or evaluation_is_stale
         ):
             priority.add(source_job_id)
     return priority

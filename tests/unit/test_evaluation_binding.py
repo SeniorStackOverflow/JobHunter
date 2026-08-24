@@ -288,6 +288,11 @@ async def test_manual_approval_rejects_markerless_stale_evaluation(
         application_id = application.id
         graph["job_b"].content_hash = "7" * 64
         graph["job_b"].matching_content_hash = "7" * 64
+        await session.flush()
+
+        priority = await _priority_rematch_source_ids(session, graph["profile"].id)
+
+        assert graph["job_b"].id in priority
         await session.commit()
 
         with pytest.raises(ApplicationPreparationError, match="match evaluation is stale"):
@@ -361,6 +366,7 @@ async def test_manual_approval_accepts_metadata_only_source_revision(
         job = graph["job_b"]
         evaluation = graph["evaluation_b"]
         application.status = ApplicationStatus.PENDING_REVIEW
+        application.policy_decision = PolicyDecision.PENDING_REVIEW
         job.content_hash = "6" * 64
         session.add(
             JobSnapshot(
@@ -376,6 +382,9 @@ async def test_manual_approval_accepts_metadata_only_source_revision(
             )
         )
         await session.flush()
+
+        priority = await _priority_rematch_source_ids(session, graph["profile"].id)
+        assert job.id not in priority
 
         approved = await ApplicationService(current_settings).approve(
             session,
