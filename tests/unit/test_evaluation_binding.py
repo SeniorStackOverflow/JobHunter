@@ -10,7 +10,10 @@ import pytest
 from sqlalchemy import select
 
 from app.applications import ApplicationService
-from app.applications.service import prepare_pending_applications
+from app.applications.service import (
+    ApplicationPreparationError,
+    prepare_pending_applications,
+)
 from app.contacts import ContactDiscoveryService
 from app.email.providers import FakeGmailProvider
 from app.email.service import EmailSendBlocked, EmailService
@@ -261,6 +264,33 @@ async def test_stale_pending_application_is_selected_for_priority_rematch(
         priority = await _priority_rematch_source_ids(session, graph["profile"].id)
 
         assert graph["job_b"].id in priority
+
+
+async def test_manual_approval_rejects_markerless_stale_evaluation(
+    sqlite_session_factory,
+    tmp_path: Path,
+) -> None:
+    current_settings = _settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        graph = await _duplicate_graph(session, tmp_path)
+        application = await ApplicationService(current_settings).prepare(
+            session,
+            graph["canonical"].id,
+        )
+        assert application.source_job_id == graph["job_b"].id
+        application.status = ApplicationStatus.PENDING_REVIEW
+        application_id = application.id
+        graph["job_b"].content_hash = "7" * 64
+        await session.commit()
+
+        with pytest.raises(ApplicationPreparationError, match="match evaluation is stale"):
+            await ApplicationService(current_settings).approve(session, application_id)
+        await session.rollback()
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.PENDING_REVIEW
 
 
 async def test_sender_cannot_use_newest_duplicate_evaluation_for_stale_publication(

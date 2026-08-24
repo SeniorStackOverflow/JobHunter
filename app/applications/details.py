@@ -10,11 +10,13 @@ from app.applications.reconciliation import (
     delivery_is_stale,
     delivery_reconcile_available_at,
 )
+from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
     Application,
     EmailDelivery,
     EmployerContact,
     JobSource,
+    MatchEvaluation,
     Resume,
     SourceJob,
 )
@@ -37,12 +39,30 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
     if application is None:
         raise LookupError(f"application {application_id} does not exist")
     job = await session.get(SourceJob, application.source_job_id)
+    evaluation = (
+        await session.get(MatchEvaluation, application.match_evaluation_id)
+        if application.match_evaluation_id is not None
+        else None
+    )
     resume = await session.get(Resume, application.resume_id)
     contact = await session.get(EmployerContact, application.recipient_contact_id)
     delivery = await session.scalar(
         select(EmailDelivery).where(EmailDelivery.application_id == application.id)
     )
     source = await session.get(JobSource, job.source_id) if job is not None else None
+
+    if (
+        job is None
+        or evaluation is None
+        or evaluation.profile_id != application.profile_id
+        or evaluation.source_job_id != application.source_job_id
+        or evaluation.canonical_job_id != application.canonical_job_id
+    ):
+        match_evaluation_issue = "invalid_match_evaluation_binding"
+    elif not await evaluation_is_current(session, evaluation, job):
+        match_evaluation_issue = "match_evaluation_stale"
+    else:
+        match_evaluation_issue = None
 
     policy_result = application.policy_result if isinstance(application.policy_result, dict) else {}
     failed_rules = policy_result.get("rules_failed", [])
@@ -90,6 +110,7 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
             )
             or {}
         ),
+        "match_evaluation_issue": match_evaluation_issue,
         "failed_policy_rules": [str(item) for item in failed_rules],
         "job": _fields(
             job,

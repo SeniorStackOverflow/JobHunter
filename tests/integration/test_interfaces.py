@@ -1507,12 +1507,14 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             canonical.status = vacancy_statuses[index]
         internal_application = await session.get(Application, internal_review["application_id"])
         stale_application = await session.get(Application, stale_review["application_id"])
+        stale_source_job = await session.get(SourceJob, stale_review["source_job_id"])
         internal_contact = await session.get(EmployerContact, internal_review["contact_id"])
         internal_preferences = await session.scalar(
             select(JobPreference).where(JobPreference.profile_id == internal_review["profile_id"])
         )
         assert internal_application is not None
         assert stale_application is not None
+        assert stale_source_job is not None
         assert internal_contact is not None
         assert internal_preferences is not None
         internal_resume = await session.get(Resume, internal_application.resume_id)
@@ -1525,15 +1527,14 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             "rules_failed": ["verified_email_contact", "letter_validated"],
         }
         stale_application.status = ApplicationStatus.PENDING_REVIEW
-        stale_application.policy_decision = PolicyDecision.PENDING_REVIEW
+        stale_application.policy_decision = PolicyDecision.AUTO_APPROVED
         stale_application.content_validated = True
         stale_application.policy_result = {
             **stale_application.policy_result,
-            "decision": "pending_review",
-            "rules_failed": ["match_evaluation_current"],
-            "safe_stop_reason": "match_evaluation_stale",
-            "requires_rematch": True,
+            "decision": "auto_approved",
+            "rules_failed": [],
         }
+        stale_source_job.content_hash = "f" * 64
         internal_preferences.allowed_cities = ["Chisinau"]
         for index in range(3):
             session.add_all(
@@ -1632,6 +1633,20 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     await expect(
                         page.get_by_role("button", name="Одобрение недоступно")
                     ).to_be_disabled()
+                    if index == 0:
+                        stale_csrf = await page.locator(
+                            'form[action$="/reject"] input[name="csrf_token"]'
+                        ).input_value()
+                        direct_approval = await context.request.post(
+                            f"{base_url}/admin/applications/{stale_review['application_id']}/approve",
+                            form={"csrf_token": stale_csrf},
+                            max_redirects=0,
+                        )
+                        assert direct_approval.status == 303
+                        assert direct_approval.headers["location"] == (
+                            f"/admin/applications/{stale_review['application_id']}"
+                            "?notice=application_approval_stale_evaluation"
+                        )
                     await page.goto(f"{base_url}/admin/applications/{seeded['application_id']}")
                     await expect(
                         page.get_by_text(f"Saved browser vacancy description {index}.")

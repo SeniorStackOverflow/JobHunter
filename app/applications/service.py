@@ -339,11 +339,30 @@ class ApplicationService:
             )
         if not application.content_validated:
             raise ApplicationPreparationError("application content has not passed validation")
+        policy_result = (
+            application.policy_result if isinstance(application.policy_result, dict) else {}
+        )
+        if policy_result.get("requires_rematch") is True or policy_result.get(
+            "safe_stop_reason"
+        ) in {
+            "match_evaluation_stale",
+            "match_evaluation_inputs_stale",
+        }:
+            raise ApplicationPreparationError("match evaluation is stale")
         source_job = await session.scalar(
             select(SourceJob).where(SourceJob.id == application.source_job_id).with_for_update()
         )
         if source_job is None or source_job.status != JobStatus.ACTIVE:
             raise ApplicationPreparationError("vacancy is no longer active")
+        evaluation = await session.get(MatchEvaluation, application.match_evaluation_id)
+        if (
+            evaluation is None
+            or evaluation.profile_id != application.profile_id
+            or evaluation.source_job_id != application.source_job_id
+            or evaluation.canonical_job_id != application.canonical_job_id
+            or not await evaluation_is_current(session, evaluation, source_job)
+        ):
+            raise ApplicationPreparationError("match evaluation is stale")
         ensure_transition(application.status, ApplicationStatus.APPROVED)
         application.status = ApplicationStatus.APPROVED
         await session.flush()

@@ -238,6 +238,10 @@ _FEEDBACK_NOTICES = {
         "Одобрение недоступно",
         "Вакансия больше не активна. Отклик остался в безопасном состоянии.",
     ),
+    "application_approval_stale_evaluation": (
+        "Требуется повторный анализ",
+        "Вакансия или данные профиля изменились. Одобрение станет доступно после переоценки.",
+    ),
     "application_approval_unavailable": (
         "Одобрение не выполнено",
         "Состояние отклика изменилось или он не готов к одобрению. "
@@ -266,6 +270,7 @@ _FEEDBACK_NOTICE_TONES = {
     "application_approval_no_email": "warning",
     "application_approval_invalid_content": "danger",
     "application_approval_inactive_vacancy": "warning",
+    "application_approval_stale_evaluation": "warning",
     "application_approval_unavailable": "danger",
 }
 
@@ -354,10 +359,19 @@ def _application_approval_issue(application: Any) -> str | None:
     """Explain why a review cannot currently become an approved email application."""
 
     safe_stop_reason = _application_safe_stop_reason(application)
-    if safe_stop_reason == "match_evaluation_stale":
+    if isinstance(application, dict):
+        match_evaluation_issue = application.get("match_evaluation_issue")
+    else:
+        match_evaluation_issue = getattr(application, "match_evaluation_issue", None)
+    if (
+        safe_stop_reason == "match_evaluation_stale"
+        or match_evaluation_issue == "match_evaluation_stale"
+    ):
         return "Вакансия изменилась — JobHunter выполняет повторный анализ."
     if safe_stop_reason == "match_evaluation_inputs_stale":
         return "Профиль или настройки изменились — JobHunter выполняет повторный анализ."
+    if match_evaluation_issue == "invalid_match_evaluation_binding":
+        return "Проверка соответствия вакансии недоступна — JobHunter выполняет повторный анализ."
     if _application_content_validated(application):
         return None
     if "verified_email_contact" in _application_failed_policy_rules(application):
@@ -376,6 +390,8 @@ def _approval_failure_notice(application: Application | None, error: Exception) 
         return "application_approval_invalid_content"
     if message == "vacancy is no longer active":
         return "application_approval_inactive_vacancy"
+    if message == "match evaluation is stale":
+        return "application_approval_stale_evaluation"
     return "application_approval_unavailable"
 
 

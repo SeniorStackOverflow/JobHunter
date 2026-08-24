@@ -596,14 +596,18 @@ async def test_delivery_preflight_keeps_current_auto_approved_application(
         assert stored.policy_decision == PolicyDecision.AUTO_APPROVED
 
 
+@pytest.mark.parametrize(
+    "application_status",
+    [ApplicationStatus.AUTO_APPROVED, ApplicationStatus.PENDING_REVIEW],
+)
 async def test_delivery_preflight_moves_stale_application_to_priority_rematch(
-    sqlite_session_factory, tmp_path: Path
+    sqlite_session_factory, tmp_path: Path, application_status: ApplicationStatus
 ) -> None:
     async with sqlite_session_factory() as session:
         values = await make_graph(session, tmp_path)
         job = values[5]
         application = values[8]
-        application.status = ApplicationStatus.AUTO_APPROVED
+        application.status = application_status
         application.policy_decision = PolicyDecision.AUTO_APPROVED
         application.policy_result = {
             "decision": "auto_approved",

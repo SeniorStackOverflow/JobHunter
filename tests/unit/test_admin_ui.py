@@ -51,6 +51,21 @@ def test_admin_explains_stale_review_even_when_letter_was_validated() -> None:
     )
 
 
+def test_admin_explains_markerless_legacy_stale_review() -> None:
+    application = {
+        "content_validated": True,
+        "policy_result": {
+            "decision": "auto_approved",
+            "rules_failed": [],
+        },
+        "match_evaluation_issue": "match_evaluation_stale",
+    }
+
+    assert _application_approval_issue(application) == (
+        "Вакансия изменилась — JobHunter выполняет повторный анализ."
+    )
+
+
 def test_admin_javascript_initializes_every_custom_control() -> None:
     script = Path("app/admin/static/admin.js").read_text(encoding="utf-8")
 

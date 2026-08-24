@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
@@ -172,7 +172,7 @@ class EmailService:
         self,
         session: AsyncSession,
     ) -> dict[str, int]:
-        """Move unsafe AUTO_APPROVED rows out of the sender queue before delivery."""
+        """Reconcile unsafe current and legacy auto-approval states before delivery."""
 
         rows = (
             await session.execute(
@@ -193,7 +193,15 @@ class EmailService:
                         MatchEvaluation.canonical_job_id == Application.canonical_job_id,
                     ),
                 )
-                .where(Application.status == ApplicationStatus.AUTO_APPROVED)
+                .where(
+                    or_(
+                        Application.status == ApplicationStatus.AUTO_APPROVED,
+                        and_(
+                            Application.status == ApplicationStatus.PENDING_REVIEW,
+                            Application.policy_decision == PolicyDecision.AUTO_APPROVED,
+                        ),
+                    )
+                )
                 .with_for_update(of=Application)
             )
         ).all()
