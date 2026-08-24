@@ -23,6 +23,7 @@ from app.crawlers.source_control import disable_source_record, enable_source_rec
 from app.email.service import EmailService
 from app.learning import (
     ReviewLearningService,
+    ReviewLearningSummary,
     fixed_preference_dimensions,
     review_reason_labels,
 )
@@ -1176,14 +1177,34 @@ async def get_review_queue(limit: int = 50, profile_id: str | None = None) -> di
         profile_service = ProfileService()
         preferences = await profile_service.get_preferences(session, profile.id)
         learning_service = ReviewLearningService()
+        ignored_learning_dimensions = fixed_preference_dimensions(preferences.allowed_cities)
         learning_summary = await learning_service.summary(
             session,
             profile.id,
-            ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+            ignored_dimensions=ignored_learning_dimensions,
         )
+        resume_ids = {application.resume_id for application, _job in rows}
+        resumes = {
+            resume.id: resume
+            for resume in (
+                await session.scalars(select(Resume).where(Resume.id.in_(resume_ids)))
+            ).all()
+        }
+        summaries_by_resume_category: dict[str | None, ReviewLearningSummary] = {}
         ranked: list[tuple[int, int, dict[str, Any]]] = []
         for original_order, (application, job) in enumerate(rows):
-            score = learning_service.score(learning_summary, job)
+            resume = resumes.get(application.resume_id)
+            resume_category = resume.category if resume is not None else None
+            category_summary = summaries_by_resume_category.get(resume_category)
+            if category_summary is None:
+                category_summary = await learning_service.summary(
+                    session,
+                    profile.id,
+                    ignored_dimensions=ignored_learning_dimensions,
+                    resume_category=resume_category,
+                )
+                summaries_by_resume_category[resume_category] = category_summary
+            score = learning_service.score(category_summary, job)
             ranked.append(
                 (
                     score.value if score is not None else 50,
@@ -1211,7 +1232,7 @@ async def get_review_queue(limit: int = 50, profile_id: str | None = None) -> di
                     },
                 )
             )
-        if learning_summary.ready and learning_summary.influence_enabled:
+        if learning_summary.influence_enabled:
             ranked.sort(key=lambda item: (-item[0], item[1]))
         return {
             "profile_id": str(profile.id),

@@ -46,6 +46,7 @@ from app.learning import (
     LearnedReviewScore,
     ReviewJobInput,
     ReviewLearningService,
+    ReviewLearningSummary,
     fixed_preference_dimensions,
 )
 from app.matching.providers import MATCHING_RULES_VERSION
@@ -881,10 +882,11 @@ async def dashboard(
         )
     elif view == "decisions":
         learning_service = ReviewLearningService()
+        ignored_learning_dimensions = fixed_preference_dimensions(preferences.allowed_cities)
         learning_summary = await learning_service.summary(
             session,
             selected_profile_id,
-            ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+            ignored_dimensions=ignored_learning_dimensions,
         )
         decision_statuses = {
             "pending_review": [ApplicationStatus.PENDING_REVIEW, ApplicationStatus.PREPARED],
@@ -923,14 +925,15 @@ async def dashboard(
         pagination = _pagination(total, page, 10)
         if (
             status_filter == "pending_review"
-            and learning_summary.ready
             and learning_summary.influence_enabled
+            and learning_summary.approved + learning_summary.rejected > 0
         ):
             feature_rows = (
                 await session.execute(
                     select(
                         Application.id,
                         Application.created_at,
+                        Resume.category.label("resume_category"),
                         SourceJob.title,
                         SourceJob.company,
                         SourceJob.category,
@@ -947,14 +950,25 @@ async def dashboard(
                         SourceJob.salary_text,
                     )
                     .join(SourceJob, SourceJob.id == Application.source_job_id)
+                    .join(Resume, Resume.id == Application.resume_id)
                     .where(*conditions)
                     .order_by(desc(Application.created_at))
                 )
             ).all()
             ranked_ids: list[tuple[UUID, int, int]] = []
+            summaries_by_resume_category: dict[str, ReviewLearningSummary] = {}
             for original_order, row in enumerate(feature_rows):
+                category_summary = summaries_by_resume_category.get(row.resume_category)
+                if category_summary is None:
+                    category_summary = await learning_service.summary(
+                        session,
+                        selected_profile_id,
+                        ignored_dimensions=ignored_learning_dimensions,
+                        resume_category=row.resume_category,
+                    )
+                    summaries_by_resume_category[row.resume_category] = category_summary
                 score = learning_service.score(
-                    learning_summary,
+                    category_summary,
                     ReviewJobInput(
                         title=row.title,
                         company=row.company,
@@ -967,11 +981,9 @@ async def dashboard(
                         employment_type=row.employment_type,
                         required_experience=row.required_experience,
                         no_experience=row.no_experience,
-                        salary_present=(
-                            row.salary_min is not None
-                            or row.salary_max is not None
-                            or bool(row.salary_text)
-                        ),
+                        salary_text=row.salary_text,
+                        salary_min=row.salary_min,
+                        salary_max=row.salary_max,
                     ),
                 )
                 if score is not None:

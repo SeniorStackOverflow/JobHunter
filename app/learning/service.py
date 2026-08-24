@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -13,13 +14,15 @@ from app.matching.prefilter import canonicalize_location
 from app.models.entities import (
     Application,
     MatchEvaluation,
+    Resume,
     ReviewFeedbackEvent,
     ReviewLearningSetting,
     SourceJob,
 )
 from app.models.enums import ReviewOutcome, ReviewReason
 
-FEATURE_SCHEMA_VERSION = "review-v1"
+FEATURE_SCHEMA_VERSION = "review-v2"
+LEGACY_FEATURE_SCHEMA_VERSION = "review-v1"
 MINIMUM_LABELS = 6
 MINIMUM_PER_OUTCOME = 2
 
@@ -42,29 +45,48 @@ _ALL_DIMENSIONS = (
     "category",
     "title",
     "city",
+    "area",
     "schedule",
     "workplace",
-    "employment",
     "experience",
     "company",
     "salary",
 )
+_LEGACY_COMPATIBLE_DIMENSIONS = frozenset(
+    {
+        "category",
+        "title",
+        "city",
+        "area",
+        "schedule",
+        "workplace",
+        "experience",
+        "company",
+    }
+)
+_SCHEMA_DIMENSIONS = {
+    LEGACY_FEATURE_SCHEMA_VERSION: _LEGACY_COMPATIBLE_DIMENSIONS,
+    FEATURE_SCHEMA_VERSION: frozenset(_ALL_DIMENSIONS),
+}
+_RESUME_DEPENDENT_DIMENSIONS = frozenset({"category", "title", "experience"})
 _REJECTION_DIMENSIONS = {
     ReviewReason.ROLE: ("category", "title"),
     ReviewReason.SALARY: ("salary",),
-    ReviewReason.SCHEDULE: ("schedule", "employment"),
-    ReviewReason.LOCATION: ("city", "workplace"),
+    ReviewReason.SCHEDULE: ("schedule",),
+    ReviewReason.LOCATION: ("city", "area", "workplace"),
     ReviewReason.COMPANY: ("company",),
     ReviewReason.REQUIREMENTS: ("experience",),
-    ReviewReason.OTHER: _ALL_DIMENSIONS,
+    # An unstructured rejection is a real owner decision, but it is not evidence
+    # that every visible attribute caused the rejection.
+    ReviewReason.OTHER: (),
 }
 _DIMENSION_LABELS = {
     "category": "категория",
     "title": "должность",
     "city": "город",
+    "area": "район",
     "schedule": "график",
     "workplace": "формат работы",
-    "employment": "занятость",
     "experience": "опыт",
     "company": "компания",
     "salary": "зарплата",
@@ -83,6 +105,32 @@ _CITY_LABELS = {
     "balti": "Бельцы",
     "chisinau": "Кишинёв",
 }
+_SCHEDULE_LABELS = {
+    "flexible": "гибкий",
+    "full_time": "полный день",
+    "part_time": "частичная занятость",
+    "shifts": "сменный",
+}
+_SALARY_LABELS = {
+    "missing": "не указана",
+    "numeric": "указана числом",
+    "textual": "указана без суммы",
+}
+
+_NO_EXPERIENCE = re.compile(
+    r"\bno\s+experience\b|\bwithout\s+experience\b|"
+    r"без\s+опыта|опыт\s+не\s+требуется|f[ăa]r[ăa]\s+experien[țt][ăa]",
+    re.IGNORECASE,
+)
+_REMOTE_LOCATION = re.compile(
+    r"\bremote\b|удал\w*\s*н|distan[țt][ăa]|distanta",
+    re.IGNORECASE,
+)
+_MISSING_SALARY = re.compile(
+    r"^(?:не\s+указан[ао]?|not\s+(?:specified|provided)|"  # noqa: RUF001
+    r"nespecificat[ăa]?|nu\s+este\s+specificat[ăa]?)\.?$",
+    re.IGNORECASE,
+)
 
 
 class ReviewLearningError(ValueError):
@@ -102,7 +150,9 @@ class ReviewJobInput:
     employment_type: str | None = None
     required_experience: str | None = None
     no_experience: bool | None = None
-    salary_present: bool = False
+    salary_text: str | None = None
+    salary_min: Decimal | None = None
+    salary_max: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +165,24 @@ class _FeatureStat:
     @property
     def support(self) -> int:
         return self.approved + self.rejected
+
+
+@dataclass(frozen=True, slots=True)
+class _DimensionStat:
+    approved: int = 0
+    rejected: int = 0
+
+    @property
+    def support(self) -> int:
+        return self.approved + self.rejected
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.support >= MINIMUM_LABELS
+            and self.approved >= MINIMUM_PER_OUTCOME
+            and self.rejected >= MINIMUM_PER_OUTCOME
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +224,7 @@ class ReviewLearningSummary:
     status_label: str
     proposals: tuple[LearningProposal, ...]
     _feature_stats: dict[str, _FeatureStat] = field(repr=False)
+    _dimension_stats: dict[str, _DimensionStat] = field(repr=False)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -206,10 +275,87 @@ def review_job_input(job: SourceJob) -> ReviewJobInput:
         employment_type=job.employment_type,
         required_experience=job.required_experience,
         no_experience=job.no_experience,
-        salary_present=(
-            job.salary_min is not None or job.salary_max is not None or bool(job.salary_text)
-        ),
+        salary_text=job.salary_text,
+        salary_min=job.salary_min,
+        salary_max=job.salary_max,
     )
+
+
+def _canonical_schedule(value: str | None) -> str | None:
+    normalized = _normalized(value)
+    if normalized is None:
+        return None
+    if any(marker in normalized for marker in ("частичная занятость", "part-time", "part time")):
+        return "part_time"
+    if any(
+        marker in normalized
+        for marker in ("по сменному графику", "сменн", "în ture", "in ture", "shift")
+    ):
+        return "shifts"
+    if any(marker in normalized for marker in ("гибк", "свободный график", "flexibil")):
+        return "flexible"
+    if normalized in {"полный день", "full-time", "full time"}:
+        return "full_time"
+    return normalized
+
+
+def _canonical_experience(value: str | None, no_experience: bool | None = None) -> str | None:
+    normalized = _normalized(value)
+    if normalized is not None:
+        if _NO_EXPERIENCE.search(normalized):
+            return "без опыта"
+        if "более 5" in normalized or re.search(r"\b(?:over|peste)\s+5\b", normalized):
+            return "от 5 лет"
+        years = re.search(
+            # The Cyrillic alternatives and en dash are intentional source text.
+            r"(?:\bот\s*|\bmin(?:im(?:um)?)?\s*|\bat\s+least\s*)"  # noqa: RUF001
+            r"([1-5])(?:\s*[-–]\s*\d+)?\s*(?:лет|год|ani|years?)?",  # noqa: RUF001
+            normalized,
+        )
+        if years:
+            return f"от {years.group(1)} лет"
+        if normalized == "до года":
+            return "до года"
+        if normalized in {
+            "с опытом",  # noqa: RUF001
+            "experience required",
+            "cu experiență",
+            "cu experienta",
+        }:
+            return "опыт требуется"
+        return normalized
+    if no_experience is not None:
+        return "без опыта" if no_experience else "опыт требуется"
+    return None
+
+
+def _salary_state(job: ReviewJobInput) -> str:
+    if job.salary_min is not None or job.salary_max is not None:
+        return "numeric"
+    text = _normalized(job.salary_text, limit=500)
+    if text is None or _MISSING_SALARY.fullmatch(text):
+        return "missing"
+    return "textual"
+
+
+def _location_features(job: ReviewJobInput) -> tuple[list[str], list[str]]:
+    values = _unique(
+        [
+            canonicalize_location(job.location),
+            *(canonicalize_location(item) for item in job.cities),
+        ]
+    )
+    primary = canonicalize_location(job.location) or (values[0] if values else None)
+    cities: list[str] = []
+    areas: list[str] = []
+    for value in values:
+        if _REMOTE_LOCATION.search(value):
+            continue
+        if value == primary or value in _CITY_LABELS:
+            cities.append(value)
+        else:
+            areas.append(value)
+    return cities[:4], areas[:4]
 
 
 def _feature_snapshot(job: ReviewJobInput) -> dict[str, list[str]]:
@@ -223,32 +369,97 @@ def _feature_snapshot(job: ReviewJobInput) -> dict[str, list[str]]:
     categories = _unique(
         [_normalized(job.category), *(_normalized(item) for item in job.categories_seen)]
     )[:4]
-    cities = _unique(
-        [
-            *(canonicalize_location(item) for item in job.cities),
-            canonicalize_location(job.location),
-        ]
-    )[:4]
-    experience = _normalized(job.required_experience)
-    if experience is None and job.no_experience is not None:
-        experience = "без опыта" if job.no_experience else "опыт требуется"
+    cities, areas = _location_features(job)
+    experience = _canonical_experience(job.required_experience, job.no_experience)
     return {
         "category": categories,
         "title": title_terms,
         "city": cities,
-        "schedule": _unique([_normalized(job.schedule)]),
+        "area": areas,
+        "schedule": _unique([_canonical_schedule(job.schedule)]),
         "workplace": _unique([_normalized(job.workplace_type)]),
-        "employment": _unique([_normalized(job.employment_type)]),
         "experience": _unique([experience]),
         "company": _unique([_normalized(job.company)]),
-        "salary": ["указана" if job.salary_present else "не указана"],
+        "salary": [_salary_state(job)],
     }
 
 
 def _feature_label(dimension: str, value: str) -> str:
     if dimension == "city":
         value = _CITY_LABELS.get(value, value)
+    elif dimension == "schedule":
+        value = _SCHEDULE_LABELS.get(value, value)
+    elif dimension == "salary":
+        value = _SALARY_LABELS.get(value, value)
     return f"{_DIMENSION_LABELS.get(dimension, dimension)}: {value}"
+
+
+def _normalized_feature_value(dimension: str, value: Any) -> str | None:
+    raw = str(value)
+    if dimension == "city":
+        return canonicalize_location(raw) or None
+    if dimension == "schedule":
+        return _canonical_schedule(raw)
+    if dimension == "experience":
+        return _canonical_experience(raw)
+    return _normalized(raw)
+
+
+def _event_features(event: ReviewFeedbackEvent) -> dict[str, list[str]]:
+    raw_features = event.feature_snapshot.get("features", {})
+    if not isinstance(raw_features, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for raw_dimension, raw_values in raw_features.items():
+        dimension = str(raw_dimension)
+        if not isinstance(raw_values, list):
+            continue
+        values = _unique(
+            [_normalized_feature_value(dimension, raw_value) for raw_value in raw_values]
+        )
+        if event.feature_schema_version == LEGACY_FEATURE_SCHEMA_VERSION and dimension == "city":
+            primary = values[0] if values else None
+            result["city"] = [
+                value for value in values if value == primary or value in _CITY_LABELS
+            ][:4]
+            result["area"] = [
+                value
+                for value in values
+                if value != primary
+                and value not in _CITY_LABELS
+                and not _REMOTE_LOCATION.search(value)
+            ][:4]
+            continue
+        result[dimension] = values[:8]
+    return result
+
+
+def _event_resume_category(
+    event: ReviewFeedbackEvent,
+    resume_categories_by_sha: Mapping[str, str],
+) -> str | None:
+    raw_context = event.feature_snapshot.get("context", {})
+    if isinstance(raw_context, dict):
+        category = _normalized(str(raw_context.get("resume_category") or ""))
+        if category:
+            return category
+    if event.resume_sha256:
+        return resume_categories_by_sha.get(event.resume_sha256)
+    return None
+
+
+def _labels_needed(stat: _DimensionStat) -> int:
+    return max(
+        0,
+        MINIMUM_LABELS - stat.support,
+        max(0, MINIMUM_PER_OUTCOME - stat.approved) + max(0, MINIMUM_PER_OUTCOME - stat.rejected),
+    )
+
+
+def _feature_delta(stat: _FeatureStat, dimension: _DimensionStat) -> float:
+    acceptance = (stat.approved + 1) / (stat.support + 2)
+    dimension_baseline = (dimension.approved + 1) / (dimension.support + 2)
+    return (acceptance - dimension_baseline) * min(1.0, stat.support / 5)
 
 
 def _summarize_events(
@@ -256,50 +467,68 @@ def _summarize_events(
     *,
     influence_enabled: bool,
     ignored_dimensions: Iterable[str] = (),
+    resume_categories_by_sha: Mapping[str, str] | None = None,
+    resume_category: str | None = None,
+    restrict_resume_category: bool = False,
 ) -> ReviewLearningSummary:
-    approved = sum(
-        event.learning_eligible and event.outcome == ReviewOutcome.APPROVED for event in events
-    )
-    rejected = sum(
-        event.learning_eligible and event.outcome == ReviewOutcome.REJECTED for event in events
-    )
-    excluded = sum(not event.learning_eligible for event in events)
+    supported_events = [
+        event
+        for event in events
+        if event.learning_eligible and event.feature_schema_version in _SCHEMA_DIMENSIONS
+    ]
+    approved = sum(event.outcome == ReviewOutcome.APPROVED for event in supported_events)
+    rejected = sum(event.outcome == ReviewOutcome.REJECTED for event in supported_events)
+    excluded = len(events) - len(supported_events)
     ignored = set(ignored_dimensions)
+    target_resume_category = _normalized(resume_category)
+    category_by_sha = resume_categories_by_sha or {}
     mutable_stats: dict[str, dict[str, Any]] = {}
-    for event in events:
-        if not event.learning_eligible:
-            continue
-        raw_features = event.feature_snapshot.get("features", {})
+    mutable_dimensions: dict[str, dict[str, int]] = {}
+    for event in supported_events:
+        features = _event_features(event)
         raw_dimensions = event.feature_snapshot.get("learning_dimensions", [])
-        if not isinstance(raw_features, dict) or not isinstance(raw_dimensions, list):
+        if not isinstance(raw_dimensions, list):
             continue
-        dimensions = {str(item) for item in raw_dimensions} - ignored
-        for dimension, raw_values in raw_features.items():
-            if dimension not in dimensions or not isinstance(raw_values, list):
-                continue
-            for raw_value in raw_values:
-                value = (
-                    canonicalize_location(str(raw_value)) if dimension == "city" else str(raw_value)
-                )[:100]
-                if not value:
-                    continue
+        compatible = _SCHEMA_DIMENSIONS[event.feature_schema_version]
+        dimensions = {str(item) for item in raw_dimensions} & compatible
+        if (
+            event.feature_schema_version == LEGACY_FEATURE_SCHEMA_VERSION
+            and "city" in dimensions
+            and features.get("area")
+        ):
+            dimensions.add("area")
+        dimensions -= ignored
+        if restrict_resume_category and (
+            target_resume_category is None
+            or _event_resume_category(event, category_by_sha) != target_resume_category
+        ):
+            dimensions -= _RESUME_DEPENDENT_DIMENSIONS
+        for dimension in dimensions:
+            dimension_entry = mutable_dimensions.setdefault(
+                dimension, {"approved": 0, "rejected": 0}
+            )
+            dimension_entry[event.outcome.value] += 1
+            for value in features.get(dimension, []):
                 key = f"{dimension}\x00{value}"
                 entry = mutable_stats.setdefault(
                     key,
-                    {"dimension": str(dimension), "value": value, "approved": 0, "rejected": 0},
+                    {"dimension": dimension, "value": value, "approved": 0, "rejected": 0},
                 )
                 entry[event.outcome.value] += 1
     stats = {key: _FeatureStat(**value) for key, value in mutable_stats.items()}
-    ready = (
-        approved + rejected >= MINIMUM_LABELS
-        and approved >= MINIMUM_PER_OUTCOME
-        and rejected >= MINIMUM_PER_OUTCOME
-    )
+    dimension_stats = {
+        dimension: _DimensionStat(**values) for dimension, values in mutable_dimensions.items()
+    }
+    ready = any(stat.ready for stat in dimension_stats.values())
     proposals: list[LearningProposal] = []
     for stat in stats.values():
-        if stat.support < 3 or max(stat.approved, stat.rejected) / stat.support < 0.75:
+        dimension_stat = dimension_stats.get(stat.dimension)
+        if dimension_stat is None or not dimension_stat.ready or stat.support < 3:
             continue
-        direction = "чаще принимаете" if stat.approved > stat.rejected else "чаще отклоняете"
+        delta = _feature_delta(stat, dimension_stat)
+        if abs(delta) < 0.1:
+            continue
+        direction = "чаще принимаете" if delta > 0 else "чаще отклоняете"
         proposals.append(
             LearningProposal(
                 direction=direction,
@@ -310,11 +539,13 @@ def _summarize_events(
             )
         )
     proposals.sort(key=lambda item: (-item.support, item.label))
-    total = approved + rejected
-    labels_needed = max(
-        0,
-        MINIMUM_LABELS - total,
-        max(0, MINIMUM_PER_OUTCOME - approved) + max(0, MINIMUM_PER_OUTCOME - rejected),
+    labels_needed = (
+        0
+        if ready
+        else min(
+            (_labels_needed(stat) for stat in dimension_stats.values()),
+            default=MINIMUM_LABELS,
+        )
     )
     if not influence_enabled:
         status_label = "приостановлено"
@@ -332,6 +563,7 @@ def _summarize_events(
         status_label=status_label,
         proposals=tuple(proposals[:3]),
         _feature_stats=stats,
+        _dimension_stats=dimension_stats,
     )
 
 
@@ -342,13 +574,17 @@ def _score(summary: ReviewLearningSummary, job: ReviewJobInput) -> LearnedReview
     baseline = (summary.approved + 1) / (total + 2)
     dimension_factors: list[tuple[float, _FeatureStat]] = []
     for dimension, values in _feature_snapshot(job).items():
+        dimension_stat = summary._dimension_stats.get(dimension)
+        if dimension_stat is None or not dimension_stat.ready:
+            continue
         options: list[tuple[float, _FeatureStat]] = []
         for value in values:
             stat = summary._feature_stats.get(f"{dimension}\x00{value}")
             if stat is None or stat.support < 2:
                 continue
-            acceptance = (stat.approved + 1) / (stat.support + 2)
-            delta = (acceptance - baseline) * min(1.0, stat.support / 5)
+            delta = _feature_delta(stat, dimension_stat)
+            if abs(delta) < 0.05:
+                continue
             options.append((delta, stat))
         if options:
             dimension_factors.append(max(options, key=lambda item: abs(item[0])))
@@ -390,6 +626,7 @@ class ReviewLearningService:
             reason = ReviewReason.OTHER
         job = await session.get(SourceJob, application.source_job_id)
         evaluation = await session.get(MatchEvaluation, application.match_evaluation_id)
+        resume = await session.get(Resume, application.resume_id)
         if job is None:
             raise ReviewLearningError("review job does not exist")
         learning_eligible = learn
@@ -420,6 +657,9 @@ class ReviewLearningService:
         snapshot = {
             "features": _feature_snapshot(review_job_input(job)),
             "learning_dimensions": list(dimensions),
+            "context": {
+                "resume_category": resume.category if resume is not None else None,
+            },
         }
         event = ReviewFeedbackEvent(
             profile_id=application.profile_id,
@@ -450,6 +690,7 @@ class ReviewLearningService:
         profile_id: UUID,
         *,
         ignored_dimensions: Iterable[str] = (),
+        resume_category: str | None = None,
     ) -> ReviewLearningSummary:
         setting = await session.scalar(
             select(ReviewLearningSetting).where(ReviewLearningSetting.profile_id == profile_id)
@@ -463,10 +704,32 @@ class ReviewLearningService:
                 )
             ).all()
         )
+        resumes = list(
+            (await session.scalars(select(Resume).where(Resume.profile_id == profile_id))).all()
+        )
+        resume_categories_by_sha = {
+            resume.sha256: category
+            for resume in resumes
+            if (category := _normalized(resume.category)) is not None
+        }
+        active_resume_categories = {
+            category
+            for resume in resumes
+            if resume.active and (category := _normalized(resume.category)) is not None
+        }
+        if resume_category is not None:
+            target_resume_category = _normalized(resume_category)
+        elif len(active_resume_categories) == 1:
+            target_resume_category = next(iter(active_resume_categories))
+        else:
+            target_resume_category = None
         return _summarize_events(
             events,
             influence_enabled=setting.influence_enabled if setting is not None else True,
             ignored_dimensions=ignored_dimensions,
+            resume_categories_by_sha=resume_categories_by_sha,
+            resume_category=target_resume_category,
+            restrict_resume_category=bool(resumes),
         )
 
     async def set_influence(

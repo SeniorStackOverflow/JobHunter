@@ -21,6 +21,7 @@ from app.admin import routes as admin_routes
 from app.api import dependencies as api_dependencies
 from app.api import routes as api_routes
 from app.database.session import get_session
+from app.learning import FEATURE_SCHEMA_VERSION
 from app.matching.bindings import (
     confirmed_fact_hashes,
     preference_fingerprint,
@@ -826,6 +827,7 @@ async def test_admin_application_detail_approval_and_policy_gated_send(
         assert "https://jobs.example.test/jobs/admin-send" in detail.text
         assert "manual_review_requested" in detail.text
         assert "storage_key" not in detail.text
+        assert "data-review-reject" in detail.text
 
         approved = await client.post(
             f"/admin/applications/{application_id}/approve",
@@ -1080,7 +1082,7 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         assert "Отклонить" in queue.text
         assert "Обучение: собирает примеры" in queue.text
         assert "data-review-reject" in queue.text
-        assert "Ещё 6 решений до первых подсказок" in queue.text
+        assert "Ещё 6 причинных решений по одному признаку до первых подсказок" in queue.text
         assert "Критерии и лимиты" not in queue.text
         assert len(HTMLParser(queue.text).css(".queue-card")) == 10
         assert "Страница 1 из 2" in queue.text
@@ -1166,7 +1168,13 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         assert feedback.outcome == ReviewOutcome.REJECTED
         assert feedback.reason_code == ReviewReason.LOCATION
         assert feedback.learning_eligible is True
-        assert feedback.feature_snapshot["learning_dimensions"] == ["city", "workplace"]
+        assert feedback.feature_schema_version == FEATURE_SCHEMA_VERSION
+        assert feedback.feature_snapshot["context"]["resume_category"] == "technology"
+        assert feedback.feature_snapshot["learning_dimensions"] == [
+            "city",
+            "area",
+            "workplace",
+        ]
         assert learning_setting is not None
         assert learning_setting.influence_enabled is False
 
@@ -1500,6 +1508,8 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         assert internal_application is not None
         assert internal_contact is not None
         assert internal_preferences is not None
+        internal_resume = await session.get(Resume, internal_application.resume_id)
+        assert internal_resume is not None
         internal_contact.contact_type = ContactType.INTERNAL_JOB_BOARD
         internal_contact.value = "https://jobs.example.test/jobs/browser-internal-apply"
         internal_application.content_validated = False
@@ -1520,10 +1530,15 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                         outcome=ReviewOutcome.APPROVED,
                         actor="browser-city-fixture",
                         learning_eligible=True,
+                        resume_sha256=internal_resume.sha256,
                         feature_schema_version="review-v1",
                         feature_snapshot={
-                            "features": {"city": ["Кишинев"]},
-                            "learning_dimensions": ["city"],
+                            "features": {
+                                "category": ["warehouses"],
+                                "title": ["picker"],
+                                "city": ["Кишинев"],
+                            },
+                            "learning_dimensions": ["category", "title", "city"],
                         },
                     ),
                     ReviewFeedbackEvent(
@@ -1536,10 +1551,15 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                         reason_code=ReviewReason.ROLE,
                         actor="browser-city-fixture",
                         learning_eligible=True,
+                        resume_sha256=internal_resume.sha256,
                         feature_schema_version="review-v1",
                         feature_snapshot={
-                            "features": {"title": [f"unrelated-{index}"]},
-                            "learning_dimensions": ["title"],
+                            "features": {
+                                "category": ["sales"],
+                                "title": [f"unrelated-{index}"],
+                                "city": ["Бельцы"],
+                            },
+                            "learning_dimensions": ["category", "title"],
                         },
                     ),
                 ]
@@ -1596,6 +1616,18 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                         await expect(
                             page.get_by_role("button", name="Одобрение недоступно")
                         ).to_be_disabled()
+                    await page.get_by_role("button", name="Отклонить", exact=True).click()
+                    detail_dialog = page.locator("dialog[data-confirm-dialog]")
+                    await expect(detail_dialog).to_be_visible()
+                    await expect(detail_dialog.get_by_text("Должность", exact=True)).to_be_visible()
+                    await expect(detail_dialog.get_by_text("Зарплата", exact=True)).to_be_visible()
+                    detail_dialog_box = await detail_dialog.bounding_box()
+                    assert detail_dialog_box is not None
+                    assert detail_dialog_box["x"] >= 0
+                    assert detail_dialog_box["y"] >= 0
+                    assert detail_dialog_box["x"] + detail_dialog_box["width"] <= width
+                    assert detail_dialog_box["y"] + detail_dialog_box["height"] <= height
+                    await detail_dialog.get_by_role("button", name="Отмена", exact=True).click()
                     await page.goto(f"{base_url}/?view=decisions&profile_id={seeded['profile_id']}")
                     await expect(
                         page.get_by_role("heading", name="Требуют решения")

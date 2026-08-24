@@ -345,6 +345,7 @@ def test_workplace_type_matrix(raw: str | None, expected: str | None) -> None:
         (None, "Se acceptă fara experienta", True),
         ("От 2 лет", "", False),
         ("С опытом", "Можно обучиться", False),  # noqa: RUF001
+        ("С опытом", "Работа рядом с вакансиями без опыта", False),  # noqa: RUF001
         (None, "Обычное описание", None),
     ],
 )

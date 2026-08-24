@@ -1562,14 +1562,16 @@ class RabotaMdAdapter:
 
     @staticmethod
     def _no_experience(experience: str | None, full_text: str) -> bool | None:
-        folded = f"{experience or ''} {full_text}".casefold()
-        if any(
-            marker in folded
-            for marker in ("без опыта", "опыт не требуется", "fără experiență", "fara experienta")
-        ):
+        markers = ("без опыта", "опыт не требуется", "fără experiență", "fara experienta")
+        structured = (experience or "").casefold()
+        if any(marker in structured for marker in markers):
             return True
         if experience:
+            # A structured source experience requirement is authoritative. A
+            # stray phrase elsewhere must not reverse it into a no-experience job.
             return False
+        if any(marker in full_text.casefold() for marker in markers):
+            return True
         return None
 
     @staticmethod

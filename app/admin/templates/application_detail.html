@@ -32,7 +32,7 @@
       {% else %}
       <button class="btn btn-primary" type="button" disabled>Одобрение недоступно</button>
       {% endif %}
-      <form method="post" action="/admin/applications/{{ application.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Причина сохранится в истории решений." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Например: не подходит вакансия, график или зарплата"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="reason_code" value="other"><input type="hidden" name="learn_from_review" value="true"><button class="btn btn-danger">Отклонить</button></form>
+      <form method="post" action="/admin/applications/{{ application.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Конкретная причина поможет точнее разбирать следующие вакансии." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Необязательная заметка" data-review-reject><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="reason_code" value="other"><input type="hidden" name="learn_from_review" value="true"><button class="btn btn-danger">Отклонить</button></form>
     </div>
   </div>
   {% elif application.status == 'approved' %}
