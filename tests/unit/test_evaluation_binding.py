@@ -19,10 +19,12 @@ from app.matching.bindings import (
     preference_fingerprint,
     profile_fingerprint,
 )
+from app.matching.service import _priority_rematch_source_ids
 from app.models.entities import (
     Application,
     AuditEvent,
     CanonicalJob,
+    EmailDelivery,
     JobPreference,
     JobSnapshot,
     JobSource,
@@ -33,6 +35,7 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
+    DeliveryStatus,
     JobStatus,
     MatchDecision,
     PolicyDecision,
@@ -233,6 +236,33 @@ async def test_prepare_binds_one_evaluation_source_pair_when_duplicate_recency_d
         assert contact.value == "jobs-b@example.com"
 
 
+async def test_stale_pending_application_is_selected_for_priority_rematch(
+    sqlite_session_factory,
+    tmp_path: Path,
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _duplicate_graph(session, tmp_path)
+        application = await ApplicationService(_settings(tmp_path)).prepare(
+            session,
+            graph["canonical"].id,
+        )
+        application.status = ApplicationStatus.PENDING_REVIEW
+        application.policy_decision = PolicyDecision.PENDING_REVIEW
+        application.policy_result = {
+            "decision": "pending_review",
+            "rules_passed": [],
+            "rules_failed": ["match_evaluation_current"],
+            "policy_version": "test",
+            "safe_stop_reason": "match_evaluation_stale",
+            "requires_rematch": True,
+        }
+        await session.flush()
+
+        priority = await _priority_rematch_source_ids(session, graph["profile"].id)
+
+        assert graph["job_b"].id in priority
+
+
 async def test_sender_cannot_use_newest_duplicate_evaluation_for_stale_publication(
     sqlite_session_factory,
     tmp_path: Path,
@@ -288,7 +318,70 @@ async def test_sender_cannot_use_newest_duplicate_evaluation_for_stale_publicati
         persisted = await session.get(Application, application_id)
         assert persisted is not None
         assert persisted.status == ApplicationStatus.PENDING_REVIEW
+        assert persisted.policy_decision == PolicyDecision.PENDING_REVIEW
+        assert persisted.policy_result["safe_stop_reason"] == "match_evaluation_stale"
+        assert persisted.policy_result["requires_rematch"] is True
+        assert "match_evaluation_current" in persisted.policy_result["rules_failed"]
         assert persisted.match_evaluation_id == graph["evaluation_a"].id
+
+
+@pytest.mark.e2e
+async def test_stale_auto_approved_application_is_rematched_prepared_and_sent(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.applications import service as application_service
+    from app.email import service as email_service
+    from app.matching import service as matching_service
+
+    current_settings = _settings(tmp_path)
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(matching_service, "get_settings", lambda: current_settings)
+    monkeypatch.setattr(application_service, "get_settings", lambda: current_settings)
+    monkeypatch.setattr(email_service, "get_settings", lambda: current_settings)
+
+    async with sqlite_session_factory() as session:
+        graph = await _duplicate_graph(session, tmp_path)
+        application = await ApplicationService(current_settings).prepare(
+            session,
+            graph["canonical"].id,
+        )
+        assert application.source_job_id == graph["job_b"].id
+        assert application.status == ApplicationStatus.AUTO_APPROVED
+        graph["job_b"].description = "Updated active publication requiring a fresh match."
+        graph["job_b"].content_hash = "9" * 64
+        application_id = application.id
+        original_evaluation_id = application.match_evaluation_id
+        await session.commit()
+
+    assert await email_service.send_auto_approved_applications() == 0
+    async with sqlite_session_factory() as session:
+        pending = await session.get(Application, application_id)
+        assert pending is not None
+        assert pending.status == ApplicationStatus.PENDING_REVIEW
+        assert pending.policy_result["safe_stop_reason"] == "match_evaluation_stale"
+
+    assert await matching_service.process_unprocessed_jobs() == 2
+    assert await application_service.prepare_pending_applications() == 1
+
+    async with sqlite_session_factory() as session:
+        refreshed = await session.get(Application, application_id)
+        assert refreshed is not None
+        assert refreshed.match_evaluation_id != original_evaluation_id
+        assert refreshed.status == ApplicationStatus.AUTO_APPROVED
+        assert "safe_stop_reason" not in refreshed.policy_result
+
+    assert await email_service.send_auto_approved_applications() == 1
+    async with sqlite_session_factory() as session:
+        sent = await session.get(Application, application_id)
+        delivery = await session.scalar(
+            select(EmailDelivery).where(EmailDelivery.application_id == application_id)
+        )
+        assert sent is not None
+        assert sent.status == ApplicationStatus.SENT
+        assert delivery is not None
+        assert delivery.status == DeliveryStatus.SENT
 
 
 @pytest.mark.asyncio

@@ -1488,6 +1488,11 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         settings,
         suffix="browser-internal-apply",
     )
+    stale_review = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="browser-stale-rematch",
+    )
     vacancy_statuses = [JobStatus.POSSIBLY_CLOSED, JobStatus.ACTIVE, JobStatus.CLOSED]
     async with sqlite_session_factory() as session:
         for index, seeded in enumerate(seeded_reviews):
@@ -1501,11 +1506,13 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             source_job.responsibilities = f"Browser responsibility {index}."
             canonical.status = vacancy_statuses[index]
         internal_application = await session.get(Application, internal_review["application_id"])
+        stale_application = await session.get(Application, stale_review["application_id"])
         internal_contact = await session.get(EmployerContact, internal_review["contact_id"])
         internal_preferences = await session.scalar(
             select(JobPreference).where(JobPreference.profile_id == internal_review["profile_id"])
         )
         assert internal_application is not None
+        assert stale_application is not None
         assert internal_contact is not None
         assert internal_preferences is not None
         internal_resume = await session.get(Resume, internal_application.resume_id)
@@ -1516,6 +1523,16 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         internal_application.policy_result = {
             **internal_application.policy_result,
             "rules_failed": ["verified_email_contact", "letter_validated"],
+        }
+        stale_application.status = ApplicationStatus.PENDING_REVIEW
+        stale_application.policy_decision = PolicyDecision.PENDING_REVIEW
+        stale_application.content_validated = True
+        stale_application.policy_result = {
+            **stale_application.policy_result,
+            "decision": "pending_review",
+            "rules_failed": ["match_evaluation_current"],
+            "safe_stop_reason": "match_evaluation_stale",
+            "requires_rematch": True,
         }
         internal_preferences.allowed_cities = ["Chisinau"]
         for index in range(3):
@@ -1601,6 +1618,20 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     await page.goto(f"{base_url}/login")
                     await page.get_by_label("Пароль администратора").fill(ADMIN_PASSWORD)
                     await page.get_by_role("button", name="Войти", exact=True).click()
+                    await page.goto(
+                        f"{base_url}/admin/applications/{stale_review['application_id']}"
+                    )
+                    await expect(
+                        page.get_by_text(
+                            "Вакансия изменилась — JobHunter выполняет повторный анализ."
+                        )
+                    ).to_be_visible()
+                    await expect(
+                        page.get_by_role("button", name="Одобрить", exact=True)
+                    ).to_have_count(0)
+                    await expect(
+                        page.get_by_role("button", name="Одобрение недоступно")
+                    ).to_be_disabled()
                     await page.goto(f"{base_url}/admin/applications/{seeded['application_id']}")
                     await expect(
                         page.get_by_text(f"Saved browser vacancy description {index}.")

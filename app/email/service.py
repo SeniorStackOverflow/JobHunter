@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
@@ -40,10 +40,12 @@ from app.models.enums import (
     ApplicationStatus,
     ContactType,
     DeliveryStatus,
+    JobStatus,
     PolicyDecision,
     VerificationStatus,
 )
 from app.policies import PolicyEngine
+from app.policies.schemas import PolicyResult
 from app.profiles.service import choose_resume_for_job
 from app.security.files import UnsafeResumeError, read_verified_resume
 from app.settings import Settings, get_settings
@@ -52,8 +54,32 @@ from app.settings import Settings, get_settings
 class EmailSendBlocked(ValueError):
     """Persisted state does not authorize this delivery."""
 
+    def __init__(self, message: str, *, reason: str = "delivery_not_authorized") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 logger = structlog.get_logger(__name__)
+
+_AUTO_SEND_HARD_FAILURES = {
+    "source_actions_enabled",
+    "match_not_blocked",
+    "match_not_skipped",
+    "vacancy_active",
+    "all_claims_confirmed",
+    "no_prompt_injection",
+    "no_deterministic_scam_pattern",
+    "no_scam_indicators",
+    "not_previously_sent",
+    "no_delivery_unknown",
+}
+_AUTO_SEND_TRANSIENT_FAILURES = {
+    "deployment_emergency_switch_off",
+    "auto_send_enabled",
+    "global_pause_off",
+    "daily_limit",
+    "source_healthy",
+}
 
 
 class EmailService:
@@ -68,14 +94,64 @@ class EmailService:
         self._provider = provider
 
     @staticmethod
+    def _apply_safe_stop(
+        application: Application,
+        *,
+        status: ApplicationStatus,
+        reason: str,
+        failed_rules: tuple[str, ...] = (),
+        policy: PolicyResult | None = None,
+        requires_rematch: bool = False,
+    ) -> None:
+        if policy is not None:
+            policy_result = policy.model_dump(mode="json")
+        else:
+            policy_result = dict(application.policy_result)
+        decision = {
+            ApplicationStatus.PENDING_REVIEW: PolicyDecision.PENDING_REVIEW,
+            ApplicationStatus.BLOCKED: PolicyDecision.BLOCKED,
+        }[status]
+        passed = [
+            item
+            for item in policy_result.get("rules_passed", [])
+            if isinstance(item, str) and item not in failed_rules
+        ]
+        failed = [item for item in policy_result.get("rules_failed", []) if isinstance(item, str)]
+        for rule_name in failed_rules:
+            if rule_name not in failed:
+                failed.append(rule_name)
+        policy_result.update(
+            {
+                "decision": decision.value,
+                "rules_passed": passed,
+                "rules_failed": failed,
+                "safe_stop_reason": reason,
+                "requires_rematch": requires_rematch,
+            }
+        )
+        application.status = status
+        application.policy_decision = decision
+        application.policy_result = policy_result
+
+    @staticmethod
     async def _persist_safe_stop(
         session: AsyncSession,
         application: Application,
         *,
         status: ApplicationStatus,
         reason: str,
+        failed_rules: tuple[str, ...] = (),
+        policy: PolicyResult | None = None,
+        requires_rematch: bool = False,
     ) -> None:
-        application.status = status
+        EmailService._apply_safe_stop(
+            application,
+            status=status,
+            reason=reason,
+            failed_rules=failed_rules,
+            policy=policy,
+            requires_rematch=requires_rematch,
+        )
         await record_audit_event(
             session,
             actor="email_worker",
@@ -84,9 +160,201 @@ class EmailService:
             entity_id=str(application.id),
             correlation_id=str(application.id),
             decision=status.value,
-            details={"reason": reason},
+            details={
+                "reason": reason,
+                "failed_rules": list(failed_rules),
+                "requires_rematch": requires_rematch,
+            },
         )
         await session.commit()
+
+    async def reconcile_auto_approved_applications(
+        self,
+        session: AsyncSession,
+    ) -> dict[str, int]:
+        """Move unsafe AUTO_APPROVED rows out of the sender queue before delivery."""
+
+        rows = (
+            await session.execute(
+                select(Application, SourceJob, MatchEvaluation)
+                .outerjoin(
+                    SourceJob,
+                    and_(
+                        SourceJob.id == Application.source_job_id,
+                        SourceJob.canonical_job_id == Application.canonical_job_id,
+                    ),
+                )
+                .outerjoin(
+                    MatchEvaluation,
+                    and_(
+                        MatchEvaluation.id == Application.match_evaluation_id,
+                        MatchEvaluation.profile_id == Application.profile_id,
+                        MatchEvaluation.source_job_id == Application.source_job_id,
+                        MatchEvaluation.canonical_job_id == Application.canonical_job_id,
+                    ),
+                )
+                .where(Application.status == ApplicationStatus.AUTO_APPROVED)
+                .with_for_update(of=Application)
+            )
+        ).all()
+        if not rows:
+            return {}
+        profile_ids = {application.profile_id for application, _job, _evaluation in rows}
+        contact_ids = {application.recipient_contact_id for application, _job, _evaluation in rows}
+        profiles = {
+            profile.id: profile
+            for profile in (
+                await session.scalars(select(UserProfile).where(UserProfile.id.in_(profile_ids)))
+            ).all()
+        }
+        preferences_by_profile = {
+            preference.profile_id: preference
+            for preference in (
+                await session.scalars(
+                    select(JobPreference).where(JobPreference.profile_id.in_(profile_ids))
+                )
+            ).all()
+        }
+        contacts = {
+            contact.id: contact
+            for contact in (
+                await session.scalars(
+                    select(EmployerContact).where(EmployerContact.id.in_(contact_ids))
+                )
+            ).all()
+        }
+        resumes_by_profile: dict[UUID, list[Resume]] = {}
+        for resume in (
+            await session.scalars(
+                select(Resume).where(
+                    Resume.profile_id.in_(profile_ids),
+                    Resume.active.is_(True),
+                    Resume.verified.is_(True),
+                )
+            )
+        ).all():
+            resumes_by_profile.setdefault(resume.profile_id, []).append(resume)
+        counts: dict[str, int] = {}
+        policy_engine = PolicyEngine(self.settings)
+        for application, job, evaluation in rows:
+            status: ApplicationStatus | None = None
+            reason: str | None = None
+            failed_rules: tuple[str, ...] = ()
+            policy: PolicyResult | None = None
+            requires_rematch = False
+
+            if job is None or evaluation is None:
+                status = ApplicationStatus.BLOCKED
+                reason = "invalid_match_evaluation_binding"
+                failed_rules = ("match_evaluation_binding_valid",)
+            elif job.status != JobStatus.ACTIVE:
+                status = ApplicationStatus.BLOCKED
+                reason = "vacancy_not_active"
+                failed_rules = ("vacancy_active",)
+            elif not await evaluation_is_current(session, evaluation, job):
+                status = ApplicationStatus.PENDING_REVIEW
+                reason = "match_evaluation_stale"
+                failed_rules = ("match_evaluation_current",)
+                requires_rematch = True
+            else:
+                profile = profiles.get(application.profile_id)
+                preferences = preferences_by_profile.get(application.profile_id)
+                contact = contacts.get(application.recipient_contact_id)
+                current_resumes = resumes_by_profile.get(application.profile_id, [])
+                selected_resume = (
+                    choose_resume_for_job(current_resumes, job)
+                    if profile is not None and preferences is not None
+                    else None
+                )
+                if profile is None or preferences is None or contact is None:
+                    status = ApplicationStatus.BLOCKED
+                    reason = "application_dependencies_incomplete"
+                    failed_rules = ("application_dependencies_complete",)
+                elif (
+                    selected_resume is None
+                    or selected_resume.id != application.resume_id
+                    or not evaluation_inputs_are_current(
+                        evaluation,
+                        profile,
+                        preferences,
+                        selected_resume,
+                    )
+                    or not used_confirmed_facts_are_current(
+                        evaluation,
+                        profile,
+                        application.used_confirmed_facts,
+                    )
+                ):
+                    status = ApplicationStatus.PENDING_REVIEW
+                    reason = "match_evaluation_inputs_stale"
+                    failed_rules = ("match_evaluation_inputs_current",)
+                    requires_rematch = True
+                else:
+                    current_public_email = (
+                        validate_public_email(job.public_email) if job.public_email else None
+                    )
+                    if (
+                        contact.source_job_id != application.source_job_id
+                        or contact.canonical_job_id != application.canonical_job_id
+                        or contact.contact_type != ContactType.EMAIL
+                        or contact.verification_status != VerificationStatus.VERIFIED
+                        or current_public_email != contact.value
+                    ):
+                        status = ApplicationStatus.BLOCKED
+                        reason = "recipient_not_verified"
+                        failed_rules = ("contact_verified",)
+                    elif not application.content_validated:
+                        status = ApplicationStatus.BLOCKED
+                        reason = "application_content_not_validated"
+                        failed_rules = ("letter_validated",)
+                    else:
+                        policy = await policy_engine.evaluate(
+                            session,
+                            application,
+                            preferences,
+                            evaluation,
+                            job,
+                            selected_resume,
+                            contact,
+                            profile,
+                        )
+                        current_failed = set(policy.rules_failed)
+                        if _AUTO_SEND_HARD_FAILURES & current_failed:
+                            status = ApplicationStatus.BLOCKED
+                            reason = "current_policy_hard_failure"
+                            failed_rules = tuple(policy.rules_failed)
+                        elif current_failed - _AUTO_SEND_TRANSIENT_FAILURES:
+                            status = ApplicationStatus.PENDING_REVIEW
+                            reason = "current_policy_requires_review"
+                            failed_rules = tuple(policy.rules_failed)
+
+            if status is None or reason is None:
+                continue
+            self._apply_safe_stop(
+                application,
+                status=status,
+                reason=reason,
+                failed_rules=failed_rules,
+                policy=policy,
+                requires_rematch=requires_rematch,
+            )
+            await record_audit_event(
+                session,
+                actor="email_scheduler",
+                action="application.delivery_preflight_reconciled",
+                entity_type="application",
+                entity_id=str(application.id),
+                correlation_id=str(application.id),
+                decision=status.value,
+                details={
+                    "reason": reason,
+                    "failed_rules": list(failed_rules),
+                    "requires_rematch": requires_rematch,
+                },
+            )
+            counts[reason] = counts.get(reason, 0) + 1
+        await session.flush()
+        return counts
 
     async def _provider_for(self, session: AsyncSession) -> EmailProvider:
         if self._provider is not None:
@@ -192,12 +460,24 @@ class EmailService:
                     application,
                     status=ApplicationStatus.BLOCKED,
                     reason="invalid_match_evaluation_binding",
+                    failed_rules=("match_evaluation_binding_valid",),
                 )
                 raise EmailSendBlocked(
-                    "application is not bound to an evaluation for the same source publication"
+                    "application is not bound to an evaluation for the same source publication",
+                    reason="invalid_match_evaluation_binding",
                 )
             if any(value is None for value in (resume, contact, preferences, profile)):
-                raise EmailSendBlocked("application dependencies are incomplete")
+                await self._persist_safe_stop(
+                    session,
+                    application,
+                    status=ApplicationStatus.BLOCKED,
+                    reason="application_dependencies_incomplete",
+                    failed_rules=("application_dependencies_complete",),
+                )
+                raise EmailSendBlocked(
+                    "application dependencies are incomplete",
+                    reason="application_dependencies_incomplete",
+                )
             if resume is not None and resume.profile_id != application.profile_id:
                 raise EmailSendBlocked("resume belongs to another profile")
             if evaluation is not None and evaluation.profile_id != application.profile_id:
@@ -214,9 +494,12 @@ class EmailService:
                     application,
                     status=ApplicationStatus.PENDING_REVIEW,
                     reason="match_evaluation_stale",
+                    failed_rules=("match_evaluation_current",),
+                    requires_rematch=True,
                 )
                 raise EmailSendBlocked(
-                    "the bound match evaluation is stale for this source publication"
+                    "the bound match evaluation is stale for this source publication",
+                    reason="match_evaluation_stale",
                 )
             current_resumes = list(
                 (
@@ -250,9 +533,12 @@ class EmailService:
                     application,
                     status=ApplicationStatus.PENDING_REVIEW,
                     reason="match_evaluation_inputs_stale",
+                    failed_rules=("match_evaluation_inputs_current",),
+                    requires_rematch=True,
                 )
                 raise EmailSendBlocked(
-                    "profile, preferences, resume, or confirmed facts changed after matching"
+                    "profile, preferences, resume, or confirmed facts changed after matching",
+                    reason="match_evaluation_inputs_stale",
                 )
             current_public_email = (
                 validate_public_email(job.public_email) if job.public_email else None
@@ -269,80 +555,90 @@ class EmailService:
                     application,
                     status=ApplicationStatus.BLOCKED,
                     reason="recipient_not_verified",
+                    failed_rules=("contact_verified",),
                 )
-                raise EmailSendBlocked("recipient is not a verified public email")
+                raise EmailSendBlocked(
+                    "recipient is not a verified public email",
+                    reason="recipient_not_verified",
+                )
             if not resume.active or not resume.verified:
                 await self._persist_safe_stop(
                     session,
                     application,
                     status=ApplicationStatus.BLOCKED,
                     reason="resume_not_active_verified",
+                    failed_rules=("resume_active_verified",),
                 )
-                raise EmailSendBlocked("resume is not active and verified")
+                raise EmailSendBlocked(
+                    "resume is not active and verified",
+                    reason="resume_not_active_verified",
+                )
             if not application.content_validated:
                 await self._persist_safe_stop(
                     session,
                     application,
                     status=ApplicationStatus.BLOCKED,
                     reason="application_content_not_validated",
+                    failed_rules=("letter_validated",),
                 )
-                raise EmailSendBlocked("application content is not validated")
+                raise EmailSendBlocked(
+                    "application content is not validated",
+                    reason="application_content_not_validated",
+                )
             policy = await PolicyEngine(self.settings).evaluate(
                 session, application, preferences, evaluation, job, resume, contact, profile
             )
-            hard_failures = {
-                "source_actions_enabled",
-                "match_not_blocked",
-                "match_not_skipped",
-                "vacancy_active",
-                "all_claims_confirmed",
-                "no_prompt_injection",
-                "no_deterministic_scam_pattern",
-                "no_scam_indicators",
-                "not_previously_sent",
-                "no_delivery_unknown",
-            }
             failed_rules = set(policy.rules_failed)
             if (
                 application.status == ApplicationStatus.AUTO_APPROVED
                 and policy.decision != PolicyDecision.AUTO_APPROVED
             ):
-                if hard_failures & failed_rules:
+                safe_stop_reason: str | None = None
+                if _AUTO_SEND_HARD_FAILURES & failed_rules:
+                    safe_stop_reason = "current_policy_hard_failure"
                     await self._persist_safe_stop(
                         session,
                         application,
                         status=ApplicationStatus.BLOCKED,
-                        reason="current_policy_hard_failure",
+                        reason=safe_stop_reason,
+                        failed_rules=tuple(policy.rules_failed),
+                        policy=policy,
                     )
-                elif failed_rules - {
-                    "deployment_emergency_switch_off",
-                    "global_pause_off",
-                    "daily_limit",
-                    "source_healthy",
-                }:
+                elif failed_rules - _AUTO_SEND_TRANSIENT_FAILURES:
+                    safe_stop_reason = "current_policy_requires_review"
                     await self._persist_safe_stop(
                         session,
                         application,
                         status=ApplicationStatus.PENDING_REVIEW,
-                        reason="current_policy_requires_review",
+                        reason=safe_stop_reason,
+                        failed_rules=tuple(policy.rules_failed),
+                        policy=policy,
                     )
-                raise EmailSendBlocked("current policy no longer permits automatic delivery")
+                raise EmailSendBlocked(
+                    "current policy no longer permits automatic delivery",
+                    reason=safe_stop_reason or "current_policy_transient_failure",
+                )
             if application.status == ApplicationStatus.APPROVED:
-                manual_required = hard_failures | {
+                manual_required = _AUTO_SEND_HARD_FAILURES | {
                     "deployment_emergency_switch_off",
                     "global_pause_off",
                     "daily_limit",
                     "source_healthy",
                 }
                 if manual_required & failed_rules:
-                    if hard_failures & failed_rules:
+                    if _AUTO_SEND_HARD_FAILURES & failed_rules:
                         await self._persist_safe_stop(
                             session,
                             application,
                             status=ApplicationStatus.BLOCKED,
                             reason="manual_approval_hard_failure",
+                            failed_rules=tuple(policy.rules_failed),
+                            policy=policy,
                         )
-                    raise EmailSendBlocked("manual approval cannot override delivery safety rules")
+                    raise EmailSendBlocked(
+                        "manual approval cannot override delivery safety rules",
+                        reason="manual_approval_policy_failure",
+                    )
 
             try:
                 attachment_data = read_verified_resume(
@@ -358,8 +654,12 @@ class EmailService:
                     application,
                     status=ApplicationStatus.BLOCKED,
                     reason="resume_integrity_failure",
+                    failed_rules=("resume_integrity_valid",),
                 )
-                raise EmailSendBlocked("verified resume failed the final integrity check") from exc
+                raise EmailSendBlocked(
+                    "verified resume failed the final integrity check",
+                    reason="resume_integrity_failure",
+                ) from exc
             message = PreparedEmail(
                 application_id=str(application.id),
                 recipient=contact.value,
@@ -440,6 +740,14 @@ async def send_auto_approved_applications() -> int:
     service = EmailService(settings, async_session_factory)
     start_of_day = datetime.combine(datetime.now(UTC).date(), time.min, UTC)
     async with async_session_factory() as session:
+        reconciled = await service.reconcile_auto_approved_applications(session)
+        await session.commit()
+        if reconciled:
+            logger.info(
+                "automatic_email_reconciled",
+                total=sum(reconciled.values()),
+                reasons=reconciled,
+            )
         attempt_rows = (
             await session.execute(
                 select(Application.profile_id, func.count(EmailDelivery.id))
@@ -460,19 +768,30 @@ async def send_auto_approved_applications() -> int:
         attempts_by_profile: dict[UUID, int] = {
             profile_id: int(attempt_count) for profile_id, attempt_count in attempt_rows
         }
+        preference_rows = (
+            await session.execute(
+                select(
+                    JobPreference.profile_id,
+                    JobPreference.maximum_daily_applications,
+                    JobPreference.auto_send_enabled,
+                    JobPreference.global_pause,
+                )
+            )
+        ).all()
+        if not preference_rows:
+            logger.info("automatic_email_deferred", reason="missing_preferences")
+            return 0
+        enabled_rows = [row for row in preference_rows if row.auto_send_enabled]
+        if not enabled_rows:
+            logger.info("automatic_email_deferred", reason="auto_send_disabled")
+            return 0
+        eligible_rows = [row for row in enabled_rows if not row.global_pause]
+        if not eligible_rows:
+            logger.info("automatic_email_deferred", reason="global_pause")
+            return 0
         capacities = {
             profile_id: max(0, maximum - int(attempts_by_profile.get(profile_id, 0)))
-            for profile_id, maximum in (
-                await session.execute(
-                    select(
-                        JobPreference.profile_id,
-                        JobPreference.maximum_daily_applications,
-                    ).where(
-                        JobPreference.auto_send_enabled.is_(True),
-                        JobPreference.global_pause.is_(False),
-                    )
-                )
-            ).all()
+            for profile_id, maximum, _auto_send_enabled, _global_pause in eligible_rows
         }
         if not any(capacities.values()):
             logger.info("automatic_email_deferred", reason="daily_limit")
@@ -500,11 +819,20 @@ async def send_auto_approved_applications() -> int:
     for application_id in application_ids:
         try:
             delivery = await service.send_application(application_id)
-        except (EmailSendBlocked, LookupError) as exc:
+        except EmailSendBlocked as exc:
             logger.warning(
                 "automatic_email_skipped",
                 application_id=str(application_id),
                 error_type=type(exc).__name__,
+                reason=exc.reason,
+            )
+            continue
+        except LookupError as exc:
+            logger.warning(
+                "automatic_email_skipped",
+                application_id=str(application_id),
+                error_type=type(exc).__name__,
+                reason="application_missing",
             )
             continue
         if delivery.status == DeliveryStatus.SENT:
@@ -540,11 +868,20 @@ async def retry_temporary_failures() -> int:
     for application_id in ids:
         try:
             delivery = await service.send_application(application_id)
-        except (EmailSendBlocked, LookupError) as exc:
+        except EmailSendBlocked as exc:
             logger.warning(
                 "temporary_email_retry_skipped",
                 application_id=str(application_id),
                 error_type=type(exc).__name__,
+                reason=exc.reason,
+            )
+            continue
+        except LookupError as exc:
+            logger.warning(
+                "temporary_email_retry_skipped",
+                application_id=str(application_id),
+                error_type=type(exc).__name__,
+                reason="application_missing",
             )
             continue
         if delivery.status == DeliveryStatus.SENT:

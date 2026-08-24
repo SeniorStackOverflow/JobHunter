@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     llmrouter_base_url: str = "http://127.0.0.1:4000"
     llmrouter_prefer: Literal["fast", "cheap", "quality", "balanced"] = "quality"
     matching_batch_size: int = Field(default=8, ge=1, le=100)
+    matching_priority_batch_size: int = Field(default=4, ge=1, le=100)
     matching_max_jobs_per_cycle: int = Field(default=100, ge=1, le=1000)
     matching_inter_job_delay_seconds: float = Field(default=8.0, ge=0, le=60)
     matching_provider_failure_retry_seconds: int = Field(default=3600, ge=60, le=86400)

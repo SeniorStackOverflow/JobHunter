@@ -3,7 +3,11 @@ from pathlib import Path
 
 import httpx
 
-from app.admin.routes import _admin_asset_url, _daily_application_rules
+from app.admin.routes import (
+    _admin_asset_url,
+    _application_approval_issue,
+    _daily_application_rules,
+)
 from app.main import app
 
 
@@ -31,6 +35,20 @@ def test_admin_daily_application_rules_preserve_advanced_settings() -> None:
     assert disabled["verified_only"] is True
     assert disabled["force_minimum_daily_applications"] is False
     assert existing == {"verified_only": True, "minimum_daily_applications": 9}
+
+
+def test_admin_explains_stale_review_even_when_letter_was_validated() -> None:
+    application = {
+        "content_validated": True,
+        "policy_result": {
+            "safe_stop_reason": "match_evaluation_stale",
+            "rules_failed": ["match_evaluation_current"],
+        },
+    }
+
+    assert _application_approval_issue(application) == (
+        "Вакансия изменилась — JobHunter выполняет повторный анализ."
+    )
 
 
 def test_admin_javascript_initializes_every_custom_control() -> None:

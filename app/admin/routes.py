@@ -339,9 +339,25 @@ def _application_content_validated(application: Any) -> bool:
     return getattr(application, "content_validated", False) is True
 
 
+def _application_safe_stop_reason(application: Any) -> str | None:
+    if isinstance(application, dict):
+        policy_result = application.get("policy_result")
+    else:
+        policy_result = getattr(application, "policy_result", None)
+    if not isinstance(policy_result, dict):
+        return None
+    reason = policy_result.get("safe_stop_reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
 def _application_approval_issue(application: Any) -> str | None:
     """Explain why a review cannot currently become an approved email application."""
 
+    safe_stop_reason = _application_safe_stop_reason(application)
+    if safe_stop_reason == "match_evaluation_stale":
+        return "Вакансия изменилась — JobHunter выполняет повторный анализ."
+    if safe_stop_reason == "match_evaluation_inputs_stale":
+        return "Профиль или настройки изменились — JobHunter выполняет повторный анализ."
     if _application_content_validated(application):
         return None
     if "verified_email_contact" in _application_failed_policy_rules(application):

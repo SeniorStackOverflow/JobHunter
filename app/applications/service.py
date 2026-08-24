@@ -37,6 +37,8 @@ _POLICY_ONLY_REFRESH_RULES = {
     "global_pause_off",
     "source_healthy",
     "source_actions_enabled",
+    "category_allowed_for_auto_send",
+    "overall_score_threshold",
     "vacancy_active",
     "verified_email_contact",
     "contact_verified",

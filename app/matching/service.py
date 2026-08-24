@@ -38,7 +38,12 @@ from app.models.entities import (
     SourceJob,
     UserProfile,
 )
-from app.models.enums import ApplicationStatus, JobStatus, MatchDecision
+from app.models.enums import (
+    ApplicationStatus,
+    JobStatus,
+    MatchDecision,
+    PolicyDecision,
+)
 from app.profiles.service import ProfileService, choose_resume_for_job
 from app.settings import Settings, get_settings
 
@@ -46,6 +51,11 @@ _MAX_JOB_FIELD_CHARS = 50_000
 _MAX_RESUME_SUMMARY_CHARS = 50_000
 _MATCHING_PROVIDER_BACKOFF_KEY = "job-agent:matching:provider-backoff"
 logger = structlog.get_logger(__name__)
+
+_PRIORITY_REMATCH_SAFE_STOPS = {
+    "match_evaluation_stale",
+    "match_evaluation_inputs_stale",
+}
 
 
 async def _matching_provider_backoff_remaining(settings: Settings) -> int:
@@ -74,6 +84,85 @@ async def _set_matching_provider_backoff(settings: Settings, retry_after_seconds
     finally:
         await client.aclose()
     return ttl
+
+
+async def _priority_rematch_source_ids(
+    session: AsyncSession,
+    profile_id: UUID,
+) -> set[UUID]:
+    rows = (
+        await session.execute(
+            select(
+                Application.source_job_id,
+                Application.status,
+                Application.policy_decision,
+                Application.policy_result,
+            ).where(
+                Application.profile_id == profile_id,
+                Application.status.in_(
+                    {
+                        ApplicationStatus.AUTO_APPROVED,
+                        ApplicationStatus.PENDING_REVIEW,
+                    }
+                ),
+            )
+        )
+    ).all()
+    priority: set[UUID] = set()
+    for source_job_id, status, policy_decision, policy_result in rows:
+        safe_stop_reason = (
+            policy_result.get("safe_stop_reason") if isinstance(policy_result, dict) else None
+        )
+        if (
+            status == ApplicationStatus.AUTO_APPROVED
+            or policy_decision == PolicyDecision.AUTO_APPROVED
+            or safe_stop_reason in _PRIORITY_REMATCH_SAFE_STOPS
+        ):
+            priority.add(source_job_id)
+    return priority
+
+
+def _select_matching_batch(
+    candidates: list[tuple[UUID, bool, bool]],
+    *,
+    ai_batch_size: int,
+    priority_ai_batch_size: int,
+    max_jobs: int,
+    backoff_remaining: int,
+) -> tuple[list[tuple[UUID, bool]], int, int, int]:
+    """Select a bounded batch while reserving AI capacity for safety rematches."""
+
+    ai_deferred = (
+        sum(1 for _, needs_ai, _ in candidates if needs_ai) if backoff_remaining > 0 else 0
+    )
+    priority_candidates = [item for item in candidates if item[2]]
+    regular_candidates = [item for item in candidates if not item[2]]
+    priority_budget = min(priority_ai_batch_size, ai_batch_size)
+    priority_head: list[tuple[UUID, bool, bool]] = []
+    priority_tail: list[tuple[UUID, bool, bool]] = []
+    priority_ai_queued = 0
+    for candidate in priority_candidates:
+        if candidate[1] and priority_ai_queued >= priority_budget:
+            priority_tail.append(candidate)
+            continue
+        priority_head.append(candidate)
+        priority_ai_queued += int(candidate[1])
+
+    ordered = [*priority_head, *regular_candidates, *priority_tail]
+    batch: list[tuple[UUID, bool]] = []
+    ai_selected = 0
+    priority_selected = 0
+    for source_job_id, needs_ai, is_priority in ordered:
+        if len(batch) >= max_jobs:
+            break
+        if needs_ai and backoff_remaining > 0:
+            continue
+        if needs_ai and ai_selected >= ai_batch_size:
+            continue
+        batch.append((source_job_id, needs_ai))
+        ai_selected += int(needs_ai)
+        priority_selected += int(is_priority)
+    return batch, ai_selected, ai_deferred, priority_selected
 
 
 class MatchingConfigurationError(RuntimeError):
@@ -492,6 +581,7 @@ async def process_unprocessed_jobs() -> int:
 
         for profile in profiles:
             preference = await profile_service.get_preferences(session, profile.id)
+            priority_source_ids = await _priority_rematch_source_ids(session, profile.id)
             resumes = list(
                 (
                     await session.scalars(
@@ -538,7 +628,7 @@ async def process_unprocessed_jobs() -> int:
                     .order_by(SourceJob.last_seen_at.desc(), SourceJob.id, MatchEvaluation.id)
                 )
             ).all()
-            candidates: list[tuple[UUID, bool]] = []
+            candidates: list[tuple[UUID, bool, bool]] = []
             seen: set[UUID] = set()
             for job, evaluation, snapshot_at in rows:
                 if job.id in seen:
@@ -569,21 +659,15 @@ async def process_unprocessed_jobs() -> int:
                     needs_ai = service.prefilter.evaluate(
                         job, preference, profile, resume_fit=resume_fit
                     ).eligible_for_ai
-                    candidates.append((job.id, needs_ai))
+                    candidates.append((job.id, needs_ai, job.id in priority_source_ids))
 
-            batch: list[tuple[UUID, bool]] = []
-            ai_selected = 0
-            ai_deferred = 0
-            for source_job_id, needs_ai in candidates:
-                if len(batch) >= settings.matching_max_jobs_per_cycle:
-                    break
-                if needs_ai and backoff_remaining > 0:
-                    ai_deferred += 1
-                    continue
-                if needs_ai and ai_selected >= settings.matching_batch_size:
-                    continue
-                batch.append((source_job_id, needs_ai))
-                ai_selected += int(needs_ai)
+            batch, ai_selected, ai_deferred, priority_selected = _select_matching_batch(
+                candidates,
+                ai_batch_size=settings.matching_batch_size,
+                priority_ai_batch_size=settings.matching_priority_batch_size,
+                max_jobs=settings.matching_max_jobs_per_cycle,
+                backoff_remaining=backoff_remaining,
+            )
 
             if ai_deferred:
                 logger.info(
@@ -599,7 +683,10 @@ async def process_unprocessed_jobs() -> int:
                 candidates=len(candidates),
                 batch_size=len(batch),
                 ai_batch_size=ai_selected,
+                priority_candidates=sum(int(item[2]) for item in candidates),
+                priority_selected=priority_selected,
                 configured_ai_batch_size=settings.matching_batch_size,
+                configured_priority_batch_size=settings.matching_priority_batch_size,
                 configured_max_jobs_per_cycle=settings.matching_max_jobs_per_cycle,
             )
             for index, (source_job_id, needs_ai) in enumerate(batch):

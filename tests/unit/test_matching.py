@@ -25,6 +25,7 @@ from app.matching import (
     MockProvider,
     OpenAIProvider,
 )
+from app.matching.service import _select_matching_batch
 from app.models.entities import (
     CanonicalJob,
     JobPreference,
@@ -37,6 +38,69 @@ from app.models.entities import (
 )
 from app.models.enums import JobStatus, MatchDecision, SourceHealth
 from app.settings import Settings
+
+
+def test_matching_batch_reserves_capacity_for_priority_rematches() -> None:
+    regular = [uuid4() for _ in range(4)]
+    priority = [uuid4() for _ in range(3)]
+    candidates = [
+        *((item, True, False) for item in regular),
+        *((item, True, True) for item in priority),
+    ]
+
+    batch, ai_selected, ai_deferred, priority_selected = _select_matching_batch(
+        candidates,
+        ai_batch_size=4,
+        priority_ai_batch_size=2,
+        max_jobs=10,
+        backoff_remaining=0,
+    )
+
+    assert [item for item, _ in batch] == [priority[0], priority[1], *regular[:2]]
+    assert ai_selected == 4
+    assert ai_deferred == 0
+    assert priority_selected == 2
+
+
+def test_matching_batch_uses_spare_capacity_for_additional_priority_work() -> None:
+    regular = uuid4()
+    priority = [uuid4() for _ in range(4)]
+    candidates = [
+        (regular, True, False),
+        *((item, True, True) for item in priority),
+    ]
+
+    batch, _, _, priority_selected = _select_matching_batch(
+        candidates,
+        ai_batch_size=4,
+        priority_ai_batch_size=2,
+        max_jobs=10,
+        backoff_remaining=0,
+    )
+
+    assert [item for item, _ in batch] == [priority[0], priority[1], regular, priority[2]]
+    assert priority_selected == 3
+
+
+def test_matching_batch_provider_backoff_defers_priority_and_regular_ai() -> None:
+    candidates = [
+        (uuid4(), True, True),
+        (uuid4(), True, False),
+        (uuid4(), False, False),
+    ]
+
+    batch, ai_selected, ai_deferred, priority_selected = _select_matching_batch(
+        candidates,
+        ai_batch_size=4,
+        priority_ai_batch_size=2,
+        max_jobs=10,
+        backoff_remaining=20,
+    )
+
+    assert batch == [(candidates[2][0], False)]
+    assert ai_selected == 0
+    assert ai_deferred == 2
+    assert priority_selected == 0
 
 
 def make_job(**overrides: Any) -> SourceJob:
