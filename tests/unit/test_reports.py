@@ -149,6 +149,8 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         report = await _generate(session)
 
         assert report.summary["duplicates_merged"] == 1
+        assert report.summary["prepared"] == 1
+        assert report.summary["auto_approved"] == 1
         assert report.summary["automatically_sent"] == 1
         assert report.summary["sent_total"] == 1
         assert report.summary["sent_applications"][0] == {

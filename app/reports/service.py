@@ -144,6 +144,25 @@ async def _generate(session: AsyncSession) -> DailyReport:
                 "automatic": automatic,
             }
         )
+    prepared = int(
+        await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.created_at >= start,
+                Application.created_at < end,
+            )
+        )
+        or 0
+    )
+    auto_approved = int(
+        await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.created_at >= start,
+                Application.created_at < end,
+                Application.policy_decision == PolicyDecision.AUTO_APPROVED,
+            )
+        )
+        or 0
+    )
     delivery_errors = int(
         await session.scalar(
             select(func.count(EmailDelivery.id)).where(
@@ -178,6 +197,8 @@ async def _generate(session: AsyncSession) -> DailyReport:
         ),
         "duplicates_merged": max(0, new_source_jobs - new_canonical_jobs),
         "matching_jobs": matched,
+        "prepared": prepared,
+        "auto_approved": auto_approved,
         "automatically_sent": automatically_sent,
         "sent_total": len(sent_applications),
         "sent_applications": sent_applications,
