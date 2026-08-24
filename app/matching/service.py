@@ -543,6 +543,7 @@ class MatchingService:
             model=self.provider.model_name,
             prompt_rules_version=MATCHING_RULES_VERSION,
             source_content_hash=job.content_hash,
+            source_matching_hash=job.matching_content_hash,
             resume_id=resume.id if resume is not None else None,
             resume_sha256=resume.sha256 if resume is not None else None,
             profile_fingerprint=profile_fingerprint(profile),
@@ -575,6 +576,7 @@ async def process_unprocessed_jobs() -> int:
                 JobSnapshot.source_job_id.label("source_job_id"),
                 func.max(JobSnapshot.timestamp).label("snapshot_at"),
             )
+            .where(JobSnapshot.requires_rematch.is_(True))
             .group_by(JobSnapshot.source_job_id)
             .subquery()
         )
@@ -648,7 +650,8 @@ async def process_unprocessed_jobs() -> int:
                 if (
                     evaluation is None
                     or evaluation.prompt_rules_version != MATCHING_RULES_VERSION
-                    or evaluation.source_content_hash != job.content_hash
+                    or evaluation.source_matching_hash is None
+                    or evaluation.source_matching_hash != job.matching_content_hash
                     or (snapshot_at is not None and snapshot_at > evaluation.created_at)
                     or not evaluation_inputs_are_current(evaluation, profile, preference, resume)
                     or retry_due

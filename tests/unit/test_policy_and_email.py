@@ -17,6 +17,7 @@ from app.matching.bindings import (
     preference_fingerprint,
     profile_fingerprint,
 )
+from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
     AuditEvent,
@@ -127,6 +128,7 @@ async def make_graph(session, storage: Path):
         status=JobStatus.ACTIVE,
         raw_metadata={},
     )
+    job.matching_content_hash = compute_source_matching_hash(job)
     session.add(job)
     await session.flush()
     canonical.primary_source_job_id = job.id
@@ -146,6 +148,7 @@ async def make_graph(session, storage: Path):
         model="mock-v1",
         prompt_rules_version="test",
         source_content_hash=job.content_hash,
+        source_matching_hash=job.matching_content_hash,
         resume_id=resume.id,
         resume_sha256=resume.sha256,
         profile_fingerprint=profile_fingerprint(profile),
@@ -616,6 +619,7 @@ async def test_delivery_preflight_moves_stale_application_to_priority_rematch(
             "policy_version": "test",
         }
         job.content_hash = "a" * 64
+        job.matching_content_hash = "1" * 64
         application_id = application.id
         await session.commit()
 
@@ -768,6 +772,7 @@ async def test_auto_send_scheduler_reconciles_stale_rows_before_delivery(
         application.status = ApplicationStatus.AUTO_APPROVED
         application.policy_decision = PolicyDecision.AUTO_APPROVED
         job.content_hash = "a" * 64
+        job.matching_content_hash = "1" * 64
         application_id = application.id
         await session.commit()
 

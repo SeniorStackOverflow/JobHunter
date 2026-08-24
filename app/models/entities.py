@@ -225,6 +225,7 @@ class SourceJob(UUIDPrimaryKeyMixin, Base):
     )
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    matching_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[JobStatus] = mapped_column(
         enum_column(JobStatus), default=JobStatus.ACTIVE, nullable=False
@@ -245,6 +246,7 @@ class JobSnapshot(UUIDPrimaryKeyMixin, Base):
     requirements: Mapped[str | None] = mapped_column(Text)
     contacts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    requires_rematch: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -311,6 +313,9 @@ class MatchEvaluation(UUIDPrimaryKeyMixin, Base):
     # decision to the exact SourceJob content that was presented to the matcher.
     # A legacy NULL is deliberately treated as stale by the delivery path.
     source_content_hash: Mapped[str | None] = mapped_column(String(64))
+    # Technical source metadata may change without invalidating matching.
+    # This hash binds the decision only to matching/safety-relevant fields.
+    source_matching_hash: Mapped[str | None] = mapped_column(String(64))
     resume_id: Mapped[UUID | None] = mapped_column(ForeignKey("resumes.id", ondelete="RESTRICT"))
     resume_sha256: Mapped[str | None] = mapped_column(String(64))
     profile_fingerprint: Mapped[str | None] = mapped_column(String(64))

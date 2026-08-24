@@ -28,6 +28,7 @@ def job(source_id, external_id: str, title: str) -> SourceJob:
         location="Balti",
         public_email="careers@logico.example",
         content_hash=f"hash-{external_id}",
+        matching_content_hash=f"matching-{external_id}",
         source_fingerprint=f"source-{external_id}",
         raw_metadata={},
     )

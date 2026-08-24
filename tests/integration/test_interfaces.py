@@ -27,6 +27,7 @@ from app.matching.bindings import (
     preference_fingerprint,
     profile_fingerprint,
 )
+from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Alert,
     Application,
@@ -222,6 +223,7 @@ async def _seed_review_application(
             status=JobStatus.ACTIVE,
             raw_metadata={},
         )
+        job.matching_content_hash = compute_source_matching_hash(job)
         session.add(job)
         await session.flush()
         canonical.primary_source_job_id = job.id
@@ -241,6 +243,7 @@ async def _seed_review_application(
             model="mock",
             prompt_rules_version="test-v1",
             source_content_hash=job.content_hash,
+            source_matching_hash=job.matching_content_hash,
             resume_id=resume.id,
             resume_sha256=resume.sha256,
             profile_fingerprint=profile_fingerprint(profile),
@@ -952,6 +955,7 @@ async def test_admin_decision_queue_hides_markerless_stale_approval(
             if key not in {"safe_stop_reason", "requires_rematch"}
         }
         source_job.content_hash = "f" * 64
+        source_job.matching_content_hash = "f" * 64
         await session.commit()
 
     transport = httpx.ASGITransport(app=application)
@@ -1082,6 +1086,7 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
                 status=JobStatus.ACTIVE,
                 raw_metadata={},
             )
+            job.matching_content_hash = compute_source_matching_hash(job)
             session.add(job)
             await session.flush()
             session.add(
@@ -1333,6 +1338,7 @@ async def test_admin_review_queue_uses_learned_order_and_explanations(
                 status=JobStatus.ACTIVE,
                 raw_metadata={},
             )
+            job.matching_content_hash = compute_source_matching_hash(job)
             session.add(job)
             await session.flush()
             evaluation = MatchEvaluation(
@@ -1351,6 +1357,7 @@ async def test_admin_review_queue_uses_learned_order_and_explanations(
                 model="mock",
                 prompt_rules_version="learning-test-v1",
                 source_content_hash=job.content_hash,
+                source_matching_hash=job.matching_content_hash,
                 resume_id=resume.id,
                 resume_sha256=resume.sha256,
                 profile_fingerprint=profile_fingerprint(profile),
@@ -1574,6 +1581,7 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             "rules_failed": [],
         }
         stale_source_job.content_hash = "f" * 64
+        stale_source_job.matching_content_hash = "f" * 64
         internal_preferences.allowed_cities = ["Chisinau"]
         for index in range(3):
             session.add_all(

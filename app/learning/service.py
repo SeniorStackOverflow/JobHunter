@@ -10,6 +10,7 @@ from uuid import UUID
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.matching.freshness import evaluation_is_current
 from app.matching.prefilter import canonicalize_location
 from app.models.entities import (
     Application,
@@ -644,7 +645,7 @@ class ReviewLearningService:
             evaluation.profile_id != application.profile_id
             or evaluation.source_job_id != application.source_job_id
             or evaluation.canonical_job_id != application.canonical_job_id
-            or evaluation.source_content_hash != job.content_hash
+            or not await evaluation_is_current(session, evaluation, job)
             or evaluation.resume_id != application.resume_id
         ):
             learning_eligible = False

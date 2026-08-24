@@ -26,6 +26,7 @@ from app.matching import (
     OpenAIProvider,
 )
 from app.matching.service import _select_matching_batch
+from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     CanonicalJob,
     JobPreference,
@@ -141,7 +142,9 @@ def make_job(**overrides: Any) -> SourceJob:
         "raw_metadata": {},
     }
     values.update(overrides)
-    return SourceJob(**values)
+    job = SourceJob(**values)
+    job.matching_content_hash = compute_source_matching_hash(job)
+    return job
 
 
 def make_profile(**overrides: Any) -> UserProfile:
@@ -948,6 +951,7 @@ async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
         assert stored_job is not None
         stored_job.description = "The employer added a new requirement."
         stored_job.content_hash = "9" * 64
+        stored_job.matching_content_hash = compute_source_matching_hash(stored_job)
         session.add(
             JobSnapshot(
                 source_job_id=stored_job.id,

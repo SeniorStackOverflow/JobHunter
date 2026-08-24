@@ -11,30 +11,33 @@ async def evaluation_is_current(
     evaluation: MatchEvaluation,
     job: SourceJob,
 ) -> bool:
-    """Return whether an evaluation describes this exact current publication.
+    """Return whether an evaluation describes current decision-relevant content.
 
-    Content hashes make the normal check deterministic. The snapshot timestamp
-    also handles an A -> B -> A content sequence: even though the current hash
-    then equals an old hash, the later snapshot still requires a new evaluation.
+    The broad source hash remains available for audit and crawler history.
+    Matching freshness uses a narrower hash so publication timestamps and other
+    technical metadata cannot block owner decisions. A relevant A -> B -> A
+    revision is still stale because the intervening snapshot is retained.
     """
 
     if (
         job.canonical_job_id is None
         or evaluation.source_job_id != job.id
         or evaluation.canonical_job_id != job.canonical_job_id
-        or evaluation.source_content_hash is None
-        or evaluation.source_content_hash != job.content_hash
+        or evaluation.source_matching_hash is None
+        or job.matching_content_hash is None
+        or evaluation.source_matching_hash != job.matching_content_hash
     ):
         return False
-    newer_snapshot = await session.scalar(
+    newer_relevant_snapshot = await session.scalar(
         select(JobSnapshot.id)
         .where(
             JobSnapshot.source_job_id == job.id,
+            JobSnapshot.requires_rematch.is_(True),
             JobSnapshot.timestamp > evaluation.created_at,
         )
         .limit(1)
     )
-    return newer_snapshot is None
+    return newer_relevant_snapshot is None
 
 
 __all__ = ["evaluation_is_current"]

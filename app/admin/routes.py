@@ -702,7 +702,7 @@ async def dashboard(
             MatchEvaluation.source_job_id == SourceJob.id,
             MatchEvaluation.profile_id == selected_profile_id,
             MatchEvaluation.prompt_rules_version == MATCHING_RULES_VERSION,
-            MatchEvaluation.source_content_hash == SourceJob.content_hash,
+            MatchEvaluation.source_matching_hash == SourceJob.matching_content_hash,
         )
         .correlate(SourceJob)
         .exists()

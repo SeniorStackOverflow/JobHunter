@@ -22,7 +22,9 @@ from app.matching.bindings import (
     preference_fingerprint,
     profile_fingerprint,
 )
+from app.matching.freshness import evaluation_is_current
 from app.matching.service import _priority_rematch_source_ids
+from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
     AuditEvent,
@@ -154,6 +156,8 @@ async def _duplicate_graph(session, storage: Path) -> dict[str, object]:
         last_seen_at=now - timedelta(hours=1),
         **common,
     )
+    job_a.matching_content_hash = compute_source_matching_hash(job_a)
+    job_b.matching_content_hash = compute_source_matching_hash(job_b)
     session.add_all([job_a, job_b])
     await session.flush()
     canonical.primary_source_job_id = job_a.id
@@ -174,6 +178,7 @@ async def _duplicate_graph(session, storage: Path) -> dict[str, object]:
         model="mock",
         prompt_rules_version="test",
         source_content_hash=job_a.content_hash,
+        source_matching_hash=job_a.matching_content_hash,
         resume_id=resume.id,
         resume_sha256=resume.sha256,
         profile_fingerprint=profile_fingerprint(profile),
@@ -197,6 +202,7 @@ async def _duplicate_graph(session, storage: Path) -> dict[str, object]:
         model="mock",
         prompt_rules_version="test",
         source_content_hash=job_b.content_hash,
+        source_matching_hash=job_b.matching_content_hash,
         resume_id=resume.id,
         resume_sha256=resume.sha256,
         profile_fingerprint=profile_fingerprint(profile),
@@ -281,6 +287,7 @@ async def test_manual_approval_rejects_markerless_stale_evaluation(
         application.status = ApplicationStatus.PENDING_REVIEW
         application_id = application.id
         graph["job_b"].content_hash = "7" * 64
+        graph["job_b"].matching_content_hash = "7" * 64
         await session.commit()
 
         with pytest.raises(ApplicationPreparationError, match="match evaluation is stale"):
@@ -291,6 +298,91 @@ async def test_manual_approval_rejects_markerless_stale_evaluation(
         stored = await session.get(Application, application_id)
         assert stored is not None
         assert stored.status == ApplicationStatus.PENDING_REVIEW
+
+
+async def test_freshness_ignores_metadata_revision_but_not_material_a_b_a(
+    sqlite_session_factory,
+    tmp_path: Path,
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _duplicate_graph(session, tmp_path)
+        job = graph["job_a"]
+        evaluation = graph["evaluation_a"]
+        original_matching_hash = job.matching_content_hash
+
+        job.content_hash = "6" * 64
+        session.add(
+            JobSnapshot(
+                source_job_id=job.id,
+                changed_fields=["published_at", "source_updated_at", "content_hash"],
+                description=job.description,
+                salary={},
+                requirements=job.requirements,
+                contacts={},
+                content_hash=job.content_hash,
+                requires_rematch=False,
+                timestamp=evaluation.created_at + timedelta(seconds=1),
+            )
+        )
+        await session.flush()
+
+        assert await evaluation_is_current(session, evaluation, job)
+
+        session.add(
+            JobSnapshot(
+                source_job_id=job.id,
+                changed_fields=["description"],
+                description="Temporarily changed and then restored.",
+                salary={},
+                requirements=job.requirements,
+                contacts={},
+                content_hash="8" * 64,
+                requires_rematch=True,
+                timestamp=evaluation.created_at + timedelta(seconds=2),
+            )
+        )
+        job.matching_content_hash = original_matching_hash
+        await session.flush()
+
+        assert not await evaluation_is_current(session, evaluation, job)
+
+
+async def test_manual_approval_accepts_metadata_only_source_revision(
+    sqlite_session_factory,
+    tmp_path: Path,
+) -> None:
+    current_settings = _settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        graph = await _duplicate_graph(session, tmp_path)
+        application = await ApplicationService(current_settings).prepare(
+            session,
+            graph["canonical"].id,
+        )
+        job = graph["job_b"]
+        evaluation = graph["evaluation_b"]
+        application.status = ApplicationStatus.PENDING_REVIEW
+        job.content_hash = "6" * 64
+        session.add(
+            JobSnapshot(
+                source_job_id=job.id,
+                changed_fields=["published_at", "source_updated_at", "content_hash"],
+                description=job.description,
+                salary={},
+                requirements=job.requirements,
+                contacts={},
+                content_hash=job.content_hash,
+                requires_rematch=False,
+                timestamp=evaluation.created_at + timedelta(seconds=1),
+            )
+        )
+        await session.flush()
+
+        approved = await ApplicationService(current_settings).approve(
+            session,
+            application.id,
+        )
+
+        assert approved.status == ApplicationStatus.APPROVED
 
 
 async def test_sender_cannot_use_newest_duplicate_evaluation_for_stale_publication(
@@ -307,6 +399,7 @@ async def test_sender_cannot_use_newest_duplicate_evaluation_for_stale_publicati
         old_hash = job_a.content_hash
         job_a.description = "The publication changed after matching."
         job_a.content_hash = "d" * 64
+        job_a.matching_content_hash = compute_source_matching_hash(job_a)
         session.add(
             JobSnapshot(
                 source_job_id=job_a.id,
@@ -381,6 +474,7 @@ async def test_stale_auto_approved_application_is_rematched_prepared_and_sent(
         assert application.status == ApplicationStatus.AUTO_APPROVED
         graph["job_b"].description = "Updated active publication requiring a fresh match."
         graph["job_b"].content_hash = "9" * 64
+        graph["job_b"].matching_content_hash = compute_source_matching_hash(graph["job_b"])
         application_id = application.id
         original_evaluation_id = application.match_evaluation_id
         await session.commit()

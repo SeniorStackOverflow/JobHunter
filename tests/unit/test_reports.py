@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
     CanonicalJob,
@@ -78,6 +79,7 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
                 raw_metadata={},
                 first_seen_at=now,
             )
+            job.matching_content_hash = compute_source_matching_hash(job)
             session.add(job)
             jobs.append(job)
         await session.flush()
@@ -108,6 +110,7 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             model="mock",
             prompt_rules_version="v1",
             source_content_hash=jobs[0].content_hash,
+            source_matching_hash=jobs[0].matching_content_hash,
         )
         session.add_all([contact, evaluation])
         await session.flush()

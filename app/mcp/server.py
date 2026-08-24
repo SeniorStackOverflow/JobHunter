@@ -1377,7 +1377,7 @@ async def get_daily_report() -> dict[str, Any]:
             .where(
                 MatchEvaluation.source_job_id == SourceJob.id,
                 MatchEvaluation.prompt_rules_version == MATCHING_RULES_VERSION,
-                MatchEvaluation.source_content_hash == SourceJob.content_hash,
+                MatchEvaluation.source_matching_hash == SourceJob.matching_content_hash,
             )
             .correlate(SourceJob)
             .exists()
@@ -1441,7 +1441,7 @@ async def get_daily_report() -> dict[str, Any]:
                     SourceJob.status == JobStatus.ACTIVE,
                     SourceJob.canonical_job_id.is_not(None),
                     MatchEvaluation.prompt_rules_version == MATCHING_RULES_VERSION,
-                    MatchEvaluation.source_content_hash == SourceJob.content_hash,
+                    MatchEvaluation.source_matching_hash == SourceJob.matching_content_hash,
                 )
             )
         ).all()

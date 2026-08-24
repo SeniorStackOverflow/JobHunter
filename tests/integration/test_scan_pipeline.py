@@ -296,6 +296,7 @@ async def test_full_update_deduplicate_checkpoint_and_recheck_pipeline(
         )
         assert len(snapshots) == 1
         assert {"salary_text", "salary_min", "salary_max"} <= set(snapshots[0].changed_fields)
+        assert snapshots[0].requires_rematch is True
         assert snapshots[0].salary == {
             "text": "30000 - 40000 MDL",
             "minimum": "30000",

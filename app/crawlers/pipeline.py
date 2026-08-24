@@ -14,6 +14,10 @@ from app.audit import record_audit_event
 from app.crawlers.registry import JobSourceAdapterRegistry
 from app.crawlers.schemas import NormalizedJobData, RawJobReference, ScanCheckpoint
 from app.deduplication import DeduplicationService
+from app.matching.source_version import (
+    changes_require_rematch,
+    compute_source_matching_hash,
+)
 from app.models.entities import (
     Alert,
     BatchScanRun,
@@ -41,6 +45,8 @@ SOURCE_JOB_FIELDS = (
     "salary_min",
     "salary_max",
     "currency",
+    "location",
+    "cities",
     "schedule",
     "employment_type",
     "required_experience",
@@ -673,6 +679,7 @@ class ScanService:
                 status=normalized.status,
                 raw_metadata=raw_metadata,
             )
+            job.matching_content_hash = compute_source_matching_hash(job)
             session.add(job)
             await session.flush()
             result = await self.deduplication.assign(session, job)
@@ -693,6 +700,7 @@ class ScanService:
         if normalized.status == JobStatus.ACTIVE and existing.status != JobStatus.ACTIVE:
             existing.status = JobStatus.ACTIVE
         if not changed:
+            existing.matching_content_hash = compute_source_matching_hash(existing)
             if existing.canonical_job_id is not None:
                 await self._refresh_canonical_status(session, {existing.canonical_job_id})
             await session.flush()
@@ -701,6 +709,8 @@ class ScanService:
         changed_fields: list[str] = []
         value_map: dict[str, Any] = {
             **normalized.model_dump(),
+            "location": normalized.city,
+            "cities": normalized.cities,
             "source_updated_at": normalized.updated_at,
             "raw_metadata": existing.raw_metadata,
         }
@@ -716,8 +726,7 @@ class ScanService:
             if getattr(existing, field) != new_value:
                 changed_fields.append(field)
                 setattr(existing, field, new_value)
-        existing.location = normalized.city
-        existing.cities = normalized.cities
+        existing.matching_content_hash = compute_source_matching_hash(existing)
         session.add(
             JobSnapshot(
                 source_job_id=existing.id,
@@ -741,6 +750,7 @@ class ScanService:
                     "phones": normalized.public_phones,
                 },
                 content_hash=normalized.content_hash,
+                requires_rematch=changes_require_rematch(changed_fields),
             )
         )
         if existing.canonical_job_id is not None:

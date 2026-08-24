@@ -20,6 +20,7 @@ def _job(locale: str = "ru") -> SourceJob:
         localized_urls={},
         categories_seen=[],
         content_hash="a" * 64,
+        matching_content_hash="c" * 64,
         source_fingerprint="b" * 64,
         raw_metadata={},
     )
