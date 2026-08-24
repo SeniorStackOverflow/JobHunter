@@ -293,6 +293,8 @@ async def _seed_review_application(
             "contact_id": contact.id,
             "resume_id": resume.id,
             "source_id": source.id,
+            "source_job_id": job.id,
+            "canonical_job_id": canonical.id,
         }
 
 
@@ -864,6 +866,61 @@ async def test_admin_application_detail_approval_and_policy_gated_send(
         assert {"application.approved", "application.send_requested", "email.delivery"} <= actions
 
 
+async def test_admin_application_uses_saved_vacancy_when_source_is_unavailable(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="saved-unavailable-vacancy",
+    )
+    application_id = seeded["application_id"]
+    async with sqlite_session_factory() as session:
+        source_job = await session.get(SourceJob, seeded["source_job_id"])
+        canonical = await session.get(CanonicalJob, seeded["canonical_job_id"])
+        assert source_job is not None
+        assert canonical is not None
+        source_job.status = JobStatus.POSSIBLY_CLOSED
+        source_job.confirmed_absence_count = 2
+        source_job.description = "Saved description remains readable after the source disappears."
+        source_job.requirements = "Python and careful production operations."
+        source_job.responsibilities = "Maintain the application and review failures."
+        canonical.status = JobStatus.POSSIBLY_CLOSED
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        detail = await client.get(f"/admin/applications/{application_id}")
+
+        assert detail.status_code == 200
+        assert "Вакансия временно не подтверждена" in detail.text
+        assert "Saved description remains readable" in detail.text
+        assert "Python and careful production operations" in detail.text
+        assert "Maintain the application and review failures" in detail.text
+        assert "Открыть исходную страницу" in detail.text
+        assert "Одобрение недоступно" in detail.text
+        assert f'action="/admin/applications/{application_id}/approve"' not in detail.text
+
+        direct_approval = await client.post(
+            f"/admin/applications/{application_id}/approve",
+            data={"csrf_token": csrf_token},
+        )
+        assert direct_approval.status_code == 409
+        assert direct_approval.json()["detail"] == "vacancy is no longer active"
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.PENDING_REVIEW
+
+
 async def test_admin_decision_queue_filters_and_rejects_without_sending(
     interface_app: tuple[FastAPI, Settings],
     sqlite_session_factory: Any,
@@ -1342,6 +1399,19 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         )
         for index in range(3)
     ]
+    vacancy_statuses = [JobStatus.POSSIBLY_CLOSED, JobStatus.ACTIVE, JobStatus.CLOSED]
+    async with sqlite_session_factory() as session:
+        for index, seeded in enumerate(seeded_reviews):
+            source_job = await session.get(SourceJob, seeded["source_job_id"])
+            canonical = await session.get(CanonicalJob, seeded["canonical_job_id"])
+            assert source_job is not None
+            assert canonical is not None
+            source_job.status = vacancy_statuses[index]
+            source_job.description = f"Saved browser vacancy description {index}."
+            source_job.requirements = f"Browser requirement {index}."
+            source_job.responsibilities = f"Browser responsibility {index}."
+            canonical.status = vacancy_statuses[index]
+        await session.commit()
     with socket.socket() as port_socket:
         port_socket.bind(("127.0.0.1", 0))
         port = int(port_socket.getsockname()[1])
@@ -1378,6 +1448,21 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     await page.goto(f"{base_url}/login")
                     await page.get_by_label("Пароль администратора").fill(ADMIN_PASSWORD)
                     await page.get_by_role("button", name="Войти", exact=True).click()
+                    await page.goto(f"{base_url}/admin/applications/{seeded['application_id']}")
+                    await expect(
+                        page.get_by_text(f"Saved browser vacancy description {index}.")
+                    ).to_be_visible()
+                    if vacancy_statuses[index] == JobStatus.ACTIVE:
+                        await expect(
+                            page.get_by_role("button", name="Одобрить", exact=True)
+                        ).to_be_visible()
+                    else:
+                        await expect(
+                            page.get_by_role("button", name="Одобрить", exact=True)
+                        ).to_have_count(0)
+                        await expect(
+                            page.get_by_role("button", name="Одобрение недоступно")
+                        ).to_be_disabled()
                     await page.goto(f"{base_url}/?view=decisions&profile_id={seeded['profile_id']}")
                     await expect(
                         page.get_by_role("heading", name="Требуют решения")

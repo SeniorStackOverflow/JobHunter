@@ -9,6 +9,7 @@ import httpx
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.applications.availability import block_closed_vacancy_applications
 from app.audit import record_audit_event
 from app.crawlers.registry import JobSourceAdapterRegistry
 from app.crawlers.schemas import NormalizedJobData, RawJobReference, ScanCheckpoint
@@ -889,6 +890,15 @@ class ScanService:
             await self._refresh_canonical_status(
                 session,
                 {
+                    job.canonical_job_id
+                    for job, _result in results
+                    if job.canonical_job_id is not None
+                },
+            )
+            await block_closed_vacancy_applications(
+                session,
+                actor="scan_recheck",
+                canonical_job_ids={
                     job.canonical_job_id
                     for job, _result in results
                     if job.canonical_job_id is not None

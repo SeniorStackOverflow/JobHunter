@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.applications.availability import block_closed_vacancy_applications
 from app.applications.states import ensure_transition
 from app.contacts import ContactDiscoveryService
 from app.crawlers.parsing.normalization import detect_prompt_injection, stable_hash
@@ -322,7 +323,9 @@ class ApplicationService:
         return application
 
     async def approve(self, session: AsyncSession, application_id: UUID) -> Application:
-        application = await session.get(Application, application_id)
+        application = await session.scalar(
+            select(Application).where(Application.id == application_id).with_for_update()
+        )
         if application is None:
             raise LookupError(f"application {application_id} does not exist")
         if application.status not in {
@@ -334,6 +337,11 @@ class ApplicationService:
             )
         if not application.content_validated:
             raise ApplicationPreparationError("application content has not passed validation")
+        source_job = await session.scalar(
+            select(SourceJob).where(SourceJob.id == application.source_job_id).with_for_update()
+        )
+        if source_job is None or source_job.status != JobStatus.ACTIVE:
+            raise ApplicationPreparationError("vacancy is no longer active")
         ensure_transition(application.status, ApplicationStatus.APPROVED)
         application.status = ApplicationStatus.APPROVED
         await session.flush()
@@ -365,6 +373,10 @@ async def prepare_pending_applications() -> int:
         ApplicationStatus.BLOCKED,
     }
     async with async_session_factory() as session:
+        await block_closed_vacancy_applications(
+            session,
+            actor="application_scheduler",
+        )
         ranked = (
             select(
                 MatchEvaluation.profile_id.label("profile_id"),

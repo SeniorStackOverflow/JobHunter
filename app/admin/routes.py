@@ -159,6 +159,7 @@ _VIEW_TITLES = {
 _AUDIT_ACTION_LABELS = {
     "admin.login.google": "Выполнен вход через Google",
     "application.approved": "Отклик одобрен",
+    "application.blocked_closed_vacancy": "Отклик остановлен: вакансия закрыта",
     "application.rejected_by_owner": "Отклик отклонён",
     "application.send_requested": "Запрошена отправка отклика",
     "auto_send.paused": "Автоотправка поставлена на паузу",

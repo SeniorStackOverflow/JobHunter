@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
 from app.applications import ApplicationService
 from app.applications.service import prepare_pending_applications
@@ -20,6 +21,7 @@ from app.matching.bindings import (
 )
 from app.models.entities import (
     Application,
+    AuditEvent,
     CanonicalJob,
     JobPreference,
     JobSnapshot,
@@ -33,6 +35,7 @@ from app.models.enums import (
     ApplicationStatus,
     JobStatus,
     MatchDecision,
+    PolicyDecision,
     SourceHealth,
 )
 from app.settings import Settings
@@ -315,3 +318,43 @@ async def test_periodic_prepare_does_not_overwrite_manual_approval(
         assert persisted is not None
         assert persisted.status == ApplicationStatus.APPROVED
         assert persisted.match_evaluation_id == approved_evaluation_id
+
+
+@pytest.mark.asyncio
+async def test_periodic_prepare_blocks_unsent_application_when_canonical_vacancy_closes(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    async with sqlite_session_factory() as session:
+        graph = await _duplicate_graph(session, tmp_path)
+        application = await ApplicationService(_settings(tmp_path)).prepare(
+            session, graph["canonical"].id
+        )
+        application.status = ApplicationStatus.APPROVED
+        graph["job_a"].status = JobStatus.CLOSED
+        graph["job_b"].status = JobStatus.CLOSED
+        graph["canonical"].status = JobStatus.CLOSED
+        application_id = application.id
+        await session.commit()
+
+    prepared = await prepare_pending_applications()
+
+    assert prepared == 0
+    async with sqlite_session_factory() as session:
+        persisted = await session.get(Application, application_id)
+        audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "application.blocked_closed_vacancy",
+                AuditEvent.entity_id == str(application_id),
+            )
+        )
+        assert persisted is not None
+        assert persisted.status == ApplicationStatus.BLOCKED
+        assert persisted.policy_decision == PolicyDecision.BLOCKED
+        assert "vacancy_active" in persisted.policy_result["rules_failed"]
+        assert audit is not None
+        assert audit.actor == "application_scheduler"
