@@ -929,6 +929,45 @@ async def test_admin_application_uses_saved_vacancy_when_source_is_unavailable(
         assert stored.status == ApplicationStatus.PENDING_REVIEW
 
 
+async def test_admin_decision_queue_hides_markerless_stale_approval(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="admin-stale-queue",
+    )
+    application_id = seeded["application_id"]
+    profile_id = seeded["profile_id"]
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        source_job = await session.get(SourceJob, seeded["source_job_id"])
+        assert stored is not None
+        assert source_job is not None
+        stored.policy_result = {
+            key: value
+            for key, value in stored.policy_result.items()
+            if key not in {"safe_stop_reason", "requires_rematch"}
+        }
+        source_job.content_hash = "f" * 64
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        await _login_admin(client, settings)
+        queue = await client.get(f"/?view=decisions&profile_id={profile_id}")
+
+        assert queue.status_code == 200
+        assert "Вакансия изменилась — JobHunter выполняет повторный анализ." in queue.text
+        assert f'action="/admin/applications/{application_id}/approve"' not in queue.text
+
+
 async def test_admin_hides_approval_without_public_email_and_redirects_stale_post(
     interface_app: tuple[FastAPI, Settings],
     sqlite_session_factory: Any,

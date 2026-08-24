@@ -49,6 +49,7 @@ from app.learning import (
     ReviewLearningSummary,
     fixed_preference_dimensions,
 )
+from app.matching.freshness import evaluation_is_current
 from app.matching.providers import MATCHING_RULES_VERSION
 from app.models.entities import (
     Alert,
@@ -355,14 +356,18 @@ def _application_safe_stop_reason(application: Any) -> str | None:
     return reason if isinstance(reason, str) and reason else None
 
 
-def _application_approval_issue(application: Any) -> str | None:
+def _application_approval_issue(
+    application: Any,
+    match_evaluation_issue: str | None = None,
+) -> str | None:
     """Explain why a review cannot currently become an approved email application."""
 
     safe_stop_reason = _application_safe_stop_reason(application)
-    if isinstance(application, dict):
-        match_evaluation_issue = application.get("match_evaluation_issue")
-    else:
-        match_evaluation_issue = getattr(application, "match_evaluation_issue", None)
+    if match_evaluation_issue is None:
+        if isinstance(application, dict):
+            match_evaluation_issue = application.get("match_evaluation_issue")
+        else:
+            match_evaluation_issue = getattr(application, "match_evaluation_issue", None)
     if (
         safe_stop_reason == "match_evaluation_stale"
         or match_evaluation_issue == "match_evaluation_stale"
@@ -879,6 +884,7 @@ async def dashboard(
     applications: list[Application] = []
     recent_applications: list[Application] = []
     application_jobs: dict[UUID, SourceJob] = {}
+    application_match_evaluation_issues: dict[UUID, str] = {}
     jobs: list[SourceJob] = []
     matches: list[MatchEvaluation] = []
     match_jobs: dict[UUID, SourceJob] = {}
@@ -1236,6 +1242,37 @@ async def dashboard(
                 )
             ).all()
         }
+    if view == "decisions" and applications:
+        evaluation_ids = {
+            item.match_evaluation_id
+            for item in applications
+            if item.match_evaluation_id is not None
+        }
+        evaluations = {
+            item.id: item
+            for item in (
+                await session.scalars(
+                    select(MatchEvaluation).where(MatchEvaluation.id.in_(evaluation_ids))
+                )
+            ).all()
+        }
+        for item in applications:
+            job = application_jobs.get(item.source_job_id)
+            evaluation = (
+                evaluations.get(item.match_evaluation_id)
+                if item.match_evaluation_id is not None
+                else None
+            )
+            if (
+                job is None
+                or evaluation is None
+                or evaluation.profile_id != item.profile_id
+                or evaluation.source_job_id != item.source_job_id
+                or evaluation.canonical_job_id != item.canonical_job_id
+            ):
+                application_match_evaluation_issues[item.id] = "invalid_match_evaluation_binding"
+            elif not await evaluation_is_current(session, evaluation, job):
+                application_match_evaluation_issues[item.id] = "match_evaluation_stale"
     match_job_ids = {item.source_job_id for item in matches}
     if match_job_ids:
         match_jobs = {
@@ -1280,6 +1317,7 @@ async def dashboard(
             "applications": applications,
             "recent_applications": recent_applications,
             "application_jobs": application_jobs,
+            "application_match_evaluation_issues": application_match_evaluation_issues,
             "learning_summary": learning_summary,
             "learning_scores": learning_scores,
             "scans": scans,
