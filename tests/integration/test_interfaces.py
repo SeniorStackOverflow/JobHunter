@@ -1370,8 +1370,10 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
             except Exception as exc:  # pragma: no cover - depends on optional browser install
                 pytest.skip(f"Playwright Chromium is unavailable: {type(exc).__name__}")
             try:
+                viewports = [(390, 844), (768, 900), (1440, 900)]
                 for index, seeded in enumerate(seeded_reviews):
-                    context = await browser.new_context()
+                    width, height = viewports[index]
+                    context = await browser.new_context(viewport={"width": width, "height": height})
                     page = await context.new_page()
                     await page.goto(f"{base_url}/login")
                     await page.get_by_label("Пароль администратора").fill(ADMIN_PASSWORD)
@@ -1381,10 +1383,13 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                         page.get_by_role("heading", name="Требуют решения")
                     ).to_be_visible()
                     await page.locator("details.learning-control > summary").click()
-                    await expect(page.locator(".learning-popover")).to_be_visible()
-                    await expect(page.locator(".learning-popover")).to_contain_text(
-                        "0 принято · 0 отклонено"
-                    )
+                    learning_popover = page.locator(".learning-popover")
+                    await expect(learning_popover).to_be_visible()
+                    await expect(learning_popover).to_contain_text("0 принято · 0 отклонено")
+                    popover_box = await learning_popover.bounding_box()
+                    assert popover_box is not None
+                    assert popover_box["x"] >= 0
+                    assert popover_box["x"] + popover_box["width"] <= width
                     await (
                         page.locator(".queue-card").get_by_role("button", name="Отклонить").click()
                     )
