@@ -327,8 +327,20 @@ class RabotaMdAdapter:
 
     async def aclose(self) -> None:
         close = getattr(self._http, "aclose", None)
-        if self._owns_http and close is not None:
-            await close()
+        try:
+            if self._owns_http and close is not None:
+                await close()
+        finally:
+            # Full scans can cache thousands of references. Release those objects as soon as
+            # the adapter is closed so a long-lived Celery worker does not retain their heap.
+            self._references_by_id.clear()
+            self._locale_pages.clear()
+            self._locale_cache = None
+            self._category_cache = None
+            self._region_cache = None
+            self._general_entrypoints = None
+            self._access_result = None
+            self.last_checkpoint = ScanCheckpoint()
 
     async def validate_source(self) -> SourceValidationResult:
         policy = await self.check_access_policy()
@@ -806,12 +818,17 @@ class RabotaMdAdapter:
                         hint_unchanged = known_unchanged(reference)
                         unchanged_run = unchanged_run + 1 if hint_unchanged else 0
                         self._merge_reference(existing, reference)
-                        existing.metadata["known_unchanged"] = hint_unchanged
-                        existing.metadata["scan_checkpoint"] = state.model_dump(mode="json")
-                        existing.metadata["duplicate_reference"] = True
+                        # Never attach the growing checkpoint snapshot to the cached reference.
+                        # Keeping one full yielded_external_ids list per cached vacancy makes a
+                        # full scan O(n^2) in retained memory. Only the short-lived yielded copy
+                        # carries checkpoint progress to the common pipeline.
+                        yielded = existing.model_copy(deep=True)
+                        yielded.metadata["known_unchanged"] = hint_unchanged
+                        yielded.metadata["scan_checkpoint"] = state.model_dump(mode="json")
+                        yielded.metadata["duplicate_reference"] = True
                         # The common pipeline keeps SourceJob unique while merging every
                         # category/locale occurrence without fetching details twice.
-                        yield existing.model_copy(deep=True)
+                        yield yielded
                         if (
                             incremental
                             and unchanged_run >= self.config.known_unchanged_stop_threshold
@@ -825,11 +842,14 @@ class RabotaMdAdapter:
                     if reference.external_id not in seen_ids:
                         seen_ids.add(reference.external_id)
                         state.yielded_external_ids.append(reference.external_id)
-                        reference.metadata["known_unchanged"] = hint_unchanged
-                        reference.metadata["scan_checkpoint"] = state.model_dump(mode="json")
+                        # Keep the cache compact: the full checkpoint belongs only to the
+                        # short-lived item crossing the adapter/pipeline boundary.
+                        yielded = reference.model_copy(deep=True)
+                        yielded.metadata["known_unchanged"] = hint_unchanged
+                        yielded.metadata["scan_checkpoint"] = state.model_dump(mode="json")
                         # Later locale/category occurrences merge into the cached reference;
                         # callers must receive an immutable view of this occurrence.
-                        yield reference.model_copy(deep=True)
+                        yield yielded
                     if incremental and unchanged_run >= self.config.known_unchanged_stop_threshold:
                         current_url = None
                         break

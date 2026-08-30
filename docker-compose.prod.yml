@@ -76,7 +76,10 @@ services:
       - --loglevel=${LOG_LEVEL:-INFO}
       - --hostname=crawler@%h
       - --queues=crawling,celery
-      - --pool=solo
+      - --pool=prefork
+      - --concurrency=1
+      - --max-tasks-per-child=20
+      - --max-memory-per-child=600000
     volumes:
       - resumes:/data/resumes:ro
 

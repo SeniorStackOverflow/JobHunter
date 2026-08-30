@@ -237,6 +237,31 @@ async def test_checkpoint_resumes_without_refetching_seen_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scan_cache_does_not_retain_checkpoint_snapshots_and_closes_cleanly() -> None:
+    adapter = RabotaMdAdapter(adapter_config(), http_fetcher=FixtureFetcher(routes()))
+
+    references = await collect(adapter.iterate_full_scan())
+
+    assert references
+    assert any("scan_checkpoint" in item.metadata for item in references)
+    assert adapter._references_by_id
+    assert all(
+        "scan_checkpoint" not in item.metadata
+        for item in adapter._references_by_id.values()
+    )
+
+    await adapter.aclose()
+
+    assert adapter._references_by_id == {}
+    assert adapter._locale_pages == {}
+    assert adapter._locale_cache is None
+    assert adapter._category_cache is None
+    assert adapter._region_cache is None
+    assert adapter._general_entrypoints is None
+    assert adapter.last_checkpoint == ScanCheckpoint()
+
+
+@pytest.mark.asyncio
 async def test_incremental_known_run_stops_before_next_general_page() -> None:
     incremental_routes = routes()
     incremental_routes[f"{BASE}/ru/jobs"] = fixture("empty_listing.html")
