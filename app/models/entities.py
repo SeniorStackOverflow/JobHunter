@@ -456,6 +456,7 @@ class EmailDelivery(UUIDPrimaryKeyMixin, Base):
         JSON, default=dict, nullable=False
     )
     error: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(128), index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False

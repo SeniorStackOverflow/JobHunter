@@ -9,8 +9,14 @@ import pytest
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
-from app.email.oauth import GmailOAuthError
-from app.email.providers import GMAIL_SEND_SCOPE, FakeGmailProvider, deterministic_message_id
+from app.email.oauth import GmailOAuthError, GmailOAuthService
+from app.email.providers import (
+    GMAIL_REAUTH_REQUIRED_CODE,
+    GMAIL_SEND_SCOPE,
+    FakeGmailProvider,
+    GmailReauthorizationRequired,
+    deterministic_message_id,
+)
 from app.email.service import EmailSendBlocked, EmailService
 from app.matching.bindings import (
     confirmed_fact_hashes,
@@ -954,3 +960,73 @@ async def test_retry_temporary_failures_skips_pending_review_application(
         assert delivery is not None
         assert delivery.status == DeliveryStatus.TEMPORARY_FAILURE
         assert delivery.attempt_count == 1
+
+
+class ReauthorizationRequiredProvider:
+    name = "gmail"
+
+    async def send(self, _message):
+        raise GmailReauthorizationRequired("Gmail reauthorization is required")
+
+
+async def test_gmail_reauthorization_is_not_retried_and_is_recoverable(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    current_settings = settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        application = values[8]
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        session.add(
+            OAuthCredential(
+                provider="gmail",
+                encrypted_refresh_token=b"legacy-token-placeholder",
+                scopes=[GMAIL_SEND_SCOPE],
+                token_metadata={"identity_verified": True},
+            )
+        )
+        await session.commit()
+
+    service = EmailService(
+        current_settings, sqlite_session_factory, ReauthorizationRequiredProvider()
+    )
+    first = await service.send_application(application_id)
+    assert first.status == DeliveryStatus.TEMPORARY_FAILURE
+    assert first.error_code == GMAIL_REAUTH_REQUIRED_CODE
+    assert first.attempt_count == 1
+
+    with pytest.raises(EmailSendBlocked, match="not safely retryable"):
+        await service.send_application(application_id)
+
+    oauth = GmailOAuthService(current_settings)
+    async with sqlite_session_factory() as session:
+        status = await oauth.get_status(session)
+        assert status["reauth_required"] is True
+        assert status["last_refresh_error"] == GMAIL_REAUTH_REQUIRED_CODE
+        delivery = await session.scalar(
+            select(EmailDelivery).where(EmailDelivery.application_id == application_id)
+        )
+        assert delivery is not None
+        assert delivery.attempt_count == 1
+
+        recovered = await oauth.recover_reauthorization_failures(session)
+        await oauth.mark_refresh_ok(session)
+        await session.commit()
+
+    assert recovered == 1
+    async with sqlite_session_factory() as session:
+        restored = await session.get(Application, application_id)
+        delivery = await session.scalar(
+            select(EmailDelivery).where(EmailDelivery.application_id == application_id)
+        )
+        status = await oauth.get_status(session)
+        assert restored is not None
+        assert restored.status == ApplicationStatus.AUTO_APPROVED
+        assert delivery is not None
+        assert delivery.attempt_count == 0
+        assert delivery.error is None
+        assert delivery.error_code is None
+        assert status["reauth_required"] is False
+        assert status["last_refresh_ok"] is not None

@@ -550,7 +550,11 @@ async def google_admin_login_start(
         authorization = await service.create_authorization_request(
             session,
             actor=GOOGLE_ADMIN_OAUTH_ACTOR,
-            force_consent=consent or not oauth_status["connected"],
+            force_consent=(
+                consent
+                or not oauth_status["connected"]
+                or oauth_status["reauth_required"]
+            ),
         )
     except GmailOAuthError as exc:
         await session.rollback()
@@ -816,6 +820,14 @@ async def dashboard(
                 "action": "Подключить",
             }
         )
+    elif gmail_oauth["reauth_required"]:
+        attention_items.append({
+            "tone": "danger",
+            "title": "Gmail требует переподключения",
+            "detail": "Автоотправка остановлена до получения нового OAuth-доступа.",
+            "href": "/admin/auth/google?consent=1",
+            "action": "Переподключить Gmail",
+        })
     elif not gmail_oauth["identity_verified"]:
         attention_items.append(
             {

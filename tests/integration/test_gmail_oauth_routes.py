@@ -286,11 +286,12 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
     async with oauth_api.session_factory() as session:
         credential = await session.scalar(select(OAuthCredential))
         assert credential is not None
-        assert credential.token_metadata == {
-            "identity_verified": True,
-            "identity_email": "owner@example.test",
-            "identity_provider": "google",
-        }
+        assert credential.token_metadata["identity_verified"] is True
+        assert credential.token_metadata["identity_email"] == "owner@example.test"
+        assert credential.token_metadata["identity_provider"] == "google"
+        assert credential.token_metadata["reauth_required"] is False
+        assert credential.token_metadata["last_refresh_ok"]
+        assert credential.token_metadata["last_refresh_error"] is None
         actions = set((await session.scalars(select(AuditEvent.action))).all())
         assert "admin.login.google_started" in actions
         assert "admin.login.google" in actions
@@ -366,3 +367,38 @@ async def test_google_admin_login_rejects_scope_change_beyond_email_alias(
         )
         assert failed is not None
         assert failed.sanitized_details["error_code"] == "token_exchange_failed"
+
+
+@pytest.mark.asyncio
+async def test_google_login_only_forces_consent_when_gmail_needs_reauthorization(
+    oauth_api: OAuthApiContext,
+) -> None:
+    async with oauth_api.session_factory() as session:
+        session.add(
+            OAuthCredential(
+                provider="gmail",
+                encrypted_refresh_token=b"stored-refresh-token",
+                scopes=list(GOOGLE_ADMIN_SCOPES),
+                token_metadata={
+                    "identity_verified": True,
+                    "identity_email": "owner@example.test",
+                    "identity_provider": "google",
+                    "reauth_required": False,
+                },
+            )
+        )
+        await session.commit()
+
+    healthy_login = await oauth_api.client.get("/admin/auth/google")
+    healthy_query = parse_qs(urlsplit(healthy_login.headers["location"]).query)
+    assert healthy_query["prompt"] == ["select_account"]
+
+    async with oauth_api.session_factory() as session:
+        credential = await session.scalar(select(OAuthCredential))
+        assert credential is not None
+        credential.token_metadata = {**credential.token_metadata, "reauth_required": True}
+        await session.commit()
+
+    recovery_login = await oauth_api.client.get("/admin/auth/google")
+    recovery_query = parse_qs(urlsplit(recovery_login.headers["location"]).query)
+    assert recovery_query["prompt"] == ["consent select_account"]

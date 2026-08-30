@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_REAUTH_REQUIRED_CODE = "gmail_reauthorization_required"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,10 @@ class ProviderSendResult:
 
 class TemporaryDeliveryError(RuntimeError):
     """Provider explicitly rejected the request temporarily; retry can be safe."""
+
+
+class GmailReauthorizationRequired(RuntimeError):
+    """Gmail refresh was rejected before delivery; user consent is required."""
 
 
 class DeliveryUnknownError(RuntimeError):
@@ -123,9 +128,7 @@ class GmailApiProvider:
         except RefreshError as exc:
             # OAuth refresh happens before the Gmail send request, so a rejected
             # refresh is a known non-delivery outcome rather than an unknown send.
-            raise TemporaryDeliveryError(
-                "Gmail OAuth refresh failed; reauthorization is required"
-            ) from exc
+            raise GmailReauthorizationRequired("Gmail reauthorization is required") from exc
         except HttpError as exc:
             status = getattr(exc.resp, "status", None)
             if status == 429:

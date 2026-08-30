@@ -16,7 +16,7 @@
     <div class="sidebar-status">
       <span class="badge {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Отправка на паузе' if preferences.global_pause else ('Автоотправка включена' if preferences.auto_send_enabled else 'Автоотправка выключена') }}</span>
       <div class="sidebar-status-row"><span>Источники</span><strong>{{ counts.healthy_sources }} из {{ counts.enabled_sources }}</strong></div>
-      <div class="sidebar-status-row"><span>Google</span><strong>{{ 'подключён' if gmail_oauth.connected else 'не подключён' }}</strong></div>
+      <div class="sidebar-status-row"><span>Gmail</span><strong>{{ 'переподключить' if gmail_oauth.reauth_required else ('готов' if gmail_oauth.delivery_ready else 'не подключён') }}</strong></div>
     </div>
     <div class="sidebar-footer"><button class="btn btn-icon btn-ghost" type="button" data-theme-toggle title="Сменить тему">◐</button><form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-ghost">Выйти</button></form></div>
   </aside>

@@ -17,8 +17,14 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.email.providers import GMAIL_SEND_SCOPE
-from app.models.entities import OAuthAuthorizationRequest, OAuthCredential
+from app.email.providers import GMAIL_REAUTH_REQUIRED_CODE, GMAIL_SEND_SCOPE
+from app.models.entities import (
+    Application,
+    EmailDelivery,
+    OAuthAuthorizationRequest,
+    OAuthCredential,
+)
+from app.models.enums import ApplicationStatus, DeliveryStatus, PolicyDecision
 from app.security.crypto import SecretBox, TokenDecryptionError
 from app.settings import Settings
 
@@ -73,6 +79,7 @@ class OAuthExchangeResult:
     actor: str
     request_id: UUID
     identity: GoogleAdminIdentity | None = None
+    recovered_applications: int = 0
 
 
 def _hash_token(value: str) -> str:
@@ -156,6 +163,93 @@ class GmailOAuthService:
     @property
     def secure_cookie(self) -> bool:
         return self.settings.public_base_url.casefold().startswith("https://")
+
+    @staticmethod
+    def _oauth_health(metadata: dict[str, Any]) -> dict[str, Any]:
+        last_ok = metadata.get("last_refresh_ok")
+        if isinstance(last_ok, str):
+            try:
+                last_ok = datetime.fromisoformat(last_ok)
+            except ValueError:
+                last_ok = None
+        return {
+            "reauth_required": metadata.get("reauth_required") is True,
+            "last_refresh_ok": last_ok,
+            "last_refresh_error": metadata.get("last_refresh_error"),
+        }
+
+    async def mark_refresh_ok(self, session: AsyncSession) -> None:
+        credential = await session.scalar(
+            select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
+        )
+        if credential is None:
+            return
+        metadata = dict(credential.token_metadata)
+        metadata.update(
+            {
+                "reauth_required": False,
+                "last_refresh_ok": datetime.now(UTC).isoformat(),
+                "last_refresh_error": None,
+            }
+        )
+        credential.token_metadata = metadata
+        await session.flush()
+
+    async def mark_reauthorization_required(
+        self, session: AsyncSession, *, error: str = GMAIL_REAUTH_REQUIRED_CODE
+    ) -> None:
+        credential = await session.scalar(
+            select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
+        )
+        if credential is None:
+            return
+        metadata = dict(credential.token_metadata)
+        metadata.update(
+            {
+                "reauth_required": True,
+                "last_refresh_error": error,
+            }
+        )
+        credential.token_metadata = metadata
+        await session.flush()
+
+    async def recover_reauthorization_failures(self, session: AsyncSession) -> int:
+        rows = (
+            await session.execute(
+                select(EmailDelivery, Application)
+                .join(Application, Application.id == EmailDelivery.application_id)
+                .where(
+                    EmailDelivery.error_code == GMAIL_REAUTH_REQUIRED_CODE,
+                    EmailDelivery.status == DeliveryStatus.TEMPORARY_FAILURE,
+                    EmailDelivery.provider_message_id.is_(None),
+                    Application.status == ApplicationStatus.FAILED,
+                )
+                .with_for_update()
+            )
+        ).all()
+        recovered = 0
+        for delivery, application in rows:
+            original_status = delivery.sanitized_provider_response.get(
+                "reauth_original_application_status"
+            )
+            if original_status == ApplicationStatus.APPROVED.value:
+                application.status = ApplicationStatus.APPROVED
+            elif application.policy_decision == PolicyDecision.AUTO_APPROVED:
+                application.status = ApplicationStatus.AUTO_APPROVED
+            else:
+                # A manually approved application has no dedicated PolicyDecision value.
+                # If legacy metadata is absent, keep it out of automatic delivery.
+                continue
+            delivery.attempt_count = 0
+            delivery.error = None
+            delivery.error_code = None
+            delivery.sanitized_provider_response = {
+                **dict(delivery.sanitized_provider_response),
+                "reauthorized_at": datetime.now(UTC).isoformat(),
+            }
+            recovered += 1
+        await session.flush()
+        return recovered
 
     def _flow(
         self,
@@ -545,7 +639,7 @@ class GmailOAuthService:
                 correlation_id=request_id,
             )
 
-        token_metadata = (
+        identity_metadata = (
             {
                 "identity_verified": True,
                 "identity_email": identity.email,
@@ -579,7 +673,7 @@ class GmailOAuthService:
                 provider=GMAIL_PROVIDER,
                 encrypted_refresh_token=self._require_box().encrypt(refresh_token),
                 scopes=sorted(normalized_scopes),
-                token_metadata=token_metadata,
+                token_metadata=identity_metadata,
             )
             session.add(credential)
             try:
@@ -599,17 +693,32 @@ class GmailOAuthService:
                         actor=actor,
                         correlation_id=request_id,
                     ) from exc
+        previous_metadata = dict(credential.token_metadata)
         if has_refresh_token:
             assert isinstance(refresh_token, str)
             credential.encrypted_refresh_token = self._require_box().encrypt(refresh_token)
         credential.scopes = sorted(normalized_scopes)
-        credential.token_metadata = token_metadata
+        credential.token_metadata = {**previous_metadata, **identity_metadata}
+        recovered = 0
+        if has_refresh_token:
+            metadata = dict(credential.token_metadata)
+            metadata.update(
+                {
+                    "reauth_required": False,
+                    "last_refresh_ok": datetime.now(UTC).isoformat(),
+                    "last_refresh_error": None,
+                }
+            )
+            credential.token_metadata = metadata
+            await session.flush()
+            recovered = await self.recover_reauthorization_failures(session)
         await session.flush()
         return OAuthExchangeResult(
             credential=credential,
             actor=actor,
             request_id=request_id,
             identity=identity,
+            recovered_applications=recovered,
         )
 
     async def get_status(self, session: AsyncSession) -> dict[str, Any]:
@@ -626,10 +735,19 @@ class GmailOAuthService:
         metadata = dict(credential.token_metadata) if credential is not None else {}
         identity_verified = metadata.get("identity_verified") is True
         identity_email = metadata.get("identity_email")
+        health = self._oauth_health(metadata)
         return {
             "provider": GMAIL_PROVIDER,
             "configured": self.configured,
             "connected": credential is not None,
+            "delivery_ready": (
+                credential is not None
+                and GMAIL_SEND_SCOPE in credential.scopes
+                and not health["reauth_required"]
+            ),
+            "reauth_required": health["reauth_required"],
+            "last_refresh_ok": health["last_refresh_ok"],
+            "last_refresh_error": health["last_refresh_error"],
             "scopes": list(credential.scopes) if credential is not None else [],
             "identity_verified": identity_verified,
             "identity_email": identity_email if isinstance(identity_email, str) else None,

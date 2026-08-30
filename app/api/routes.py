@@ -770,6 +770,7 @@ async def gmail_oauth_callback(
                 "provider": "gmail",
                 "scopes": list(exchange.credential.scopes),
                 "identity_verified": exchange.identity is not None,
+                "recovered_applications": exchange.recovered_applications,
             },
         )
         if exchange.identity is not None:

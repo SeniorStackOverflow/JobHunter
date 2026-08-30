@@ -12,10 +12,12 @@ from app.audit import record_audit_event
 from app.contacts import validate_public_email
 from app.email.oauth import GmailOAuthService
 from app.email.providers import (
+    GMAIL_REAUTH_REQUIRED_CODE,
     DeliveryUnknownError,
     EmailProvider,
     FakeGmailProvider,
     GmailApiProvider,
+    GmailReauthorizationRequired,
     PermanentDeliveryError,
     PreparedEmail,
     TemporaryDeliveryError,
@@ -423,6 +425,7 @@ class EmailService:
             if application.status == ApplicationStatus.FAILED and (
                 existing is None
                 or existing.status != DeliveryStatus.TEMPORARY_FAILURE
+                or existing.error_code == GMAIL_REAUTH_REQUIRED_CODE
                 or existing.attempt_count >= 3
             ):
                 raise EmailSendBlocked("failed application is not safely retryable")
@@ -678,6 +681,7 @@ class EmailService:
                 attachment_data=attachment_data,
                 message_id=deterministic_message_id(str(application.id)),
             )
+            authorized_status = application.status
             provider = await self._provider_for(session)
             if existing is None:
                 delivery = EmailDelivery(
@@ -694,32 +698,52 @@ class EmailService:
                 delivery.status = DeliveryStatus.SENDING
                 delivery.attempt_count += 1
                 delivery.error = None
+                delivery.error_code = None
             application.status = ApplicationStatus.SENDING
             await session.commit()
 
             try:
                 result = await provider.send(message)
+            except GmailReauthorizationRequired as exc:
+                delivery.status = DeliveryStatus.TEMPORARY_FAILURE
+                delivery.error = str(exc)
+                delivery.error_code = GMAIL_REAUTH_REQUIRED_CODE
+                delivery.sanitized_provider_response = {
+                    **dict(delivery.sanitized_provider_response),
+                    "reauth_original_application_status": authorized_status.value,
+                }
+                application.status = ApplicationStatus.FAILED
+                await GmailOAuthService(self.settings).mark_reauthorization_required(
+                    session, error=GMAIL_REAUTH_REQUIRED_CODE
+                )
             except DeliveryUnknownError as exc:
                 delivery.status = DeliveryStatus.DELIVERY_UNKNOWN
                 delivery.error = str(exc)
+                delivery.error_code = None
                 application.status = ApplicationStatus.DELIVERY_UNKNOWN
             except TemporaryDeliveryError as exc:
                 delivery.status = DeliveryStatus.TEMPORARY_FAILURE
                 delivery.error = str(exc)
+                delivery.error_code = None
                 application.status = ApplicationStatus.FAILED
             except PermanentDeliveryError as exc:
                 delivery.status = DeliveryStatus.PERMANENT_FAILURE
                 delivery.error = str(exc)
+                delivery.error_code = None
                 application.status = ApplicationStatus.FAILED
             else:
                 delivery.status = DeliveryStatus.SENT
                 delivery.provider_message_id = result.message_id
                 delivery.thread_id = result.thread_id
                 delivery.sanitized_provider_response = result.sanitized_response
+                delivery.error = None
+                delivery.error_code = None
                 application.status = ApplicationStatus.SENT
                 from app.database.base import utcnow
 
                 application.sent_at = utcnow()
+                if provider.name == "gmail":
+                    await GmailOAuthService(self.settings).mark_refresh_ok(session)
             await record_audit_event(
                 session,
                 actor="email_worker",
@@ -748,6 +772,15 @@ async def send_auto_approved_applications() -> int:
     service = EmailService(settings, async_session_factory)
     start_of_day = datetime.combine(datetime.now(UTC).date(), time.min, UTC)
     async with async_session_factory() as session:
+        oauth_status = await GmailOAuthService(settings).get_status(session)
+        if settings.email_provider == "gmail" and not oauth_status["delivery_ready"]:
+            reason = (
+                GMAIL_REAUTH_REQUIRED_CODE
+                if oauth_status["reauth_required"]
+                else "gmail_not_connected"
+            )
+            logger.warning("automatic_email_deferred", reason=reason)
+            return 0
         reconciled = await service.reconcile_auto_approved_applications(session)
         await session.commit()
         if reconciled:
@@ -845,14 +878,27 @@ async def send_auto_approved_applications() -> int:
             continue
         if delivery.status == DeliveryStatus.SENT:
             sent += 1
+        if delivery.error_code == GMAIL_REAUTH_REQUIRED_CODE:
+            logger.warning("automatic_email_batch_stopped", reason=GMAIL_REAUTH_REQUIRED_CODE)
+            break
     return sent
 
 
 async def retry_temporary_failures() -> int:
     from app.database.session import async_session_factory
 
-    service = EmailService(get_settings(), async_session_factory)
+    settings = get_settings()
+    service = EmailService(settings, async_session_factory)
     async with async_session_factory() as session:
+        oauth_status = await GmailOAuthService(settings).get_status(session)
+        if settings.email_provider == "gmail" and not oauth_status["delivery_ready"]:
+            reason = (
+                GMAIL_REAUTH_REQUIRED_CODE
+                if oauth_status["reauth_required"]
+                else "gmail_not_connected"
+            )
+            logger.warning("temporary_email_retry_deferred", reason=reason)
+            return 0
         ids = list(
             (
                 await session.scalars(
@@ -860,6 +906,10 @@ async def retry_temporary_failures() -> int:
                     .join(Application, Application.id == EmailDelivery.application_id)
                     .where(
                         EmailDelivery.status == DeliveryStatus.TEMPORARY_FAILURE,
+                        or_(
+                            EmailDelivery.error_code.is_(None),
+                            EmailDelivery.error_code != GMAIL_REAUTH_REQUIRED_CODE,
+                        ),
                         EmailDelivery.attempt_count < 3,
                         Application.status.in_(
                             {
@@ -894,4 +944,7 @@ async def retry_temporary_failures() -> int:
             continue
         if delivery.status == DeliveryStatus.SENT:
             retried += 1
+        if delivery.error_code == GMAIL_REAUTH_REQUIRED_CODE:
+            logger.warning("temporary_email_retry_stopped", reason=GMAIL_REAUTH_REQUIRED_CODE)
+            break
     return retried
