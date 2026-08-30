@@ -86,6 +86,17 @@ def _degradation_reason(exc: Exception) -> str | None:
     return None
 
 
+def scan_has_pending_reference_failures(run: ScanRun) -> bool:
+    checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
+    state = checkpoint.get("adapter_state")
+    if not isinstance(state, dict):
+        return False
+    failures = state.get("failed_reference_attempts")
+    return isinstance(failures, dict) and any(
+        isinstance(n, int) and n > 0 for n in failures.values()
+    )
+
+
 class ScanService:
     def __init__(
         self,
@@ -773,8 +784,11 @@ class ScanService:
         )
         if run.found_jobs == 0:
             return "source returned zero jobs; automatic actions were paused for review"
+        # A detail failure stops iteration intentionally. found_jobs is then only a prefix,
+        # not a complete source result, so comparing it with the previous full scan is invalid.
         if (
-            previous is not None
+            not scan_has_pending_reference_failures(run)
+            and previous is not None
             and previous.found_jobs >= 20
             and run.found_jobs < previous.found_jobs * 0.2
         ):

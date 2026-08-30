@@ -14,7 +14,7 @@ from celery.schedules import crontab
 from redis import Redis
 from sqlalchemy import select
 
-from app.crawlers.pipeline import ScanService
+from app.crawlers.pipeline import ScanService, scan_has_pending_reference_failures
 from app.crawlers.registry import build_default_registry
 from app.database import async_session_factory
 from app.models.entities import JobSource, ScanRun
@@ -269,6 +269,39 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
         } and _run_async(_downstream_actions_allowed(source_id)):
             processing_task = process_unprocessed_jobs_task.apply_async(queue="matching")
             processing_task_id = str(processing_task.id)
+
+        resume_scan_id: str | None = None
+        if (
+            run.status == RunStatus.PARTIAL
+            and health == SourceHealth.HEALTHY
+            and scan_has_pending_reference_failures(run)
+        ):
+            resumed = _run_async(
+                _scan_service().create_scan(source_id, scan_type, actor="partial_resume")
+            )
+            reservation = reserve_once(
+                client,
+                lock_key("partial-resume", str(run.id)),
+                ttl_seconds=86_400,
+            )
+            if reservation is not None:
+                try:
+                    run_scan_task.apply_async(
+                        args=[str(resumed.id)],
+                        queue="crawling",
+                        countdown=60,
+                    )
+                    resume_scan_id = str(resumed.id)
+                    logger.info(
+                        "partial_scan_resume_scheduled",
+                        scan_id=str(run.id),
+                        resume_scan_id=resume_scan_id,
+                        source_id=str(source_id),
+                        scan_type=scan_type.value,
+                    )
+                except Exception:
+                    reservation.release()
+                    raise
         return {
             "scan_id": str(run.id),
             "source_id": str(run.source_id),
@@ -280,6 +313,7 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
             "unchanged_jobs": run.unchanged_jobs,
             "errors": run.parsing_errors + run.network_errors,
             "processing_task_id": processing_task_id,
+            "resume_scan_id": resume_scan_id,
         }
     finally:
         close_redis_client(client)

@@ -155,6 +155,42 @@ async def test_degradation_baseline_does_not_compare_full_and_incremental_scans(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_incomplete_full_scan_does_not_trigger_mass_drop_degradation(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    service = ScanService(sqlite_session_factory, build_default_registry())
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Interrupted full-scan fixture"),
+    )
+    async with sqlite_session_factory() as session:
+        previous_full = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.FULL,
+            status=RunStatus.SUCCEEDED,
+            found_jobs=4_458,
+            finished_at=datetime.now(UTC),
+        )
+        interrupted_full = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.FULL,
+            status=RunStatus.RUNNING,
+            found_jobs=815,
+            updated_jobs=814,
+            parsing_errors=1,
+            checkpoint={
+                "adapter_state": {"failed_reference_attempts": {"127405": 1}}
+            },
+        )
+        session.add_all([previous_full, interrupted_full])
+        await session.flush()
+
+        assert await service._detect_degradation(session, interrupted_full) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_failed_detail_is_retried_from_checkpoint_without_data_loss(
     fixture_site_client: httpx.AsyncClient,
     sqlite_session_factory: async_sessionmaker[AsyncSession],
