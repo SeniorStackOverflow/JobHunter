@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+from app.models.enums import ShadowDecision
 
 SHADOW_APPROVE_P = 0.90
 SHADOW_REJECT_P = 0.12
@@ -271,3 +274,148 @@ def time_series_cv(
             oof_w=ww,
         )
     return neutral
+
+
+@dataclass(frozen=True)
+class Contribution:
+    label: str
+    logit_delta: float
+
+
+@dataclass(frozen=True)
+class Prediction:
+    p_approve: float
+    ci_low: float
+    ci_high: float
+    support_ok: bool
+    would_decide: ShadowDecision
+    top_contributions: tuple[Contribution, ...]
+
+
+@dataclass(frozen=True)
+class TrainedModel:
+    feature_spec: dict[str, Any]
+    feature_spec_version: str
+    feature_names: tuple[str, ...]
+    coefficients: tuple[float, ...]
+    calibration: IsotonicCalibration
+    feature_frequencies: dict[str, int]
+    n_labels: int
+    n_approved: int
+    n_rejected: int
+    cv_auc: float
+    cv_logloss: float
+    cv_ece: float
+    best_l2: float
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "feature_spec": self.feature_spec,
+            "feature_spec_version": self.feature_spec_version,
+            "feature_names": list(self.feature_names),
+            "coefficients": list(self.coefficients),
+            "calibration": self.calibration.to_dict(),
+            "feature_frequencies": self.feature_frequencies,
+            "n_labels": self.n_labels,
+            "n_approved": self.n_approved,
+            "n_rejected": self.n_rejected,
+            "cv_auc": self.cv_auc,
+            "cv_logloss": self.cv_logloss,
+            "cv_ece": self.cv_ece,
+            "best_l2": self.best_l2,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> TrainedModel:
+        return cls(
+            feature_spec=data["feature_spec"],
+            feature_spec_version=data["feature_spec_version"],
+            feature_names=tuple(data["feature_names"]),
+            coefficients=tuple(float(v) for v in data["coefficients"]),
+            calibration=IsotonicCalibration.from_dict(data["calibration"]),
+            feature_frequencies={str(k): int(v) for k, v in data["feature_frequencies"].items()},
+            n_labels=int(data["n_labels"]),
+            n_approved=int(data["n_approved"]),
+            n_rejected=int(data["n_rejected"]),
+            cv_auc=float(data["cv_auc"]),
+            cv_logloss=float(data["cv_logloss"]),
+            cv_ece=float(data["cv_ece"]),
+            best_l2=float(data["best_l2"]),
+        )
+
+
+def build_trained_model(
+    *,
+    feature_spec: dict[str, Any],
+    feature_spec_version: str,
+    feature_names: Sequence[str],
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    w: NDArray[np.float64],
+    feature_frequencies: dict[str, int],
+) -> TrainedModel:
+    cv = time_series_cv(x, y, w)
+    beta = fit_l2_logistic(x, y, w, cv.best_l2)
+    if cv.oof_raw.size > 0:
+        calibration = pava_isotonic(cv.oof_raw, cv.oof_y, cv.oof_w)
+    else:
+        calibration = pava_isotonic(_sigmoid(x @ beta), y, w)
+    return TrainedModel(
+        feature_spec=feature_spec,
+        feature_spec_version=feature_spec_version,
+        feature_names=tuple(feature_names),
+        coefficients=tuple(float(v) for v in beta),
+        calibration=calibration,
+        feature_frequencies=dict(feature_frequencies),
+        n_labels=len(y),
+        n_approved=int(y.sum()),
+        n_rejected=int((1.0 - y).sum()),
+        cv_auc=cv.cv_auc,
+        cv_logloss=cv.cv_logloss,
+        cv_ece=cv.cv_ece,
+        best_l2=cv.best_l2,
+    )
+
+
+def predict(
+    model: TrainedModel,
+    *,
+    row: NDArray[np.float64],
+    present_values: Sequence[str],
+    contribution_labels: Mapping[str, str],
+) -> Prediction:
+    beta = np.asarray(model.coefficients, dtype=np.float64)
+    full = np.concatenate([np.array([1.0]), row])
+    raw = float(_sigmoid(np.array([full @ beta]))[0])
+    p_approve = model.calibration.predict(raw)
+    ci_low, ci_high = model.calibration.interval(raw)
+    support_ok = all(
+        model.feature_frequencies.get(value, 0) >= MIN_FEATURE_SUPPORT for value in present_values
+    )
+    narrow = (ci_high - ci_low) <= CI_MAX_WIDTH
+    if support_ok and narrow and p_approve >= SHADOW_APPROVE_P:
+        decision = ShadowDecision.APPROVE
+    elif support_ok and narrow and p_approve <= SHADOW_REJECT_P:
+        decision = ShadowDecision.REJECT
+    else:
+        decision = ShadowDecision.ABSTAIN
+    contributions = sorted(
+        (
+            Contribution(
+                label=contribution_labels.get(name, name),
+                logit_delta=float(beta[i + 1] * row[i]),
+            )
+            for i, name in enumerate(model.feature_names[1:])
+            if row[i] != 0.0
+        ),
+        key=lambda c: abs(c.logit_delta),
+        reverse=True,
+    )
+    return Prediction(
+        p_approve=p_approve,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        support_ok=support_ok,
+        would_decide=decision,
+        top_contributions=tuple(contributions[:3]),
+    )

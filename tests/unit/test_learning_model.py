@@ -3,13 +3,18 @@ import numpy as np
 from app.learning.model import (
     CvResult,
     IsotonicCalibration,
+    Prediction,
+    TrainedModel,
+    build_trained_model,
     expected_calibration_error,
     fit_l2_logistic,
     pava_isotonic,
+    predict,
     time_series_cv,
     weighted_auc,
     weighted_logloss,
 )
+from app.models.enums import ShadowDecision
 
 
 def _design(rows: list[tuple[float, ...]] | list[tuple[float, float]]) -> np.ndarray:
@@ -149,3 +154,71 @@ def test_cv_degrades_gracefully_on_tiny_input() -> None:
 
     assert result.best_l2 == 0.3
     assert result.cv_auc == 0.5
+
+
+def _fitted() -> TrainedModel:
+    rng = np.random.default_rng(1)
+    feature = rng.normal(size=300)
+    logit = 2.0 * feature
+    y = (rng.uniform(size=300) < 1.0 / (1.0 + np.exp(-logit))).astype(np.float64)
+    x = np.column_stack([np.ones(300), feature])
+    return build_trained_model(
+        feature_spec={"version": "features-v3"},
+        feature_spec_version="features-v3",
+        feature_names=("__intercept__", "signal"),
+        x=x,
+        y=y,
+        w=np.ones(300),
+        feature_frequencies={"cat:warehouses": 40},
+    )
+
+
+def test_trained_model_predicts_high_probability_for_a_strong_positive_row() -> None:
+    model = _fitted()
+
+    result = predict(
+        model,
+        row=np.array([3.0]),
+        present_values=["cat:warehouses"],
+        contribution_labels={"signal": "категория: склад"},
+    )
+
+    assert isinstance(result, Prediction)
+    assert result.p_approve > 0.8
+    assert result.support_ok is True
+    assert result.top_contributions[0].label == "категория: склад"
+
+
+def test_novel_feature_value_forces_abstain() -> None:
+    model = _fitted()
+
+    result = predict(
+        model,
+        row=np.array([3.0]),
+        present_values=["cat:brand-new"],
+        contribution_labels={},
+    )
+
+    assert result.support_ok is False
+    assert result.would_decide is ShadowDecision.ABSTAIN
+
+
+def test_trained_model_round_trips_through_json() -> None:
+    model = _fitted()
+
+    restored = TrainedModel.from_json(model.to_json())
+
+    assert restored.coefficients == model.coefficients
+    assert restored.cv_auc == model.cv_auc
+    same = predict(
+        restored,
+        row=np.array([1.0]),
+        present_values=["cat:warehouses"],
+        contribution_labels={},
+    )
+    assert (
+        same.p_approve
+        == predict(
+            model, row=np.array([1.0]), present_values=["cat:warehouses"], contribution_labels={}
+        ).p_approve
+    )

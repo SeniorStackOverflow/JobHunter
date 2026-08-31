@@ -92,3 +92,9 @@ class ContactType(StrEnum):
     EMAIL = "email"
     APPLICATION_URL = "application_url"
     INTERNAL_JOB_BOARD = "internal_job_board"
+
+
+class ShadowDecision(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    ABSTAIN = "abstain"
