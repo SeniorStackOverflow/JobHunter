@@ -1273,6 +1273,32 @@ async def test_mcp_review_workflow_records_structured_learning_feedback(
         assert audit.actor == "mcp"
 
 
+async def test_get_learning_model_status_reports_no_model_initially(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+    from app.mcp import server as mcp_server
+
+    _application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="mcp-model-status",
+    )
+    profile_id = seeded["profile_id"]
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+
+    status = await mcp_server.get_learning_model_status(profile_id=str(profile_id))
+
+    assert status["profile_id"] == str(profile_id)
+    assert status["segment_key"] == "global"
+    assert status["model"] is None
+    assert status["shadow"]["cases_total"] == 0
+
+
 async def test_admin_review_queue_uses_learned_order_and_explanations(
     interface_app: tuple[FastAPI, Settings],
     sqlite_session_factory: Any,

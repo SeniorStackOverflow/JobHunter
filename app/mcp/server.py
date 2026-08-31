@@ -1271,6 +1271,40 @@ async def get_review_learning_status(profile_id: str | None = None) -> dict[str,
 
 
 @mcp.tool()
+async def get_learning_model_status(profile_id: str | None = None) -> dict[str, Any]:
+    """Report the latest calibrated learning model and its shadow-mode scorecard."""
+    from app.database.session import async_session_factory
+    from app.learning.shadow import shadow_scorecard
+    from app.learning.training import latest_model_version
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        version = await latest_model_version(session, profile.id)
+        return {
+            "profile_id": str(profile.id),
+            "segment_key": "global",
+            "model": None
+            if version is None
+            else {
+                "trained_at": version.trained_at.isoformat(),
+                "feature_spec_version": version.feature_spec_version,
+                "algorithm": version.algorithm,
+                "n_labels": version.n_labels,
+                "n_approved": version.n_approved,
+                "n_rejected": version.n_rejected,
+                "cv_auc": version.cv_auc,
+                "cv_logloss": version.cv_logloss,
+                "cv_ece": version.cv_ece,
+            },
+            "shadow": await shadow_scorecard(session, profile.id),
+        }
+
+
+@mcp.tool()
 async def set_review_learning_influence(
     enabled: bool, profile_id: str | None = None
 ) -> dict[str, Any]:
