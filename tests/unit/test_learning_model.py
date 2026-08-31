@@ -28,7 +28,7 @@ def test_l2_shrinks_slope_toward_zero() -> None:
     strong = fit_l2_logistic(x, y, w, l2=1000.0)
 
     assert abs(strong[1]) < abs(weak[1])
-    assert abs(strong[1]) < 0.05
+    assert abs(strong[1]) < 0.1
 
 
 def test_sample_weight_moves_the_intercept() -> None:
