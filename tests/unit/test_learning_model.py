@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 
 from app.learning.model import (
@@ -186,6 +188,7 @@ def test_trained_model_predicts_high_probability_for_a_strong_positive_row() -> 
     assert isinstance(result, Prediction)
     assert result.p_approve > 0.8
     assert result.support_ok is True
+    assert result.would_decide is ShadowDecision.APPROVE
     assert result.top_contributions[0].label == "категория: склад"
 
 
@@ -206,7 +209,7 @@ def test_novel_feature_value_forces_abstain() -> None:
 def test_trained_model_round_trips_through_json() -> None:
     model = _fitted()
 
-    restored = TrainedModel.from_json(model.to_json())
+    restored = TrainedModel.from_json(json.loads(json.dumps(model.to_json())))
 
     assert restored.coefficients == model.coefficients
     assert restored.cv_auc == model.cv_auc

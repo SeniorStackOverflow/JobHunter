@@ -316,13 +316,13 @@ class TrainedModel:
             "coefficients": list(self.coefficients),
             "calibration": self.calibration.to_dict(),
             "feature_frequencies": self.feature_frequencies,
-            "n_labels": self.n_labels,
-            "n_approved": self.n_approved,
-            "n_rejected": self.n_rejected,
-            "cv_auc": self.cv_auc,
-            "cv_logloss": self.cv_logloss,
-            "cv_ece": self.cv_ece,
-            "best_l2": self.best_l2,
+            "n_labels": int(self.n_labels),
+            "n_approved": int(self.n_approved),
+            "n_rejected": int(self.n_rejected),
+            "cv_auc": float(self.cv_auc),
+            "cv_logloss": float(self.cv_logloss),
+            "cv_ece": float(self.cv_ece),
+            "best_l2": float(self.best_l2),
         }
 
     @classmethod
