@@ -7,6 +7,9 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import numpy as np
+from numpy.typing import NDArray
+
 from app.learning.service import (
     _ALL_DIMENSIONS,
     _DIMENSION_LABELS,
@@ -297,4 +300,78 @@ def extract_live(
         source_key=source_key or _source_key(job),
         age_bucket=age_bucket_for(job),
         active_dimensions=frozenset(_ALL_DIMENSIONS),
+    )
+
+
+def present_values(spec: FeatureSpec, features: ExtractedFeatures) -> list[str]:
+    found: list[str] = []
+    for dimension in _ALL_DIMENSIONS:
+        vocab = set(spec.categorical.get(dimension, ()))
+        for value in features.categorical.get(dimension, []):
+            key = f"{dimension}:{value}"
+            if value in vocab and key not in found:
+                found.append(key)
+    return found
+
+
+def vectorize(spec: FeatureSpec, features: ExtractedFeatures) -> NDArray[np.float64]:
+    names = spec.feature_names()[1:]
+    index = {name: i for i, name in enumerate(names)}
+    row = np.zeros(len(names), dtype=np.float64)
+    for dimension in _ALL_DIMENSIONS:
+        active = dimension in features.active_dimensions
+        row[index[f"obs:{dimension}"]] = 1.0 if active else 0.0
+        if not active:
+            continue
+        vocab = set(spec.categorical.get(dimension, ()))
+        for value in features.categorical.get(dimension, []):
+            if value in vocab:
+                row[index[f"{dimension}:{value}"]] = 1.0
+    for name in NUMERIC_NAMES:
+        row[index[name]] = float(features.numeric.get(name, _NEUTRAL_NUMERIC[name]))
+    source_name = f"source:{features.source_key}"
+    row[index[source_name if source_name in index else "source:__other__"]] = 1.0
+    bucket = features.age_bucket if features.age_bucket in AGE_BUCKETS else "unknown"
+    row[index[f"age:{bucket}"]] = 1.0
+    return row
+
+
+def build_matrix(
+    events: Sequence[ReviewFeedbackEvent],
+    spec: FeatureSpec,
+    *,
+    now: datetime | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], dict[str, int]]:
+    moment = now or datetime.now(UTC)
+    usable = sorted(
+        (
+            event
+            for event in events
+            if event.learning_eligible and event.feature_schema_version in MODEL_ELIGIBLE_SCHEMAS
+        ),
+        key=lambda e: e.created_at,
+    )
+    rows: list[NDArray[np.float64]] = []
+    labels: list[float] = []
+    weights: list[float] = []
+    frequencies: Counter[str] = Counter()
+    for event in usable:
+        features, label = extract_from_event(event)
+        rows.append(vectorize(spec, features))
+        labels.append(label)
+        age_days = max(0, (moment - event.created_at).days)
+        weights.append(0.5 ** (age_days / HALF_LIFE_DAYS))
+        for key in present_values(spec, features):
+            frequencies[key] += 1
+    if not rows:
+        width = len(spec.feature_names())
+        empty = np.empty((0, width), dtype=np.float64)
+        return empty, np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64), {}
+    body = np.vstack(rows)
+    x = np.column_stack([np.ones(len(rows), dtype=np.float64), body])
+    return (
+        x,
+        np.array(labels, dtype=np.float64),
+        np.array(weights, dtype=np.float64),
+        dict(frequencies),
     )

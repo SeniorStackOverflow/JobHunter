@@ -6,8 +6,11 @@ from app.learning.features import (
     MIN_VOCAB_SUPPORT,
     FeatureSpec,
     build_feature_spec,
+    build_matrix,
     build_snapshot_extras,
     extract_from_event,
+    present_values,
+    vectorize,
 )
 from app.models.entities import JobPreference, MatchEvaluation, ReviewFeedbackEvent, SourceJob
 from app.models.enums import MatchDecision, ReviewOutcome, ReviewReason
@@ -154,3 +157,61 @@ def test_snapshot_extras_normalise_scores_and_salary_gap() -> None:
     assert extras["numeric"]["n_missing_requirements"] == 0.2  # 1 / 5
     assert extras["numeric"]["salary_gap"] == -0.2  # (8000 - 10000) / 10000
     assert extras["numeric"]["salary_missing"] == 0.0
+
+
+def _approved(dimensions: list[str], **features: list[str]) -> ReviewFeedbackEvent:
+    return ReviewFeedbackEvent(
+        profile_id=uuid4(),
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=ReviewOutcome.APPROVED,
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
+        feature_snapshot={"features": features, "learning_dimensions": dimensions},
+        created_at=datetime(2026, 8, 20, tzinfo=UTC),
+    )
+
+
+def test_vectorize_applies_the_causal_mask() -> None:
+    spec = build_feature_spec(
+        [
+            _approved(["category", "title"], category=["warehouses"], title=["picker"])
+            for _ in range(MIN_VOCAB_SUPPORT)
+        ]
+    )
+    features, _ = extract_from_event(_rejected_event(["salary"], ReviewReason.SALARY))
+    # rejected-for-salary event: category present in snapshot but not active
+    names = spec.feature_names()[1:]
+    row = vectorize(spec, features)
+
+    idx_obs_category = names.index("obs:category")
+    assert row[idx_obs_category] == 0.0  # category dimension masked out
+
+
+def test_matrix_weights_decay_with_age() -> None:
+    old = _approved(["category"], category=["warehouses"])
+    old.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    recent = _approved(["category"], category=["warehouses"])
+    recent.created_at = datetime(2026, 8, 20, tzinfo=UTC)
+    spec = build_feature_spec(
+        [old, recent]
+        + [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
+    )
+
+    x, _y, w, freq = build_matrix([old, recent], spec, now=datetime(2026, 8, 21, tzinfo=UTC))
+
+    assert x.shape[0] == 2
+    assert x[:, 0].tolist() == [1.0, 1.0]  # intercept column
+    assert w[0] < w[1]
+    assert freq["category:warehouses"] == 2
+
+
+def test_present_values_ignores_out_of_vocab() -> None:
+    spec = build_feature_spec(
+        [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
+    )
+    features, _ = extract_from_event(_approved(["category"], category=["warehouses", "unlisted"]))
+
+    assert present_values(spec, features) == ["category:warehouses"]
