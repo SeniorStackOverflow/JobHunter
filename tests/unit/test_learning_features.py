@@ -5,6 +5,7 @@ from uuid import uuid4
 from app.learning.features import (
     MIN_VOCAB_SUPPORT,
     FeatureSpec,
+    age_bucket_for,
     build_feature_spec,
     build_matrix,
     build_snapshot_extras,
@@ -206,6 +207,34 @@ def test_matrix_weights_decay_with_age() -> None:
     assert x[:, 0].tolist() == [1.0, 1.0]  # intercept column
     assert w[0] < w[1]
     assert freq["category:warehouses"] == 2
+
+
+def test_build_matrix_tolerates_naive_created_at() -> None:
+    naive_events = []
+    for _ in range(3):
+        e = _approved(["category"], category=["warehouses"])
+        e.created_at = datetime(2026, 3, 1)  # naive, as SQLite returns
+        naive_events.append(e)
+    spec = build_feature_spec(naive_events)
+
+    x, _y, w, _freq = build_matrix(naive_events, spec, now=datetime(2026, 8, 1, tzinfo=UTC))
+
+    assert x.shape[0] == 3
+    assert (w > 0).all()
+
+
+def test_age_bucket_for_tolerates_naive_published_at() -> None:
+    job = SourceJob(
+        source_id=uuid4(),
+        external_job_id="x",
+        canonical_url="https://e/j",
+        title="T",
+        content_hash="a",
+        matching_content_hash="b",
+        source_fingerprint="c",
+        published_at=datetime(2026, 8, 20),  # naive
+    )
+    assert age_bucket_for(job) in {"0-3", "4-7", "8-30", "31+"}
 
 
 def test_present_values_ignores_out_of_vocab() -> None:

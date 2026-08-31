@@ -169,11 +169,17 @@ def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _as_aware(value: datetime) -> datetime:
+    """Coerce a possibly-naive datetime (SQLite round-trips tz-aware columns as
+    naive) to UTC-aware so arithmetic against ``datetime.now(UTC)`` is safe."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def age_bucket_for(job: SourceJob) -> str:
     published = job.published_at
     if published is None:
         return "unknown"
-    days = (datetime.now(UTC) - published).days
+    days = (datetime.now(UTC) - _as_aware(published)).days
     if days <= 3:
         return "0-3"
     if days <= 7:
@@ -342,14 +348,14 @@ def build_matrix(
     *,
     now: datetime | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], dict[str, int]]:
-    moment = now or datetime.now(UTC)
+    moment = _as_aware(now) if now is not None else datetime.now(UTC)
     usable = sorted(
         (
             event
             for event in events
             if event.learning_eligible and event.feature_schema_version in MODEL_ELIGIBLE_SCHEMAS
         ),
-        key=lambda e: e.created_at,
+        key=lambda e: _as_aware(e.created_at),
     )
     rows: list[NDArray[np.float64]] = []
     labels: list[float] = []
@@ -359,7 +365,7 @@ def build_matrix(
         features, label = extract_from_event(event)
         rows.append(vectorize(spec, features))
         labels.append(label)
-        age_days = max(0, (moment - event.created_at).days)
+        age_days = max(0, (moment - _as_aware(event.created_at)).days)
         weights.append(0.5 ** (age_days / HALF_LIFE_DAYS))
         for key in present_values(spec, features):
             frequencies[key] += 1

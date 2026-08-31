@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import select
@@ -37,13 +36,7 @@ async def _load_events(session: AsyncSession, profile_id: UUID) -> list[ReviewFe
 async def train_profile(session: AsyncSession, profile_id: UUID) -> LearningModelVersion | None:
     events = await _load_events(session, profile_id)
     spec = build_feature_spec(events)
-    # SQLite round-trips ``DateTime(timezone=True)`` as naive values; match the
-    # decay reference clock to whatever awareness the loaded rows carry so the
-    # subtraction in ``build_matrix`` never mixes naive and aware datetimes.
-    now = datetime.now(UTC)
-    if any(event.created_at.tzinfo is None for event in events):
-        now = now.replace(tzinfo=None)
-    x, y, w, frequencies = build_matrix(events, spec, now=now)
+    x, y, w, frequencies = build_matrix(events, spec)
     if len(y) < MODEL_MIN_LABELS:
         return None
     if float(y.sum()) < MODEL_MIN_PER_OUTCOME or float((1.0 - y).sum()) < MODEL_MIN_PER_OUTCOME:
