@@ -86,6 +86,16 @@ celery_app.conf.update(
             "schedule": crontab(minute=15, hour=21),
             "options": {"queue": "reports"},
         },
+        "train-learning-models": {
+            "task": "job_agent.scheduler.train_learning_models",
+            "schedule": crontab(minute=30, hour=1),
+            "options": {"queue": "matching", "expires": 3000},
+        },
+        "record-learning-shadow": {
+            "task": "job_agent.scheduler.record_learning_shadow",
+            "schedule": 300.0,
+            "options": {"queue": "matching", "expires": 270},
+        },
     },
     task_routes={
         "job_agent.scheduler.run_scan": {"queue": "crawling"},
@@ -96,6 +106,8 @@ celery_app.conf.update(
         "job_agent.scheduler.send_auto_approved_applications": {"queue": "email"},
         "job_agent.scheduler.retry_temporary_failures": {"queue": "email"},
         "job_agent.scheduler.generate_daily_report": {"queue": "reports"},
+        "job_agent.scheduler.train_learning_models": {"queue": "matching"},
+        "job_agent.scheduler.record_learning_shadow": {"queue": "matching"},
     },
 )
 

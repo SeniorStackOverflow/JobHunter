@@ -527,6 +527,20 @@ def generate_daily_report_task() -> dict[str, Any]:
     return result
 
 
+@celery_app.task(name="job_agent.scheduler.train_learning_models")
+def train_learning_models_task() -> int | dict[str, str]:
+    from app.learning.training import train_all_profiles
+
+    return _run_locked_periodic("train-learning-models", train_all_profiles(), ttl_seconds=1800)
+
+
+@celery_app.task(name="job_agent.scheduler.record_learning_shadow")
+def record_learning_shadow_task() -> int | dict[str, str]:
+    from app.learning.shadow import record_learning_shadow
+
+    return _run_locked_periodic("record-learning-shadow", record_learning_shadow(), ttl_seconds=600)
+
+
 __all__ = [
     "DEFAULT_SOURCE_SCHEDULES",
     "close_task_event_loop",
@@ -536,8 +550,10 @@ __all__ = [
     "prepare_pending_applications_task",
     "process_unprocessed_jobs_task",
     "recheck_source_task",
+    "record_learning_shadow_task",
     "retry_temporary_failures_task",
     "run_scan_task",
     "send_auto_approved_applications_task",
     "start_scan_task",
+    "train_learning_models_task",
 ]
