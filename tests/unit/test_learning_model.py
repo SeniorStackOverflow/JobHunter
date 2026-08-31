@@ -1,6 +1,13 @@
 import numpy as np
 
-from app.learning.model import IsotonicCalibration, fit_l2_logistic, pava_isotonic
+from app.learning.model import (
+    IsotonicCalibration,
+    expected_calibration_error,
+    fit_l2_logistic,
+    pava_isotonic,
+    weighted_auc,
+    weighted_logloss,
+)
 
 
 def _design(rows: list[tuple[float, ...]] | list[tuple[float, float]]) -> np.ndarray:
@@ -84,3 +91,30 @@ def test_isotonic_round_trips_through_dict() -> None:
 
     assert restored.predict(0.7) == cal.predict(0.7)
     assert restored.interval(0.7) == cal.interval(0.7)
+
+
+def test_auc_is_one_for_a_perfect_ranker_and_half_for_noise() -> None:
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    w = np.ones(4)
+    assert weighted_auc(y, np.array([0.1, 0.2, 0.8, 0.9]), w) == 1.0
+    assert weighted_auc(y, np.array([0.5, 0.5, 0.5, 0.5]), w) == 0.5
+
+
+def test_logloss_rewards_confident_correct_predictions() -> None:
+    y = np.array([1.0, 0.0])
+    w = np.ones(2)
+    good = weighted_logloss(y, np.array([0.95, 0.05]), w)
+    bad = weighted_logloss(y, np.array([0.55, 0.45]), w)
+    assert good < bad
+
+
+def test_ece_is_zero_for_perfectly_calibrated_predictions() -> None:
+    y = np.concatenate([np.zeros(50), np.ones(50)])
+    p = np.concatenate([np.zeros(50), np.ones(50)])
+    assert expected_calibration_error(y, p, np.ones(100)) == 0.0
+
+
+def test_ece_flags_overconfidence() -> None:
+    y = np.concatenate([np.zeros(50), np.ones(50)])
+    p = np.full(100, 0.99)  # always confident, only right half the time
+    assert expected_calibration_error(y, p, np.ones(100)) > 0.4

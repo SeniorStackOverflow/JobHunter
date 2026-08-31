@@ -136,3 +136,49 @@ def pava_isotonic(
     knots_p = tuple(min(1.0, max(0.0, b[2])) for b in blocks)
     made = tuple(_Block(b[0], b[2], int(b[3]), b[4]) for b in blocks)
     return IsotonicCalibration(knots_x=knots_x, knots_p=knots_p, blocks=made)
+
+
+def weighted_auc(y: NDArray[np.float64], p: NDArray[np.float64], w: NDArray[np.float64]) -> float:
+    pos = p[y == 1.0]
+    pos_w = w[y == 1.0]
+    neg = p[y == 0.0]
+    neg_w = w[y == 0.0]
+    if pos.size == 0 or neg.size == 0:
+        return 0.5
+    numer = 0.0
+    denom = float(pos_w.sum() * neg_w.sum())
+    for value, weight in zip(pos, pos_w, strict=True):
+        numer += float(weight) * float(neg_w[neg < value].sum() + 0.5 * neg_w[neg == value].sum())
+    return numer / denom if denom else 0.5
+
+
+def weighted_logloss(
+    y: NDArray[np.float64], p: NDArray[np.float64], w: NDArray[np.float64]
+) -> float:
+    clipped = np.clip(p, 1e-6, 1.0 - 1e-6)
+    terms = -(y * np.log(clipped) + (1.0 - y) * np.log(1.0 - clipped))
+    return float(np.average(terms, weights=w))
+
+
+def expected_calibration_error(
+    y: NDArray[np.float64],
+    p: NDArray[np.float64],
+    w: NDArray[np.float64],
+    *,
+    bins: int = 10,
+) -> float:
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    total = float(w.sum())
+    if total == 0.0:
+        return 0.0
+    error = 0.0
+    for i in range(bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (p >= lo) & (p <= hi) if i == bins - 1 else (p >= lo) & (p < hi)
+        if not mask.any():
+            continue
+        bin_w = float(w[mask].sum())
+        confidence = float(np.average(p[mask], weights=w[mask]))
+        accuracy = float(np.average(y[mask], weights=w[mask]))
+        error += (bin_w / total) * abs(confidence - accuracy)
+    return error
