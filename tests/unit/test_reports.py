@@ -167,3 +167,18 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             "thread_id": "thread-1",
             "automatic": True,
         }
+
+
+async def test_daily_report_includes_learning_shadow_block(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="p", is_default=True)
+        session.add(profile)
+        await session.flush()
+
+        report = await _generate(session)
+
+    assert "learning_shadow" in report.summary
+    assert isinstance(report.summary["learning_shadow"], list)
+    assert report.summary["learning_shadow"][0]["profile_id"] == str(profile.id)

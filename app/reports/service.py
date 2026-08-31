@@ -236,6 +236,13 @@ async def _generate(session: AsyncSession) -> DailyReport:
         "email_delivery_errors": delivery_errors,
         "failed_scans": sum(scan.status == RunStatus.FAILED for scan in scans),
     }
+    from app.learning.shadow import shadow_scorecard
+    from app.profiles import ProfileService
+
+    summary["learning_shadow"] = [
+        await shadow_scorecard(session, profile.id)
+        for profile in await ProfileService().list_profiles(session)
+    ]
     existing = await session.scalar(select(DailyReport).where(DailyReport.report_date == start))
     if existing is None:
         existing = DailyReport(report_date=start, summary=summary)
