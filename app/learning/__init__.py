@@ -10,7 +10,11 @@ from app.learning.service import (
     review_job_input,
     review_reason_labels,
 )
-from app.learning.shadow import record_learning_shadow, record_shadow_outcomes
+from app.learning.shadow import (
+    record_learning_shadow,
+    record_shadow_outcomes,
+    shadow_scorecard,
+)
 from app.learning.training import (
     GLOBAL_SEGMENT,
     latest_model,
@@ -33,6 +37,7 @@ __all__ = [
     "record_shadow_outcomes",
     "review_job_input",
     "review_reason_labels",
+    "shadow_scorecard",
     "train_all_profiles",
     "train_profile",
 ]

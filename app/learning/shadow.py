@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -149,3 +151,58 @@ async def attach_human_decision(
         row.human_reason = reason
         row.agreed = agreement_of(row.would_decide, outcome)
     return len(pending)
+
+
+def _rate(numer: int, denom: int) -> float | None:
+    return numer / denom if denom else None
+
+
+async def shadow_scorecard(
+    session: AsyncSession, profile_id: UUID, *, window_days: int = 90
+) -> dict[str, Any]:
+    cutoff = datetime.now(UTC) - timedelta(days=window_days)
+    rows = list(
+        (
+            await session.scalars(
+                select(LearningShadowOutcome).where(
+                    LearningShadowOutcome.profile_id == profile_id,
+                    LearningShadowOutcome.created_at >= cutoff,
+                )
+            )
+        ).all()
+    )
+    resolved = [r for r in rows if r.human_decision is not None and r.agreed is not None]
+    would_approve = [r for r in resolved if r.would_decide is ShadowDecision.APPROVE]
+    would_reject = [r for r in resolved if r.would_decide is ShadowDecision.REJECT]
+    version = await session.scalar(
+        select(LearningModelVersion)
+        .where(LearningModelVersion.profile_id == profile_id)
+        .order_by(LearningModelVersion.trained_at.desc())
+        .limit(1)
+    )
+    return {
+        "profile_id": str(profile_id),
+        "window_days": window_days,
+        "cases_total": len(rows),
+        "resolved": len(resolved),
+        "would_approve": sum(r.would_decide is ShadowDecision.APPROVE for r in rows),
+        "would_reject": sum(r.would_decide is ShadowDecision.REJECT for r in rows),
+        "would_abstain": sum(r.would_decide is ShadowDecision.ABSTAIN for r in rows),
+        "agreement_overall": _rate(sum(1 if r.agreed else 0 for r in resolved), len(resolved)),
+        "would_approve_agreement": _rate(
+            sum(1 if r.agreed else 0 for r in would_approve), len(would_approve)
+        ),
+        "would_reject_agreement": _rate(
+            sum(1 if r.agreed else 0 for r in would_reject), len(would_reject)
+        ),
+        "support_ok_rate": _rate(sum(r.support_ok for r in rows), len(rows)),
+        "model": None
+        if version is None
+        else {
+            "trained_at": version.trained_at.isoformat(),
+            "n_labels": version.n_labels,
+            "cv_auc": version.cv_auc,
+            "cv_logloss": version.cv_logloss,
+            "cv_ece": version.cv_ece,
+        },
+    }
