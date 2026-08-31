@@ -39,12 +39,14 @@ implements **Phase 1** from §13 only).
 - **Segment:** Phase 1 trains exactly one model per profile with
   `segment_key = "global"`.
 - **All tunables are module constants in Phase 1** (Phase 2 promotes them to
-  `Settings`), defined once in `app/learning/features.py` and imported elsewhere:
-  `HALF_LIFE_DAYS = 120`, `MIN_FEATURE_SUPPORT = 5`, `MIN_VOCAB_SUPPORT = 3`,
-  `TITLE_VOCAB_CAP = 40`, `OTHER_VOCAB_CAP = 24`, `MODEL_MIN_LABELS = 40`,
-  `MODEL_MIN_PER_OUTCOME = 8`. In `app/learning/model.py`:
+  `Settings`). In `app/learning/features.py`: `FEATURE_SPEC_VERSION = "features-v3"`,
+  `HALF_LIFE_DAYS = 120`, `MIN_VOCAB_SUPPORT = 3`, `TITLE_VOCAB_CAP = 40`,
+  `OTHER_VOCAB_CAP = 24`, `MODEL_MIN_LABELS = 40`, `MODEL_MIN_PER_OUTCOME = 8`,
+  `MODEL_ELIGIBLE_SCHEMAS = frozenset({"review-v2"})`. In `app/learning/model.py`:
   `SHADOW_APPROVE_P = 0.90`, `SHADOW_REJECT_P = 0.12`, `CI_MAX_WIDTH = 0.15`,
-  `L2_GRID = (0.03, 0.1, 0.3, 1.0, 3.0)`, `CV_FOLDS = 4`.
+  `MIN_FEATURE_SUPPORT = 5`, `L2_GRID = (0.03, 0.1, 0.3, 1.0, 3.0)`, `CV_FOLDS = 4`.
+  (`MIN_FEATURE_SUPPORT` lives in `model.py` because `predict` is its only consumer
+  and `model.py` must not import `features.py`.)
 - Migrations are **hand-written** to match the models exactly; `alembic check` must
   report no diff. Enum columns use `native_enum=False` (follow existing entities).
 - Commit after every task with a `feat:` / `test:` / `chore:` prefixed message.
@@ -211,6 +213,7 @@ from numpy.typing import NDArray
 SHADOW_APPROVE_P = 0.90
 SHADOW_REJECT_P = 0.12
 CI_MAX_WIDTH = 0.15
+MIN_FEATURE_SUPPORT = 5
 L2_GRID: tuple[float, ...] = (0.03, 0.1, 0.3, 1.0, 3.0)
 CV_FOLDS = 4
 
@@ -777,8 +780,8 @@ git commit -m "feat: add time-series CV and L2 selection for review learning"
     `present_values` are the categorical feature values on this job (for the support
     check); `contribution_labels` maps `feature_name -> human label`. `support_ok` is
     `all(model.feature_frequencies.get(v, 0) >= MIN_FEATURE_SUPPORT for v in present_values)`
-    (import `MIN_FEATURE_SUPPORT` from `app.learning.features` **inside** the function to
-    avoid a module cycle). `would_decide`: `APPROVE` if
+    (`MIN_FEATURE_SUPPORT` is a module constant of `model.py`, defined in Task 2).
+    `would_decide`: `APPROVE` if
     `p_approve >= SHADOW_APPROVE_P and (ci_high - ci_low) <= CI_MAX_WIDTH and support_ok`;
     `REJECT` if `p_approve <= SHADOW_REJECT_P and (ci_high - ci_low) <= CI_MAX_WIDTH and support_ok`;
     else `ABSTAIN`. `top_contributions`: the 3 features with the largest `abs(coef * value)`.
@@ -988,8 +991,6 @@ def predict(
     present_values: Sequence[str],
     contribution_labels: Mapping[str, str],
 ) -> Prediction:
-    from app.learning.features import MIN_FEATURE_SUPPORT
-
     beta = np.asarray(model.coefficients, dtype=np.float64)
     full = np.concatenate([[1.0], row])
     raw = float(_sigmoid(np.array([full @ beta]))[0])
@@ -1053,10 +1054,11 @@ git commit -m "feat: add TrainedModel, prediction and JSON persistence for revie
   `_REJECTION_DIMENSIONS`, `_ALL_DIMENSIONS`, `_DIMENSION_LABELS`, `_feature_label`
   (existing, importable). `ReviewFeedbackEvent` model.
 - Produces (constants): `FEATURE_SPEC_VERSION = "features-v3"`, `HALF_LIFE_DAYS = 120`,
-  `MIN_FEATURE_SUPPORT = 5`, `MIN_VOCAB_SUPPORT = 3`, `TITLE_VOCAB_CAP = 40`,
+  `MIN_VOCAB_SUPPORT = 3`, `TITLE_VOCAB_CAP = 40`,
   `OTHER_VOCAB_CAP = 24`, `MODEL_MIN_LABELS = 40`, `MODEL_MIN_PER_OUTCOME = 8`,
   `MODEL_ELIGIBLE_SCHEMAS = frozenset({"review-v2"})`,
   `NUMERIC_NAMES: tuple[str, ...]`, `AGE_BUCKETS: tuple[str, ...]`.
+  (`MIN_FEATURE_SUPPORT` is **not** here — it lives in `model.py`, Task 2.)
 - Produces (types):
   - `@dataclass(frozen=True) class FeatureSpec: version: str; categorical: dict[str, tuple[str, ...]]; source_keys: tuple[str, ...]`
     with `.feature_names() -> tuple[str, ...]` (ordered, index 0 == `"__intercept__"`)
