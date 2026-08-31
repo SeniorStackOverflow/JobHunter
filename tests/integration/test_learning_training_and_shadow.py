@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.learning.service import ReviewLearningService
-from app.learning.shadow import record_shadow_outcomes
+from app.learning.shadow import record_shadow_outcomes, shadow_scorecard
 from app.learning.training import latest_model, train_profile
 from app.models.entities import (
     Application,
@@ -251,3 +251,39 @@ async def test_human_decision_backfills_shadow_agreement(sqlite_session_factory)
         row = (await session.scalars(select(LearningShadowOutcome))).one()
         assert row.human_decision == ReviewOutcome.APPROVED
         assert row.agreed is True
+
+
+async def test_full_shadow_loop(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        application = await _prepared_application(session)
+        # Alternate outcomes over time so the time-series CV sees both classes in
+        # every fold and produces a usable, confident model.
+        events = [
+            _feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d)
+            if d % 2 == 0
+            else _feedback(application.profile_id, ReviewOutcome.REJECTED, "sales", d)
+            for d in range(60)
+        ]
+        session.add_all(events)
+        await session.flush()
+
+        # train_profile clears the balanced-label gate and writes a model version.
+        version = await train_profile(session, application.profile_id)
+        assert version is not None
+        assert version.n_labels == 60
+        await session.flush()
+
+        # The shadow recorder scores the one pending review and writes one row.
+        assert await record_shadow_outcomes(session) == 1
+        await session.flush()
+
+        # The operator's explicit decision backfills that shadow row.
+        await ReviewLearningService().record_decision(
+            session, application, outcome=ReviewOutcome.APPROVED, actor="test"
+        )
+        await session.flush()
+
+        card = await shadow_scorecard(session, application.profile_id)
+        assert card["cases_total"] == 1
+        assert card["resolved"] == 1
+        assert card["model"]["n_labels"] == 60
