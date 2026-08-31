@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -40,3 +43,96 @@ def fit_l2_logistic(
         if float(np.max(np.abs(step))) < tol:
             break
     return beta
+
+
+def _wilson(successes: float, total: float, z: float = 1.96) -> tuple[float, float]:
+    if total <= 0:
+        return (0.0, 1.0)
+    phat = successes / total
+    denom = 1.0 + z * z / total
+    centre = (phat + z * z / (2.0 * total)) / denom
+    margin = z * np.sqrt(phat * (1.0 - phat) / total + z * z / (4.0 * total * total)) / denom
+    return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+@dataclass(frozen=True)
+class _Block:
+    x_right: float
+    mean: float
+    n_raw: int
+    sum_y: float
+
+
+@dataclass(frozen=True)
+class IsotonicCalibration:
+    knots_x: tuple[float, ...]
+    knots_p: tuple[float, ...]
+    blocks: tuple[_Block, ...]
+
+    def predict(self, raw: float) -> float:
+        xs, ps = self.knots_x, self.knots_p
+        if raw <= xs[0]:
+            return ps[0]
+        if raw >= xs[-1]:
+            return ps[-1]
+        hi = int(np.searchsorted(np.asarray(xs), raw))
+        lo = hi - 1
+        span = xs[hi] - xs[lo]
+        frac = 0.0 if span == 0 else (raw - xs[lo]) / span
+        return float(min(1.0, max(0.0, ps[lo] + frac * (ps[hi] - ps[lo]))))
+
+    def interval(self, raw: float) -> tuple[float, float]:
+        idx = min(
+            range(len(self.blocks)),
+            key=lambda i: abs(self.blocks[i].x_right - raw),
+        )
+        block = self.blocks[idx]
+        if block.n_raw < 20:
+            return (0.0, 1.0)
+        return _wilson(block.sum_y, float(block.n_raw))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "knots_x": list(self.knots_x),
+            "knots_p": list(self.knots_p),
+            "blocks": [
+                {"x_right": b.x_right, "mean": b.mean, "n_raw": b.n_raw, "sum_y": b.sum_y}
+                for b in self.blocks
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> IsotonicCalibration:
+        return cls(
+            knots_x=tuple(float(v) for v in data["knots_x"]),
+            knots_p=tuple(float(v) for v in data["knots_p"]),
+            blocks=tuple(
+                _Block(float(b["x_right"]), float(b["mean"]), int(b["n_raw"]), float(b["sum_y"]))
+                for b in data["blocks"]
+            ),
+        )
+
+
+def pava_isotonic(
+    raw: NDArray[np.float64],
+    y: NDArray[np.float64],
+    sample_weight: NDArray[np.float64],
+) -> IsotonicCalibration:
+    order = np.argsort(raw, kind="stable")
+    xs = raw[order].astype(np.float64)
+    ys = y[order].astype(np.float64)
+    ws = sample_weight[order].astype(np.float64)
+    # each block: [x_right, weight, mean, n_raw, sum_y_raw]
+    blocks: list[list[float]] = []
+    for xi, yi, wi in zip(xs, ys, ws, strict=True):
+        blocks.append([float(xi), float(wi), float(yi), 1.0, float(yi)])
+        while len(blocks) > 1 and blocks[-2][2] >= blocks[-1][2]:
+            x_r2, w2, m2, n2, s2 = blocks.pop()
+            _x_r1, w1, m1, n1, s1 = blocks.pop()
+            w_new = w1 + w2
+            m_new = (w1 * m1 + w2 * m2) / w_new
+            blocks.append([x_r2, w_new, m_new, n1 + n2, s1 + s2])
+    knots_x = tuple(b[0] for b in blocks)
+    knots_p = tuple(min(1.0, max(0.0, b[2])) for b in blocks)
+    made = tuple(_Block(b[0], b[2], int(b[3]), b[4]) for b in blocks)
+    return IsotonicCalibration(knots_x=knots_x, knots_p=knots_p, blocks=made)
