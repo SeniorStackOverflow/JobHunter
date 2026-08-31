@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.learning.service import ReviewLearningService
+from app.learning.shadow import record_shadow_outcomes
 from app.learning.training import latest_model, train_profile
 from app.models.entities import (
     Application,
@@ -191,3 +192,32 @@ async def test_record_decision_stores_numeric_and_context(sqlite_session_factory
         assert event.feature_snapshot["numeric"]["overall_fit"] == 0.72
         assert event.feature_snapshot["numeric"]["salary_gap"] == -0.2
         assert event.feature_snapshot["context"]["source_key"] == "rabota_md"
+
+
+async def test_shadow_outcome_recorded_for_pending_application(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        application = await _prepared_application(session)
+        # enough labels for a model, same profile
+        events = []
+        for d in range(30):
+            events.append(
+                _feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d)
+            )
+        for d in range(30, 55):
+            events.append(_feedback(application.profile_id, ReviewOutcome.REJECTED, "sales", d))
+        session.add_all(events)
+        await session.flush()
+        await train_profile(session, application.profile_id)
+        await session.flush()
+
+        written = await record_shadow_outcomes(session)
+        await session.flush()
+
+        assert written == 1
+        outcome = (await session.scalars(select(LearningShadowOutcome))).one()
+        assert outcome.application_id == application.id
+        assert 0.0 <= outcome.p_approve <= 1.0
+        assert outcome.human_decision is None
+
+        # idempotent: no second row, no overwrite
+        assert await record_shadow_outcomes(session) == 0

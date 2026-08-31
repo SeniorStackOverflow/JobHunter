@@ -81,7 +81,17 @@ async def train_all_profiles() -> int:
 async def latest_model(
     session: AsyncSession, profile_id: UUID, *, segment_key: str = GLOBAL_SEGMENT
 ) -> TrainedModel | None:
-    version = await session.scalar(
+    version = await latest_model_version(session, profile_id, segment_key=segment_key)
+    if version is None:
+        return None
+    return TrainedModel.from_json(version.payload)
+
+
+async def latest_model_version(
+    session: AsyncSession, profile_id: UUID, *, segment_key: str = GLOBAL_SEGMENT
+) -> LearningModelVersion | None:
+    """Return the profile's newest model-version row (payload not deserialized)."""
+    return await session.scalar(
         select(LearningModelVersion)
         .where(
             LearningModelVersion.profile_id == profile_id,
@@ -90,6 +100,3 @@ async def latest_model(
         .order_by(LearningModelVersion.trained_at.desc())
         .limit(1)
     )
-    if version is None:
-        return None
-    return TrainedModel.from_json(version.payload)
