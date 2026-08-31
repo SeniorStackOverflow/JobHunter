@@ -2187,6 +2187,7 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "list_applications",
             "get_review_queue",
             "get_review_learning_status",
+            "get_learning_model_status",
             "set_review_learning_influence",
             "get_application_status",
             "reconcile_stale_application_delivery",

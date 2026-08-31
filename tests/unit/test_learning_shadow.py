@@ -1,8 +1,6 @@
-from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
 
 from app.learning.shadow import agreement_of, shadow_scorecard
 from app.models.entities import LearningShadowOutcome, UserProfile
