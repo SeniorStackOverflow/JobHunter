@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +24,7 @@ from app.models.entities import (
     MatchEvaluation,
     SourceJob,
 )
-from app.models.enums import ApplicationStatus
+from app.models.enums import ApplicationStatus, ReviewOutcome, ReviewReason, ShadowDecision
 
 _ModelEntry = tuple[LearningModelVersion, TrainedModel, FeatureSpec]
 
@@ -115,3 +117,35 @@ async def record_learning_shadow() -> int:
         written = await record_shadow_outcomes(session)
         await session.commit()
         return written
+
+
+def agreement_of(would_decide: ShadowDecision, outcome: ReviewOutcome) -> bool | None:
+    if would_decide is ShadowDecision.ABSTAIN:
+        return None
+    approved = outcome is ReviewOutcome.APPROVED
+    if would_decide is ShadowDecision.APPROVE:
+        return approved
+    return not approved
+
+
+async def attach_human_decision(
+    session: AsyncSession,
+    application_id: UUID,
+    outcome: ReviewOutcome,
+    reason: ReviewReason | None,
+) -> int:
+    pending = list(
+        (
+            await session.scalars(
+                select(LearningShadowOutcome).where(
+                    LearningShadowOutcome.application_id == application_id,
+                    LearningShadowOutcome.human_decision.is_(None),
+                )
+            )
+        ).all()
+    )
+    for row in pending:
+        row.human_decision = outcome
+        row.human_reason = reason
+        row.agreed = agreement_of(row.would_decide, outcome)
+    return len(pending)

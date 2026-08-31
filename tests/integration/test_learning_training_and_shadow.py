@@ -221,3 +221,33 @@ async def test_shadow_outcome_recorded_for_pending_application(sqlite_session_fa
 
         # idempotent: no second row, no overwrite
         assert await record_shadow_outcomes(session) == 0
+
+
+async def test_human_decision_backfills_shadow_agreement(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        application = await _prepared_application(session)
+        session.add(
+            LearningShadowOutcome(
+                profile_id=application.profile_id,
+                application_id=application.id,
+                model_version_id=None,
+                segment_key="global",
+                p_approve=0.95,
+                ci_low=0.9,
+                ci_high=0.98,
+                support_ok=True,
+                would_decide=__import__(
+                    "app.models.enums", fromlist=["ShadowDecision"]
+                ).ShadowDecision.APPROVE,
+            )
+        )
+        await session.flush()
+
+        await ReviewLearningService().record_decision(
+            session, application, outcome=ReviewOutcome.APPROVED, actor="test"
+        )
+        await session.flush()
+
+        row = (await session.scalars(select(LearningShadowOutcome))).one()
+        assert row.human_decision == ReviewOutcome.APPROVED
+        assert row.agreed is True

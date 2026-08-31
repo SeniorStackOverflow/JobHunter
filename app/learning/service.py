@@ -692,6 +692,9 @@ class ReviewLearningService:
         )
         session.add(event)
         await session.flush()
+        from app.learning.shadow import attach_human_decision
+
+        await attach_human_decision(session, application.id, outcome, reason)
         return event
 
     async def summary(
