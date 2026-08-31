@@ -1,13 +1,16 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import uuid4
 
 from app.learning.features import (
     MIN_VOCAB_SUPPORT,
     FeatureSpec,
     build_feature_spec,
+    build_snapshot_extras,
+    extract_from_event,
 )
-from app.models.entities import ReviewFeedbackEvent
-from app.models.enums import ReviewOutcome
+from app.models.entities import JobPreference, MatchEvaluation, ReviewFeedbackEvent, SourceJob
+from app.models.enums import MatchDecision, ReviewOutcome, ReviewReason
 
 
 def _event(**snapshot_features: list[str]) -> ReviewFeedbackEvent:
@@ -57,3 +60,97 @@ def test_feature_spec_round_trips_through_dict() -> None:
     spec = build_feature_spec(events)
 
     assert FeatureSpec.from_dict(spec.to_dict()).feature_names() == spec.feature_names()
+
+
+def _rejected_event(dimensions: list[str], reason: ReviewReason) -> ReviewFeedbackEvent:
+    return ReviewFeedbackEvent(
+        profile_id=uuid4(),
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=ReviewOutcome.REJECTED,
+        reason_code=reason,
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
+        feature_snapshot={
+            "features": {"category": ["sales"], "salary": ["missing"]},
+            "learning_dimensions": dimensions,
+            "numeric": {"overall_fit": 40.0},
+        },
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+
+def test_event_extraction_reads_label_and_active_dimensions() -> None:
+    event = _rejected_event(["salary"], ReviewReason.SALARY)
+
+    features, label = extract_from_event(event)
+
+    assert label == 0.0
+    assert features.active_dimensions == frozenset({"salary"})
+    assert features.numeric["overall_fit"] == 0.4  # normalised
+    assert features.numeric["salary_missing"] == 0.0  # numeric present -> not missing
+
+
+def test_missing_numeric_block_is_flagged() -> None:
+    event = ReviewFeedbackEvent(
+        profile_id=uuid4(),
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=ReviewOutcome.APPROVED,
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
+        feature_snapshot={
+            "features": {"category": ["warehouses"]},
+            "learning_dimensions": ["category"],
+        },
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    features, _ = extract_from_event(event)
+
+    assert features.numeric["llm_scores_missing"] == 1.0
+    assert features.numeric["overall_fit"] == 0.5
+    assert features.source_key == "__other__"
+    assert features.age_bucket == "unknown"
+
+
+def test_snapshot_extras_normalise_scores_and_salary_gap() -> None:
+    job = SourceJob(
+        source_id=uuid4(),
+        external_job_id="x",
+        canonical_url="https://e/j",
+        title="Picker",
+        content_hash="a",
+        matching_content_hash="b",
+        source_fingerprint="c",
+        salary_min=Decimal("8000"),
+    )
+    evaluation = MatchEvaluation(
+        profile_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        resume_fit=60,
+        preference_fit=80,
+        overall_fit=72,
+        requirements_met=[],
+        missing_requirements=["x"],
+        risks=[],
+        scam_indicators=[],
+        explanation="",
+        decision=MatchDecision.PREPARE_FOR_REVIEW,
+        model="m",
+        prompt_rules_version="v",
+    )
+    preference = JobPreference(profile_id=uuid4(), minimum_salary=Decimal("10000"))
+
+    extras = build_snapshot_extras(job, evaluation, preference)
+
+    assert extras["numeric"]["overall_fit"] == 0.72
+    assert extras["numeric"]["llm_prepare"] == 1.0
+    assert extras["numeric"]["n_missing_requirements"] == 0.2  # 1 / 5
+    assert extras["numeric"]["salary_gap"] == -0.2  # (8000 - 10000) / 10000
+    assert extras["numeric"]["salary_missing"] == 0.0
