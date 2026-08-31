@@ -35,6 +35,7 @@ from app.models.enums import (
     ReviewReason,
     RunStatus,
     ScanType,
+    ShadowDecision,
     SourceHealth,
     VerificationStatus,
 )
@@ -439,6 +440,66 @@ class ReviewLearningSetting(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
     )
     influence_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class LearningModelVersion(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "learning_model_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id", "segment_key", "trained_at", name="uq_learning_model_versions_identity"
+        ),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True
+    )
+    segment_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    feature_spec_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    n_labels: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    n_approved: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    n_rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cv_auc: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    cv_logloss: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    cv_ece: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    trained_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class LearningShadowOutcome(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "learning_shadow_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id", "model_version_id", name="uq_learning_shadow_outcomes_identity"
+        ),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True
+    )
+    application_id: Mapped[UUID] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
+    model_version_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("learning_model_versions.id", ondelete="SET NULL")
+    )
+    segment_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    p_approve: Mapped[float] = mapped_column(Float, nullable=False)
+    ci_low: Mapped[float] = mapped_column(Float, nullable=False)
+    ci_high: Mapped[float] = mapped_column(Float, nullable=False)
+    support_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    would_decide: Mapped[ShadowDecision] = mapped_column(
+        enum_column(ShadowDecision), nullable=False
+    )
+    human_decision: Mapped[ReviewOutcome | None] = mapped_column(enum_column(ReviewOutcome))
+    human_reason: Mapped[ReviewReason | None] = mapped_column(enum_column(ReviewReason))
+    agreed: Mapped[bool | None] = mapped_column(Boolean)
+    sampled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
 
 
 class EmailDelivery(UUIDPrimaryKeyMixin, Base):

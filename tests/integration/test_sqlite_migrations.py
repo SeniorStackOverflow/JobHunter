@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -24,9 +25,9 @@ def test_fresh_sqlite_database_migrations_round_trip(
     finally:
         get_settings.cache_clear()
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("a4f0c2d8e731",)
+    assert revision == ("5191960d5cc9",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -55,6 +56,6 @@ def test_fresh_sqlite_database_migrations_round_trip(
     finally:
         get_settings.cache_clear()
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("a4f0c2d8e731",)
+    assert revision == ("5191960d5cc9",)
