@@ -464,10 +464,28 @@ LLM сказал `PREPARE_FOR_REVIEW`, а не `AUTO_APPLY`.
 - Ослабляются **только** правила из `relaxes`:
   ```python
   trusted = trusted_model_approval is not None
-  def relaxed(name): return trusted and name in trusted_model_approval.relaxes
-  rule("category_allowed_for_auto_send", relaxed("category_allowed_for_auto_send") or category in auto_categories)
-  rule("overall_score_threshold", minimum_catchup_active or relaxed("overall_score_threshold") or evaluation.overall_fit >= preferences.minimum_auto_send_score)
-  rule("match_auto_apply", minimum_catchup_active or relaxed("match_auto_apply") or evaluation.decision == MatchDecision.AUTO_APPLY)
+
+
+  def relaxed(name):
+      return trusted and name in trusted_model_approval.relaxes
+
+
+  rule(
+      "category_allowed_for_auto_send",
+      relaxed("category_allowed_for_auto_send") or category in auto_categories,
+  )
+  rule(
+      "overall_score_threshold",
+      minimum_catchup_active
+      or relaxed("overall_score_threshold")
+      or evaluation.overall_fit >= preferences.minimum_auto_send_score,
+  )
+  rule(
+      "match_auto_apply",
+      minimum_catchup_active
+      or relaxed("match_auto_apply")
+      or evaluation.decision == MatchDecision.AUTO_APPLY,
+  )
   ```
   `match_not_skipped` **не** ослабляется: `SKIP` → `PolicyDecision.SKIPPED` →
   `CANCELLED`, такие заявки вне области `apply_learning_autonomy` (работает только с

@@ -246,8 +246,7 @@ async def test_scan_cache_does_not_retain_checkpoint_snapshots_and_closes_cleanl
     assert any("scan_checkpoint" in item.metadata for item in references)
     assert adapter._references_by_id
     assert all(
-        "scan_checkpoint" not in item.metadata
-        for item in adapter._references_by_id.values()
+        "scan_checkpoint" not in item.metadata for item in adapter._references_by_id.values()
     )
 
     await adapter.aclose()

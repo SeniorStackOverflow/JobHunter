@@ -106,6 +106,8 @@ module = [
   "selectolax.*",
   "yaml.*",
   "playwright.*",
+  "playwright_stealth",
+  "playwright_stealth.*",
 ]
 ignore_missing_imports = true
 

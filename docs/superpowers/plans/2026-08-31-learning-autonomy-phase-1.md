@@ -356,9 +356,7 @@ def _wilson(successes: float, total: float, z: float = 1.96) -> tuple[float, flo
     phat = successes / total
     denom = 1.0 + z * z / total
     centre = (phat + z * z / (2.0 * total)) / denom
-    margin = (
-        z * np.sqrt(phat * (1.0 - phat) / total + z * z / (4.0 * total * total)) / denom
-    )
+    margin = z * np.sqrt(phat * (1.0 - phat) / total + z * z / (4.0 * total * total)) / denom
     return (max(0.0, centre - margin), min(1.0, centre + margin))
 
 
@@ -518,9 +516,7 @@ Expected: FAIL — import error.
 
 ```python
 # app/learning/model.py — append
-def weighted_auc(
-    y: NDArray[np.float64], p: NDArray[np.float64], w: NDArray[np.float64]
-) -> float:
+def weighted_auc(y: NDArray[np.float64], p: NDArray[np.float64], w: NDArray[np.float64]) -> float:
     pos = p[y == 1.0]
     pos_w = w[y == 1.0]
     neg = p[y == 0.0]
@@ -530,9 +526,7 @@ def weighted_auc(
     numer = 0.0
     denom = float(pos_w.sum() * neg_w.sum())
     for value, weight in zip(pos, pos_w, strict=True):
-        numer += float(weight) * float(
-            neg_w[neg < value].sum() + 0.5 * neg_w[neg == value].sum()
-        )
+        numer += float(weight) * float(neg_w[neg < value].sum() + 0.5 * neg_w[neg == value].sum())
     return numer / denom if denom else 0.5
 
 
@@ -854,9 +848,12 @@ def test_trained_model_round_trips_through_json() -> None:
         present_values=["cat:warehouses"],
         contribution_labels={},
     )
-    assert same.p_approve == predict(
-        model, row=np.array([1.0]), present_values=["cat:warehouses"], contribution_labels={}
-    ).p_approve
+    assert (
+        same.p_approve
+        == predict(
+            model, row=np.array([1.0]), present_values=["cat:warehouses"], contribution_labels={}
+        ).p_approve
+    )
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -997,8 +994,7 @@ def predict(
     p_approve = model.calibration.predict(raw)
     ci_low, ci_high = model.calibration.interval(raw)
     support_ok = all(
-        model.feature_frequencies.get(value, 0) >= MIN_FEATURE_SUPPORT
-        for value in present_values
+        model.feature_frequencies.get(value, 0) >= MIN_FEATURE_SUPPORT for value in present_values
     )
     narrow = (ci_high - ci_low) <= CI_MAX_WIDTH
     if support_ok and narrow and p_approve >= SHADOW_APPROVE_P:
@@ -1266,7 +1262,9 @@ def build_feature_spec(events: Sequence[ReviewFeedbackEvent]) -> FeatureSpec:
         for dimension, counter in counts.items()
     }
     source_keys = tuple(
-        key for key, count in source_counts.most_common(OTHER_VOCAB_CAP) if count >= MIN_VOCAB_SUPPORT
+        key
+        for key, count in source_counts.most_common(OTHER_VOCAB_CAP)
+        if count >= MIN_VOCAB_SUPPORT
     )
     return FeatureSpec(
         version=FEATURE_SPEC_VERSION, categorical=categorical, source_keys=source_keys
@@ -1371,10 +1369,18 @@ def test_event_extraction_reads_label_and_active_dimensions() -> None:
 
 def test_missing_numeric_block_is_flagged() -> None:
     event = ReviewFeedbackEvent(
-        profile_id=uuid4(), application_id=uuid4(), canonical_job_id=uuid4(),
-        source_job_id=uuid4(), outcome=ReviewOutcome.APPROVED, actor="test",
-        learning_eligible=True, feature_schema_version="review-v2",
-        feature_snapshot={"features": {"category": ["warehouses"]}, "learning_dimensions": ["category"]},
+        profile_id=uuid4(),
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=ReviewOutcome.APPROVED,
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
+        feature_snapshot={
+            "features": {"category": ["warehouses"]},
+            "learning_dimensions": ["category"],
+        },
         created_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
 
@@ -1388,15 +1394,30 @@ def test_missing_numeric_block_is_flagged() -> None:
 
 def test_snapshot_extras_normalise_scores_and_salary_gap() -> None:
     job = SourceJob(
-        source_id=uuid4(), external_job_id="x", canonical_url="https://e/j", title="Picker",
-        content_hash="a", matching_content_hash="b", source_fingerprint="c",
+        source_id=uuid4(),
+        external_job_id="x",
+        canonical_url="https://e/j",
+        title="Picker",
+        content_hash="a",
+        matching_content_hash="b",
+        source_fingerprint="c",
         salary_min=Decimal("8000"),
     )
     evaluation = MatchEvaluation(
-        profile_id=uuid4(), canonical_job_id=uuid4(), source_job_id=uuid4(),
-        resume_fit=60, preference_fit=80, overall_fit=72, requirements_met=[],
-        missing_requirements=["x"], risks=[], scam_indicators=[], explanation="",
-        decision=MatchDecision.PREPARE_FOR_REVIEW, model="m", prompt_rules_version="v",
+        profile_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        resume_fit=60,
+        preference_fit=80,
+        overall_fit=72,
+        requirements_met=[],
+        missing_requirements=["x"],
+        risks=[],
+        scam_indicators=[],
+        explanation="",
+        decision=MatchDecision.PREPARE_FOR_REVIEW,
+        model="m",
+        prompt_rules_version="v",
     )
     preference = JobPreference(profile_id=uuid4(), minimum_salary=Decimal("10000"))
 
@@ -1546,9 +1567,11 @@ def extract_from_event(event: ReviewFeedbackEvent) -> tuple[ExtractedFeatures, f
         if context.get("age_bucket") in AGE_BUCKETS:
             age_bucket = str(context["age_bucket"])
     raw_dimensions = snapshot.get("learning_dimensions", [])
-    active = frozenset(
-        str(item) for item in raw_dimensions if str(item) in _ALL_DIMENSIONS
-    ) if isinstance(raw_dimensions, list) else frozenset()
+    active = (
+        frozenset(str(item) for item in raw_dimensions if str(item) in _ALL_DIMENSIONS)
+        if isinstance(raw_dimensions, list)
+        else frozenset()
+    )
     label = 1.0 if event.outcome.value == "approved" else 0.0
     return (
         ExtractedFeatures(
@@ -1570,9 +1593,7 @@ def extract_live(
     source_key: str | None = None,
 ) -> ExtractedFeatures:
     snapshot = _feature_snapshot(review_job_input(job))
-    categorical = {
-        dimension: list(snapshot.get(dimension, [])) for dimension in _ALL_DIMENSIONS
-    }
+    categorical = {dimension: list(snapshot.get(dimension, [])) for dimension in _ALL_DIMENSIONS}
     return ExtractedFeatures(
         categorical=categorical,
         numeric=numeric_from_evaluation(evaluation, job, preference),
@@ -1636,19 +1657,27 @@ from app.learning.features import build_matrix, present_values, vectorize
 
 def _approved(dimensions: list[str], **features: list[str]) -> ReviewFeedbackEvent:
     return ReviewFeedbackEvent(
-        profile_id=uuid4(), application_id=uuid4(), canonical_job_id=uuid4(),
-        source_job_id=uuid4(), outcome=ReviewOutcome.APPROVED, actor="test",
-        learning_eligible=True, feature_schema_version="review-v2",
+        profile_id=uuid4(),
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=ReviewOutcome.APPROVED,
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
         feature_snapshot={"features": features, "learning_dimensions": dimensions},
         created_at=datetime(2026, 8, 20, tzinfo=UTC),
     )
 
 
 def test_vectorize_applies_the_causal_mask() -> None:
-    spec = build_feature_spec([_approved(["category", "title"], category=["warehouses"], title=["picker"]) for _ in range(MIN_VOCAB_SUPPORT)])
-    features, _ = extract_from_event(
-        _rejected_event(["salary"], ReviewReason.SALARY)
+    spec = build_feature_spec(
+        [
+            _approved(["category", "title"], category=["warehouses"], title=["picker"])
+            for _ in range(MIN_VOCAB_SUPPORT)
+        ]
     )
+    features, _ = extract_from_event(_rejected_event(["salary"], ReviewReason.SALARY))
     # rejected-for-salary event: category present in snapshot but not active
     names = spec.feature_names()[1:]
     row = vectorize(spec, features)
@@ -1662,7 +1691,10 @@ def test_matrix_weights_decay_with_age() -> None:
     old.created_at = datetime(2026, 1, 1, tzinfo=UTC)
     recent = _approved(["category"], category=["warehouses"])
     recent.created_at = datetime(2026, 8, 20, tzinfo=UTC)
-    spec = build_feature_spec([old, recent] + [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)])
+    spec = build_feature_spec(
+        [old, recent]
+        + [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
+    )
 
     x, y, w, freq = build_matrix([old, recent], spec, now=datetime(2026, 8, 21, tzinfo=UTC))
 
@@ -1673,7 +1705,9 @@ def test_matrix_weights_decay_with_age() -> None:
 
 
 def test_present_values_ignores_out_of_vocab() -> None:
-    spec = build_feature_spec([_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)])
+    spec = build_feature_spec(
+        [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
+    )
     features, _ = extract_from_event(_approved(["category"], category=["warehouses", "unlisted"]))
 
     assert present_values(spec, features) == ["category:warehouses"]
@@ -1736,8 +1770,7 @@ def build_matrix(
         (
             event
             for event in events
-            if event.learning_eligible
-            and event.feature_schema_version in MODEL_ELIGIBLE_SCHEMAS
+            if event.learning_eligible and event.feature_schema_version in MODEL_ELIGIBLE_SCHEMAS
         ),
         key=lambda e: e.created_at,
     )
@@ -1958,10 +1991,15 @@ from app.models.enums import ReviewOutcome, ReviewReason
 
 def _feedback(profile_id, outcome, category, day) -> ReviewFeedbackEvent:
     return ReviewFeedbackEvent(
-        profile_id=profile_id, application_id=uuid4(), canonical_job_id=uuid4(),
-        source_job_id=uuid4(), outcome=outcome,
+        profile_id=profile_id,
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=outcome,
         reason_code=None if outcome == ReviewOutcome.APPROVED else ReviewReason.ROLE,
-        actor="test", learning_eligible=True, feature_schema_version="review-v2",
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
         feature_snapshot={
             "features": {
                 "category": [category],
@@ -2054,9 +2092,7 @@ async def _load_events(session: AsyncSession, profile_id: UUID) -> list[ReviewFe
     )
 
 
-async def train_profile(
-    session: AsyncSession, profile_id: UUID
-) -> LearningModelVersion | None:
+async def train_profile(session: AsyncSession, profile_id: UUID) -> LearningModelVersion | None:
     events = await _load_events(session, profile_id)
     spec = build_feature_spec(events)
     x, y, w, frequencies = build_matrix(events, spec)
@@ -2154,7 +2190,13 @@ git commit -m "feat: train and persist per-profile review-learning models"
 # add to tests/integration/test_learning_training_and_shadow.py
 from app.learning.service import ReviewLearningService
 from app.models.entities import (
-    Application, CanonicalJob, EmployerContact, JobPreference, MatchEvaluation, Resume, SourceJob,
+    Application,
+    CanonicalJob,
+    EmployerContact,
+    JobPreference,
+    MatchEvaluation,
+    Resume,
+    SourceJob,
 )
 from app.models.enums import ApplicationStatus, ContactType, MatchDecision, VerificationStatus
 
@@ -2170,39 +2212,74 @@ async def _prepared_application(session) -> Application:
     session.add(canonical)
     await session.flush()
     job = SourceJob(
-        source_id=uuid4(), canonical_job_id=canonical.id, external_job_id="x",
-        canonical_url="https://e/j", title="Picker", content_hash="a",
-        matching_content_hash="b", source_fingerprint="c", salary_min=8000,
+        source_id=uuid4(),
+        canonical_job_id=canonical.id,
+        external_job_id="x",
+        canonical_url="https://e/j",
+        title="Picker",
+        content_hash="a",
+        matching_content_hash="b",
+        source_fingerprint="c",
+        salary_min=8000,
         raw_metadata={"adapter_type": "rabota_md"},
     )
     resume = Resume(
-        profile_id=profile.id, name="r", category="logistics", storage_key=uuid4().hex,
-        original_filename="r.pdf", mime_type="application/pdf", sha256="d" * 64,
-        active=True, verified=True,
+        profile_id=profile.id,
+        name="r",
+        category="logistics",
+        storage_key=uuid4().hex,
+        original_filename="r.pdf",
+        mime_type="application/pdf",
+        sha256="d" * 64,
+        active=True,
+        verified=True,
     )
     session.add_all([job, resume])
     await session.flush()
     evaluation = MatchEvaluation(
-        profile_id=profile.id, canonical_job_id=canonical.id, source_job_id=job.id,
-        resume_fit=60, preference_fit=80, overall_fit=72, requirements_met=[],
-        missing_requirements=[], risks=[], scam_indicators=[], explanation="",
-        decision=MatchDecision.PREPARE_FOR_REVIEW, model="m", prompt_rules_version="v",
-        source_content_hash="a", source_matching_hash="b", resume_id=resume.id,
+        profile_id=profile.id,
+        canonical_job_id=canonical.id,
+        source_job_id=job.id,
+        resume_fit=60,
+        preference_fit=80,
+        overall_fit=72,
+        requirements_met=[],
+        missing_requirements=[],
+        risks=[],
+        scam_indicators=[],
+        explanation="",
+        decision=MatchDecision.PREPARE_FOR_REVIEW,
+        model="m",
+        prompt_rules_version="v",
+        source_content_hash="a",
+        source_matching_hash="b",
+        resume_id=resume.id,
         resume_sha256="d" * 64,
     )
     contact = EmployerContact(
-        canonical_job_id=canonical.id, source_job_id=job.id, value="hr@e.test",
-        contact_type=ContactType.EMAIL, discovery_source="page",
-        verification_status=VerificationStatus.VERIFIED, evidence_url="https://e/j",
+        canonical_job_id=canonical.id,
+        source_job_id=job.id,
+        value="hr@e.test",
+        contact_type=ContactType.EMAIL,
+        discovery_source="page",
+        verification_status=VerificationStatus.VERIFIED,
+        evidence_url="https://e/j",
     )
     session.add_all([evaluation, contact])
     await session.flush()
     application = Application(
-        profile_id=profile.id, canonical_job_id=canonical.id, source_job_id=job.id,
-        match_evaluation_id=evaluation.id, resume_id=resume.id,
-        recipient_contact_id=contact.id, subject="Отклик на вакансию «Picker»",
-        body="body", language="ru", status=ApplicationStatus.PENDING_REVIEW,
-        idempotency_key=uuid4().hex, content_validated=True,
+        profile_id=profile.id,
+        canonical_job_id=canonical.id,
+        source_job_id=job.id,
+        match_evaluation_id=evaluation.id,
+        resume_id=resume.id,
+        recipient_contact_id=contact.id,
+        subject="Отклик на вакансию «Picker»",
+        body="body",
+        language="ru",
+        status=ApplicationStatus.PENDING_REVIEW,
+        idempotency_key=uuid4().hex,
+        content_validated=True,
     )
     session.add(application)
     await session.flush()
@@ -2325,7 +2402,9 @@ async def test_shadow_outcome_recorded_for_pending_application(sqlite_session_fa
         # enough labels for a model, same profile
         events = []
         for d in range(30):
-            events.append(_feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d))
+            events.append(
+                _feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d)
+            )
         for d in range(30, 55):
             events.append(_feedback(application.profile_id, ReviewOutcome.REJECTED, "sales", d))
         session.add_all(events)
@@ -2377,7 +2456,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import async_session_factory
-from app.learning.features import FeatureSpec, contribution_labels, extract_live, present_values, vectorize
+from app.learning.features import (
+    FeatureSpec,
+    contribution_labels,
+    extract_live,
+    present_values,
+    vectorize,
+)
 from app.learning.model import TrainedModel, predict
 from app.learning.training import GLOBAL_SEGMENT, latest_model_version
 from app.matching.freshness import evaluation_is_current
@@ -2528,10 +2613,17 @@ async def test_human_decision_backfills_shadow_agreement(sqlite_session_factory)
         application = await _prepared_application(session)
         session.add(
             LearningShadowOutcome(
-                profile_id=application.profile_id, application_id=application.id,
-                model_version_id=None, segment_key="global", p_approve=0.95,
-                ci_low=0.9, ci_high=0.98, support_ok=True,
-                would_decide=__import__("app.models.enums", fromlist=["ShadowDecision"]).ShadowDecision.APPROVE,
+                profile_id=application.profile_id,
+                application_id=application.id,
+                model_version_id=None,
+                segment_key="global",
+                p_approve=0.95,
+                ci_low=0.9,
+                ci_high=0.98,
+                support_ok=True,
+                would_decide=__import__(
+                    "app.models.enums", fromlist=["ShadowDecision"]
+                ).ShadowDecision.APPROVE,
             )
         )
         await session.flush()
@@ -2628,17 +2720,25 @@ git commit -m "feat: resolve shadow outcomes against operator review decisions"
     `created_at >= now - window_days`:
     ```python
     {
-      "profile_id": str, "window_days": int,
-      "cases_total": int, "resolved": int,
-      "would_approve": int, "would_reject": int, "would_abstain": int,
-      "agreement_overall": float | None,        # over resolved non-abstain rows
-      "would_approve_agreement": float | None,
-      "would_reject_agreement": float | None,
-      "support_ok_rate": float | None,
-      "model": {                                # from newest LearningModelVersion or None
-        "trained_at": str, "n_labels": int, "cv_auc": float,
-        "cv_logloss": float, "cv_ece": float,
-      } | None,
+        "profile_id": str,
+        "window_days": int,
+        "cases_total": int,
+        "resolved": int,
+        "would_approve": int,
+        "would_reject": int,
+        "would_abstain": int,
+        "agreement_overall": float | None,  # over resolved non-abstain rows
+        "would_approve_agreement": float | None,
+        "would_reject_agreement": float | None,
+        "support_ok_rate": float | None,
+        "model": {  # from newest LearningModelVersion or None
+            "trained_at": str,
+            "n_labels": int,
+            "cv_auc": float,
+            "cv_logloss": float,
+            "cv_ece": float,
+        }
+        | None,
     }
     ```
   - exported from `app/learning/__init__.py`.
@@ -2668,17 +2768,27 @@ async def test_scorecard_counts_and_agreement(sqlite_session_factory) -> None:
 
         def row(decide, human, agreed, support=True):
             return LearningShadowOutcome(
-                profile_id=profile.id, application_id=uuid4(), model_version_id=None,
-                segment_key="global", p_approve=0.5, ci_low=0.4, ci_high=0.6,
-                support_ok=support, would_decide=decide, human_decision=human, agreed=agreed,
+                profile_id=profile.id,
+                application_id=uuid4(),
+                model_version_id=None,
+                segment_key="global",
+                p_approve=0.5,
+                ci_low=0.4,
+                ci_high=0.6,
+                support_ok=support,
+                would_decide=decide,
+                human_decision=human,
+                agreed=agreed,
             )
 
-        session.add_all([
-            row(ShadowDecision.APPROVE, ReviewOutcome.APPROVED, True),
-            row(ShadowDecision.APPROVE, ReviewOutcome.REJECTED, False),
-            row(ShadowDecision.REJECT, ReviewOutcome.REJECTED, True),
-            row(ShadowDecision.ABSTAIN, None, None, support=False),
-        ])
+        session.add_all(
+            [
+                row(ShadowDecision.APPROVE, ReviewOutcome.APPROVED, True),
+                row(ShadowDecision.APPROVE, ReviewOutcome.REJECTED, False),
+                row(ShadowDecision.REJECT, ReviewOutcome.REJECTED, True),
+                row(ShadowDecision.ABSTAIN, None, None, support=False),
+            ]
+        )
         await session.flush()
 
         card = await shadow_scorecard(session, profile.id)
@@ -2743,12 +2853,8 @@ async def shadow_scorecard(
         "would_reject": sum(r.would_decide is ShadowDecision.REJECT for r in rows),
         "would_abstain": sum(r.would_decide is ShadowDecision.ABSTAIN for r in rows),
         "agreement_overall": _rate(sum(r.agreed for r in resolved), len(resolved)),
-        "would_approve_agreement": _rate(
-            sum(r.agreed for r in would_approve), len(would_approve)
-        ),
-        "would_reject_agreement": _rate(
-            sum(r.agreed for r in would_reject), len(would_reject)
-        ),
+        "would_approve_agreement": _rate(sum(r.agreed for r in would_approve), len(would_approve)),
+        "would_reject_agreement": _rate(sum(r.agreed for r in would_reject), len(would_reject)),
         "support_ok_rate": _rate(sum(r.support_ok for r in rows), len(rows)),
         "model": None
         if version is None
@@ -2830,18 +2936,14 @@ Append to `app/scheduler/tasks.py` (before `__all__`, then add both names to `__
 def train_learning_models_task() -> int | dict[str, str]:
     from app.learning.training import train_all_profiles
 
-    return _run_locked_periodic(
-        "train-learning-models", train_all_profiles(), ttl_seconds=1800
-    )
+    return _run_locked_periodic("train-learning-models", train_all_profiles(), ttl_seconds=1800)
 
 
 @celery_app.task(name="job_agent.scheduler.record_learning_shadow")
 def record_learning_shadow_task() -> int | dict[str, str]:
     from app.learning.shadow import record_learning_shadow
 
-    return _run_locked_periodic(
-        "record-learning-shadow", record_learning_shadow(), ttl_seconds=600
-    )
+    return _run_locked_periodic("record-learning-shadow", record_learning_shadow(), ttl_seconds=600)
 ```
 
 In `app/scheduler/celery_app.py`, add to `beat_schedule`:
@@ -3067,7 +3169,9 @@ async def test_full_shadow_loop(sqlite_session_factory) -> None:
         application = await _prepared_application(session)
         events = []
         for d in range(30):
-            events.append(_feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d))
+            events.append(
+                _feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d)
+            )
         for d in range(30, 60):
             events.append(_feedback(application.profile_id, ReviewOutcome.REJECTED, "sales", d))
         session.add_all(events)

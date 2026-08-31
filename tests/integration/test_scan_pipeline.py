@@ -179,9 +179,7 @@ async def test_incomplete_full_scan_does_not_trigger_mass_drop_degradation(
             found_jobs=815,
             updated_jobs=814,
             parsing_errors=1,
-            checkpoint={
-                "adapter_state": {"failed_reference_attempts": {"127405": 1}}
-            },
+            checkpoint={"adapter_state": {"failed_reference_attempts": {"127405": 1}}},
         )
         session.add_all([previous_full, interrupted_full])
         await session.flush()

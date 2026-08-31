@@ -82,7 +82,7 @@ class StealthPlaywrightBrowser:
             return
         try:
             from playwright.async_api import async_playwright
-            from playwright_stealth import Stealth  # type: ignore[import-untyped]
+            from playwright_stealth import Stealth
         except ImportError as exc:  # pragma: no cover - depends on optional extras
             raise BrowserFallbackUnavailable(
                 "install the 'playwright' extra and run 'playwright install chromium'"
