@@ -641,11 +641,16 @@ LLM сказал `PREPARE_FOR_REVIEW`, а не `AUTO_APPLY`.
 - Дневной отчёт (`app/reports/service.py`): блок shadow scorecard. Новый read-only
   MCP-тул `get_learning_model_status` (версия модели, CV-метрики, scorecard) —
   грантов ещё нет.
-- `ReviewLearningService.score()` переключается на `model.predict(...).p_approve`;
-  `_score()` и тупиковые ветки `_summarize_events` удаляются, `summary()`
-  сохраняется для UI-счётчиков (метрика «ready» считается по CV-метрикам новой
-  модели). `tests/unit/test_review_learning.py` переписывается под новую модель.
-- **Автономии, грантов, изменений `policy/engine.py` и `email/service.py` — нет.**
+- **Автономии, грантов, изменений `policy/engine.py`, `email/service.py`,
+  `_score()` / `_summarize_events()` / `ReviewLearningService.score()` — нет.**
+  Phase 1 намеренно ничего не меняет в наблюдаемом поведении (порядок очереди,
+  подсказки, счётчики). `tests/unit/test_review_learning.py` остаётся зелёным без
+  изменений.
+
+Переключение `ReviewLearningService.score()` на калиброванную модель для сортировки
+очереди перенесено в **первую задачу Фазы 2**: это единственный пункт, меняющий
+существующее наблюдаемое поведение, и его безопаснее включать после того, как
+shadow-scorecard подтвердит качество новой модели.
 
 ### Фаза 2 — Авто-отклонение
 - `LearningAutonomyGrant`, `LearningAutonomyAction`, `autonomy.py`.
