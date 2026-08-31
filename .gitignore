@@ -17,6 +17,8 @@ deploy-credentials*.txt
 playwright-report/
 *.db
 .codegraph/
+.superpowers/
+.worktrees/
 
 # Local secrets
 .admin-password
