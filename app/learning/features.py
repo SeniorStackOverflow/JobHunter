@@ -242,16 +242,19 @@ def extract_from_event(event: ReviewFeedbackEvent) -> tuple[ExtractedFeatures, f
     numeric = dict(_NEUTRAL_NUMERIC)
     stored_numeric = snapshot.get("numeric", {})
     if isinstance(stored_numeric, dict):
+        raw_overall = stored_numeric.get("overall_fit")
+        legacy_scale = isinstance(raw_overall, (int, float)) and float(raw_overall) > 1.0
         for name in NUMERIC_NAMES:
-            if name in stored_numeric:
-                numeric[name] = float(stored_numeric[name])
-        if "overall_fit" in stored_numeric and stored_numeric["overall_fit"] is not None:
-            # a normalised value (<=1) is already stored; a raw 0..100 is legacy.
-            if numeric["overall_fit"] > 1.0:
-                for key in ("overall_fit", "resume_fit", "preference_fit"):
-                    numeric[key] = _clip(numeric[key] / 100.0, 0.0, 1.0)
+            value = stored_numeric.get(name)
+            if value is None:
+                continue
+            number = float(value)
+            if legacy_scale and name in ("overall_fit", "resume_fit", "preference_fit"):
+                number = _clip(number / 100.0, 0.0, 1.0)
+            numeric[name] = number
+        # a stored raw score with no explicit flag means "scores are present"
+        if raw_overall is not None and "llm_scores_missing" not in stored_numeric:
             numeric["llm_scores_missing"] = 0.0
-            numeric["salary_missing"] = 0.0
     context = snapshot.get("context", {})
     source_key = "__other__"
     age_bucket = "unknown"

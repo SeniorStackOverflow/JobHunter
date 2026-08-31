@@ -90,7 +90,7 @@ def test_event_extraction_reads_label_and_active_dimensions() -> None:
     assert label == 0.0
     assert features.active_dimensions == frozenset({"salary"})
     assert features.numeric["overall_fit"] == 0.4  # normalised
-    assert features.numeric["salary_missing"] == 0.0  # numeric present -> not missing
+    assert features.numeric["salary_missing"] == 1.0  # no salary key stored -> stays neutral
 
 
 def test_missing_numeric_block_is_flagged() -> None:
