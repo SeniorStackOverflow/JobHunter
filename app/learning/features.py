@@ -10,7 +10,6 @@ from app.models.entities import ReviewFeedbackEvent
 
 FEATURE_SPEC_VERSION = "features-v3"
 HALF_LIFE_DAYS = 120
-MIN_FEATURE_SUPPORT = 5
 MIN_VOCAB_SUPPORT = 3
 TITLE_VOCAB_CAP = 40
 OTHER_VOCAB_CAP = 24
