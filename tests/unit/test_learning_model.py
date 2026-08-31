@@ -1,10 +1,12 @@
 import numpy as np
 
 from app.learning.model import (
+    CvResult,
     IsotonicCalibration,
     expected_calibration_error,
     fit_l2_logistic,
     pava_isotonic,
+    time_series_cv,
     weighted_auc,
     weighted_logloss,
 )
@@ -118,3 +120,32 @@ def test_ece_flags_overconfidence() -> None:
     y = np.concatenate([np.zeros(50), np.ones(50)])
     p = np.full(100, 0.99)  # always confident, only right half the time
     assert expected_calibration_error(y, p, np.ones(100)) > 0.4
+
+
+def _ramped_design(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(0)
+    feature = rng.normal(size=n)
+    logit = 1.5 * feature
+    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-logit))).astype(np.float64)
+    x = np.column_stack([np.ones(n), feature])
+    return x, y, np.ones(n)
+
+
+def test_cv_selects_a_grid_value_and_reports_reasonable_auc() -> None:
+    x, y, w = _ramped_design(200)
+
+    result = time_series_cv(x, y, w)
+
+    assert isinstance(result, CvResult)
+    assert result.best_l2 in (0.03, 0.1, 0.3, 1.0, 3.0)
+    assert result.cv_auc > 0.65
+    assert result.oof_raw.size > 0
+
+
+def test_cv_degrades_gracefully_on_tiny_input() -> None:
+    x, y, w = _ramped_design(3)
+
+    result = time_series_cv(x, y, w)
+
+    assert result.best_l2 == 0.3
+    assert result.cv_auc == 0.5

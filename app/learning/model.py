@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -182,3 +183,91 @@ def expected_calibration_error(
         accuracy = float(np.average(y[mask], weights=w[mask]))
         error += (bin_w / total) * abs(confidence - accuracy)
     return error
+
+
+@dataclass(frozen=True)
+class CvResult:
+    best_l2: float
+    cv_auc: float
+    cv_logloss: float
+    cv_ece: float
+    oof_raw: NDArray[np.float64]
+    oof_y: NDArray[np.float64]
+    oof_w: NDArray[np.float64]
+
+
+def _fold_bounds(n: int, folds: int) -> list[tuple[int, int, int]]:
+    chunk = n // (folds + 1)
+    bounds = []
+    for k in range(1, folds + 1):
+        train_end = chunk * k
+        test_end = n if k == folds else chunk * (k + 1)
+        bounds.append((0, train_end, test_end))
+    return bounds
+
+
+def _oof_for_l2(
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    w: NDArray[np.float64],
+    l2: float,
+    folds: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]] | None:
+    raw_parts: list[NDArray[np.float64]] = []
+    y_parts: list[NDArray[np.float64]] = []
+    w_parts: list[NDArray[np.float64]] = []
+    for tr_lo, tr_hi, te_hi in _fold_bounds(len(y), folds):
+        y_tr = y[tr_lo:tr_hi]
+        if y_tr.size == 0 or y_tr.min() == y_tr.max():
+            return None
+        beta = fit_l2_logistic(x[tr_lo:tr_hi], y_tr, w[tr_lo:tr_hi], l2)
+        raw_parts.append(_sigmoid(x[tr_hi:te_hi] @ beta))
+        y_parts.append(y[tr_hi:te_hi])
+        w_parts.append(w[tr_hi:te_hi])
+    return (
+        np.concatenate(raw_parts),
+        np.concatenate(y_parts),
+        np.concatenate(w_parts),
+    )
+
+
+def time_series_cv(
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    w: NDArray[np.float64],
+    *,
+    l2_grid: tuple[float, ...] = L2_GRID,
+    folds: int = CV_FOLDS,
+) -> CvResult:
+    neutral = CvResult(
+        best_l2=l2_grid[len(l2_grid) // 2],
+        cv_auc=0.5,
+        cv_logloss=math.log(2.0),
+        cv_ece=0.0,
+        oof_raw=np.empty(0, dtype=np.float64),
+        oof_y=np.empty(0, dtype=np.float64),
+        oof_w=np.empty(0, dtype=np.float64),
+    )
+    for candidate_folds in (folds, 2):
+        if len(y) < candidate_folds + 1:
+            continue
+        scored: list[tuple[float, float, tuple[NDArray[np.float64], ...]]] = []
+        for l2 in l2_grid:
+            oof = _oof_for_l2(x, y, w, l2, candidate_folds)
+            if oof is None:
+                continue
+            raw, yy, ww = oof
+            scored.append((weighted_logloss(yy, raw, ww), l2, oof))
+        if not scored:
+            continue
+        _, best_l2, (raw, yy, ww) = min(scored, key=lambda item: item[0])
+        return CvResult(
+            best_l2=best_l2,
+            cv_auc=weighted_auc(yy, raw, ww),
+            cv_logloss=weighted_logloss(yy, raw, ww),
+            cv_ece=expected_calibration_error(yy, raw, ww),
+            oof_raw=raw,
+            oof_y=yy,
+            oof_w=ww,
+        )
+    return neutral
