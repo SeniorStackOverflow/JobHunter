@@ -14,6 +14,7 @@ from app.matching.freshness import evaluation_is_current
 from app.matching.prefilter import canonicalize_location
 from app.models.entities import (
     Application,
+    JobPreference,
     MatchEvaluation,
     Resume,
     ReviewFeedbackEvent,
@@ -630,6 +631,12 @@ class ReviewLearningService:
         resume = await session.get(Resume, application.resume_id)
         if job is None:
             raise ReviewLearningError("review job does not exist")
+        from app.learning.features import build_snapshot_extras
+
+        preference = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == application.profile_id)
+        )
+        snapshot_extras = build_snapshot_extras(job, evaluation, preference)
         learning_eligible = learn
         exclusion_reason: str | None = None
         if not learn:
@@ -658,8 +665,10 @@ class ReviewLearningService:
         snapshot = {
             "features": _feature_snapshot(review_job_input(job)),
             "learning_dimensions": list(dimensions),
+            "numeric": snapshot_extras["numeric"],
             "context": {
                 "resume_category": resume.category if resume is not None else None,
+                **snapshot_extras["context"],
             },
         }
         event = ReviewFeedbackEvent(
