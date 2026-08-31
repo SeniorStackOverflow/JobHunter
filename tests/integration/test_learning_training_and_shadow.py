@@ -19,7 +19,14 @@ from app.models.entities import (
     SourceJob,
     UserProfile,
 )
-from app.models.enums import ApplicationStatus, ContactType, MatchDecision, ReviewOutcome, ReviewReason, VerificationStatus
+from app.models.enums import (
+    ApplicationStatus,
+    ContactType,
+    MatchDecision,
+    ReviewOutcome,
+    ReviewReason,
+    VerificationStatus,
+)
 
 pytestmark = pytest.mark.asyncio
 
