@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 import httpx
-from sqlalchemy import desc, func, select
+from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.applications.availability import block_closed_vacancy_applications
@@ -799,8 +799,18 @@ class ScanService:
         return None
 
     async def recheck_active_jobs(
-        self, source_id: UUID, close_after_confirmed_absence_count: int = 3
+        self,
+        source_id: UUID,
+        close_after_confirmed_absence_count: int = 3,
+        *,
+        max_jobs_per_run: int | None = None,
+        min_recheck_interval_hours: int = 0,
     ) -> dict[str, int]:
+        if max_jobs_per_run is not None and max_jobs_per_run < 1:
+            raise ValueError("max_jobs_per_run must be positive when configured")
+        if min_recheck_interval_hours < 0:
+            raise ValueError("min_recheck_interval_hours cannot be negative")
+
         async with self.session_factory() as session:
             source = await session.get(JobSource, source_id)
             if source is None:
@@ -811,16 +821,27 @@ class ScanService:
                 SourceHealth.DISABLED,
             }:
                 return {"checked": 0, "updated": 0, "possibly_closed": 0, "closed": 0, "errors": 0}
-            jobs = list(
-                (
-                    await session.scalars(
-                        select(SourceJob).where(
-                            SourceJob.source_id == source_id,
-                            SourceJob.status.in_([JobStatus.ACTIVE, JobStatus.POSSIBLY_CLOSED]),
-                        )
-                    )
-                ).all()
+            query = select(SourceJob).where(
+                SourceJob.source_id == source_id,
+                SourceJob.status.in_([JobStatus.ACTIVE, JobStatus.POSSIBLY_CLOSED]),
             )
+            if min_recheck_interval_hours:
+                cutoff = datetime.now(UTC) - timedelta(hours=min_recheck_interval_hours)
+                query = query.where(
+                    or_(
+                        SourceJob.last_checked_at.is_(None),
+                        SourceJob.last_checked_at <= cutoff,
+                    )
+                )
+            query = query.order_by(
+                case((SourceJob.status == JobStatus.POSSIBLY_CLOSED, 0), else_=1),
+                SourceJob.confirmed_absence_count.desc(),
+                SourceJob.last_checked_at.asc().nullsfirst(),
+                SourceJob.id,
+            )
+            if max_jobs_per_run is not None:
+                query = query.limit(max_jobs_per_run)
+            jobs = list((await session.scalars(query)).all())
             adapter = self.registry.create(source)
             results: list[tuple[SourceJob, Any]] = []
             try:

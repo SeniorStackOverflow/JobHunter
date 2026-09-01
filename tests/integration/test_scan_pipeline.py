@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -424,6 +424,70 @@ async def test_full_update_deduplicate_checkpoint_and_recheck_pipeline(
         assert courier is not None
         assert courier.status == JobStatus.CLOSED
         assert courier.confirmed_absence_count == 2
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recheck_batch_prioritizes_possible_closures_and_oldest_jobs(
+    fixture_site_client: httpx.AsyncClient,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    registry = build_default_registry(
+        client_factory=lambda _source: FixtureSiteFetcher(fixture_site_client)
+    )
+    service = ScanService(sqlite_session_factory, registry)
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Bounded recheck fixture"),
+    )
+    full = await run_full_scan(service, source_id)
+    assert full.status == RunStatus.SUCCEEDED
+
+    now = datetime.now(UTC)
+    old_possible = now - timedelta(days=2)
+    oldest_active = now - timedelta(days=3)
+    other_old = now - timedelta(days=1)
+    async with sqlite_session_factory() as session:
+        jobs = {
+            job.external_job_id: job
+            for job in (
+                await session.scalars(
+                    select(SourceJob).where(SourceJob.source_id == source_id)
+                )
+            ).all()
+        }
+        for job in jobs.values():
+            job.last_checked_at = now
+        jobs["fx-003"].status = JobStatus.POSSIBLY_CLOSED
+        jobs["fx-003"].confirmed_absence_count = 1
+        jobs["fx-003"].last_checked_at = old_possible
+        jobs["fx-004"].last_checked_at = oldest_active
+        jobs["fx-005"].last_checked_at = other_old
+        await session.commit()
+
+    result = await service.recheck_active_jobs(
+        source_id,
+        close_after_confirmed_absence_count=3,
+        max_jobs_per_run=2,
+        min_recheck_interval_hours=20,
+    )
+    assert result["checked"] == 2
+
+    async with sqlite_session_factory() as session:
+        jobs = {
+            job.external_job_id: job
+            for job in (
+                await session.scalars(
+                    select(SourceJob).where(SourceJob.source_id == source_id)
+                )
+            ).all()
+        }
+        assert jobs["fx-003"].last_checked_at.replace(tzinfo=UTC) > old_possible
+        assert jobs["fx-004"].last_checked_at.replace(tzinfo=UTC) > oldest_active
+        assert jobs["fx-005"].last_checked_at.replace(tzinfo=UTC) == other_old
+        assert jobs["fx-001"].last_checked_at.replace(tzinfo=UTC) == now
+
 
 
 @pytest.mark.integration

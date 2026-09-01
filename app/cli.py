@@ -53,8 +53,10 @@ async def seed_defaults(include_fixture: bool) -> None:
                             "max_pages_per_entrypoint": 20,
                         },
                         "active_job_recheck": {
-                            "schedule": "0 2 * * *",
+                            "schedule": "20 * * * *",
                             "close_after_confirmed_absence_count": 3,
+                            "max_jobs_per_run": 300,
+                            "min_recheck_interval_hours": 20,
                         },
                         "full_scan": {
                             "schedule": "0 3 * * *",

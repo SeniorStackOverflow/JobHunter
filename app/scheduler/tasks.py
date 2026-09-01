@@ -204,21 +204,46 @@ async def _downstream_actions_allowed(source_id: UUID) -> bool:
         return paused is False
 
 
-async def _recheck_absence_threshold(source_id: UUID) -> int:
-    async with async_session_factory() as session:
-        configuration = await session.scalar(
-            select(JobSource.configuration).where(JobSource.id == source_id)
-        )
+@dataclass(frozen=True, slots=True)
+class RecheckPolicy:
+    close_after_confirmed_absence_count: int = 3
+    max_jobs_per_run: int = 300
+    min_recheck_interval_hours: int = 20
+
+
+def _recheck_policy_from_configuration(configuration: object) -> RecheckPolicy:
     raw = configuration if isinstance(configuration, dict) else {}
     nested = raw.get("source")
     roots = [raw, nested] if isinstance(nested, dict) else [raw]
     for root in roots:
         section = root.get("active_job_recheck")
-        if isinstance(section, dict):
-            value = section.get("close_after_confirmed_absence_count")
-            if isinstance(value, int) and 1 <= value <= 100:
-                return value
-    return 3
+        if not isinstance(section, dict):
+            continue
+        threshold = section.get("close_after_confirmed_absence_count")
+        max_jobs = section.get("max_jobs_per_run")
+        min_interval = section.get("min_recheck_interval_hours")
+        return RecheckPolicy(
+            close_after_confirmed_absence_count=(
+                threshold if isinstance(threshold, int) and 1 <= threshold <= 100 else 3
+            ),
+            max_jobs_per_run=(
+                max_jobs if isinstance(max_jobs, int) and 1 <= max_jobs <= 10_000 else 300
+            ),
+            min_recheck_interval_hours=(
+                min_interval
+                if isinstance(min_interval, int) and 0 <= min_interval <= 168
+                else 20
+            ),
+        )
+    return RecheckPolicy()
+
+
+async def _recheck_policy(source_id: UUID) -> RecheckPolicy:
+    async with async_session_factory() as session:
+        configuration = await session.scalar(
+            select(JobSource.configuration).where(JobSource.id == source_id)
+        )
+    return _recheck_policy_from_configuration(configuration)
 
 
 def _set_source_health_metric(source_id: UUID, current: SourceHealth | None) -> None:
@@ -348,11 +373,15 @@ def recheck_source_task(self: Task, source_id: str) -> dict[str, int | str]:
         ) as lease:
             if lease is None:
                 _retry_busy(self, f"recheck for source {source_id}")
-            threshold = _run_async(_recheck_absence_threshold(parsed_source_id))
+            policy = _run_async(_recheck_policy(parsed_source_id))
             result = _run_async(
                 _scan_service().recheck_active_jobs(
                     parsed_source_id,
-                    close_after_confirmed_absence_count=threshold,
+                    close_after_confirmed_absence_count=(
+                        policy.close_after_confirmed_absence_count
+                    ),
+                    max_jobs_per_run=policy.max_jobs_per_run,
+                    min_recheck_interval_hours=policy.min_recheck_interval_hours,
                 )
             )
         if lease.lease_lost:
