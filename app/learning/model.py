@@ -126,10 +126,24 @@ def pava_isotonic(
     xs = raw[order].astype(np.float64)
     ys = y[order].astype(np.float64)
     ws = sample_weight[order].astype(np.float64)
+    # Pre-aggregate runs of equal x into a single point before pooling, so the
+    # calibration is a pure function of the data and never depends on the order
+    # in which tied raw scores arrived. Accumulate raw sums and take the mean once
+    # (a single division, not a running one) so the result is bit-for-bit stable.
+    agg: list[list[float]] = []  # [x, sum_w, sum_wy, n_raw, sum_y]
+    for xi, yi, wi in zip(xs, ys, ws, strict=True):
+        x_val, y_val, w_val = float(xi), float(yi), float(wi)
+        if agg and agg[-1][0] == x_val:
+            agg[-1][1] += w_val
+            agg[-1][2] += w_val * y_val
+            agg[-1][3] += 1.0
+            agg[-1][4] += y_val
+        else:
+            agg.append([x_val, w_val, w_val * y_val, 1.0, y_val])
     # each block: [x_right, weight, mean, n_raw, sum_y_raw]
     blocks: list[list[float]] = []
-    for xi, yi, wi in zip(xs, ys, ws, strict=True):
-        blocks.append([float(xi), float(wi), float(yi), 1.0, float(yi)])
+    for x_val, sum_w, sum_wy, n_val, s_val in agg:
+        blocks.append([x_val, sum_w, sum_wy / sum_w, n_val, s_val])
         while len(blocks) > 1 and blocks[-2][2] >= blocks[-1][2]:
             x_r2, w2, m2, n2, s2 = blocks.pop()
             _x_r1, w1, m1, n1, s1 = blocks.pop()

@@ -309,15 +309,21 @@ def extract_live(
     )
 
 
-def present_values(spec: FeatureSpec, features: ExtractedFeatures) -> list[str]:
+def present_values(features: ExtractedFeatures) -> list[str]:
+    """Every categorical value on an active dimension, in-vocab or not.
+
+    Out-of-vocabulary and seen-but-rare values must still reach the support gate
+    in ``predict`` (their ``feature_frequencies`` count is 0 / below the floor),
+    so a job whose categorical values are all novel gates to ``ABSTAIN`` rather
+    than sailing through an empty ``all([])``.
+    """
     found: list[str] = []
     for dimension in _ALL_DIMENSIONS:
         if dimension not in features.active_dimensions:
             continue
-        vocab = set(spec.categorical.get(dimension, ()))
         for value in features.categorical.get(dimension, []):
             key = f"{dimension}:{value}"
-            if value in vocab and key not in found:
+            if key not in found:
                 found.append(key)
     return found
 
@@ -369,7 +375,7 @@ def build_matrix(
         labels.append(label)
         age_days = max(0, (moment - _as_aware(event.created_at)).days)
         weights.append(0.5 ** (age_days / HALF_LIFE_DAYS))
-        for key in present_values(spec, features):
+        for key in present_values(features):
             frequencies[key] += 1
     if not rows:
         width = len(spec.feature_names())
