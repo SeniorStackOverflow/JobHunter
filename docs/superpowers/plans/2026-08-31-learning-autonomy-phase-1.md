@@ -44,9 +44,11 @@ implements **Phase 1** from §13 only).
   `OTHER_VOCAB_CAP = 24`, `MODEL_MIN_LABELS = 40`, `MODEL_MIN_PER_OUTCOME = 8`,
   `MODEL_ELIGIBLE_SCHEMAS = frozenset({"review-v2"})`. In `app/learning/model.py`:
   `SHADOW_APPROVE_P = 0.90`, `SHADOW_REJECT_P = 0.12`, `CI_MAX_WIDTH = 0.15`,
-  `MIN_FEATURE_SUPPORT = 5`, `L2_GRID = (0.03, 0.1, 0.3, 1.0, 3.0)`, `CV_FOLDS = 4`.
-  (`MIN_FEATURE_SUPPORT` lives in `model.py` because `predict` is its only consumer
-  and `model.py` must not import `features.py`.)
+  `MIN_FEATURE_SUPPORT = 5`, `L2_GRID = (0.03, 0.1, 0.3, 1.0, 3.0)`, `CV_FOLDS = 4`,
+  `SUPPORT_GATE_DIMENSIONS = frozenset({"category", "city", "schedule", "workplace",
+  "experience", "salary"})`.
+  (`MIN_FEATURE_SUPPORT` / `SUPPORT_GATE_DIMENSIONS` live in `model.py` because
+  `predict` is their only consumer and `model.py` must not import `features.py`.)
 - Migrations are **hand-written** to match the models exactly; `alembic check` must
   report no diff. Enum columns use `native_enum=False` (follow existing entities).
 - Commit after every task with a `feat:` / `test:` / `chore:` prefixed message.
@@ -216,6 +218,13 @@ CI_MAX_WIDTH = 0.15
 MIN_FEATURE_SUPPORT = 5
 L2_GRID: tuple[float, ...] = (0.03, 0.1, 0.3, 1.0, 3.0)
 CV_FOLDS = 4
+
+# `support_ok` gates only on low-cardinality, decision-relevant dimensions.
+# company / title tokens / area are high-cardinality: requiring every one of
+# them to be well-seen would make support unattainable on real jobs.
+SUPPORT_GATE_DIMENSIONS: frozenset[str] = frozenset(
+    {"category", "city", "schedule", "workplace", "experience", "salary"}
+)
 
 
 def _sigmoid(eta: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -771,10 +780,15 @@ git commit -m "feat: add time-series CV and L2 selection for review learning"
     OOF is empty), fills the metrics.
   - `predict(model: TrainedModel, *, row: NDArray[np.float64], present_values: Sequence[str], contribution_labels: Mapping[str, str]) -> Prediction`
     — `row` is the already-vectorised feature row **without** the intercept slot;
-    `present_values` are the categorical feature values on this job (for the support
-    check); `contribution_labels` maps `feature_name -> human label`. `support_ok` is
-    `all(model.feature_frequencies.get(v, 0) >= MIN_FEATURE_SUPPORT for v in present_values)`
-    (`MIN_FEATURE_SUPPORT` is a module constant of `model.py`, defined in Task 2).
+    `present_values` are the `f"{dim}:{value}"` categorical entries on this job (for
+    the support check); `contribution_labels` maps `feature_name -> human label`.
+    `support_ok` is a **per-dimension** gate over the low-cardinality decision
+    dimensions only (`SUPPORT_GATE_DIMENSIONS` = `category`, `city`, `schedule`,
+    `workplace`, `experience`, `salary`): for every gate dimension the job carries at
+    least one value for, at least one of those values must have been seen
+    `>= MIN_FEATURE_SUPPORT` times. High-cardinality dimensions (`company`, `title`,
+    `area`) never gate. (`MIN_FEATURE_SUPPORT` / `SUPPORT_GATE_DIMENSIONS` are module
+    constants of `model.py`, defined in Task 2.)
     `would_decide`: `APPROVE` if
     `p_approve >= SHADOW_APPROVE_P and (ci_high - ci_low) <= CI_MAX_WIDTH and support_ok`;
     `REJECT` if `p_approve <= SHADOW_REJECT_P and (ci_high - ci_low) <= CI_MAX_WIDTH and support_ok`;
@@ -801,7 +815,7 @@ def _fitted() -> TrainedModel:
         x=x,
         y=y,
         w=np.ones(300),
-        feature_frequencies={"cat:warehouses": 40},
+        feature_frequencies={"category:warehouses": 40},
     )
 
 
@@ -811,7 +825,7 @@ def test_trained_model_predicts_high_probability_for_a_strong_positive_row() -> 
     result = predict(
         model,
         row=np.array([3.0]),
-        present_values=["cat:warehouses"],
+        present_values=["category:warehouses"],
         contribution_labels={"signal": "категория: склад"},
     )
 
@@ -827,7 +841,7 @@ def test_novel_feature_value_forces_abstain() -> None:
     result = predict(
         model,
         row=np.array([3.0]),
-        present_values=["cat:brand-new"],
+        present_values=["category:brand-new"],  # novel value in a gate dimension
         contribution_labels={},
     )
 
@@ -845,13 +859,16 @@ def test_trained_model_round_trips_through_json() -> None:
     same = predict(
         restored,
         row=np.array([1.0]),
-        present_values=["cat:warehouses"],
+        present_values=["category:warehouses"],
         contribution_labels={},
     )
     assert (
         same.p_approve
         == predict(
-            model, row=np.array([1.0]), present_values=["cat:warehouses"], contribution_labels={}
+            model,
+            row=np.array([1.0]),
+            present_values=["category:warehouses"],
+            contribution_labels={},
         ).p_approve
     )
 ```
@@ -993,8 +1010,14 @@ def predict(
     raw = float(_sigmoid(np.array([full @ beta]))[0])
     p_approve = model.calibration.predict(raw)
     ci_low, ci_high = model.calibration.interval(raw)
+    by_dimension: dict[str, list[str]] = {}
+    for value in present_values:
+        dimension = value.split(":", 1)[0]
+        by_dimension.setdefault(dimension, []).append(value)
     support_ok = all(
-        model.feature_frequencies.get(value, 0) >= MIN_FEATURE_SUPPORT for value in present_values
+        any(model.feature_frequencies.get(v, 0) >= MIN_FEATURE_SUPPORT for v in keys)
+        for dimension, keys in by_dimension.items()
+        if dimension in SUPPORT_GATE_DIMENSIONS
     )
     narrow = (ci_high - ci_low) <= CI_MAX_WIDTH
     if support_ok and narrow and p_approve >= SHADOW_APPROVE_P:
@@ -1650,9 +1673,11 @@ git commit -m "feat: extract learning features from events and live jobs"
     `features.active_dimensions` (causal mask). `obs:{dimension}` = `1.0` iff the
     dimension is active. Numeric entries copied in `NUMERIC_NAMES` order. `source:{key}`
     one-hot (`source:__other__` when the key is not in the spec). `age:{bucket}` one-hot.
-  - `present_values(spec: FeatureSpec, features: ExtractedFeatures) -> list[str]`
-    — the `f"{dimension}:{value}"` keys actually present on this job **and** in the
-    spec vocab (used for the support check; unaffected by the causal mask).
+  - `present_values(features: ExtractedFeatures) -> list[str]`
+    — every `f"{dimension}:{value}"` key on an **active** dimension of this job,
+    in-vocab or not (used for the support check; out-of-vocab / rare values must
+    still reach the gate so a novel job abstains rather than sailing through an
+    empty `all([])`).
   - `build_matrix(events: Sequence[ReviewFeedbackEvent], spec: FeatureSpec, *, now: datetime | None = None) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], dict[str, int]]`
     — returns `(X, y, w, feature_frequencies)`. `X` includes the intercept column at 0.
     Rows come only from events with `feature_schema_version in MODEL_ELIGIBLE_SCHEMAS`
@@ -1719,13 +1744,12 @@ def test_matrix_weights_decay_with_age() -> None:
     assert freq["category:warehouses"] == 2
 
 
-def test_present_values_ignores_out_of_vocab() -> None:
-    spec = build_feature_spec(
-        [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
-    )
+def test_present_values_reports_every_active_value() -> None:
     features, _ = extract_from_event(_approved(["category"], category=["warehouses", "unlisted"]))
 
-    assert present_values(spec, features) == ["category:warehouses"]
+    # every value on an active dimension is reported, in-vocab ("warehouses") or
+    # not ("unlisted"), so predict()'s support gate can veto a novel job
+    assert present_values(features) == ["category:warehouses", "category:unlisted"]
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1741,13 +1765,16 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-def present_values(spec: FeatureSpec, features: ExtractedFeatures) -> list[str]:
+def present_values(features: ExtractedFeatures) -> list[str]:
+    """Every categorical value on an active dimension, in-vocab or not, so
+    out-of-vocab / rare values still reach the support gate in ``predict``."""
     found: list[str] = []
     for dimension in _ALL_DIMENSIONS:
-        vocab = set(spec.categorical.get(dimension, ()))
+        if dimension not in features.active_dimensions:
+            continue
         for value in features.categorical.get(dimension, []):
             key = f"{dimension}:{value}"
-            if value in vocab and key not in found:
+            if key not in found:
                 found.append(key)
     return found
 
@@ -1799,7 +1826,7 @@ def build_matrix(
         labels.append(label)
         age_days = max(0, (moment - _as_aware(event.created_at)).days)
         weights.append(0.5 ** (age_days / HALF_LIFE_DAYS))
-        for key in present_values(spec, features):
+        for key in present_values(features):
             frequencies[key] += 1
     if not rows:
         width = len(spec.feature_names())
@@ -2540,7 +2567,7 @@ async def record_shadow_outcomes(session: AsyncSession) -> int:
         prediction = predict(
             trained,
             row=vectorize(spec, features),
-            present_values=present_values(spec, features),
+            present_values=present_values(features),
             contribution_labels=contribution_labels(spec),
         )
         session.add(

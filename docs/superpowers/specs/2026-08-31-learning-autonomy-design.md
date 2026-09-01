@@ -165,7 +165,8 @@ policy engine и весь укреплённый путь `EmailService`. Мод
 
 **Выход:** `FeatureVector` — разрежённый вектор фиксированной размерности (порядок
 задаётся `FeatureSpec`, сериализуется вместе с моделью) + список присутствующих
-категориальных значений (для `support_ok`).
+категориальных значений всех активных измерений (в т.ч. вне словаря — для
+`support_ok`).
 
 ### 5.2. `app/learning/model.py` — обучение и предсказание
 
@@ -192,10 +193,20 @@ policy engine и весь укреплённый путь `EmailService`. Мод
 Prediction(
     p_approve: float,            # калиброванная вероятность
     ci_low: float, ci_high: float,  # Wilson-интервал бина калибровки (n сэмплов бина)
-    support_ok: bool,            # все присутствующие кат. значения встречались ≥ learning_min_feature_support раз
+    support_ok: bool,            # см. ниже — гейт по решающим измерениям
     top_contributions: list[(feature_label, logit_delta, support)],  # ±3 сильнейших, человекочитаемо
 )
 ```
+
+**`support_ok`** — гейт по каждому измерению отдельно, только по низкокардинальным
+решающим измерениям `SUPPORT_GATE_DIMENSIONS` = {`category`, `city`, `schedule`, `workplace`,
+`experience`, `salary`}: для каждого такого измерения, у которого вакансия несёт
+хотя бы одно значение, хотя бы одно из этих значений должно встречаться в обучении
+≥ `learning_min_feature_support` раз (дефолт 5). Высококардинальные измерения
+(`company`, `title`, `area`) не гейтят — они почти уникальны на вакансию, и
+требование «каждое значение хорошо изучено» сделало бы `support_ok` недостижимым.
+Новая категория (город/график/…) → измерение есть, но ни одно значение не изучено
+→ `support_ok = False` → `ABSTAIN`. Новая компания одна по себе не блокирует.
 
 CI: для предсказанного `p` берётся бин изотонической функции, к его `(approve, n)`
 применяется интервал Уилсона (95%). Если `n < 20` — интервал расширяется до `[0,1]`
@@ -392,8 +403,11 @@ Beat-таск `finalize_auto_declined` переводит `AUTO_DECLINED` ста
 - `auto_send`: `p_approve ≥ learning_send_approve_threshold` (0.90).
 - `auto_reject`: `p_approve ≤ learning_reject_threshold` (0.12).
 - `ci_high − ci_low ≤ learning_ci_max_width` (0.15).
-- `support_ok` (все присутствующие категориальные значения встречались
-  ≥ `learning_min_feature_support` раз, дефолт 5) — иначе `ABSTAIN`.
+- `support_ok`: гейт по каждому измерению отдельно, только по низкокардинальным
+  решающим измерениям (`category`, `city`, `schedule`, `workplace`, `experience`,
+  `salary`) — для каждого присутствующего на вакансии такого измерения хотя бы одно его значение
+  встречалось ≥ `learning_min_feature_support` раз (дефолт 5); `company`, `title`,
+  `area` не гейтят. Иначе `ABSTAIN`.
 
 ### 7.5. Scorecard (поле `LearningAutonomyGrant.scorecard`)
 Скользящие агрегаты за окно, обновляются в `evaluate_grants` из
@@ -496,9 +510,10 @@ LLM сказал `PREPARE_FOR_REVIEW`, а не `AUTO_APPLY`.
   весь `hard_block_rules`.
 - Что продолжает защищать при ослабленном `category_allowed_for_auto_send`:
   `forbidden_categories` отсекается раньше детерминированным prefilter (`SKIP`/`BLOCK`,
-  сюда не доходит); `support_ok` требует, чтобы значение категории встречалось в
-  обучении ≥ `learning_min_feature_support` раз (новая категория → `ABSTAIN`);
-  высокий порог `p_approve`; длинный shadow; квота; sampling.
+  сюда не доходит); `support_ok` требует, чтобы для категории (как и для
+  города/графика/формата/опыта/зарплаты) хотя бы одно присутствующее значение
+  встречалось в обучении ≥ `learning_min_feature_support` раз (новая категория →
+  `ABSTAIN`); высокий порог `p_approve`; длинный shadow; квота; sampling.
 - Новое **hard-правило** `autonomous_send_within_quota`: добавляется в список
   `failed` только когда `trusted_model_approval` присутствует и
   `capability == auto_send` и `model_sends_today >= settings.learning_autonomy_max_sends_per_day`.
@@ -615,7 +630,8 @@ LLM сказал `PREPARE_FOR_REVIEW`, а не `AUTO_APPLY`.
 - Каузальное маскирование: строка-отказ `reason=SALARY` не двигает коэффициенты
   `title`/`company`/`schedule`.
 - Time-decay: старая метка весит меньше по формуле half-life.
-- `support_ok`: новое категориальное значение → `False` → `ABSTAIN`.
+- `support_ok`: новое значение в решающем измерении (напр. категория) → `False` →
+  `ABSTAIN`; новая компания (высокая кардинальность) — не гейтит.
 - CI: узкий бин с малым `n` → интервал `[0,1]`.
 - Grant state machine: каждый переход; каждый порог §7 блокирует независимо.
 - Каждый circuit breaker срабатывает независимо; rate-limit; sampling;
