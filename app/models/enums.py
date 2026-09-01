@@ -92,9 +92,62 @@ class ContactType(StrEnum):
     EMAIL = "email"
     APPLICATION_URL = "application_url"
     INTERNAL_JOB_BOARD = "internal_job_board"
+    PHONE = "phone"
 
 
 class ShadowDecision(StrEnum):
     APPROVE = "approve"
     REJECT = "reject"
     ABSTAIN = "abstain"
+
+
+class CommunicationChannel(StrEnum):
+    CALL = "call"
+    SMS = "sms"
+
+
+class CommunicationDirection(StrEnum):
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
+
+
+class CommunicationOutcome(StrEnum):
+    MISSED = "missed"
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
+    UNKNOWN = "unknown"
+
+
+class TurnSpeaker(StrEnum):
+    EMPLOYER = "employer"
+    ASSISTANT = "assistant"
+    OPERATOR = "operator"
+    SYSTEM = "system"
+
+
+class CallFactState(StrEnum):
+    CANDIDATE = "candidate"
+    CONFIRMED = "confirmed"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"
+
+
+class InterviewFormat(StrEnum):
+    ONSITE = "onsite"
+    REMOTE = "remote"
+    PHONE = "phone"
+    UNKNOWN = "unknown"
+
+
+class InterviewStatus(StrEnum):
+    PROPOSED = "proposed"
+    CONFIRMED = "confirmed"
+    NEEDS_REVIEW = "needs_review"
+    CANCELLED = "cancelled"
+
+
+class PhoneComponentStatus(StrEnum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
