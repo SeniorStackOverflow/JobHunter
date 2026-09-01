@@ -26,10 +26,17 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
 from app.models.enums import (
     ApplicationStatus,
+    CallFactState,
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
     ContactType,
     DeliveryStatus,
+    InterviewFormat,
+    InterviewStatus,
     JobStatus,
     MatchDecision,
+    PhoneComponentStatus,
     PolicyDecision,
     ReviewOutcome,
     ReviewReason,
@@ -37,6 +44,7 @@ from app.models.enums import (
     ScanType,
     ShadowDecision,
     SourceHealth,
+    TurnSpeaker,
     VerificationStatus,
 )
 
@@ -600,3 +608,150 @@ class DailyReport(UUIDPrimaryKeyMixin, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+
+
+class CommunicationSession(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "communication_sessions"
+    __table_args__ = (
+        Index("ix_communication_sessions_profile_started", "profile_id", "started_at"),
+        Index("ix_communication_sessions_remote_started", "remote_address", "started_at"),
+        Index("ix_communication_sessions_ended_at", "ended_at"),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True
+    )
+    application_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL")
+    )
+    canonical_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_jobs.id", ondelete="SET NULL")
+    )
+    source_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("source_jobs.id", ondelete="SET NULL")
+    )
+    contact_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("employer_contacts.id", ondelete="SET NULL")
+    )
+    channel: Mapped[CommunicationChannel] = mapped_column(
+        enum_column(CommunicationChannel), nullable=False
+    )
+    transport: Mapped[str] = mapped_column(String(32), nullable=False)
+    direction: Mapped[CommunicationDirection] = mapped_column(
+        enum_column(CommunicationDirection), nullable=False
+    )
+    remote_address: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    remote_raw: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    phonegate_event_id_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ringing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[CommunicationOutcome | None] = mapped_column(enum_column(CommunicationOutcome))
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    rx_frame_stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class CommunicationTurn(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "communication_turns"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "phonegate_transcript_id",
+            name="uq_communication_turns_session_transcript",
+        ),
+    )
+
+    session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("communication_sessions.id", ondelete="CASCADE"), index=True
+    )
+    phonegate_transcript_id: Mapped[int | None] = mapped_column(Integer)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    speaker: Mapped[TurnSpeaker] = mapped_column(enum_column(TurnSpeaker), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_text: Mapped[str | None] = mapped_column(Text)
+    asr_backend: Mapped[str | None] = mapped_column(String(32))
+    asr_confidence: Mapped[float | None] = mapped_column(Float)
+    asr_meta: Mapped[str | None] = mapped_column(String(255))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class CallFact(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "call_facts"
+
+    session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("communication_sessions.id", ondelete="CASCADE"), index=True
+    )
+    source_turn_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("communication_turns.id", ondelete="SET NULL")
+    )
+    field: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_expression: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_value: Mapped[str | None] = mapped_column(String(500))
+    asr_confidence: Mapped[float | None] = mapped_column(Float)
+    llm_confidence: Mapped[float | None] = mapped_column(Float)
+    state: Mapped[CallFactState] = mapped_column(enum_column(CallFactState), nullable=False)
+    confirmed_by_turn_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("communication_turns.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class InterviewAppointment(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "interview_appointments"
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True
+    )
+    application_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL")
+    )
+    communication_session_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("communication_sessions.id", ondelete="SET NULL")
+    )
+    starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timezone: Mapped[str] = mapped_column(String(64), default="Europe/Chisinau", nullable=False)
+    format: Mapped[InterviewFormat] = mapped_column(
+        enum_column(InterviewFormat), default=InterviewFormat.UNKNOWN, nullable=False
+    )
+    address: Mapped[str | None] = mapped_column(String(500))
+    meeting_url: Mapped[str | None] = mapped_column(String(2048))
+    contact_person: Mapped[str | None] = mapped_column(String(255))
+    preparation: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[InterviewStatus] = mapped_column(
+        enum_column(InterviewStatus), default=InterviewStatus.PROPOSED, nullable=False
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class PhoneChannelHealth(Base):
+    __tablename__ = "phone_channel_health"
+
+    component: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[PhoneComponentStatus] = mapped_column(
+        enum_column(PhoneComponentStatus), nullable=False
+    )
+    detail: Mapped[str | None] = mapped_column(String(500))
+    last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
