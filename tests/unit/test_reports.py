@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
@@ -8,6 +8,7 @@ from app.models.entities import (
     CanonicalJob,
     EmailDelivery,
     EmployerContact,
+    JobPreference,
     JobSource,
     MatchEvaluation,
     Resume,
@@ -49,6 +50,16 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         profile = UserProfile(name="Report Candidate")
         session.add(profile)
         await session.flush()
+        session.add(
+            JobPreference(
+                profile_id=profile.id,
+                maximum_daily_applications=20,
+                additional_rules={
+                    "minimum_daily_applications": 2,
+                    "force_minimum_daily_applications": False,
+                },
+            )
+        )
         resume = Resume(
             profile_id=profile.id,
             name="CV",
@@ -111,8 +122,47 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             prompt_rules_version="v1",
             source_content_hash=jobs[0].content_hash,
             source_matching_hash=jobs[0].matching_content_hash,
+            created_at=now + timedelta(seconds=2),
         )
-        session.add_all([contact, evaluation])
+        fallback_1 = MatchEvaluation(
+            profile_id=profile.id,
+            canonical_job_id=canonical.id,
+            source_job_id=jobs[0].id,
+            resume_fit=0,
+            preference_fit=0,
+            overall_fit=0,
+            requirements_met=[],
+            missing_requirements=[],
+            risks=["llm_provider_failure:llmrouter:ReadTimeout"],
+            scam_indicators=[],
+            explanation="provider timeout",
+            decision=MatchDecision.PREPARE_FOR_REVIEW,
+            model="mock",
+            prompt_rules_version="v1",
+            source_content_hash=jobs[0].content_hash,
+            source_matching_hash=jobs[0].matching_content_hash,
+            created_at=now,
+        )
+        fallback_2 = MatchEvaluation(
+            profile_id=profile.id,
+            canonical_job_id=canonical.id,
+            source_job_id=jobs[0].id,
+            resume_fit=0,
+            preference_fit=0,
+            overall_fit=0,
+            requirements_met=[],
+            missing_requirements=[],
+            risks=["llm_provider_failure:llmrouter:ReadTimeout"],
+            scam_indicators=[],
+            explanation="provider timeout retry",
+            decision=MatchDecision.PREPARE_FOR_REVIEW,
+            model="mock",
+            prompt_rules_version="v1",
+            source_content_hash=jobs[0].content_hash,
+            source_matching_hash=jobs[0].matching_content_hash,
+            created_at=now + timedelta(seconds=1),
+        )
+        session.add_all([contact, fallback_1, fallback_2, evaluation])
         await session.flush()
         application = Application(
             profile_id=profile.id,
@@ -153,6 +203,29 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         assert report.summary["auto_approved"] == 1
         assert report.summary["automatically_sent"] == 1
         assert report.summary["sent_total"] == 1
+        assert report.summary["timezone"] == "Europe/Chisinau"
+        assert report.summary["period_start"].endswith(("+02:00", "+03:00"))
+        assert report.summary["daily_limit"] == 20
+        assert report.summary["daily_minimum"] == 2
+        assert report.summary["daily_sent"] == 1
+        assert report.summary["daily_limit_used"] == 1
+        assert report.summary["daily_limit_remaining"] == 19
+        assert report.summary["daily_minimum_remaining"] == 1
+        assert report.summary["matching_attempts"] == 3
+        assert report.summary["matching_evaluated"] == 1
+        assert report.summary["matching_decisions"] == {
+            "auto_apply": 1,
+            "review": 0,
+            "skip": 0,
+            "block": 0,
+        }
+        assert report.summary["llm_provider_failures"] == {
+            "total": 2,
+            "unique_jobs": 1,
+            "resolved_jobs": 1,
+            "unresolved_jobs": 0,
+            "by_code": {"llmrouter:ReadTimeout": 2},
+        }
         assert report.summary["sent_applications"][0] == {
             "job_title": "Engineer",
             "company": "Example",

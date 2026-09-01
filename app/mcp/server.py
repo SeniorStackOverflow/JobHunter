@@ -39,7 +39,6 @@ from app.models.entities import (
 from app.models.enums import (
     ApplicationStatus,
     JobStatus,
-    MatchDecision,
     ReviewOutcome,
     ReviewReason,
     RunStatus,
@@ -1381,7 +1380,7 @@ async def get_run_summary(scan_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def get_daily_report() -> dict[str, Any]:
-    """Return today's live report, matching backlog, and safe error diagnostics."""
+    """Return today's Europe/Chisinau live report, backlog, and safe diagnostics."""
     from datetime import UTC, datetime, timedelta
 
     from sqlalchemy import and_
@@ -1389,23 +1388,11 @@ async def get_daily_report() -> dict[str, Any]:
     from app.database.session import async_session_factory
     from app.matching.providers import MATCHING_RULES_VERSION
     from app.reports.service import _generate
+    from app.time_utils import local_day_bounds
 
     async with async_session_factory() as session:
         item = await _generate(session)
-        start = item.report_date
-        end = start + timedelta(days=1)
-
-        decision_rows = (
-            await session.execute(
-                select(MatchEvaluation.decision, func.count(MatchEvaluation.id))
-                .where(
-                    MatchEvaluation.created_at >= start,
-                    MatchEvaluation.created_at < end,
-                )
-                .group_by(MatchEvaluation.decision)
-            )
-        ).all()
-        decision_counts = {decision: int(count) for decision, count in decision_rows}
+        start_local, start, end = local_day_bounds()
 
         current_match_exists = (
             select(MatchEvaluation.id)
@@ -1433,25 +1420,6 @@ async def get_daily_report() -> dict[str, Any]:
             )
             or 0
         )
-
-        # Count provider failures explicitly. The legacy `errors` total intentionally
-        # covers crawler/email failures only and previously hid LLM exhaustion.
-        daily_risks = list(
-            (
-                await session.scalars(
-                    select(MatchEvaluation.risks).where(
-                        MatchEvaluation.created_at >= start,
-                        MatchEvaluation.created_at < end,
-                    )
-                )
-            ).all()
-        )
-        llm_failure_codes: dict[str, int] = {}
-        for risks in daily_risks:
-            for risk in risks or []:
-                if isinstance(risk, str) and risk.startswith("llm_provider_failure:"):
-                    code = risk.removeprefix("llm_provider_failure:")
-                    llm_failure_codes[code] = llm_failure_codes.get(code, 0) + 1
 
         latest_evaluations = (
             select(
@@ -1519,27 +1487,17 @@ async def get_daily_report() -> dict[str, Any]:
         summary = dict(item.summary)
         summary.update(
             {
-                "matching_decisions": {
-                    "auto_apply": decision_counts.get(MatchDecision.AUTO_APPLY, 0),
-                    "review": decision_counts.get(MatchDecision.PREPARE_FOR_REVIEW, 0),
-                    "skip": decision_counts.get(MatchDecision.SKIP, 0),
-                    "block": decision_counts.get(MatchDecision.BLOCK, 0),
-                },
                 "active_jobs": active_jobs,
                 "matching_backlog": matching_backlog,
                 "matching_retry_backlog": matching_retry_backlog,
                 "matching_retry_due": matching_retry_due,
                 "effective_matching_backlog": matching_backlog + matching_retry_backlog,
                 "matching_rules_version": MATCHING_RULES_VERSION,
-                "llm_provider_failures": {
-                    "total": sum(llm_failure_codes.values()),
-                    "by_code": llm_failure_codes,
-                },
                 "scan_error_details": scan_error_details,
             }
         )
         await session.commit()
-        return {"date": item.report_date.isoformat(), "summary": summary}
+        return {"date": start_local.isoformat(), "summary": summary}
 
 
 async def _set_pause(paused: bool) -> dict[str, Any]:

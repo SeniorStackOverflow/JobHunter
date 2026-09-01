@@ -46,6 +46,7 @@ from app.models.enums import (
 )
 from app.profiles.service import ProfileService, choose_resume_for_job
 from app.settings import Settings, get_settings
+from app.time_utils import local_day_bounds
 
 _MAX_JOB_FIELD_CHARS = 50_000
 _MAX_RESUME_SUMMARY_CHARS = 50_000
@@ -324,6 +325,7 @@ def _provider_from_settings(settings: Settings) -> LLMProvider:
             api_key=settings.llmrouter_api_key.get_secret_value(),
             base_url=settings.llmrouter_base_url,
             prefer=settings.llmrouter_prefer,
+            timeout_seconds=settings.llmrouter_timeout_seconds,
         )
     if settings.gemini_api_key is None:
         raise MatchingConfigurationError("GEMINI_API_KEY is required")
@@ -389,7 +391,7 @@ async def _minimum_catchup_active(
         return False
     if minimum_daily <= 0:
         return False
-    start_of_day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    _start_local, start_of_day, _end_of_day = local_day_bounds()
     sent_today = await session.scalar(
         select(func.count(Application.id)).where(
             Application.profile_id == profile_id,

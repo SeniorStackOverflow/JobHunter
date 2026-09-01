@@ -25,7 +25,7 @@ from app.matching import (
     MockProvider,
     OpenAIProvider,
 )
-from app.matching.service import _select_matching_batch
+from app.matching.service import _provider_from_settings, _select_matching_batch
 from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     CanonicalJob,
@@ -39,6 +39,23 @@ from app.models.entities import (
 )
 from app.models.enums import JobStatus, MatchDecision, SourceHealth
 from app.settings import Settings
+
+
+def test_jobhunter_llmrouter_keeps_preference_and_waits_past_upstream_timeout() -> None:
+    settings = Settings(
+        environment="test",
+        llm_provider="llmrouter",
+        llmrouter_api_key="router-key",
+        openai_model="jobhunter",
+        llmrouter_prefer="cheap",
+    )
+
+    provider = _provider_from_settings(settings)
+
+    assert isinstance(provider, LLMRouterProvider)
+    assert provider.prefer == "cheap"
+    assert provider.timeout_seconds == 75.0
+
 
 
 def test_matching_batch_reserves_capacity_for_priority_rematches() -> None:

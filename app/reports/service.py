@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -26,6 +26,8 @@ from app.models.enums import (
     PolicyDecision,
     RunStatus,
 )
+from app.profiles import ProfileService
+from app.time_utils import LOCAL_TIMEZONE_NAME, local_day_bounds
 
 
 async def get_run_summary(session: AsyncSession, scan_id: UUID) -> dict[str, Any]:
@@ -48,28 +50,152 @@ async def get_run_summary(session: AsyncSession, scan_id: UUID) -> dict[str, Any
     }
 
 
+def _llm_failure_codes(risks: list[str] | None) -> list[str]:
+    return [
+        risk.removeprefix("llm_provider_failure:")
+        for risk in (risks or [])
+        if isinstance(risk, str) and risk.startswith("llm_provider_failure:")
+    ]
+
+
+async def _daily_matching_metrics(
+    session: AsyncSession, start: datetime, end: datetime
+) -> dict[str, Any]:
+    rows = (
+        await session.execute(
+            select(
+                MatchEvaluation.source_job_id,
+                MatchEvaluation.decision,
+                MatchEvaluation.risks,
+                MatchEvaluation.created_at,
+            )
+            .where(
+                MatchEvaluation.created_at >= start,
+                MatchEvaluation.created_at < end,
+            )
+            .order_by(MatchEvaluation.created_at, MatchEvaluation.id)
+        )
+    ).all()
+    latest_by_source: dict[UUID, tuple[MatchDecision, list[str] | None]] = {}
+    failure_codes: dict[str, int] = {}
+    failure_jobs: set[UUID] = set()
+    for source_job_id, decision, risks, _created_at in rows:
+        latest_by_source[source_job_id] = (decision, risks)
+        codes = _llm_failure_codes(risks)
+        if codes:
+            failure_jobs.add(source_job_id)
+        for code in codes:
+            failure_codes[code] = failure_codes.get(code, 0) + 1
+
+    final_counts = {
+        MatchDecision.AUTO_APPLY: 0,
+        MatchDecision.PREPARE_FOR_REVIEW: 0,
+        MatchDecision.SKIP: 0,
+        MatchDecision.BLOCK: 0,
+    }
+    unresolved_failures = 0
+    for decision, risks in latest_by_source.values():
+        if _llm_failure_codes(risks):
+            unresolved_failures += 1
+            continue
+        final_counts[decision] = final_counts.get(decision, 0) + 1
+
+    return {
+        "matching_attempts": len(rows),
+        "matching_evaluated": len(latest_by_source),
+        "matching_jobs": (
+            final_counts[MatchDecision.AUTO_APPLY]
+            + final_counts[MatchDecision.PREPARE_FOR_REVIEW]
+        ),
+        "matching_decisions": {
+            "auto_apply": final_counts[MatchDecision.AUTO_APPLY],
+            "review": final_counts[MatchDecision.PREPARE_FOR_REVIEW],
+            "skip": final_counts[MatchDecision.SKIP],
+            "block": final_counts[MatchDecision.BLOCK],
+        },
+        "skipped": final_counts[MatchDecision.SKIP],
+        "llm_provider_failures": {
+            "total": sum(failure_codes.values()),
+            "unique_jobs": len(failure_jobs),
+            "resolved_jobs": max(0, len(failure_jobs) - unresolved_failures),
+            "unresolved_jobs": unresolved_failures,
+            "by_code": failure_codes,
+        },
+    }
+
+
+async def _daily_limit_metrics(
+    session: AsyncSession, start: datetime, end: datetime
+) -> dict[str, Any]:
+    profiles = ProfileService()
+    profile = await profiles.get_profile(session)
+    if profile is None:
+        return {
+            "daily_limit": None,
+            "daily_minimum": None,
+            "daily_minimum_forced": None,
+            "daily_sent": None,
+            "daily_limit_used": None,
+            "daily_limit_remaining": None,
+            "daily_minimum_remaining": None,
+        }
+    preference = await profiles.get_preferences(session, profile.id)
+    rules = preference.additional_rules or {}
+    try:
+        minimum = max(0, int(rules.get("minimum_daily_applications", 0)))
+    except (TypeError, ValueError):
+        minimum = 0
+    effective_minimum = min(minimum, preference.maximum_daily_applications)
+    sent = int(
+        await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.profile_id == profile.id,
+                Application.status == ApplicationStatus.SENT,
+                Application.sent_at >= start,
+                Application.sent_at < end,
+            )
+        )
+        or 0
+    )
+    limit_used = int(
+        await session.scalar(
+            select(func.count(EmailDelivery.id))
+            .join(Application, Application.id == EmailDelivery.application_id)
+            .where(
+                Application.profile_id == profile.id,
+                EmailDelivery.created_at >= start,
+                EmailDelivery.created_at < end,
+                EmailDelivery.status.in_(
+                    {
+                        DeliveryStatus.SENT,
+                        DeliveryStatus.SENDING,
+                        DeliveryStatus.DELIVERY_UNKNOWN,
+                    }
+                ),
+            )
+        )
+        or 0
+    )
+    return {
+        "daily_limit": preference.maximum_daily_applications,
+        "daily_minimum": minimum,
+        "daily_effective_minimum": effective_minimum,
+        "daily_minimum_forced": rules.get("force_minimum_daily_applications") is True,
+        "daily_sent": sent,
+        "daily_limit_used": limit_used,
+        "daily_limit_remaining": max(0, preference.maximum_daily_applications - limit_used),
+        "daily_minimum_remaining": max(0, effective_minimum - sent),
+    }
+
+
 async def _generate(session: AsyncSession) -> DailyReport:
-    today = datetime.now(UTC).date()
-    start = datetime.combine(today, time.min, UTC)
-    end = start + timedelta(days=1)
+    start_local, start, end = local_day_bounds()
     scans = list(
         (
             await session.scalars(
                 select(ScanRun).where(ScanRun.started_at >= start, ScanRun.started_at < end)
             )
         ).all()
-    )
-    matched = int(
-        await session.scalar(
-            select(func.count(MatchEvaluation.id)).where(
-                MatchEvaluation.created_at >= start,
-                MatchEvaluation.created_at < end,
-                MatchEvaluation.decision.in_(
-                    [MatchDecision.AUTO_APPLY, MatchDecision.PREPARE_FOR_REVIEW]
-                ),
-            )
-        )
-        or 0
     )
     new_source_jobs = int(
         await session.scalar(
@@ -180,7 +306,14 @@ async def _generate(session: AsyncSession) -> DailyReport:
         or 0
     )
     scan_errors = sum(scan.parsing_errors + scan.network_errors for scan in scans)
+    matching_metrics = await _daily_matching_metrics(session, start, end)
+    limit_metrics = await _daily_limit_metrics(session, start, end)
     summary = {
+        "calendar_date": start_local.date().isoformat(),
+        "timezone": LOCAL_TIMEZONE_NAME,
+        "period_start": start_local.isoformat(),
+        "period_start_utc": start.isoformat(),
+        "period_end_utc": end.isoformat(),
         "sources_checked": len({str(scan.source_id) for scan in scans}),
         "pages_checked": sum(scan.scanned_pages for scan in scans),
         "jobs_found": sum(scan.found_jobs for scan in scans),
@@ -196,7 +329,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
             or 0
         ),
         "duplicates_merged": max(0, new_source_jobs - new_canonical_jobs),
-        "matching_jobs": matched,
+        **matching_metrics,
         "prepared": prepared,
         "auto_approved": auto_approved,
         "automatically_sent": automatically_sent,
@@ -208,16 +341,6 @@ async def _generate(session: AsyncSession) -> DailyReport:
                     Application.status == ApplicationStatus.PENDING_REVIEW,
                     Application.created_at >= start,
                     Application.created_at < end,
-                )
-            )
-            or 0
-        ),
-        "skipped": int(
-            await session.scalar(
-                select(func.count(MatchEvaluation.id)).where(
-                    MatchEvaluation.decision == MatchDecision.SKIP,
-                    MatchEvaluation.created_at >= start,
-                    MatchEvaluation.created_at < end,
                 )
             )
             or 0
@@ -235,10 +358,9 @@ async def _generate(session: AsyncSession) -> DailyReport:
         "errors": scan_errors + delivery_errors,
         "email_delivery_errors": delivery_errors,
         "failed_scans": sum(scan.status == RunStatus.FAILED for scan in scans),
+        **limit_metrics,
     }
     from app.learning.shadow import shadow_scorecard
-    from app.profiles import ProfileService
-
     summary["learning_shadow"] = [
         await shadow_scorecard(session, profile.id)
         for profile in await ProfileService().list_profiles(session)

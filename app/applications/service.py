@@ -21,10 +21,17 @@ from app.models.entities import (
     SourceJob,
     UserProfile,
 )
-from app.models.enums import ApplicationStatus, ContactType, JobStatus
+from app.models.enums import (
+    ApplicationStatus,
+    ContactType,
+    JobStatus,
+    MatchDecision,
+    PolicyDecision,
+)
 from app.policies import PolicyEngine
 from app.profiles import ProfileService, ResumeService
 from app.settings import Settings, get_settings
+from app.time_utils import local_day_bounds
 
 
 class ApplicationPreparationError(ValueError):
@@ -394,6 +401,7 @@ async def prepare_pending_applications() -> int:
         ApplicationStatus.BLOCKED,
     }
     async with async_session_factory() as session:
+        _start_local, recovery_start, recovery_end = local_day_bounds()
         await block_closed_vacancy_applications(
             session,
             actor="application_scheduler",
@@ -403,6 +411,8 @@ async def prepare_pending_applications() -> int:
                 MatchEvaluation.profile_id.label("profile_id"),
                 MatchEvaluation.canonical_job_id.label("canonical_job_id"),
                 MatchEvaluation.id.label("evaluation_id"),
+                MatchEvaluation.decision.label("decision"),
+                MatchEvaluation.created_at.label("evaluation_created_at"),
                 func.row_number()
                 .over(
                     partition_by=(
@@ -431,7 +441,24 @@ async def prepare_pending_applications() -> int:
                 )
                 .where(
                     ranked.c.rank == 1,
-                    or_(Application.id.is_(None), Application.status.in_(refreshable)),
+                    or_(
+                        Application.id.is_(None),
+                        Application.status.in_(refreshable),
+                        and_(
+                            Application.status == ApplicationStatus.CANCELLED,
+                            Application.policy_decision == PolicyDecision.SKIPPED,
+                            ranked.c.decision == MatchDecision.AUTO_APPLY,
+                            ranked.c.evaluation_created_at >= recovery_start,
+                            ranked.c.evaluation_created_at < recovery_end,
+                            or_(
+                                Application.match_evaluation_id.is_(None),
+                                Application.match_evaluation_id != ranked.c.evaluation_id,
+                            ),
+                            ~select(EmailDelivery.id)
+                            .where(EmailDelivery.application_id == Application.id)
+                            .exists(),
+                        ),
+                    ),
                 )
             )
         ).all()

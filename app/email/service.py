@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
 from pathlib import Path
 from uuid import UUID
 
@@ -51,6 +50,7 @@ from app.policies.schemas import PolicyResult
 from app.profiles.service import choose_resume_for_job
 from app.security.files import UnsafeResumeError, read_verified_resume
 from app.settings import Settings, get_settings
+from app.time_utils import local_day_bounds
 
 
 class EmailSendBlocked(ValueError):
@@ -431,13 +431,12 @@ class EmailService:
                 raise EmailSendBlocked("failed application is not safely retryable")
 
             # PostgreSQL serializes the policy check and provider-attempt reservation for
-            # all applications in the same UTC day. The lock is transaction-scoped and is
-            # released by the commit immediately before the provider call.
+            # all applications in the same Europe/Chisinau calendar day. The lock is
+            # transaction-scoped and released before the provider call.
             bind = session.get_bind()
             if bind.dialect.name == "postgresql":
-                from datetime import UTC, datetime
-
-                quota_lock = f"job-agent:email-daily:{datetime.now(UTC).date().isoformat()}"
+                start_local, _start_of_day, _end_of_day = local_day_bounds()
+                quota_lock = f"job-agent:email-daily:{start_local.date().isoformat()}"
                 await session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:quota_lock))"),
                     {"quota_lock": quota_lock},
@@ -770,7 +769,7 @@ async def send_auto_approved_applications() -> int:
         return 0
 
     service = EmailService(settings, async_session_factory)
-    start_of_day = datetime.combine(datetime.now(UTC).date(), time.min, UTC)
+    _start_local, start_of_day, _end_of_day = local_day_bounds()
     async with async_session_factory() as session:
         oauth_status = await GmailOAuthService(settings).get_status(session)
         if settings.email_provider == "gmail" and not oauth_status["delivery_ready"]:

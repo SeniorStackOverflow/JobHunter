@@ -1030,3 +1030,193 @@ async def test_gmail_reauthorization_is_not_retried_and_is_recoverable(
         assert delivery.error_code is None
         assert status["reauth_required"] is False
         assert status["last_refresh_ok"] is not None
+
+
+async def test_periodic_prepare_revives_only_auto_skipped_cancelled_application(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.applications import service as application_service
+
+    current_settings = settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile, preference, resume, canonical, job, evaluation, application = (
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],
+            values[6],
+            values[8],
+        )
+        application.status = ApplicationStatus.CANCELLED
+        application.policy_decision = PolicyDecision.SKIPPED
+        application.policy_result = {"decision": "skipped", "rules_failed": ["match_auto_apply"]}
+        old_evaluation_id = application.match_evaluation_id
+        latest = MatchEvaluation(
+            profile_id=profile.id,
+            canonical_job_id=canonical.id,
+            source_job_id=job.id,
+            resume_fit=95,
+            preference_fit=95,
+            overall_fit=95,
+            requirements_met=[],
+            missing_requirements=[],
+            risks=[],
+            scam_indicators=[],
+            explanation="Fresh evaluation is now a strong match",
+            decision=MatchDecision.AUTO_APPLY,
+            model="mock-v2",
+            prompt_rules_version=evaluation.prompt_rules_version,
+            source_content_hash=job.content_hash,
+            source_matching_hash=job.matching_content_hash,
+            resume_id=resume.id,
+            resume_sha256=resume.sha256,
+            profile_fingerprint=profile_fingerprint(profile),
+            preference_fingerprint=preference_fingerprint(preference),
+            confirmed_fact_hashes=confirmed_fact_hashes(profile),
+        )
+        session.add(latest)
+        application_id = application.id
+        await session.commit()
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(application_service, "get_settings", lambda: current_settings)
+
+    assert await application_service.prepare_pending_applications() == 1
+
+    async with sqlite_session_factory() as session:
+        restored = await session.get(Application, application_id)
+        assert restored is not None
+        assert restored.match_evaluation_id != old_evaluation_id
+        assert restored.status == ApplicationStatus.AUTO_APPROVED
+        assert restored.policy_decision == PolicyDecision.AUTO_APPROVED
+        assert await session.scalar(
+            select(EmailDelivery.id).where(EmailDelivery.application_id == application_id)
+        ) is None
+
+
+async def test_periodic_prepare_never_revives_explicitly_cancelled_application(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.applications import service as application_service
+
+    current_settings = settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile, preference, resume, canonical, job, evaluation, application = (
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],
+            values[6],
+            values[8],
+        )
+        application.status = ApplicationStatus.CANCELLED
+        application.policy_decision = PolicyDecision.PENDING_REVIEW
+        old_evaluation_id = application.match_evaluation_id
+        session.add(
+            MatchEvaluation(
+                profile_id=profile.id,
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                resume_fit=95,
+                preference_fit=95,
+                overall_fit=95,
+                requirements_met=[],
+                missing_requirements=[],
+                risks=[],
+                scam_indicators=[],
+                explanation="Fresh evaluation must not override an owner cancellation",
+                decision=MatchDecision.AUTO_APPLY,
+                model="mock-v2",
+                prompt_rules_version=evaluation.prompt_rules_version,
+                source_content_hash=job.content_hash,
+                source_matching_hash=job.matching_content_hash,
+                resume_id=resume.id,
+                resume_sha256=resume.sha256,
+                profile_fingerprint=profile_fingerprint(profile),
+                preference_fingerprint=preference_fingerprint(preference),
+                confirmed_fact_hashes=confirmed_fact_hashes(profile),
+            )
+        )
+        application_id = application.id
+        await session.commit()
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(application_service, "get_settings", lambda: current_settings)
+
+    assert await application_service.prepare_pending_applications() == 0
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.CANCELLED
+        assert stored.policy_decision == PolicyDecision.PENDING_REVIEW
+        assert stored.match_evaluation_id == old_evaluation_id
+
+
+async def test_periodic_prepare_does_not_revive_historical_auto_skip_without_today_auto_apply(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+
+    from app.applications import service as application_service
+    from app.time_utils import local_day_bounds
+
+    current_settings = settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile, preference, resume, canonical, job, evaluation, application = (
+            values[1], values[2], values[3], values[4], values[5], values[6], values[8]
+        )
+        application.status = ApplicationStatus.CANCELLED
+        application.policy_decision = PolicyDecision.SKIPPED
+        _local, start, _end = local_day_bounds()
+        session.add(
+            MatchEvaluation(
+                profile_id=profile.id,
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                resume_fit=95,
+                preference_fit=95,
+                overall_fit=95,
+                requirements_met=[],
+                missing_requirements=[],
+                risks=[],
+                scam_indicators=[],
+                explanation="Old AUTO_APPLY must not reopen historical SKIP",
+                decision=MatchDecision.AUTO_APPLY,
+                model="mock-old",
+                prompt_rules_version=evaluation.prompt_rules_version,
+                source_content_hash=job.content_hash,
+                source_matching_hash=job.matching_content_hash,
+                resume_id=resume.id,
+                resume_sha256=resume.sha256,
+                profile_fingerprint=profile_fingerprint(profile),
+                preference_fingerprint=preference_fingerprint(preference),
+                confirmed_fact_hashes=confirmed_fact_hashes(profile),
+                created_at=start - timedelta(seconds=1),
+            )
+        )
+        application_id = application.id
+        old_evaluation_id = application.match_evaluation_id
+        await session.commit()
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(application_service, "get_settings", lambda: current_settings)
+
+    assert await application_service.prepare_pending_applications() == 0
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.CANCELLED
+        assert stored.match_evaluation_id == old_evaluation_id

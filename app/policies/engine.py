@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
-
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +31,7 @@ from app.models.enums import (
 )
 from app.policies.schemas import PolicyResult
 from app.settings import Settings
+from app.time_utils import local_day_bounds
 
 POLICY_VERSION = "2026-08-03.1"
 
@@ -95,7 +94,7 @@ class PolicyEngine:
             )
             if value
         )
-        start_of_day = datetime.combine(datetime.now(UTC).date(), time.min, UTC)
+        _start_local, start_of_day, _end_of_day = local_day_bounds()
         attempts_today = await session.scalar(
             select(func.count(EmailDelivery.id))
             .join(Application, Application.id == EmailDelivery.application_id)
