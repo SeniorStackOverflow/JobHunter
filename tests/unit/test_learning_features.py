@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from app.learning.features import (
     MIN_VOCAB_SUPPORT,
+    ExtractedFeatures,
     FeatureSpec,
     age_bucket_for,
     build_feature_spec,
@@ -181,14 +182,66 @@ def test_vectorize_applies_the_causal_mask() -> None:
             _approved(["category", "title"], category=["warehouses"], title=["picker"])
             for _ in range(MIN_VOCAB_SUPPORT)
         ]
+        + [_approved(["category"], category=["sales"]) for _ in range(MIN_VOCAB_SUPPORT)]
     )
+    # the salary-rejection event carries category=["sales"], which is in the vocab
+    assert "sales" in spec.categorical["category"]
     features, _ = extract_from_event(_rejected_event(["salary"], ReviewReason.SALARY))
-    # rejected-for-salary event: category present in snapshot but not active
+    # rejected-for-salary event: category "sales" present in snapshot but not active
     names = spec.feature_names()[1:]
     row = vectorize(spec, features)
 
-    idx_obs_category = names.index("obs:category")
-    assert row[idx_obs_category] == 0.0  # category dimension masked out
+    assert row[names.index("obs:category")] == 0.0  # category dimension masked out
+    # the one-hot must be zeroed by the mask, not merely absent from the vocab
+    assert row[names.index("category:sales")] == 0.0
+
+
+def test_present_values_skips_masked_dimensions() -> None:
+    spec = build_feature_spec(
+        [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
+    )
+    common = {
+        "categorical": {"category": ["warehouses"]},
+        "numeric": {},
+        "source_key": "__other__",
+        "age_bucket": "unknown",
+    }
+    masked = ExtractedFeatures(active_dimensions=frozenset(), **common)
+    active = ExtractedFeatures(active_dimensions=frozenset({"category"}), **common)
+
+    assert present_values(spec, masked) == []  # category not active -> not counted
+    assert present_values(spec, active) == ["category:warehouses"]
+
+
+def test_build_matrix_frequency_ignores_masked_categoricals() -> None:
+    active_events = [
+        _approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)
+    ]
+    # a salary-only rejection whose snapshot still carries category=warehouses
+    masked = ReviewFeedbackEvent(
+        profile_id=uuid4(),
+        application_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        outcome=ReviewOutcome.REJECTED,
+        reason_code=ReviewReason.SALARY,
+        actor="test",
+        learning_eligible=True,
+        feature_schema_version="review-v2",
+        feature_snapshot={
+            "features": {"category": ["warehouses"]},
+            "learning_dimensions": ["salary"],
+        },
+        created_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    spec = build_feature_spec([*active_events, masked])
+
+    _x, _y, _w, freq = build_matrix(
+        [*active_events, masked], spec, now=datetime(2026, 8, 21, tzinfo=UTC)
+    )
+
+    # counted for the active events only; the masked row's zero column is not
+    assert freq["category:warehouses"] == MIN_VOCAB_SUPPORT
 
 
 def test_matrix_weights_decay_with_age() -> None:

@@ -287,3 +287,68 @@ async def test_full_shadow_loop(sqlite_session_factory) -> None:
         assert card["cases_total"] == 1
         assert card["resolved"] == 1
         assert card["model"]["n_labels"] == 60
+        assert card["model"]["cv_ran"] is True  # alternating labels -> CV ran
+
+
+async def test_shadow_recorder_skips_a_model_with_a_stale_feature_layout(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        application = await _prepared_application(session)
+        events = [
+            _feedback(application.profile_id, ReviewOutcome.APPROVED, "warehouses", d)
+            if d % 2 == 0
+            else _feedback(application.profile_id, ReviewOutcome.REJECTED, "sales", d)
+            for d in range(60)
+        ]
+        session.add_all(events)
+        await session.flush()
+
+        version = await train_profile(session, application.profile_id)
+        assert version is not None
+        # simulate a code change that reshaped the feature layout: the stored
+        # feature_names no longer matches the spec the current code rebuilds.
+        payload = dict(version.payload)
+        payload["feature_names"] = [*payload["feature_names"], "obs:__unknown_dimension__"]
+        version.payload = payload
+        await session.flush()
+
+        # the mismatched model is skipped, not misapplied -> no row written
+        assert await record_shadow_outcomes(session) == 0
+        assert (await session.scalars(select(LearningShadowOutcome))).all() == []
+
+
+async def test_train_all_profiles_isolates_a_failing_profile(
+    sqlite_session_factory, monkeypatch
+) -> None:
+    import app.learning.training as training_module
+
+    monkeypatch.setattr(training_module, "async_session_factory", sqlite_session_factory)
+
+    async with sqlite_session_factory() as session:
+        good = UserProfile(name="good", is_default=True)
+        bad = UserProfile(name="bad")
+        session.add_all([good, bad])
+        await session.flush()
+        good_id, bad_id = good.id, bad.id
+        events = [
+            _feedback(good_id, ReviewOutcome.APPROVED, "warehouses", d) for d in range(30)
+        ] + [_feedback(good_id, ReviewOutcome.REJECTED, "sales", d) for d in range(30, 55)]
+        session.add_all(events)
+        await session.commit()
+
+    real_train_profile = training_module.train_profile
+
+    async def flaky_train_profile(session, profile_id):
+        if profile_id == bad_id:
+            raise RuntimeError("boom")
+        return await real_train_profile(session, profile_id)
+
+    monkeypatch.setattr(training_module, "train_profile", flaky_train_profile)
+
+    written = await training_module.train_all_profiles()
+
+    assert written == 1  # the good profile trained despite the bad one raising
+    async with sqlite_session_factory() as session:
+        versions = (await session.scalars(select(LearningModelVersion))).all()
+        assert [v.profile_id for v in versions] == [good_id]

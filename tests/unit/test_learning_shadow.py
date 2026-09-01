@@ -1,9 +1,10 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
 
 from app.learning.shadow import agreement_of, shadow_scorecard
-from app.models.entities import LearningShadowOutcome, UserProfile
+from app.models.entities import LearningModelVersion, LearningShadowOutcome, UserProfile
 from app.models.enums import ReviewOutcome, ShadowDecision
 
 
@@ -55,3 +56,64 @@ async def test_scorecard_counts_and_agreement(sqlite_session_factory) -> None:
         assert card["would_approve_agreement"] == pytest.approx(0.5)
         assert card["support_ok_rate"] == pytest.approx(0.75)
         assert card["model"] is None
+
+
+async def test_scorecard_dedupes_to_the_newest_model_generation(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="p", is_default=True)
+        session.add(profile)
+        await session.flush()
+
+        def version(trained_at: datetime, *, cv_ran: bool) -> LearningModelVersion:
+            return LearningModelVersion(
+                profile_id=profile.id,
+                segment_key="global",
+                feature_spec_version="features-v3",
+                algorithm="l2_logistic_isotonic",
+                payload={},
+                n_labels=50,
+                cv_auc=0.7,
+                cv_logloss=0.5,
+                cv_ece=0.05,
+                cv_ran=cv_ran,
+                trained_at=trained_at,
+            )
+
+        old = version(datetime(2026, 8, 1, tzinfo=UTC), cv_ran=True)
+        new = version(datetime(2026, 8, 20, tzinfo=UTC), cv_ran=False)
+        session.add_all([old, new])
+        await session.flush()
+
+        application_id = uuid4()
+
+        def row(model: LearningModelVersion, decide: ShadowDecision) -> LearningShadowOutcome:
+            return LearningShadowOutcome(
+                profile_id=profile.id,
+                application_id=application_id,
+                model_version_id=model.id,
+                segment_key="global",
+                p_approve=0.5,
+                ci_low=0.4,
+                ci_high=0.6,
+                support_ok=True,
+                would_decide=decide,
+                human_decision=ReviewOutcome.APPROVED,
+                agreed=decide is ShadowDecision.APPROVE,
+            )
+
+        # one long-queued application, scored once per nightly model generation
+        session.add_all(
+            [
+                row(old, ShadowDecision.REJECT),  # old generation disagreed
+                row(new, ShadowDecision.APPROVE),  # new generation agreed
+            ]
+        )
+        await session.flush()
+
+        card = await shadow_scorecard(session, profile.id)
+
+        assert card["cases_total"] == 1  # one application, not two rows
+        assert card["would_approve"] == 1  # the newest generation's call
+        assert card["would_reject"] == 0
+        assert card["agreement_overall"] == pytest.approx(1.0)
+        assert card["model"]["cv_ran"] is False  # headline labelled with newest version
