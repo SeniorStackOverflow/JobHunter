@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +20,8 @@ from app.profiles import ProfileService
 
 GLOBAL_SEGMENT = "global"
 ALGORITHM = "l2_logistic_isotonic"
+
+logger = structlog.get_logger(__name__)
 
 
 async def _load_events(session: AsyncSession, profile_id: UUID) -> list[ReviewFeedbackEvent]:
@@ -62,6 +65,7 @@ async def train_profile(session: AsyncSession, profile_id: UUID) -> LearningMode
         cv_auc=model.cv_auc,
         cv_logloss=model.cv_logloss,
         cv_ece=model.cv_ece,
+        cv_ran=model.cv_ran,
     )
     session.add(version)
     await session.flush()
@@ -72,7 +76,13 @@ async def train_all_profiles() -> int:
     written = 0
     async with async_session_factory() as session:
         for profile in await ProfileService().list_profiles(session):
-            if await train_profile(session, profile.id) is not None:
+            try:
+                async with session.begin_nested():
+                    trained = await train_profile(session, profile.id)
+            except Exception:
+                logger.exception("learning.train_profile_failed", profile_id=str(profile.id))
+                continue
+            if trained is not None:
                 written += 1
         await session.commit()
     return written

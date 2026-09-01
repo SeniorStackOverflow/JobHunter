@@ -197,6 +197,7 @@ class CvResult:
     oof_raw: NDArray[np.float64]
     oof_y: NDArray[np.float64]
     oof_w: NDArray[np.float64]
+    cv_ran: bool
 
 
 def _fold_bounds(n: int, folds: int) -> list[tuple[int, int, int]]:
@@ -250,6 +251,7 @@ def time_series_cv(
         oof_raw=np.empty(0, dtype=np.float64),
         oof_y=np.empty(0, dtype=np.float64),
         oof_w=np.empty(0, dtype=np.float64),
+        cv_ran=False,
     )
     for candidate_folds in (folds, 2):
         if len(y) < candidate_folds + 1:
@@ -272,6 +274,7 @@ def time_series_cv(
             oof_raw=raw,
             oof_y=yy,
             oof_w=ww,
+            cv_ran=True,
         )
     return neutral
 
@@ -306,6 +309,7 @@ class TrainedModel:
     cv_auc: float
     cv_logloss: float
     cv_ece: float
+    cv_ran: bool
     best_l2: float
 
     def to_json(self) -> dict[str, Any]:
@@ -322,6 +326,7 @@ class TrainedModel:
             "cv_auc": float(self.cv_auc),
             "cv_logloss": float(self.cv_logloss),
             "cv_ece": float(self.cv_ece),
+            "cv_ran": bool(self.cv_ran),
             "best_l2": float(self.best_l2),
         }
 
@@ -340,6 +345,7 @@ class TrainedModel:
             cv_auc=float(data["cv_auc"]),
             cv_logloss=float(data["cv_logloss"]),
             cv_ece=float(data["cv_ece"]),
+            cv_ran=bool(data.get("cv_ran", True)),
             best_l2=float(data["best_l2"]),
         )
 
@@ -373,6 +379,7 @@ def build_trained_model(
         cv_auc=cv.cv_auc,
         cv_logloss=cv.cv_logloss,
         cv_ece=cv.cv_ece,
+        cv_ran=cv.cv_ran,
         best_l2=cv.best_l2,
     )
 
@@ -393,7 +400,11 @@ def predict(
         model.feature_frequencies.get(value, 0) >= MIN_FEATURE_SUPPORT for value in present_values
     )
     narrow = (ci_high - ci_low) <= CI_MAX_WIDTH
-    if support_ok and narrow and p_approve >= SHADOW_APPROVE_P:
+    if not model.cv_ran:
+        # CV could not run (single-class training prefix): the point estimate is
+        # calibrated only in-sample, so it must never drive a shadow decision.
+        decision = ShadowDecision.ABSTAIN
+    elif support_ok and narrow and p_approve >= SHADOW_APPROVE_P:
         decision = ShadowDecision.APPROVE
     elif support_ok and narrow and p_approve <= SHADOW_REJECT_P:
         decision = ShadowDecision.REJECT

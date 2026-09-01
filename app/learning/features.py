@@ -312,6 +312,8 @@ def extract_live(
 def present_values(spec: FeatureSpec, features: ExtractedFeatures) -> list[str]:
     found: list[str] = []
     for dimension in _ALL_DIMENSIONS:
+        if dimension not in features.active_dimensions:
+            continue
         vocab = set(spec.categorical.get(dimension, ()))
         for value in features.categorical.get(dimension, []):
             key = f"{dimension}:{value}"

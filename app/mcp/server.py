@@ -1299,6 +1299,7 @@ async def get_learning_model_status(profile_id: str | None = None) -> dict[str, 
                 "cv_auc": version.cv_auc,
                 "cv_logloss": version.cv_logloss,
                 "cv_ece": version.cv_ece,
+                "cv_ran": version.cv_ran,
             },
             "shadow": await shadow_scorecard(session, profile.id),
         }
