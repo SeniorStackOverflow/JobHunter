@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import httpx
@@ -15,7 +15,25 @@ from sqlalchemy.ext.asyncio import (
 
 from app.database.base import Base
 from app.database.session import make_session_factory
+from app.settings.config import Settings, get_settings
 from fixture_site.main import app as fixture_app
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep a developer's local ``.env`` out of every ``Settings()`` the tests build.
+
+    CI runs with no ``.env`` file and injects configuration through real
+    environment variables (``LLM_PROVIDER=mock``, no ``GMAIL_CLIENT_ID`` …).
+    Without this, pydantic-settings reads a populated local ``.env`` for any
+    field a test does not pass explicitly, so local runs diverge from CI --
+    e.g. ``llm_provider`` becomes ``"llmrouter"`` and Gmail OAuth looks
+    configured, which breaks tests that rely on the CI defaults.
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
