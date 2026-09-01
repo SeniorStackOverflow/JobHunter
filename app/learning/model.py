@@ -17,6 +17,13 @@ MIN_FEATURE_SUPPORT = 5
 L2_GRID: tuple[float, ...] = (0.03, 0.1, 0.3, 1.0, 3.0)
 CV_FOLDS = 4
 
+# `support_ok` gates only on low-cardinality, decision-relevant dimensions.
+# company / title tokens / area are high-cardinality: requiring every one of
+# them to be well-seen would make support unattainable on real jobs.
+SUPPORT_GATE_DIMENSIONS: frozenset[str] = frozenset(
+    {"category", "city", "schedule", "workplace", "experience", "salary"}
+)
+
 
 def _sigmoid(eta: NDArray[np.float64]) -> NDArray[np.float64]:
     return 1.0 / (1.0 + np.exp(-np.clip(eta, -30.0, 30.0)))
@@ -129,7 +136,8 @@ def pava_isotonic(
     # Pre-aggregate runs of equal x into a single point before pooling, so the
     # calibration is a pure function of the data and never depends on the order
     # in which tied raw scores arrived. Accumulate raw sums and take the mean once
-    # (a single division, not a running one) so the result is bit-for-bit stable.
+    # (a single division, not a running one) so the result is order-independent up
+    # to floating-point rounding.
     agg: list[list[float]] = []  # [x, sum_w, sum_wy, n_raw, sum_y]
     for xi, yi, wi in zip(xs, ys, ws, strict=True):
         x_val, y_val, w_val = float(xi), float(yi), float(wi)
@@ -410,8 +418,14 @@ def predict(
     raw = float(_sigmoid(np.array([full @ beta]))[0])
     p_approve = model.calibration.predict(raw)
     ci_low, ci_high = model.calibration.interval(raw)
+    by_dimension: dict[str, list[str]] = {}
+    for value in present_values:
+        dimension = value.split(":", 1)[0]
+        by_dimension.setdefault(dimension, []).append(value)
     support_ok = all(
-        model.feature_frequencies.get(value, 0) >= MIN_FEATURE_SUPPORT for value in present_values
+        any(model.feature_frequencies.get(v, 0) >= MIN_FEATURE_SUPPORT for v in keys)
+        for dimension, keys in by_dimension.items()
+        if dimension in SUPPORT_GATE_DIMENSIONS
     )
     narrow = (ci_high - ci_low) <= CI_MAX_WIDTH
     if not model.cv_ran:

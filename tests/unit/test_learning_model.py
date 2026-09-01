@@ -223,7 +223,7 @@ def test_weighted_metrics_honour_non_uniform_weights() -> None:
     assert ece == pytest.approx(0.025)
 
 
-def _fitted() -> TrainedModel:
+def _fitted(frequencies: dict[str, int] | None = None) -> TrainedModel:
     rng = np.random.default_rng(1)
     feature = rng.normal(size=300)
     logit = 2.0 * feature
@@ -236,7 +236,7 @@ def _fitted() -> TrainedModel:
         x=x,
         y=y,
         w=np.ones(300),
-        feature_frequencies={"cat:warehouses": 40},
+        feature_frequencies=frequencies or {"category:warehouses": 40},
     )
 
 
@@ -246,7 +246,7 @@ def test_trained_model_predicts_high_probability_for_a_strong_positive_row() -> 
     result = predict(
         model,
         row=np.array([3.0]),
-        present_values=["cat:warehouses"],
+        present_values=["category:warehouses"],
         contribution_labels={"signal": "категория: склад"},
     )
 
@@ -255,6 +255,27 @@ def test_trained_model_predicts_high_probability_for_a_strong_positive_row() -> 
     assert result.support_ok is True
     assert result.would_decide is ShadowDecision.APPROVE
     assert result.top_contributions[0].label == "категория: склад"
+
+
+def test_known_gate_dimensions_survive_a_novel_company() -> None:
+    # company is near-unique per job: a novel company must not block support as
+    # long as the low-cardinality decision dimensions are well-seen.
+    model = _fitted({"category:warehouses": 40, "city:chisinau": 30, "schedule:full_day": 25})
+
+    result = predict(
+        model,
+        row=np.array([3.0]),  # strong positive row
+        present_values=[
+            "category:warehouses",
+            "city:chisinau",
+            "schedule:full_day",
+            "company:never-seen-before",
+        ],
+        contribution_labels={},
+    )
+
+    assert result.support_ok is True  # company does not gate
+    assert result.would_decide is ShadowDecision.APPROVE  # follows p_approve normally
 
 
 def test_cv_bailout_persists_cv_ran_false_and_forces_abstain() -> None:
@@ -273,7 +294,7 @@ def test_cv_bailout_persists_cv_ran_false_and_forces_abstain() -> None:
         x=x,
         y=y,
         w=np.ones(n),
-        feature_frequencies={"cat:warehouses": 40},
+        feature_frequencies={"category:warehouses": 40},
     )
 
     assert model.cv_ran is False
@@ -282,7 +303,7 @@ def test_cv_bailout_persists_cv_ran_false_and_forces_abstain() -> None:
     result = predict(
         model,
         row=np.array([5.0]),  # a very strong positive row
-        present_values=["cat:warehouses"],
+        present_values=["category:warehouses"],
         contribution_labels={},
     )
 
@@ -302,12 +323,25 @@ def test_novel_feature_value_forces_abstain() -> None:
     result = predict(
         model,
         row=np.array([3.0]),
-        present_values=["cat:brand-new"],
+        present_values=["category:brand-new"],  # novel value in a gate dimension
         contribution_labels={},
     )
 
     assert result.support_ok is False
     assert result.would_decide is ShadowDecision.ABSTAIN
+
+
+def test_novel_value_in_a_non_gate_dimension_keeps_support() -> None:
+    model = _fitted()
+
+    result = predict(
+        model,
+        row=np.array([3.0]),
+        present_values=["company:brand-new"],  # company is not a gate dimension
+        contribution_labels={},
+    )
+
+    assert result.support_ok is True
 
 
 def test_trained_model_round_trips_through_json() -> None:
@@ -320,12 +354,15 @@ def test_trained_model_round_trips_through_json() -> None:
     same = predict(
         restored,
         row=np.array([1.0]),
-        present_values=["cat:warehouses"],
+        present_values=["category:warehouses"],
         contribution_labels={},
     )
     assert (
         same.p_approve
         == predict(
-            model, row=np.array([1.0]), present_values=["cat:warehouses"], contribution_labels={}
+            model,
+            row=np.array([1.0]),
+            present_values=["category:warehouses"],
+            contribution_labels={},
         ).p_approve
     )
