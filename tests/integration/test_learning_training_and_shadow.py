@@ -12,6 +12,7 @@ from app.models.entities import (
     CanonicalJob,
     EmployerContact,
     JobPreference,
+    JobSource,
     LearningModelVersion,
     LearningShadowOutcome,
     MatchEvaluation,
@@ -53,8 +54,15 @@ def _feedback(profile_id, outcome, category, day) -> ReviewFeedbackEvent:
             "features": {
                 "category": [category],
                 "title": ["picker" if category == "warehouses" else "agent"],
+                "salary": ["numeric"],
             },
-            "learning_dimensions": ["category", "title"],
+            # approvals are causal for every dimension; a role rejection only for
+            # category/title -- mirrors ReviewLearningService.record_decision
+            "learning_dimensions": (
+                ["category", "title", "salary"]
+                if outcome == ReviewOutcome.APPROVED
+                else ["category", "title"]
+            ),
             "numeric": {"overall_fit": 70.0 if category == "warehouses" else 30.0},
         },
         created_at=datetime(2026, 6, 1, tzinfo=UTC) + timedelta(days=day),
@@ -105,10 +113,11 @@ async def _prepared_application(session) -> Application:
     canonical = CanonicalJob(
         normalized_company="c", normalized_title="t", canonical_fingerprint=uuid4().hex
     )
-    session.add(canonical)
+    source = JobSource(name="Rabota.md", base_url="https://rabota.md", adapter_type="rabota_md")
+    session.add_all([canonical, source])
     await session.flush()
     job = SourceJob(
-        source_id=uuid4(),
+        source_id=source.id,
         canonical_job_id=canonical.id,
         external_job_id="x",
         canonical_url="https://e/j",
@@ -117,7 +126,7 @@ async def _prepared_application(session) -> Application:
         matching_content_hash="b",
         source_fingerprint="c",
         salary_min=8000,
-        raw_metadata={"adapter_type": "rabota_md"},
+        raw_metadata={},
     )
     resume = Resume(
         profile_id=profile.id,

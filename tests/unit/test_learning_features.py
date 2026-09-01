@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -10,12 +10,15 @@ from app.learning.features import (
     build_feature_spec,
     build_matrix,
     build_snapshot_extras,
+    contribution_labels,
     extract_from_event,
     present_values,
     vectorize,
 )
+from app.learning.model import build_trained_model, predict
+from app.learning.service import _ALL_DIMENSIONS
 from app.models.entities import JobPreference, MatchEvaluation, ReviewFeedbackEvent, SourceJob
-from app.models.enums import MatchDecision, ReviewOutcome, ReviewReason
+from app.models.enums import MatchDecision, ReviewOutcome, ReviewReason, ShadowDecision
 
 
 def _event(**snapshot_features: list[str]) -> ReviewFeedbackEvent:
@@ -160,6 +163,39 @@ def test_snapshot_extras_normalise_scores_and_salary_gap() -> None:
     assert extras["numeric"]["salary_gap"] == -0.2  # (8000 - 10000) / 10000
     assert extras["numeric"]["salary_missing"] == 0.0
 
+    # both bounds present -> the gap is measured from the midpoint
+    both_bounds = SourceJob(
+        source_id=uuid4(),
+        external_job_id="x",
+        canonical_url="https://e/j",
+        title="Picker",
+        content_hash="a",
+        matching_content_hash="b",
+        source_fingerprint="c",
+        salary_min=Decimal("8000"),
+        salary_max=Decimal("12000"),
+    )
+    midpoint_extras = build_snapshot_extras(both_bounds, evaluation, preference)
+    assert midpoint_extras["numeric"]["salary_gap"] == 0.0  # midpoint 10000 == minimum
+    assert midpoint_extras["numeric"]["salary_missing"] == 0.0
+
+
+def test_snapshot_extras_uses_an_explicit_source_key() -> None:
+    job = SourceJob(
+        source_id=uuid4(),
+        external_job_id="x",
+        canonical_url="https://e/j",
+        title="Picker",
+        content_hash="a",
+        matching_content_hash="b",
+        source_fingerprint="c",
+        raw_metadata={"adapter_type": "ignored_fallback"},
+    )
+
+    extras = build_snapshot_extras(job, None, None, source_key="rabota_md")
+
+    assert extras["context"]["source_key"] == "rabota_md"
+
 
 def _approved(dimensions: list[str], **features: list[str]) -> ReviewFeedbackEvent:
     return ReviewFeedbackEvent(
@@ -197,9 +233,6 @@ def test_vectorize_applies_the_causal_mask() -> None:
 
 
 def test_present_values_skips_masked_dimensions() -> None:
-    spec = build_feature_spec(
-        [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
-    )
     common = {
         "categorical": {"category": ["warehouses"]},
         "numeric": {},
@@ -209,8 +242,8 @@ def test_present_values_skips_masked_dimensions() -> None:
     masked = ExtractedFeatures(active_dimensions=frozenset(), **common)
     active = ExtractedFeatures(active_dimensions=frozenset({"category"}), **common)
 
-    assert present_values(spec, masked) == []  # category not active -> not counted
-    assert present_values(spec, active) == ["category:warehouses"]
+    assert present_values(masked) == []  # category not active -> not counted
+    assert present_values(active) == ["category:warehouses"]
 
 
 def test_build_matrix_frequency_ignores_masked_categoricals() -> None:
@@ -290,10 +323,72 @@ def test_age_bucket_for_tolerates_naive_published_at() -> None:
     assert age_bucket_for(job) in {"0-3", "4-7", "8-30", "31+"}
 
 
-def test_present_values_ignores_out_of_vocab() -> None:
-    spec = build_feature_spec(
-        [_approved(["category"], category=["warehouses"]) for _ in range(MIN_VOCAB_SUPPORT)]
-    )
+def test_present_values_reports_every_active_value() -> None:
     features, _ = extract_from_event(_approved(["category"], category=["warehouses", "unlisted"]))
 
-    assert present_values(spec, features) == ["category:warehouses"]
+    # every value on an active dimension is reported, in-vocab ("warehouses") or
+    # not ("unlisted"), so predict()'s support gate can veto a novel job
+    assert present_values(features) == ["category:warehouses", "category:unlisted"]
+
+
+def test_only_ineligible_events_yield_an_empty_vocabulary() -> None:
+    def _ineligible() -> ReviewFeedbackEvent:
+        event = _approved(["category"], category=["warehouses"])
+        event.learning_eligible = False
+        event.feature_snapshot = {
+            **event.feature_snapshot,
+            "context": {"source_key": "rabota_md"},
+        }
+        return event
+
+    spec = build_feature_spec([_ineligible() for _ in range(2 * MIN_VOCAB_SUPPORT)])
+
+    assert spec.categorical["category"] == ()
+    assert spec.source_keys == ()
+
+
+def test_novel_categorical_value_gates_to_abstain_end_to_end() -> None:
+    # A real model whose entire training history carries category=["warehouses"].
+    events = []
+    for d in range(48):
+        event = (
+            _approved(["category", "title"], category=["warehouses"], title=["picker"])
+            if d % 2 == 0
+            else _rejected_event(["category", "title"], ReviewReason.ROLE)
+        )
+        event.created_at = datetime(2026, 7, 1, tzinfo=UTC) + timedelta(days=d)
+        events.append(event)
+    spec = build_feature_spec(events)
+    assert "warehouses" in spec.categorical["category"]
+
+    x, y, w, freq = build_matrix(events, spec, now=datetime(2026, 9, 1, tzinfo=UTC))
+    model = build_trained_model(
+        feature_spec=spec.to_dict(),
+        feature_spec_version=spec.version,
+        feature_names=spec.feature_names(),
+        x=x,
+        y=y,
+        w=w,
+        feature_frequencies=freq,
+    )
+
+    # the real inference chain on a job whose only category value is novel
+    novel = ExtractedFeatures(
+        categorical={"category": ["brand-new"], "title": ["picker"]},
+        numeric={},
+        source_key="__other__",
+        age_bucket="unknown",
+        active_dimensions=frozenset(_ALL_DIMENSIONS),
+    )
+    values = present_values(novel)
+    assert "category:brand-new" in values
+
+    prediction = predict(
+        model,
+        row=vectorize(spec, novel),
+        present_values=values,
+        contribution_labels=contribution_labels(spec),
+    )
+
+    assert prediction.support_ok is False
+    assert prediction.would_decide is ShadowDecision.ABSTAIN

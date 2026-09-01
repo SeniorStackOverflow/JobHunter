@@ -1,3 +1,4 @@
+import itertools
 import json
 
 import numpy as np
@@ -90,6 +91,28 @@ def test_small_block_returns_a_maximally_wide_interval() -> None:
     cal = pava_isotonic(raw, y, w)
 
     assert cal.interval(0.5) == (0.0, 1.0)
+
+
+def test_isotonic_is_permutation_invariant_with_duplicate_x() -> None:
+    # identical feature vectors legitimately produce identical raw scores, so the
+    # calibration must not depend on the order those tied rows arrive in
+    raw = [0.2, 0.5, 0.5, 0.5, 0.8]
+    y = [0.0, 1.0, 0.0, 1.0, 1.0]
+    w = [1.0, 2.0, 0.5, 3.0, 1.5]
+    probes = [0.0, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0]
+
+    base = pava_isotonic(np.array(raw), np.array(y), np.array(w))
+    base_predict = [base.predict(p) for p in probes]
+    base_interval = [base.interval(p) for p in probes]
+
+    for perm in itertools.permutations(range(5)):
+        cal = pava_isotonic(
+            np.array([raw[i] for i in perm], dtype=np.float64),
+            np.array([y[i] for i in perm], dtype=np.float64),
+            np.array([w[i] for i in perm], dtype=np.float64),
+        )
+        assert [cal.predict(p) for p in probes] == base_predict
+        assert [cal.interval(p) for p in probes] == base_interval
 
 
 def test_isotonic_round_trips_through_dict() -> None:
