@@ -239,6 +239,14 @@ class SourceJob(UUIDPrimaryKeyMixin, Base):
 
 class JobSnapshot(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "job_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_job_snapshots_source_rematch_timestamp",
+            "source_job_id",
+            "requires_rematch",
+            "timestamp",
+        ),
+    )
 
     source_job_id: Mapped[UUID] = mapped_column(ForeignKey("source_jobs.id", ondelete="CASCADE"))
     changed_fields: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
@@ -463,6 +471,7 @@ class LearningModelVersion(UUIDPrimaryKeyMixin, Base):
     cv_auc: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     cv_logloss: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     cv_ece: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    cv_ran: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     trained_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

@@ -29,6 +29,7 @@ def upgrade() -> None:
         sa.Column("cv_auc", sa.Float(), nullable=False),
         sa.Column("cv_logloss", sa.Float(), nullable=False),
         sa.Column("cv_ece", sa.Float(), nullable=False),
+        sa.Column("cv_ran", sa.Boolean(), nullable=False),
         sa.Column("trained_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.ForeignKeyConstraint(
@@ -134,19 +135,9 @@ def upgrade() -> None:
         ["profile_id"],
         unique=False,
     )
-    op.drop_index(
-        "ix_job_snapshots_source_rematch_timestamp",
-        table_name="job_snapshots",
-    )
 
 
 def downgrade() -> None:
-    op.create_index(
-        "ix_job_snapshots_source_rematch_timestamp",
-        "job_snapshots",
-        ["source_job_id", "requires_rematch", "timestamp"],
-        unique=False,
-    )
     op.drop_index(
         op.f("ix_learning_shadow_outcomes_profile_id"),
         table_name="learning_shadow_outcomes",
