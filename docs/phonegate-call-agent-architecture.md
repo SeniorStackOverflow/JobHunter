@@ -491,6 +491,34 @@ Persist the last consumed event ID associated with the running call-agent proces
 
 PhoneGate browser WebSocket is not required for the first production implementation. It may later replace polling if event delivery latency or efficiency becomes relevant.
 
+### Speak state fence and idempotency
+
+`POST /api/call/speak` is valid only while PhoneGate reports `IN_CALL`, and PhoneGate can return `409` during call-state transitions or while a previous TX is still preparing/playing.
+
+`jobhunter-call-agent` must own a `wait_until_speakable()` state fence before every autonomous TTS action:
+
+```text
+call state == IN_CALL
+AND tx_active == false
+AND tx_preparing == false
+```
+
+After answering an inbound call, do not immediately call `speak()`. Wait until PhoneGate has transitioned to `IN_CALL`, bounded by a short connection timeout.
+
+On a deterministic `409` response:
+
+```text
+re-read PhoneGate status
+  ↓
+IN_CALL + TX busy      → wait for TX idle, then one bounded retry
+transitional state     → wait for IN_CALL, then one bounded retry
+IDLE / call ended      → drop pending speech; never retry
+```
+
+A network timeout after submitting `/api/call/speak` is different from a deterministic `409`: delivery is ambiguous because PhoneGate may already have accepted the utterance. Do not blindly retry an ambiguous speak request, because duplicate assistant speech is worse than a missed reply. Record the turn as `delivery_unknown`/technical uncertainty and resynchronize from PhoneGate TX/transcript state.
+
+PhoneGate writes the assistant `tx` transcript entry when `/api/call/speak` is accepted, before synthesis and uplink are confirmed. A PhoneGate `tx` transcript line therefore means "attempted", not "spoken": mark a `CommunicationTurn` delivered only after the matching `tx_state` returns to idle, and reconcile turns whose TX never activated.
+
 ---
 
 ## 7. Two independent state machines
@@ -606,9 +634,31 @@ Avoid opening with a long technical warning that the system may fail to recogniz
 Подскажите, пожалуйста, по какой вакансии вы звоните?
 ```
 
-### Barge-in rule
+### Half-duplex limitation in the first production version
 
-If the caller starts speaking after any hook block, remaining greeting blocks should not continue over the caller. The dialogue should transition to listening immediately where technically possible.
+True barge-in is not supported by the current PhoneGate audio path.
+
+While PhoneGate TX is active, `on_daemon_audio_frame()` discards RX audio, and the current daemon/server protocol has no `StopSpeech` / `CancelSpeech` primitive. Therefore caller speech that overlaps assistant TX can be lost rather than buffered for later ASR.
+
+RX is also discarded while `tx_preparing` is set and for roughly the first 1.2 s after PhoneGate reports `IN_CALL` (`on_daemon_audio_frame` skips frames while `call_connect_time` is that recent). The first greeting block must therefore start only after that post-connect window, never at `t=0`.
+
+The first production version must be designed explicitly as half-duplex:
+
+```text
+assistant speaks briefly
+  ↓
+TX becomes idle
+  ↓
+listen for caller
+  ↓
+process caller turn
+  ↓
+reply briefly
+```
+
+Opening hooks must remain separate short cached blocks with listening opportunities between blocks. Do not rely on detecting caller interruption while a block is already being transmitted.
+
+A future true-barge-in implementation requires PhoneGate transport work, including an interruptible TX primitive and an RX-during-TX strategy that does not discard caller audio. This is an enhancement, not a blocker for the initial scheduling agent.
 
 The greeting should be composed from separate cached blocks, not one long generated TTS sentence.
 
@@ -983,11 +1033,15 @@ SourceJob.public_phone
 SourceJob.public_phones
 ```
 
+`ContactType.PHONE` does not exist in the current JobHunter enum yet. Adding it is an explicit Phase 1 implementation task, not an unresolved architectural dependency.
+
 Add:
 
 ```text
-ContactType.PHONE
+ContactType.PHONE = "phone"
 ```
+
+The migration must preserve existing contact types and then allow phone contacts discovered from `SourceJob.public_phone` / `SourceJob.public_phones` to be represented as `EmployerContact` records.
 
 Normalize phone contacts to E.164.
 
@@ -1066,13 +1120,17 @@ JobHunter ResponseRenderer maps `dialogue_act` to a cached or controlled phrase 
 
 ---
 
-## 19. Realtime llmRouter profile
+## 19. Realtime LLM routing policy
 
-Create a dedicated logical profile:
+Create a dedicated JobHunter logical routing profile:
 
 ```text
 call-realtime
 ```
+
+`call-realtime` is a JobHunter call-agent policy, not a required llmRouter tier alias. The first implementation must not modify llmRouter merely to add this name.
+
+The `jobhunter-call-agent` owns the ordered realtime candidate list and sends concrete model requests through llmRouter. llmRouter keeps its existing sequential reactive fallback semantics for each individual request.
 
 Do not use a generic dynamic `fast` tier as the sole selector.
 
@@ -1094,6 +1152,8 @@ Current benchmark-backed preference:
 5. deterministic safe fallback
 ```
 
+`phone_llm_models` holds the concrete provider/model strings, items 1–4. Item 5 is not a model entry: it is the separate cached-phrase path used when the realtime budget is exhausted (§28).
+
 Reasons:
 
 - Groq Qwen was extremely fast and semantically strong, but burst quota/rate limiting can arrive abruptly.
@@ -1101,21 +1161,34 @@ Reasons:
 - Google is useful as a different provider failure domain.
 - Provider-aware cooldown is required so one provider-wide 429 does not trigger sequential futile attempts across many models on the same exhausted provider.
 
-### Hedged fallback
+### Hedged fallback ownership
 
-For realtime calls, consider hedged inference:
+Hedging is implemented in `jobhunter-call-agent`, not inside llmRouter.
+
+llmRouter itself remains sequential: one request resolves/falls back through candidates according to its normal router behavior. For the latency-sensitive phone path, JobHunter may issue at most two independent concrete-model requests concurrently:
 
 ```text
-start Groq primary
+jobhunter-call-agent
   ↓
-if no valid response after ~400–500 ms
+start primary request:
+Groq / qwen/qwen3.8-27b
   ↓
-start Cloudflare fallback in parallel
+no valid schema after ~400–500 ms?
+  ↓ yes
+start second independent request:
+Cloudflare / @cf/meta/llama-4-scout-17b-16e-instruct
   ↓
-accept first valid schema-compliant answer
+first valid schema-compliant result wins
+  ↓
+ignore the loser: an in-flight HTTP request cannot be force-cancelled
+server-side, so close the local connection and drop the late response
 ```
 
-Only hedge on slow primary requests. Do not duplicate every normal request.
+Do not hedge every normal request. Maximum concurrent realtime model requests per turn is two.
+
+Both hedged requests consume llmRouter quota and can push their `(provider, model)` pairs into per-pair cooldown — the same models the phone path most needs available. Hedge only when the primary is actually slow, and budget for the doubled burn rate on the primary and secondary models.
+
+If both hedged requests fail or exceed the realtime budget, continue with the remaining configured candidates sequentially only when the remaining caller-silence budget permits; otherwise use the deterministic safe fallback.
 
 ### Time budget
 
@@ -1529,7 +1602,7 @@ Example policy:
 ```text
 primary LLM slow
   ↓
-hedge fallback
+JobHunter-level hedge to one secondary concrete model request
   ↓
 no valid result in bounded budget
   ↓
@@ -1749,7 +1822,7 @@ No autonomous interview confirmation yet.
 Add:
 
 ```text
-call-realtime llmRouter profile
+JobHunter `call-realtime` routing policy over concrete llmRouter model requests
 strict JSON schema
 dialogue acts
 ASR trust assessment
@@ -1851,6 +1924,10 @@ These rules should be encoded in tests and policy, not left only in prompts.
 13. A14 is the production modem; A06 is initially the canary/test modem.
 14. Common opening/repair phrases should be cached/prefetched.
 15. Employer-facing replies should stay short.
+16. The initial production agent is explicitly half-duplex; true barge-in must not be assumed.
+17. Realtime hedging is owned by `jobhunter-call-agent`, with at most two concurrent concrete-model requests; llmRouter remains sequential internally.
+18. Autonomous TTS must pass the `wait_until_speakable()` state fence, and ambiguous `/speak` network failures must not be blindly retried.
+19. Any future PhoneGate source modification requires a Git baseline of the known-working transport first (established: commit `45f04ea`).
 
 ---
 
@@ -2477,3 +2554,122 @@ POST /api/v1/phone/emergency-stop
 10. Увидеть calendar sync без раскрытия лишних private event titles.
 11. Увидеть Telegram delivery независимо от business state.
 12. Понять причину `needs_review` без чтения raw server logs.
+
+
+---
+
+## 40. Implementation readiness recommendations
+
+### 40.1 Phase 1 can start immediately
+
+There are no remaining architectural blockers for the first implementation phase. Start with the data and read-only integration layer:
+
+```text
+ContactType.PHONE
+E.164 normalization
+CommunicationSession
+CommunicationTurn
+CallFact
+InterviewAppointment
+PhoneGateClient
+phone health abstraction
+read-only event/transcript ingestion
+```
+
+Phase 1 should observe and persist real incoming PhoneGate events and transcripts without autonomous employer-facing speech beyond an explicitly controlled test mode. This gives the later realtime dialogue engine a stable persistence and transport foundation instead of building business logic on top of temporary structures.
+
+### 40.2 Use a dedicated `jobhunter-call-agent` process
+
+The realtime phone loop must run as its own long-lived asyncio service rather than inside the existing Celery workers.
+
+```text
+jobhunter-call-agent
+```
+
+It should own:
+
+```text
+persistent PhoneGate HTTP client
+persistent llmRouter client
+DB pool
+PhoneGate event/transcript polling
+single-active-call lock
+telephony/dialogue lifecycle
+realtime latency accounting
+```
+
+Celery remains responsible for post-call analysis, Telegram delivery, reporting, reconciliation, maintenance and periodic canary tasks. This separation prevents normal background queues from adding unpredictable latency to a live phone conversation.
+
+### 40.3 Phone LLM settings must be separate from matching LLM settings
+
+The existing JobHunter matching LLM configuration is designed for non-realtime work and may use long request timeouts. The phone agent must have independent settings and must not reuse matching timeout/routing policy blindly.
+
+Recommended dedicated settings:
+
+```text
+phone_llm_models
+phone_llm_attempt_timeout_seconds
+phone_llm_hedge_after_ms
+phonegate_url
+phonegate_auth_token
+phone_autoanswer_enabled
+phone_emergency_stop
+```
+
+`phone_llm_models` should default to the benchmark-backed `call-realtime` order from §19. This profile is owned by JobHunter and contains concrete provider/model targets; it does not require adding a `call-realtime` tier to llmRouter. Matching keeps its current routing and long timeout independently.
+
+This separation is mandatory because a matching request can reasonably wait many seconds, while a live caller cannot be left in silence waiting on the same timeout policy.
+
+### 40.4 Calendar integration does not block Phases 1–3
+
+Calendar integration belongs to Phase 4 and must not delay the transport, persistence, UI, evidence or constrained dialogue work.
+
+Before Calendar is connected, the system may still collect and confirm what the employer proposed, but it must not claim that the candidate is definitely available solely from the LLM.
+
+Without a trusted availability result:
+
+```text
+InterviewAppointment.status = proposed | needs_review
+```
+
+Recommended final calendar model:
+
+```text
+selected personal calendars → READ FREE/BUSY ONLY
+JobHunter Interviews        → READ + CREATE + UPDATE + CANCEL
+```
+
+Only `AvailabilityService == AVAILABLE` permits autonomous acceptance of a proposed interview slot. Until Phase 4 is implemented, the safe behavior is to record the proposed slot and defer final availability confirmation rather than blocking development of the rest of the phone agent.
+
+### 40.5 Establish a PhoneGate Git baseline before transport changes
+
+PhoneGate is a production dependency that until recently had no Git repository. OTA rollback and `.bak` files are useful runtime safeguards, but they are not a substitute for source-level version history, reviewable diffs, reproducible releases, or `git bisect`.
+
+Baseline status: a local Git repository was initialized for PhoneGate with the known-working transport as the initial commit (`45f04ea`); `.gitignore` was extended to exclude `.env`, `.phonegate-token`, `.mcp.json`, `venv/`, caches and `daemon/target/`. Still open from the checklist below: release tags for deployable transport versions and a private remote.
+
+This does not block JobHunter Phase 1 because the read-only integration can be implemented against the current PhoneGate API without modifying PhoneGate.
+
+However, before the first source change made to PhoneGate for JobHunter-specific requirements such as interruptible TX or future true barge-in, establish a version-control baseline:
+
+```text
+initialize Git repository for PhoneGate
+  ↓
+review .gitignore
+  ↓
+exclude .env / secrets / venv / caches / generated audio / runtime artifacts
+  ↓
+commit the known-working production baseline
+  ↓
+tag/version deployable transport releases
+  ↓
+use a private remote when available
+```
+
+The initial baseline commit must represent the currently proven working transport before any behavioral modification. PhoneGate changes should then be reviewable independently from JobHunter changes, and OTA deployment versions should be traceable back to a source commit/tag.
+
+Operational rule:
+
+```text
+JobHunter Phase 1–3 may proceed without PhoneGate source changes.
+Any future PhoneGate source modification requires the Git baseline first.
+```
