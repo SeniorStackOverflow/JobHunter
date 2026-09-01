@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     matching_inter_job_delay_seconds: float = Field(default=8.0, ge=0, le=60)
     matching_provider_failure_retry_seconds: int = Field(default=3600, ge=60, le=86400)
 
+    phonegate_url: str = "http://127.0.0.1:8888"
+    phonegate_auth_token: SecretStr | None = None
+    phone_agent_enabled: bool = False
+    phone_poll_idle_seconds: float = Field(default=1.0, ge=0.1, le=10)
+    phone_poll_active_seconds: float = Field(default=0.3, ge=0.05, le=5)
+    phone_http_timeout_seconds: float = Field(default=10.0, ge=1, le=30)
+    phone_caller_region: str = "MD"
+    phone_health_stale_after_seconds: int = Field(default=90, ge=10, le=3600)
+
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
     crawler_user_agent: str = "job-agent/0.1 (+operator contact configured by deployment)"
@@ -71,6 +80,7 @@ class Settings(BaseSettings):
         "openai_api_key",
         "gemini_api_key",
         "llmrouter_api_key",
+        "phonegate_auth_token",
         mode="before",
     )
     @classmethod
@@ -139,6 +149,8 @@ class Settings(BaseSettings):
             assert self.token_encryption_key is not None
             if len(self.token_encryption_key.get_secret_value()) < 32:
                 raise ValueError("TOKEN_ENCRYPTION_KEY must contain at least 32 characters")
+        if self.phone_agent_enabled and self.phonegate_auth_token is None:
+            raise ValueError("PHONEGATE_AUTH_TOKEN is required when PHONE_AGENT_ENABLED is true")
         return self
 
 
