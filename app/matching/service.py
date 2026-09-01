@@ -58,6 +58,16 @@ _PRIORITY_REMATCH_SAFE_STOPS = {
 }
 
 
+def _as_aware(value: datetime) -> datetime:
+    """Coerce a possibly-naive timestamp to UTC-aware before comparing it.
+
+    PostgreSQL returns ``DateTime(timezone=True)`` columns as offset-aware,
+    but SQLite round-trips them as naive. ``func.max`` aggregates and freshly
+    persisted ORM instances can therefore disagree on tzinfo within one query.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 async def _matching_provider_backoff_remaining(settings: Settings) -> int:
     if settings.environment == "test":
         return 0
@@ -154,7 +164,10 @@ async def _priority_rematch_source_ids(
             or evaluation.canonical_job_id != job.canonical_job_id
             or evaluation.source_matching_hash is None
             or evaluation.source_matching_hash != job.matching_content_hash
-            or (snapshot_at is not None and snapshot_at > evaluation.created_at)
+            or (
+                snapshot_at is not None
+                and _as_aware(snapshot_at) > _as_aware(evaluation.created_at)
+            )
         )
         if (
             status == ApplicationStatus.AUTO_APPROVED
@@ -687,7 +700,7 @@ async def process_unprocessed_jobs() -> int:
                         risk.startswith("llm_provider_failure:")
                         for risk in (evaluation.risks or [])
                     )
-                    and evaluation.created_at
+                    and _as_aware(evaluation.created_at)
                     <= datetime.now(UTC)
                     - timedelta(seconds=settings.matching_provider_failure_retry_seconds)
                 )
@@ -696,7 +709,10 @@ async def process_unprocessed_jobs() -> int:
                     or evaluation.prompt_rules_version != MATCHING_RULES_VERSION
                     or evaluation.source_matching_hash is None
                     or evaluation.source_matching_hash != job.matching_content_hash
-                    or (snapshot_at is not None and snapshot_at > evaluation.created_at)
+                    or (
+                        snapshot_at is not None
+                        and _as_aware(snapshot_at) > _as_aware(evaluation.created_at)
+                    )
                     or not evaluation_inputs_are_current(evaluation, profile, preference, resume)
                     or retry_due
                 ):

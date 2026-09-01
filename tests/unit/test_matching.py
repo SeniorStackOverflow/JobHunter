@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -1017,6 +1017,108 @@ async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
         )
         assert len(evaluations) == 6
         assert evaluations[-1].resume_sha256 == "8" * 64
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_process_unprocessed_jobs_retries_provider_failure_with_naive_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prior ``llm_provider_failure`` evaluation whose ``created_at`` comes back
+    naive from SQLite must not blow up the retry-window comparison."""
+    import app.database.session as database_session
+    import app.matching.service as matching_service
+    from app.matching.providers import MATCHING_RULES_VERSION
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        source = JobSource(
+            name="Fixture",
+            base_url="https://jobs.example.test",
+            adapter_type="fixture_source",
+            configuration={},
+            enabled=True,
+            health_status=SourceHealth.HEALTHY,
+            automatic_actions_paused=False,
+        )
+        canonical = CanonicalJob(
+            normalized_company="example employer",
+            normalized_title="warehouse assistant",
+            normalized_location="chisinau",
+            canonical_fingerprint="e" * 64,
+            status=JobStatus.ACTIVE,
+        )
+        session.add_all([source, canonical])
+        await session.flush()
+        job = make_job(source_id=source.id, canonical_job_id=canonical.id)
+        profile = make_profile()
+        profile.id = uuid4()
+        preference = make_preference(profile_id=profile.id)
+        session.add_all(
+            [
+                job,
+                profile,
+                preference,
+                Resume(
+                    profile_id=profile.id,
+                    name="Warehouse CV",
+                    category="warehouse",
+                    storage_key="warehouse.pdf",
+                    original_filename="warehouse.pdf",
+                    mime_type="application/pdf",
+                    sha256="f" * 64,
+                    active=True,
+                    verified=True,
+                    is_default=True,
+                ),
+            ]
+        )
+        await session.flush()
+        session.add(
+            MatchEvaluation(
+                profile_id=profile.id,
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                resume_fit=0,
+                preference_fit=0,
+                overall_fit=0,
+                requirements_met=[],
+                missing_requirements=[],
+                risks=["llm_provider_failure:llmrouter:timeout"],
+                scam_indicators=[],
+                explanation="provider timed out",
+                decision=MatchDecision.PREPARE_FOR_REVIEW,
+                model="mock",
+                prompt_rules_version=MATCHING_RULES_VERSION,
+                source_content_hash=job.content_hash,
+                source_matching_hash=job.matching_content_hash,
+                # Naive on purpose: SQLite round-trips DateTime(timezone=True)
+                # without an offset, so the retry-window check sees a naive value.
+                created_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2),
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(database_session, "async_session_factory", session_factory)
+    monkeypatch.setattr(matching_service, "get_settings", lambda: Settings(environment="test"))
+
+    assert await matching_service.process_unprocessed_jobs() == 1
+
+    async with session_factory() as session:
+        evaluations = list(
+            (
+                await session.scalars(
+                    select(MatchEvaluation)
+                    .where(MatchEvaluation.source_job_id == job.id)
+                    .order_by(MatchEvaluation.created_at)
+                )
+            ).all()
+        )
+        assert len(evaluations) == 2
+        assert evaluations[-1].risks == []
     await engine.dispose()
 
 
