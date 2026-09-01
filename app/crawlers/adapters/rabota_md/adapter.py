@@ -11,7 +11,6 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
-import phonenumbers
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from selectolax.parser import HTMLParser
 
@@ -1352,27 +1351,9 @@ class RabotaMdAdapter:
 
     @staticmethod
     def _normalize_phone(value: str) -> str | None:
-        raw = re.sub(r"^tel:", "", value.strip(), flags=re.IGNORECASE)
-        digits = re.sub(r"\D", "", raw)
-        region: str | None = None
-        if raw.startswith("+"):
-            candidate = f"+{digits}"
-        elif digits.startswith("00"):
-            candidate = f"+{digits[2:]}"
-        elif re.fullmatch(r"373[2678]\d{7}", digits):
-            candidate = f"+{digits}"
-        elif re.fullmatch(r"(?:0[2678]\d{7}|02\d{7}|2\d{7})", digits):
-            candidate = digits
-            region = "MD"
-        else:
-            return None
-        try:
-            parsed = phonenumbers.parse(candidate, region)
-        except phonenumbers.NumberParseException:
-            return None
-        if not phonenumbers.is_valid_number(parsed):
-            return None
-        return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+        from app.phone.numbers import normalize_e164
+
+        return normalize_e164(value, region="MD")
 
     def _external_application_url(self, tree: HTMLParser, page_url: str) -> str | None:
         for selector in (
