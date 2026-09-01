@@ -22,6 +22,7 @@ from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
     Application,
     JobPreference,
+    JobSource,
     LearningModelVersion,
     LearningShadowOutcome,
     MatchEvaluation,
@@ -57,6 +58,8 @@ async def record_shadow_outcomes(session: AsyncSession) -> int:
 
     models: dict[str, _ModelEntry | None] = {}
     preferences: dict[str, JobPreference | None] = {}
+    sources: dict[UUID, str] = {}
+    recorded: dict[str, set[UUID]] = {}
     written = 0
     for application, job, evaluation in rows:
         key = str(application.profile_id)
@@ -79,19 +82,22 @@ async def record_shadow_outcomes(session: AsyncSession) -> int:
                     models[key] = None
                 else:
                     models[key] = (version, trained, spec)
+                    # One query per model version instead of one SELECT per row:
+                    # the applications this version has already scored.
+                    recorded[key] = set(
+                        await session.scalars(
+                            select(LearningShadowOutcome.application_id).where(
+                                LearningShadowOutcome.model_version_id == version.id
+                            )
+                        )
+                    )
         entry = models[key]
         if entry is None:
             continue
         version, trained, spec = entry
 
         try:
-            existing = await session.scalar(
-                select(LearningShadowOutcome).where(
-                    LearningShadowOutcome.application_id == application.id,
-                    LearningShadowOutcome.model_version_id == version.id,
-                )
-            )
-            if existing is not None:
+            if application.id in recorded[key]:
                 continue
             if not await evaluation_is_current(session, evaluation, job):
                 continue
@@ -104,11 +110,14 @@ async def record_shadow_outcomes(session: AsyncSession) -> int:
             if preference is None:
                 continue
 
-            features = extract_live(job, evaluation, preference)
+            if job.source_id not in sources:
+                src = await session.get(JobSource, job.source_id)
+                sources[job.source_id] = src.adapter_type if src is not None else "__other__"
+            features = extract_live(job, evaluation, preference, source_key=sources[job.source_id])
             prediction = predict(
                 trained,
                 row=vectorize(spec, features),
-                present_values=present_values(spec, features),
+                present_values=present_values(features),
                 contribution_labels=contribution_labels(spec),
             )
             session.add(

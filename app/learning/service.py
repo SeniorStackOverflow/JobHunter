@@ -15,6 +15,7 @@ from app.matching.prefilter import canonicalize_location
 from app.models.entities import (
     Application,
     JobPreference,
+    JobSource,
     MatchEvaluation,
     Resume,
     ReviewFeedbackEvent,
@@ -633,10 +634,16 @@ class ReviewLearningService:
             raise ReviewLearningError("review job does not exist")
         from app.learning.features import build_snapshot_extras
 
+        source = await session.get(JobSource, job.source_id)
         preference = await session.scalar(
             select(JobPreference).where(JobPreference.profile_id == application.profile_id)
         )
-        snapshot_extras = build_snapshot_extras(job, evaluation, preference)
+        snapshot_extras = build_snapshot_extras(
+            job,
+            evaluation,
+            preference,
+            source_key=source.adapter_type if source is not None else None,
+        )
         learning_eligible = learn
         exclusion_reason: str | None = None
         if not learn:

@@ -1513,7 +1513,13 @@ def numeric_from_evaluation(
         if flag_name is not None:
             numeric[flag_name] = 1.0
             numeric["llm_decision_missing"] = 0.0
-    salary_value = job.salary_min if job.salary_min is not None else job.salary_max
+    salary_value: Decimal | None
+    if job.salary_min is not None and job.salary_max is not None:
+        salary_value = (Decimal(job.salary_min) + Decimal(job.salary_max)) / Decimal(2)
+    elif job.salary_min is not None:
+        salary_value = job.salary_min
+    else:
+        salary_value = job.salary_max
     minimum = preference.minimum_salary if preference is not None else None
     if salary_value is not None and minimum is not None and minimum > 0:
         gap = (Decimal(salary_value) - Decimal(minimum)) / Decimal(minimum)

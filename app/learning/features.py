@@ -98,7 +98,10 @@ def build_feature_spec(events: Sequence[ReviewFeedbackEvent]) -> FeatureSpec:
     counts: dict[str, Counter[str]] = {d: Counter() for d in _ALL_DIMENSIONS}
     source_counts: Counter[str] = Counter()
     for event in events:
-        if event.feature_schema_version not in MODEL_ELIGIBLE_SCHEMAS:
+        if (
+            not event.learning_eligible
+            or event.feature_schema_version not in MODEL_ELIGIBLE_SCHEMAS
+        ):
             continue
         snapshot = event.feature_snapshot or {}
         raw_features = snapshot.get("features", {})
@@ -210,7 +213,13 @@ def numeric_from_evaluation(
         if flag_name is not None:
             numeric[flag_name] = 1.0
             numeric["llm_decision_missing"] = 0.0
-    salary_value = job.salary_min if job.salary_min is not None else job.salary_max
+    salary_value: Decimal | None
+    if job.salary_min is not None and job.salary_max is not None:
+        salary_value = (Decimal(job.salary_min) + Decimal(job.salary_max)) / Decimal(2)
+    elif job.salary_min is not None:
+        salary_value = job.salary_min
+    else:
+        salary_value = job.salary_max
     minimum = preference.minimum_salary if preference is not None else None
     if salary_value is not None and minimum is not None and minimum > 0:
         gap = (Decimal(salary_value) - Decimal(minimum)) / Decimal(minimum)
@@ -225,10 +234,15 @@ def build_snapshot_extras(
     job: SourceJob,
     evaluation: MatchEvaluation | None,
     preference: JobPreference | None,
+    *,
+    source_key: str | None = None,
 ) -> dict[str, Any]:
     return {
         "numeric": numeric_from_evaluation(evaluation, job, preference),
-        "context": {"source_key": _source_key(job), "age_bucket": age_bucket_for(job)},
+        "context": {
+            "source_key": source_key or _source_key(job),
+            "age_bucket": age_bucket_for(job),
+        },
     }
 
 
