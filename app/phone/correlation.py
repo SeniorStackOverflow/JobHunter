@@ -53,12 +53,26 @@ class CallerCorrelation:
         )
         job: SourceJob | None = None
         if contact is None:
+            # First try scalar public_phone match
             job = await session.scalar(
                 select(SourceJob)
                 .where(SourceJob.public_phone == e164)
                 .order_by(SourceJob.last_seen_at.desc())
                 .limit(1)
             )
+            # If scalar misses, scan the public_phones array
+            if job is None:
+                jobs = await session.scalars(
+                    select(SourceJob)
+                    .where(SourceJob.canonical_job_id.is_not(None))
+                    .order_by(SourceJob.last_seen_at.desc())
+                    .limit(200)
+                )
+                for candidate in jobs:
+                    if candidate.public_phones and e164 in candidate.public_phones:
+                        job = candidate
+                        break
+
             if job is not None and job.canonical_job_id is not None:
                 contact = EmployerContact(
                     canonical_job_id=job.canonical_job_id,

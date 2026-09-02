@@ -132,3 +132,49 @@ async def test_creates_phone_contact_from_source_job(
     assert result2.contact_id == result.contact_id
     contacts_after = (await db.execute(EmployerContact.__table__.select())).scalars().all()
     assert len(contacts_after) == 1
+
+
+async def test_matches_public_phones_array(
+    db: AsyncSession,
+) -> None:
+    src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
+    db.add(src)
+    await db.flush()
+    canonical = CanonicalJob(
+        normalized_company="ACME",
+        normalized_title="Loader",
+        canonical_fingerprint=uuid4().hex,
+        status=JobStatus.ACTIVE,
+    )
+    db.add(canonical)
+    await db.flush()
+    job = SourceJob(
+        source_id=src.id,
+        canonical_job_id=canonical.id,
+        external_job_id=uuid4().hex,
+        canonical_url="https://x/1",
+        title="Loader",
+        content_hash="h",
+        matching_content_hash="m",
+        source_fingerprint="f",
+        public_phone=None,
+        public_phones=["+37360111222", "+37360000000"],
+        status=JobStatus.ACTIVE,
+    )
+    db.add(job)
+    await db.flush()
+
+    # Resolve with a number from the public_phones array (formatted differently)
+    result = await CallerCorrelation().resolve(db, "+373 60 111 222")
+    assert result is not None
+    assert result.canonical_job_id == canonical.id
+    assert result.contact_id is not None
+    contacts = (await db.execute(EmployerContact.__table__.select())).scalars().all()
+    assert len(contacts) == 1
+
+    # second resolve of the same number must NOT create a duplicate contact
+    result2 = await CallerCorrelation().resolve(db, "+373 60 111 222")
+    assert result2 is not None
+    assert result2.contact_id == result.contact_id
+    contacts_after = (await db.execute(EmployerContact.__table__.select())).scalars().all()
+    assert len(contacts_after) == 1
