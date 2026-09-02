@@ -14,6 +14,7 @@ from starlette.types import ASGIApp
 
 from app.admin import router as admin_router
 from app.api import router as api_router
+from app.api.phone_routes import router as phone_router
 from app.mcp.server import streamable_http_app
 from app.observability.health import router as health_router
 from app.observability.logging import configure_logging
@@ -121,6 +122,7 @@ app.add_middleware(ObservabilityMiddleware)
 app.include_router(health_router)
 app.include_router(api_router)
 app.include_router(admin_router)
+app.include_router(phone_router)
 
 # Admin assets remain same-origin so the strict CSP can keep inline scripts disabled.
 app.mount("/admin-assets", StaticFiles(directory="app/admin/static"), name="admin-assets")
