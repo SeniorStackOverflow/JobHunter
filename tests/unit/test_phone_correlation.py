@@ -125,3 +125,10 @@ async def test_creates_phone_contact_from_source_job(
     assert result.contact_id is not None
     contacts = (await db.execute(EmployerContact.__table__.select())).scalars().all()
     assert len(contacts) == 1
+
+    # second resolve of the same number must NOT create a duplicate contact
+    result2 = await CallerCorrelation().resolve(db, "+37360111222")
+    assert result2 is not None
+    assert result2.contact_id == result.contact_id
+    contacts_after = (await db.execute(EmployerContact.__table__.select())).scalars().all()
+    assert len(contacts_after) == 1
