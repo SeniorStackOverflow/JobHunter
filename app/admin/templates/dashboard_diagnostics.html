@@ -5,6 +5,7 @@
     <div class="metric-card"><div class="metric-label">Источники работают</div><div class="metric-value">{{ counts.healthy_sources }}/{{ counts.enabled_sources }}</div><div class="metric-note">среди включённых</div></div>
     <div class="metric-card"><div class="metric-label">Обходы выполняются</div><div class="metric-value">{{ counts.running_scans }}</div><div class="metric-note">прямо сейчас</div></div>
   </div>
+  {% include "_phone_health.html" %}
   <div class="panel current-issues">
     <div class="panel-head"><div><div class="panel-title">Текущие проблемы</div><div class="panel-subtitle">Состояние сейчас, а не весь архив предупреждений</div></div></div>
     <div class="panel-pad">

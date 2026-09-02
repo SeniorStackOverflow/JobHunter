@@ -1,14 +1,22 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 
 from app.admin.routes import (
     _admin_asset_url,
     _application_approval_issue,
     _daily_application_rules,
+    _phone_health,
 )
 from app.main import app
+from app.models.entities import PhoneChannelHealth
+from app.models.enums import PhoneComponentStatus
 
 
 def test_admin_javascript_uses_in_app_confirmation_dialog() -> None:
@@ -131,3 +139,45 @@ async def test_admin_asset_cache_headers_match_versioned_urls() -> None:
     assert versioned.headers["cache-control"] == "public, max-age=31536000, immutable"
     assert unversioned.status_code == 200
     assert unversioned.headers["cache-control"] == "no-cache, max-age=0, must-revalidate"
+
+
+@pytest.mark.asyncio
+async def test_phone_health_aggregates_components(sqlite_session_factory: Any) -> None:
+    from app.settings import get_settings
+
+    async with sqlite_session_factory() as session:
+        session.add(
+            PhoneChannelHealth(
+                component="phonegate_transport",
+                status=PhoneComponentStatus.HEALTHY,
+                detail=None,
+                last_ok_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            PhoneChannelHealth(
+                component="a14_daemon",
+                status=PhoneComponentStatus.DEGRADED,
+                detail="ADB fallback",
+                last_ok_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+
+        result = await _phone_health(session)
+
+        assert result["channel"] == "degraded"
+        assert len(result["components"]) == 2
+        assert result["components"][0]["component"] == "a14_daemon"
+        assert result["components"][1]["component"] == "phonegate_transport"
+        assert result["configured"] == get_settings().phone_agent_enabled
+
+
+def test_phone_health_template_exists_and_uses_correct_variables() -> None:
+    template_path = Path("app/admin/templates/_phone_health.html")
+    assert template_path.exists()
+    markup = template_path.read_text(encoding="utf-8")
+    assert "phone_health.components" in markup
+    assert "status_tone" in markup

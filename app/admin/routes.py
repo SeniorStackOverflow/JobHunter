@@ -113,6 +113,7 @@ _LOCAL_TZ = ZoneInfo("Europe/Chisinau")
 _STATUS_LABELS = {
     "healthy": "Работает",
     "degraded": "Есть проблемы",
+    "unavailable": "Недоступно",
     "paused": "На паузе",
     "disabled": "Выключен",
     "unknown": "Неизвестно",
@@ -300,9 +301,17 @@ def _status_tone(value: Any) -> str:
         "unknown",
         "prepare_for_review",
         "temporary_failure",
+        "degraded",
     }:
         return "warning"
-    if raw in {"degraded", "failed", "blocked", "block", "permanent_failure", "delivery_unknown"}:
+    if raw in {
+        "failed",
+        "blocked",
+        "block",
+        "permanent_failure",
+        "delivery_unknown",
+        "unavailable",
+    }:
         return "danger"
     if raw in {"disabled", "cancelled", "closed", "skip", "skipped"}:
         return "muted"
@@ -410,6 +419,28 @@ def _pagination(total: int, requested_page: int, per_page: int) -> dict[str, int
         "total": total,
         "has_previous": page > 1,
         "has_next": page < pages,
+    }
+
+
+async def _phone_health(session: AsyncSession) -> dict[str, Any]:
+    """Query phone channel health and aggregate component status."""
+    from app.models.entities import PhoneChannelHealth
+    from app.phone.health import HealthComponent, channel_status
+
+    rows = list((await session.scalars(select(PhoneChannelHealth))).all())
+    components = [HealthComponent(r.component, r.status, r.detail, r.last_ok_at) for r in rows]
+    return {
+        "channel": channel_status(components).value if components else "unknown",
+        "components": [
+            {
+                "component": c.component,
+                "status": c.status.value,
+                "detail": c.detail,
+                "last_ok_at": c.last_ok_at,
+            }
+            for c in sorted(rows, key=lambda r: r.component)
+        ],
+        "configured": get_settings().phone_agent_enabled,
     }
 
 
@@ -907,6 +938,7 @@ async def dashboard(
     historical_alerts: list[Alert] = []
     learning_summary = None
     learning_scores: dict[UUID, LearnedReviewScore] = {}
+    phone_health: dict[str, Any] = {}
     pagination = _pagination(0, 1, 10)
 
     if view == "overview":
@@ -1242,6 +1274,7 @@ async def dashboard(
                 )
             ).all()
         )
+        phone_health = await _phone_health(session)
 
     displayed_applications = applications or recent_applications
     application_job_ids = {item.source_job_id for item in displayed_applications}
@@ -1336,6 +1369,7 @@ async def dashboard(
             "active_alerts": active_alerts,
             "historical_alerts": historical_alerts,
             "audits": audits,
+            "phone_health": phone_health,
             "counts": counts,
             "overview": overview,
             "gmail_oauth": gmail_oauth,

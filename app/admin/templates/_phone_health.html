@@ -1,0 +1,23 @@
+<section class="card">
+  <h3>Phone channel
+    <span class="badge badge-{{ status_tone(phone_health.channel) }}">
+      {{ status_label(phone_health.channel) }}</span>
+  </h3>
+  {% if not phone_health.configured %}
+  <p class="muted">Телефонный агент выключен (PHONE_AGENT_ENABLED=false).</p>
+  {% endif %}
+  <ul class="component-list">
+    {% for c in phone_health.components %}
+    <li>
+      <span class="status-dot status-dot-{{ status_tone(c.status) }}"></span>
+      <code>{{ c.component }}</code>
+      <span>{{ status_label(c.status) }}</span>
+      {% if c.detail %}<span class="muted">{{ c.detail }}</span>{% endif %}
+      {% if c.last_ok_at %}<time class="muted">{{ format_dt(c.last_ok_at) }}</time>{% endif %}
+    </li>
+    {% endfor %}
+    {% if not phone_health.components %}
+    <li class="muted">Нет данных — агент ещё не опрашивал PhoneGate.</li>
+    {% endif %}
+  </ul>
+</section>
