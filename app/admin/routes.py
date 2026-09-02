@@ -301,7 +301,6 @@ def _status_tone(value: Any) -> str:
         "unknown",
         "prepare_for_review",
         "temporary_failure",
-        "degraded",
     }:
         return "warning"
     if raw in {
@@ -310,6 +309,7 @@ def _status_tone(value: Any) -> str:
         "block",
         "permanent_failure",
         "delivery_unknown",
+        "degraded",
         "unavailable",
     }:
         return "danger"
