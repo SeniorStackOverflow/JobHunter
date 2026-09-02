@@ -425,10 +425,24 @@ def _pagination(total: int, requested_page: int, per_page: int) -> dict[str, int
 async def _phone_health(session: AsyncSession) -> dict[str, Any]:
     """Query phone channel health and aggregate component status."""
     from app.models.entities import PhoneChannelHealth
-    from app.phone.health import HealthComponent, channel_status
+    from app.models.enums import PhoneComponentStatus
+    from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 
     rows = list((await session.scalars(select(PhoneChannelHealth))).all())
-    components = [HealthComponent(r.component, r.status, r.detail, r.last_ok_at) for r in rows]
+    agent_row = next((r for r in rows if r.component == "agent"), None)
+    agent_stale = agent_row is not None and agent_component_is_stale(
+        agent_row.updated_at,
+        stale_after_seconds=get_settings().phone_health_stale_after_seconds,
+    )
+
+    def _effective_status(row: PhoneChannelHealth) -> PhoneComponentStatus:
+        if row.component == "agent" and agent_stale:
+            return PhoneComponentStatus.UNAVAILABLE
+        return row.status
+
+    components = [
+        HealthComponent(r.component, _effective_status(r), r.detail, r.last_ok_at) for r in rows
+    ]
     return {
         "channel": channel_status(components).value if components else "unknown",
         "components": [
@@ -438,7 +452,7 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
                 "detail": c.detail,
                 "last_ok_at": c.last_ok_at,
             }
-            for c in sorted(rows, key=lambda r: r.component)
+            for c in sorted(components, key=lambda c: c.component)
         ],
         "configured": get_settings().phone_agent_enabled,
     }

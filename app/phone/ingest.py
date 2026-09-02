@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from uuid import UUID
 
 import structlog
@@ -23,6 +24,14 @@ logger = structlog.get_logger(__name__)
 
 EVENTS_CURSOR_KEY = "job-agent:phone:events:cursor"
 
+# A forced cursor replay right after a call re-emits that call's ``incoming_call``
+# event, and the dedup guard must still recognise the session it already opened.
+# But PhoneGate resets its event-id counter to 1 on restart, so a genuinely new
+# low-id ``incoming_call`` must NOT be silenced by an unrelated historical session
+# that happens to share the id. Bounding the guard in time keeps replays
+# idempotent while letting real post-restart calls through.
+_INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=10)
+
 
 class IngestLoop:
     def __init__(
@@ -45,13 +54,20 @@ class IngestLoop:
         self._cursor = 0
         self._open_session_id: UUID | None = None
 
-    async def load_cursor(self) -> int:
+    async def load_cursor(self) -> int | None:
+        """Return the stored cursor, or ``None`` when the Redis key is absent.
+
+        ``None`` lets the caller seed the cursor from ``status.latest_event_id``
+        on first start instead of replaying PhoneGate's buffered history
+        (spec §7.4).
+        """
         raw = await self._redis.get(EVENTS_CURSOR_KEY)
         try:
-            self._cursor = int(raw) if raw is not None else 0
+            value = int(raw) if raw is not None else None
         except (TypeError, ValueError):
-            self._cursor = 0
-        return self._cursor
+            value = None
+        self._cursor = value or 0
+        return value
 
     async def save_cursor(self, value: int) -> None:
         self._cursor = value
@@ -147,9 +163,11 @@ class IngestLoop:
             await self._on_transcript(session, event, status)
 
     async def _on_incoming_call(self, session: AsyncSession, event: PhoneEvent) -> None:
+        recent_cutoff = utcnow() - _INCOMING_CALL_DEDUP_WINDOW
         already = await session.scalar(
             select(CommunicationSession.id).where(
-                CommunicationSession.phonegate_event_id_start == event.id
+                CommunicationSession.phonegate_event_id_start == event.id,
+                CommunicationSession.started_at >= recent_cutoff,
             )
         )
         if already is not None:

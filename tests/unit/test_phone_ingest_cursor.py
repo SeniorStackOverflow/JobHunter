@@ -36,11 +36,13 @@ async def redis() -> FakeAsyncRedis:
 
 
 @pytest.mark.asyncio
-async def test_load_cursor_defaults_to_zero(
+async def test_load_cursor_reports_absent_key_as_none(
     sqlite_session_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:
     loop = _loop(sqlite_session_factory, redis)
-    assert await loop.load_cursor() == 0
+    # Absent key -> None (caller seeds from latest_event_id), internal cursor 0.
+    assert await loop.load_cursor() is None
+    assert loop._cursor == 0
     await loop.save_cursor(9)
     assert await redis.get(EVENTS_CURSOR_KEY) == "9"
     assert await loop.load_cursor() == 9

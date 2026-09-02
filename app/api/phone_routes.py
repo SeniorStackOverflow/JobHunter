@@ -11,8 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import require_api_actor
 from app.database import get_session
 from app.models.entities import CommunicationSession, CommunicationTurn, PhoneChannelHealth
-from app.phone.health import HealthComponent, channel_status
+from app.models.enums import PhoneComponentStatus
+from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 from app.phone.numbers import mask_phone
+from app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1/phone", tags=["phone"])
 
@@ -20,8 +22,20 @@ router = APIRouter(prefix="/api/v1/phone", tags=["phone"])
 @router.get("/status", dependencies=[Depends(require_api_actor)])
 async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     rows = list((await session.scalars(select(PhoneChannelHealth))).all())
-    components = [HealthComponent(r.component, r.status, r.detail, r.last_ok_at) for r in rows]
     agent_row = next((r for r in rows if r.component == "agent"), None)
+    agent_stale = agent_row is not None and agent_component_is_stale(
+        agent_row.updated_at,
+        stale_after_seconds=get_settings().phone_health_stale_after_seconds,
+    )
+
+    def _effective_status(row: PhoneChannelHealth) -> PhoneComponentStatus:
+        if row.component == "agent" and agent_stale:
+            return PhoneComponentStatus.UNAVAILABLE
+        return row.status
+
+    components = [
+        HealthComponent(r.component, _effective_status(r), r.detail, r.last_ok_at) for r in rows
+    ]
     newest = await session.scalar(
         select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
     )
@@ -31,12 +45,13 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
             "last_ok_at": agent_row.last_ok_at.isoformat()
             if agent_row and agent_row.last_ok_at
             else None,
-            "status": agent_row.status.value if agent_row else "unknown",
+            "status": _effective_status(agent_row).value if agent_row else "unknown",
+            "stale": agent_stale,
         },
         "components": [
             {
                 "component": r.component,
-                "status": r.status.value,
+                "status": _effective_status(r).value,
                 "detail": r.detail,
                 "last_ok_at": r.last_ok_at.isoformat() if r.last_ok_at else None,
             }

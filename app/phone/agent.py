@@ -58,10 +58,23 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
     )
 
     try:
-        await ingest.load_cursor()
-        status = await client.device_status()
-        await ingest.reconcile(status)
-        logger.info("phone_agent_started", call_state=status.call_state)
+        cursor = await ingest.load_cursor()
+        # Spec §5.1.3: confirm device status once, but never block startup on a
+        # PhoneGate outage — the ingest loop reports it as `unavailable` and the
+        # first run_cycle rewrites the health row once PhoneGate is reachable.
+        try:
+            status = await client.device_status()
+        except (PhoneGateUnavailable, PhoneGateError) as exc:
+            logger.warning("phone_agent_startup_status_failed", error_type=type(exc).__name__)
+            ingest._health.record_transport_error(type(exc).__name__)
+            await ingest._persist_health()
+        else:
+            if cursor is None:
+                # Spec §7.4: first start against a running PhoneGate must not
+                # replay buffered history — resume from the current head.
+                await ingest.save_cursor(status.latest_event_id)
+            await ingest.reconcile(status)
+            logger.info("phone_agent_started", call_state=status.call_state)
 
         while not should_stop():
             active = await ingest.run_cycle()

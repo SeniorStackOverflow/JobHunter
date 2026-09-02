@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import CommunicationSession, CommunicationTurn, UserProfile
-from app.models.enums import CommunicationOutcome
+from app.models.enums import (
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
+)
 from app.phone.client import PhoneGateClient
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
@@ -122,6 +127,50 @@ async def test_reingest_is_idempotent(
         calls = (await session.scalars(select(CommunicationSession))).all()
     assert len(turns) == 1
     assert len(calls) == 1
+
+
+async def test_new_call_after_restart_opens_session_despite_event_id_collision(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """A PhoneGate restart resets the event-id counter, so a fresh inbound call
+    gets a low ``incoming_call`` id that collides with an old session's
+    ``phonegate_event_id_start``. The time-bounded dedup guard must still let the
+    new call open its own session."""
+    async with profiled_factory() as session:
+        profile = (await session.scalars(select(UserProfile))).one()
+        old_start = datetime.now(UTC) - timedelta(hours=1)
+        session.add(
+            CommunicationSession(
+                profile_id=profile.id,
+                channel=CommunicationChannel.CALL,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                remote_address="+37360999888",
+                remote_raw="+37360999888",
+                phonegate_event_id_start=2,
+                started_at=old_start,
+                ended_at=old_start,
+                outcome=CommunicationOutcome.COMPLETED,
+            )
+        )
+        await session.commit()
+
+    fake = FakePhoneGate()
+    fake.restart()  # models a just-restarted PhoneGate: event-id counter back at 1
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        fake.ring("+37360111222")  # call_state id=1, incoming_call id=2 (collides)
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+    new_calls = [c for c in calls if c.remote_raw == "+37360111222"]
+    assert len(new_calls) == 1
+    assert new_calls[0].phonegate_event_id_start == 2
+    assert len(calls) == 2  # historical session untouched, one fresh session
 
 
 async def test_phonegate_restart_closes_open_session(

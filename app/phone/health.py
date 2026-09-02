@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -34,6 +34,26 @@ def channel_status(components: list[HealthComponent]) -> PhoneComponentStatus:
     if not relevant:
         return PhoneComponentStatus.UNKNOWN
     return max(relevant, key=lambda c: _RANK[c.status]).status
+
+
+def agent_component_is_stale(
+    updated_at: datetime | None,
+    *,
+    stale_after_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    """True when the persisted ``agent`` row is too old to still count as live.
+
+    The health tracker only writes rows while the agent polls, so a frozen
+    ``updated_at`` means the process died. Read sides downgrade a stale ``agent``
+    component to ``unavailable`` (spec §9.1).
+    """
+    if updated_at is None:
+        return True
+    reference = now if now is not None else utcnow()
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    return updated_at < reference - timedelta(seconds=stale_after_seconds)
 
 
 class HealthTracker:

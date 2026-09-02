@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -68,6 +68,53 @@ async def test_status_endpoint_reports_channel(client, sqlite_session_factory) -
     body = (await client.get("/api/v1/phone/status")).json()
     assert body["channel"] == "degraded"
     assert {c["component"] for c in body["components"]} >= {"phonegate_transport", "a14_daemon"}
+
+
+@pytest.mark.asyncio
+async def test_status_downgrades_stale_agent(client, sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        session.add(
+            PhoneChannelHealth(
+                component="phonegate_transport",
+                status=PhoneComponentStatus.HEALTHY,
+                last_ok_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            PhoneChannelHealth(
+                component="agent",
+                status=PhoneComponentStatus.HEALTHY,
+                last_ok_at=datetime.now(UTC) - timedelta(hours=1),
+                updated_at=datetime.now(UTC) - timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    body = (await client.get("/api/v1/phone/status")).json()
+    agent_component = next(c for c in body["components"] if c["component"] == "agent")
+    assert agent_component["status"] == "unavailable"
+    assert body["agent"]["status"] == "unavailable"
+    assert body["agent"]["stale"] is True
+    assert body["channel"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_status_keeps_fresh_agent_healthy(client, sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        session.add(
+            PhoneChannelHealth(
+                component="agent",
+                status=PhoneComponentStatus.HEALTHY,
+                last_ok_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+
+    body = (await client.get("/api/v1/phone/status")).json()
+    assert body["agent"]["status"] == "healthy"
+    assert body["agent"]["stale"] is False
 
 
 @pytest.mark.asyncio

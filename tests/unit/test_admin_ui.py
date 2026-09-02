@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -173,6 +173,35 @@ async def test_phone_health_aggregates_components(sqlite_session_factory: Any) -
         assert result["components"][0]["component"] == "a14_daemon"
         assert result["components"][1]["component"] == "phonegate_transport"
         assert result["configured"] == get_settings().phone_agent_enabled
+
+
+@pytest.mark.asyncio
+async def test_phone_health_downgrades_stale_agent(sqlite_session_factory: Any) -> None:
+    async with sqlite_session_factory() as session:
+        session.add(
+            PhoneChannelHealth(
+                component="phonegate_transport",
+                status=PhoneComponentStatus.HEALTHY,
+                last_ok_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            PhoneChannelHealth(
+                component="agent",
+                status=PhoneComponentStatus.HEALTHY,
+                detail="poll ok",
+                last_ok_at=datetime.now(UTC) - timedelta(hours=2),
+                updated_at=datetime.now(UTC) - timedelta(hours=2),
+            )
+        )
+        await session.commit()
+
+        result = await _phone_health(session)
+
+    agent = next(c for c in result["components"] if c["component"] == "agent")
+    assert agent["status"] == "unavailable"
+    assert result["channel"] == "unavailable"
 
 
 def test_phone_health_template_exists_and_uses_correct_variables() -> None:
