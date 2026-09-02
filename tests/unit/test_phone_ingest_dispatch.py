@@ -368,6 +368,6 @@ async def test_session_diagnostics_populated_on_open(
 
     async with profiled_factory() as session:
         call = (await session.scalars(select(CommunicationSession))).one()
-    # Diagnostics should contain daemon_version and sim_operator
-    assert "daemon_version" in call.diagnostics
-    assert "sim_operator" in call.diagnostics
+    # Diagnostics should contain correct daemon_version and sim_operator values
+    assert call.diagnostics["daemon_version"] == "0.2.30"
+    assert call.diagnostics["sim_operator"] == "Orange"

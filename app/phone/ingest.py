@@ -250,13 +250,15 @@ class IngestLoop:
         self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
     ) -> None:
         if event.type == "incoming_call":
-            await self._on_incoming_call(session, event)
+            await self._on_incoming_call(session, event, status)
         elif event.type == "call_state":
             await self._on_call_state(session, event, status)
         elif event.type == "transcript":
             await self._on_transcript(session, event, status)
 
-    async def _on_incoming_call(self, session: AsyncSession, event: PhoneEvent) -> None:
+    async def _on_incoming_call(
+        self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
+    ) -> None:
         recent_cutoff = utcnow() - _INCOMING_CALL_DEDUP_WINDOW
         already = await session.scalar(
             select(CommunicationSession.id).where(
@@ -299,9 +301,9 @@ class IngestLoop:
             correlation=correlation,
             opened_at=utcnow(),
             diagnostics={
-                "daemon_version": event.data.get("daemon_version", ""),
+                "daemon_version": status.daemon_version,
                 "sim_operator": str(
-                    event.data.get("sim_operator") or event.data.get("operator") or ""
+                    status.device.get("sim_operator") or status.device.get("operator") or ""
                 ),
             },
         )
