@@ -1,6 +1,6 @@
 """phone device snapshot
 
-Revision ID: c3d4e5f6g7h8
+Revision ID: c3d4e5f6a7b8
 Revises: b259d94e7049
 """
 
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "c3d4e5f6g7h8"
+revision: str = "c3d4e5f6a7b8"
 down_revision: str | None = "b259d94e7049"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

@@ -27,7 +27,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("c3d4e5f6g7h8",)
+    assert revision == ("c3d4e5f6a7b8",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -64,4 +64,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("c3d4e5f6g7h8",)
+    assert revision == ("c3d4e5f6a7b8",)
