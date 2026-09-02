@@ -53,6 +53,7 @@ class IngestLoop:
         self._store = SessionStore()
         self._cursor = 0
         self._open_session_id: UUID | None = None
+        self._cursor_seeded = False
 
     async def load_cursor(self) -> int | None:
         """Return the stored cursor, or ``None`` when the Redis key is absent.
@@ -67,11 +68,19 @@ class IngestLoop:
         except (TypeError, ValueError):
             value = None
         self._cursor = value or 0
+        if value is not None:
+            self._cursor_seeded = True
         return value
 
     async def save_cursor(self, value: int) -> None:
         self._cursor = value
+        self._cursor_seeded = True
         await self._redis.set(EVENTS_CURSOR_KEY, str(value))
+
+    @property
+    def open_session_id(self) -> UUID | None:
+        """Public read of the currently open session ID."""
+        return self._open_session_id
 
     async def reconcile(self, status: DeviceStatus) -> None:
         """Bring local state in line with PhoneGate after a start or a resync."""
@@ -79,6 +88,54 @@ class IngestLoop:
             open_row = await self._store.find_open(session)
             if open_row is None:
                 self._open_session_id = None
+                # A2: open a session on RINGING with no open session
+                if status.call_state == "RINGING":
+                    correlation = await self._correlation.resolve(session, status.caller_number)
+                    if correlation is not None:
+                        normalized_address = (
+                            normalize_e164(
+                                status.caller_number,
+                                region=self._settings.phone_caller_region,
+                            )
+                            or ""
+                        )
+                        call = await self._store.open(
+                            session,
+                            remote_raw=status.caller_number,
+                            remote_address=normalized_address,
+                            event_id=0,
+                            correlation=correlation,
+                            opened_at=utcnow(),
+                            needs_review=True,
+                            diagnostics={
+                                "note": "reconcile_opened_from_ringing",
+                                "daemon_version": status.daemon_version,
+                                "sim_operator": str(
+                                    status.device.get("sim_operator")
+                                    or status.device.get("operator")
+                                    or ""
+                                ),
+                            },
+                        )
+                        self._open_session_id = call.id
+                        # A3: audit the opened session
+                        await record_audit_event(
+                            session,
+                            actor="phone-agent",
+                            action="communication_session.opened",
+                            entity_type="communication_session",
+                            entity_id=str(call.id),
+                            correlation_id=str(call.id),
+                            details={
+                                "caller": mask_phone(status.caller_number),
+                                "application_id": (
+                                    str(correlation.application_id)
+                                    if correlation.application_id
+                                    else None
+                                ),
+                                "profile_id": str(correlation.profile_id),
+                            },
+                        )
             elif status.call_state == "IDLE":
                 await self._store.close(
                     session,
@@ -111,11 +168,17 @@ class IngestLoop:
 
         self._health.record_status(status)
 
+        # A1: seed cursor on first successful status if not yet seeded
+        if not self._cursor_seeded:
+            await self.save_cursor(status.latest_event_id)
+            return status.call_state != "IDLE"
+
         try:
             page = await self._client.events(after_id=self._cursor, limit=250)
         except (PhoneGateUnavailable, PhoneGateError) as exc:
             self._health.record_transport_error(type(exc).__name__)
             await self._persist_health()
+            logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
             return status.call_state != "IDLE"
 
         if page.latest_id < self._cursor:  # PhoneGate restarted / event log rotated
@@ -174,9 +237,14 @@ class IngestLoop:
             return
 
         raw = str(event.data.get("caller_number") or "")
+        # A5 minor: normalize once at the top; reuse for same-caller check and remote_address
+        normalized_address = normalize_e164(raw, region=self._settings.phone_caller_region) or ""
+
         open_row = await self._store.find_open(session)
         if open_row is not None:
-            if open_row.remote_raw == raw or (raw and open_row.remote_address == raw):
+            if open_row.remote_raw == raw or (
+                normalized_address and open_row.remote_address == normalized_address
+            ):
                 return
             await self._store.close(
                 session,
@@ -191,15 +259,23 @@ class IngestLoop:
             logger.error("phone_no_default_profile", caller=mask_phone(raw))
             return
 
+        # A4: pass diagnostics with daemon_version and sim_operator
         call = await self._store.open(
             session,
             remote_raw=raw,
-            remote_address=normalize_e164(raw, region=self._settings.phone_caller_region) or "",
+            remote_address=normalized_address,
             event_id=event.id,
             correlation=correlation,
             opened_at=utcnow(),
+            diagnostics={
+                "daemon_version": event.data.get("daemon_version", ""),
+                "sim_operator": str(
+                    event.data.get("sim_operator") or event.data.get("operator") or ""
+                ),
+            },
         )
         self._open_session_id = call.id
+        # A3: audit opened session
         await record_audit_event(
             session,
             actor="phone-agent",
@@ -209,10 +285,31 @@ class IngestLoop:
             correlation_id=str(call.id),
             details={
                 "caller": mask_phone(raw),
-                "application_id": str(correlation.application_id),
+                "application_id": (
+                    str(correlation.application_id) if correlation.application_id else None
+                ),
                 "profile_id": str(correlation.profile_id),
             },
         )
+        # A3: if correlation matched an application/contact, write a correlated event
+        if correlation.application_id is not None or correlation.contact_id is not None:
+            await record_audit_event(
+                session,
+                actor="phone-agent",
+                action="communication_session.correlated",
+                entity_type="communication_session",
+                entity_id=str(call.id),
+                correlation_id=str(call.id),
+                details={
+                    "application_id": (
+                        str(correlation.application_id) if correlation.application_id else None
+                    ),
+                    "canonical_job_id": (
+                        str(correlation.canonical_job_id) if correlation.canonical_job_id else None
+                    ),
+                    "contact_id": (str(correlation.contact_id) if correlation.contact_id else None),
+                },
+            )
 
     async def _on_call_state(
         self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
@@ -255,15 +352,43 @@ class IngestLoop:
             correlation = await self._correlation.resolve(session, status.caller_number)
             if correlation is None:
                 return
+            # A5 minor: normalize E164 for remote_address
+            normalized_address = (
+                normalize_e164(status.caller_number, region=self._settings.phone_caller_region)
+                or ""
+            )
+            # A4: pass diagnostics with daemon_version and sim_operator
             open_row = await self._store.open(
                 session,
                 remote_raw=status.caller_number,
-                remote_address="",
+                remote_address=normalized_address,
                 event_id=event.id,
                 correlation=correlation,
                 opened_at=utcnow(),
                 needs_review=True,
-                note="transcript_before_session_start",
+                diagnostics={
+                    "note": "transcript_before_session_start",
+                    "daemon_version": status.daemon_version,
+                    "sim_operator": str(
+                        status.device.get("sim_operator") or status.device.get("operator") or ""
+                    ),
+                },
             )
             self._open_session_id = open_row.id
+            # A3: audit the opened session
+            await record_audit_event(
+                session,
+                actor="phone-agent",
+                action="communication_session.opened",
+                entity_type="communication_session",
+                entity_id=str(open_row.id),
+                correlation_id=str(open_row.id),
+                details={
+                    "caller": mask_phone(status.caller_number),
+                    "application_id": (
+                        str(correlation.application_id) if correlation.application_id else None
+                    ),
+                    "profile_id": str(correlation.profile_id),
+                },
+            )
         await self._store.append_turn(session, session_id=open_row.id, entry=entry)

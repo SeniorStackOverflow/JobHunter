@@ -82,7 +82,7 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
             # active call yet a session is still open locally, meaning the
             # closing IDLE event was lost. Re-read the device status and
             # reconcile against it so the stale session is closed out.
-            if not active and ingest._open_session_id is not None:
+            if not active and ingest.open_session_id is not None:
                 try:
                     fresh_status = await client.device_status()
                 except (PhoneGateUnavailable, PhoneGateError) as exc:

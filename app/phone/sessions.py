@@ -46,7 +46,15 @@ class SessionStore:
         opened_at: datetime,
         needs_review: bool = False,
         note: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> CommunicationSession:
+        # A4: merge diagnostics dict (if provided) with note handling
+        call_diagnostics: dict[str, Any] = {}
+        if note:
+            call_diagnostics["note"] = note
+        if diagnostics:
+            call_diagnostics.update(diagnostics)
+
         call = CommunicationSession(
             profile_id=correlation.profile_id,
             application_id=correlation.application_id,
@@ -62,7 +70,7 @@ class SessionStore:
             started_at=opened_at,
             ringing_at=opened_at,
             needs_review=needs_review,
-            diagnostics={"note": note} if note else {},
+            diagnostics=call_diagnostics,
         )
         session.add(call)
         await session.flush()

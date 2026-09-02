@@ -10,10 +10,22 @@ from app.settings.config import Settings, get_settings
 
 @pytest.mark.asyncio
 async def test_run_exits_zero_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A5: when disabled, run() returns 0 and never attempts Redis connection."""
+    redis_from_url_called = False
+
+    class _MockRedis:
+        @staticmethod
+        def from_url(*args: Any, **kwargs: Any) -> Any:
+            nonlocal redis_from_url_called
+            redis_from_url_called = True
+            raise AssertionError("must not connect to Redis when disabled")
+
     monkeypatch.setattr(get_settings, "cache_clear", lambda: None, raising=False)
     monkeypatch.setattr(agent_module, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(agent_module, "SyncRedis", _MockRedis)
     code = await agent_module.run()
     assert code == 0
+    assert not redis_from_url_called
 
 
 @pytest.mark.asyncio
@@ -62,6 +74,32 @@ async def test_run_loop_survives_phonegate_down_at_startup(
     async with sqlite_session_factory() as session:
         rows = {r.component: r for r in (await session.scalars(select(PhoneChannelHealth))).all()}
     assert rows["phonegate_transport"].status is PhoneComponentStatus.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_run_returns_two_when_token_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A5: when token is None, run() returns 2 and never attempts Redis."""
+    redis_from_url_called = False
+
+    class _MockRedis:
+        @staticmethod
+        def from_url(*args: Any, **kwargs: Any) -> Any:
+            nonlocal redis_from_url_called
+            redis_from_url_called = True
+            raise AssertionError("must not connect to Redis when token is missing")
+
+    monkeypatch.setattr(get_settings, "cache_clear", lambda: None, raising=False)
+    monkeypatch.setattr(
+        agent_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, phone_agent_enabled=True),
+    )
+    monkeypatch.setattr(agent_module, "SyncRedis", _MockRedis)
+    code = await agent_module.run()
+    assert code == 2
+    assert not redis_from_url_called
 
 
 def test_cli_registers_phone_agent_subcommand() -> None:

@@ -80,3 +80,53 @@ async def test_append_turn_is_idempotent(db: AsyncSession) -> None:
     third = await store.append_turn(db, session_id=call.id, entry=entry2)
     assert third is not None and third.seq == 2 and third.speaker == TurnSpeaker.OPERATOR
     assert speaker_from_phonegate("weird") is TurnSpeaker.SYSTEM
+
+
+async def test_open_with_diagnostics(db: AsyncSession) -> None:
+    """A4: SessionStore.open accepts diagnostics parameter and merges it."""
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+37360111222",
+        remote_address="+37360111222",
+        event_id=3,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+        diagnostics={
+            "daemon_version": "0.2.1",
+            "sim_operator": "Orange",
+        },
+    )
+    await db.commit()
+
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.diagnostics.get("daemon_version") == "0.2.1"
+    assert refreshed.diagnostics.get("sim_operator") == "Orange"
+
+
+async def test_open_with_diagnostics_and_note(db: AsyncSession) -> None:
+    """A4: when both diagnostics and note are provided, both are merged."""
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+37360111222",
+        remote_address="+37360111222",
+        event_id=3,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+        note="test_note",
+        diagnostics={
+            "daemon_version": "0.2.1",
+            "sim_operator": "Orange",
+        },
+    )
+    await db.commit()
+
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.diagnostics.get("note") == "test_note"
+    assert refreshed.diagnostics.get("daemon_version") == "0.2.1"
+    assert refreshed.diagnostics.get("sim_operator") == "Orange"

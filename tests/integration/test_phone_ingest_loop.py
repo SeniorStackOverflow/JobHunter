@@ -62,7 +62,10 @@ async def test_agent_restart_reconciles_dangling_session(
     fake = FakePhoneGate()
     async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c1:
         loop1 = _loop(c1, profiled_factory, redis)
-        await loop1.load_cursor()
+        cursor = await loop1.load_cursor()
+        if cursor is None:
+            status = await c1.device_status()
+            await loop1.save_cursor(status.latest_event_id)
         fake.ring("+37360111222")
         fake.answer()
         for _ in range(3):
@@ -71,7 +74,10 @@ async def test_agent_restart_reconciles_dangling_session(
     # a brand-new loop == a restarted process, sharing the same redis + session_factory
     async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c2:
         loop2 = _loop(c2, profiled_factory, redis)
-        await loop2.load_cursor()
+        cursor = await loop2.load_cursor()
+        if cursor is None:
+            status = await c2.device_status()
+            await loop2.save_cursor(status.latest_event_id)
         fake.hangup()
         for _ in range(3):
             await loop2.run_cycle()
@@ -99,7 +105,10 @@ async def test_full_call_persists_complete_graph(
         base_url="http://pg", token="t", transport=fake.transport()
     ) as client:
         loop = _loop(client, profiled_factory, redis)
-        await loop.load_cursor()
+        cursor = await loop.load_cursor()
+        if cursor is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
 
         fake.ring("+37360111222")
         fake.answer()

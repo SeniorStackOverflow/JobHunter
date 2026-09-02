@@ -41,11 +41,16 @@ async def test_load_cursor_reports_absent_key_as_none(
 ) -> None:
     loop = _loop(sqlite_session_factory, redis)
     # Absent key -> None (caller seeds from latest_event_id), internal cursor 0.
+    # A1: _cursor_seeded should remain False when key is absent
+    assert loop._cursor_seeded is False
     assert await loop.load_cursor() is None
     assert loop._cursor == 0
+    assert loop._cursor_seeded is False  # Still not seeded
     await loop.save_cursor(9)
+    assert loop._cursor_seeded is True  # Now seeded after save
     assert await redis.get(EVENTS_CURSOR_KEY) == "9"
     assert await loop.load_cursor() == 9
+    assert loop._cursor_seeded is True  # Still seeded after load
 
 
 @pytest.mark.asyncio
