@@ -25,7 +25,8 @@ async def test_scripted_call_produces_ordered_events() -> None:
 
         events = (await client.get("/api/events", params={"after_id": 0})).json()
         types = [e["type"] for e in events["events"]]
-        assert types[0] == "incoming_call"
+        assert types[0] == "call_state"
+        assert types[1] == "incoming_call"
         assert "transcript" in types
         assert events["events"] == sorted(events["events"], key=lambda e: e["id"])
 

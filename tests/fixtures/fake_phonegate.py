@@ -55,8 +55,8 @@ class FakePhoneGate:
 
     def ring(self, caller: str) -> None:
         self._call_state, self._caller = "RINGING", caller
-        self._emit("incoming_call", self._call_state_data())
         self._emit("call_state", self._call_state_data())
+        self._emit("incoming_call", self._call_state_data())
 
     def answer(self) -> None:
         self._call_state = "IN_CALL"
