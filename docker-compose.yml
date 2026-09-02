@@ -159,6 +159,25 @@ services:
     stop_grace_period: 30s
     logging: *default-logging
 
+  call-agent:
+    <<: *app
+    command: ["job-agent", "phone-agent"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *app-healthcheck
+      test:
+        - CMD-SHELL
+        - >-
+          test -f /tmp/phone-agent-alive &&
+          test -n "$$(find /tmp/phone-agent-alive -mmin -2)"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    logging: *default-logging
+
   caddy:
     image: caddy:2.10-alpine
     environment:

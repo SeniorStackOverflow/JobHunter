@@ -173,6 +173,10 @@ services:
   beat:
     <<: *production-app
 
+  call-agent:
+    <<: *production-app
+    command: ["job-agent", "phone-agent"]
+
   caddy:
     profiles: ["container-edge"]
     environment:

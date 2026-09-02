@@ -45,6 +45,16 @@ source adapter → discovery/crawl → normalization → SourceJob
 `EmailDelivery`, `OAuthCredential`, `AuditEvent`, `Alert` и `DailyReport`.
 Начальная миграция находится в `migrations/versions/`.
 
+## Телефонный агент (Phase 1)
+
+`call-agent` — отдельный процесс `job-agent phone-agent`, который только читает
+PhoneGate REST API (`/api/events`, `/api/device/status`), сопоставляет входящие
+звонки с откликами и сохраняет `CommunicationSession` / `CommunicationTurn`. Он
+никогда не отвечает, не говорит и не звонит. По умолчанию выключен
+(`PHONE_AGENT_ENABLED=false`); включается только после настройки `PHONEGATE_URL`
+и `PHONEGATE_AUTH_TOKEN`. Здоровье канала — в разделе `Диагностика` и
+`GET /api/v1/phone/status`. Деградация телефона не влияет на `/ready`.
+
 ## Быстрый локальный запуск
 
 Требуются Docker Compose v2 и, для host-проверок, Python 3.12+ с `uv`.
