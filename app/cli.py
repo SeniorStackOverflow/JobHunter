@@ -149,6 +149,10 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--include-fixture", action="store_true")
     config = subparsers.add_parser("validate-source-config")
     config.add_argument("path", type=Path)
+    subparsers.add_parser(
+        "phone-agent",
+        help="run the read-only PhoneGate call observer",
+    )
     return parser
 
 
@@ -168,6 +172,10 @@ def main() -> None:
         asyncio.run(seed_defaults(args.include_fixture))
     elif args.command == "validate-source-config":
         print(json.dumps(validate_source_config(args.path), indent=2, ensure_ascii=False))
+    elif args.command == "phone-agent":
+        from app.phone.agent import main as phone_agent_main
+
+        phone_agent_main()
 
 
 if __name__ == "__main__":
