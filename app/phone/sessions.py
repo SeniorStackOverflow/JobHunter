@@ -1,19 +1,26 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, cast
+from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import utcnow
-from app.models.entities import CommunicationSession
+from app.models.entities import CommunicationSession, CommunicationTurn
 from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    TurnSpeaker,
 )
 from app.phone.correlation import CorrelationResult
+from app.phone.schemas import TranscriptEntry
+
+
+def speaker_from_phonegate(value: str) -> TurnSpeaker:
+    return {"rx": TurnSpeaker.EMPLOYER, "tx": TurnSpeaker.OPERATOR}.get(value, TurnSpeaker.SYSTEM)
 
 
 class SessionStore:
@@ -90,3 +97,41 @@ class SessionStore:
             call.diagnostics = {**call.diagnostics, "close_note": note}
         call.updated_at = utcnow()
         await session.flush()
+
+    async def append_turn(
+        self,
+        session: AsyncSession,
+        *,
+        session_id: UUID,
+        entry: TranscriptEntry,
+    ) -> CommunicationTurn | None:
+        exists = await session.scalar(
+            select(CommunicationTurn.id).where(
+                CommunicationTurn.session_id == session_id,
+                CommunicationTurn.phonegate_transcript_id == entry.id,
+            )
+        )
+        if exists is not None:
+            return None
+        count = await session.scalar(
+            select(func.count(CommunicationTurn.id)).where(
+                CommunicationTurn.session_id == session_id
+            )
+        )
+        turn = CommunicationTurn(
+            session_id=session_id,
+            phonegate_transcript_id=entry.id,
+            seq=int(count or 0) + 1,
+            speaker=speaker_from_phonegate(entry.speaker),
+            text=entry.text,
+            raw_text=entry.text,
+            asr_backend=entry.backend or None,
+            asr_confidence=entry.confidence,
+            asr_meta=entry.meta or None,
+            occurred_at=datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=UTC)
+            if entry.timestamp_ms
+            else datetime.now(UTC),
+        )
+        session.add(turn)
+        await session.flush()
+        return turn
