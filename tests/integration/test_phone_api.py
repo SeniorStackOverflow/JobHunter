@@ -12,6 +12,7 @@ from app.models.entities import (
     CommunicationSession,
     CommunicationTurn,
     PhoneChannelHealth,
+    PhoneDeviceSnapshot,
     UserProfile,
 )
 from app.models.enums import (
@@ -155,6 +156,58 @@ async def test_sessions_list_and_detail(client, sqlite_session_factory) -> None:
 
     detail = (await client.get(f"/api/v1/phone/sessions/{call_id}")).json()
     assert detail["turns"][0]["text"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_status_device_block_and_idle_call(client, sqlite_session_factory) -> None:
+    """Test device snapshot appears in /status and idle call state."""
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="d", is_default=True)
+        session.add(profile)
+        await session.flush()
+
+        # Add a device snapshot
+        device_snap = PhoneDeviceSnapshot(
+            id="current",
+            payload={
+                "daemon_version": "0.2.1",
+                "battery": 87,
+                "sim_operator": "Orange",
+                "rx_audio_stats": {"captured_frames": 0, "queued_frames": 0, "dropped_frames": 0},
+            },
+            updated_at=datetime.now(UTC),
+        )
+        session.add(device_snap)
+        await session.flush()
+
+        # Add an ended call
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            remote_raw="+37360111222",
+            phonegate_event_id_start=1,
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+            outcome=CommunicationOutcome.COMPLETED,
+        )
+        session.add(call)
+        await session.commit()
+
+    body = (await client.get("/api/v1/phone/status")).json()
+
+    # Verify device block is populated
+    assert body["device"]["daemon_version"] == "0.2.1"
+    assert body["device"]["battery"] == 87
+    assert body["device"]["sim_operator"] == "Orange"
+    assert "rx_audio_stats" in body["device"]
+
+    # Verify current_call is idle since session ended
+    assert body["current_call"]["state"] == "idle"
+    assert body["current_call"]["session_id"] is None
+    assert body["current_call"]["caller_number"] is None
 
 
 @pytest.mark.asyncio

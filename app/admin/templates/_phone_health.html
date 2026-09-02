@@ -6,6 +6,14 @@
   {% if not phone_health.configured %}
   <p class="muted">Телефонный агент выключен (PHONE_AGENT_ENABLED=false).</p>
   {% endif %}
+  {% if phone_health.device %}
+  <p class="muted">
+    {{ phone_health.device.daemon_version or 'unknown' }}
+    · {{ phone_health.device.sim_operator or 'no operator' }}
+    · {% if phone_health.device.battery is not none %}{{ phone_health.device.battery }}%{% else %}unknown{% endif %}
+    · {{ format_dt(phone_health.device.updated_at) if phone_health.device.updated_at else 'never' }}
+  </p>
+  {% endif %}
   <ul class="component-list">
     {% for c in phone_health.components %}
     <li>

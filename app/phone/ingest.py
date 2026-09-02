@@ -6,11 +6,13 @@ from uuid import UUID
 import structlog
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
 from app.database.base import utcnow
-from app.models.entities import CommunicationSession
+from app.models.entities import CommunicationSession, PhoneDeviceSnapshot
 from app.models.enums import CommunicationOutcome
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.correlation import CallerCorrelation
@@ -162,7 +164,7 @@ class IngestLoop:
             status = await self._client.device_status()
         except (PhoneGateUnavailable, PhoneGateError) as exc:
             self._health.record_transport_error(type(exc).__name__)
-            await self._persist_health()
+            await self._persist_health(status=None)
             logger.warning("phone_status_poll_failed", error_type=type(exc).__name__)
             return False
 
@@ -177,7 +179,7 @@ class IngestLoop:
             page = await self._client.events(after_id=self._cursor, limit=250)
         except (PhoneGateUnavailable, PhoneGateError) as exc:
             self._health.record_transport_error(type(exc).__name__)
-            await self._persist_health()
+            await self._persist_health(status=status)
             logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
             return status.call_state != "IDLE"
 
@@ -197,12 +199,41 @@ class IngestLoop:
             await self.save_cursor(max(self._cursor, page.latest_id, ordered[-1].id))
 
         self._health.mark_poll_ok()
-        await self._persist_health()
+        await self._persist_health(status=status)
         return status.call_state != "IDLE"
 
-    async def _persist_health(self) -> None:
+    async def _persist_health(self, status: DeviceStatus | None) -> None:
         async with self._session_factory() as session:
             await self._health.persist(session)
+            if status is not None:
+                # Upsert device snapshot
+                dialect = session.bind.dialect.name if session.bind is not None else "sqlite"
+                insert = pg_insert if dialect == "postgresql" else sqlite_insert
+                payload = {
+                    "connected": status.connected,
+                    "mode": status.mode,
+                    "daemon_version": status.daemon_version,
+                    "battery": status.device.get("battery"),
+                    "sim_operator": str(
+                        status.device.get("sim_operator") or status.device.get("operator") or ""
+                    ),
+                    "rx_audio_stats": status.rx_audio_stats.model_dump(),
+                    "call_state": status.call_state,
+                    "caller_number": mask_phone(status.caller_number),
+                }
+                stmt = insert(PhoneDeviceSnapshot).values(
+                    id="current",
+                    payload=payload,
+                    updated_at=utcnow(),
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[PhoneDeviceSnapshot.id],
+                    set_={
+                        "payload": stmt.excluded.payload,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                await session.execute(stmt)
             await session.commit()
 
     async def _flag_open_session_gap(self) -> None:

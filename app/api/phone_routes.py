@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import require_api_actor
 from app.database import get_session
-from app.models.entities import CommunicationSession, CommunicationTurn, PhoneChannelHealth
+from app.models.entities import (
+    CommunicationSession,
+    CommunicationTurn,
+    PhoneChannelHealth,
+    PhoneDeviceSnapshot,
+)
 from app.models.enums import PhoneComponentStatus
 from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 from app.phone.numbers import mask_phone
@@ -39,6 +44,33 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
     newest = await session.scalar(
         select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
     )
+
+    # Read device snapshot
+    device_snapshot = await session.scalar(
+        select(PhoneDeviceSnapshot).where(PhoneDeviceSnapshot.id == "current")
+    )
+    device_block = device_snapshot.payload if device_snapshot else {}
+
+    # Determine current_call state
+    if newest is None or newest.ended_at is not None:
+        current_call = {
+            "state": "idle",
+            "session_id": None,
+            "caller_number": None,
+        }
+    elif newest.answered_at is not None:
+        current_call = {
+            "state": "connected",
+            "session_id": str(newest.id),
+            "caller_number": mask_phone(newest.remote_address),
+        }
+    else:
+        current_call = {
+            "state": "ringing",
+            "session_id": str(newest.id),
+            "caller_number": mask_phone(newest.remote_address),
+        }
+
     return {
         "channel": channel_status(components).value if components else "unknown",
         "agent": {
@@ -57,13 +89,8 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
             }
             for r in rows
         ],
-        "current_call": {
-            "session_id": str(newest.id) if newest else None,
-            "state": "connected"
-            if newest and newest.ended_at is None and newest.answered_at is not None
-            else ("ringing" if newest and newest.ended_at is None else "idle"),
-            "caller_number": mask_phone(newest.remote_address) if newest else None,
-        },
+        "device": device_block,
+        "current_call": current_call,
     }
 
 

@@ -424,7 +424,7 @@ def _pagination(total: int, requested_page: int, per_page: int) -> dict[str, int
 
 async def _phone_health(session: AsyncSession) -> dict[str, Any]:
     """Query phone channel health and aggregate component status."""
-    from app.models.entities import PhoneChannelHealth
+    from app.models.entities import PhoneChannelHealth, PhoneDeviceSnapshot
     from app.models.enums import PhoneComponentStatus
     from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 
@@ -443,6 +443,12 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
     components = [
         HealthComponent(r.component, _effective_status(r), r.detail, r.last_ok_at) for r in rows
     ]
+
+    # Read device snapshot
+    device_snapshot = await session.scalar(
+        select(PhoneDeviceSnapshot).where(PhoneDeviceSnapshot.id == "current")
+    )
+
     return {
         "channel": channel_status(components).value if components else "unknown",
         "components": [
@@ -455,6 +461,7 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
             for c in sorted(components, key=lambda c: c.component)
         ],
         "configured": get_settings().phone_agent_enabled,
+        "device": device_snapshot.payload if device_snapshot else {},
     }
 
 

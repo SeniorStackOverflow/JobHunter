@@ -8,8 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import (
     AuditEvent,
+    CallFact,
     CommunicationSession,
     CommunicationTurn,
+    InterviewAppointment,
     PhoneChannelHealth,
     UserProfile,
 )
@@ -78,6 +80,9 @@ async def test_agent_restart_reconciles_dangling_session(
         if cursor is None:
             status = await c2.device_status()
             await loop2.save_cursor(status.latest_event_id)
+        # Exercise reconcile path end-to-end
+        status = await c2.device_status()
+        await loop2.reconcile(status)
         fake.hangup()
         for _ in range(3):
             await loop2.run_cycle()
@@ -123,6 +128,8 @@ async def test_full_call_persists_complete_graph(
         turns = (await session.scalars(select(CommunicationTurn))).all()
         audits = (await session.scalars(select(AuditEvent))).all()
         health = (await session.scalars(select(PhoneChannelHealth))).all()
+        facts = (await session.scalars(select(CallFact))).all()
+        appointments = (await session.scalars(select(InterviewAppointment))).all()
 
     # full graph assertions
     assert len(sessions) == 1
@@ -136,3 +143,6 @@ async def test_full_call_persists_complete_graph(
     assert any(a.action == "communication_session.opened" for a in audits)
     assert len(health) > 0
     assert {h.component for h in health} >= {"phonegate_transport", "a14_daemon", "agent"}
+    # Phase 1 does not write CallFact or InterviewAppointment, so these should be empty
+    assert facts == []
+    assert appointments == []

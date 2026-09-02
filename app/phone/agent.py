@@ -67,7 +67,7 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
         except (PhoneGateUnavailable, PhoneGateError) as exc:
             logger.warning("phone_agent_startup_status_failed", error_type=type(exc).__name__)
             ingest._health.record_transport_error(type(exc).__name__)
-            await ingest._persist_health()
+            await ingest._persist_health(status=None)
         else:
             if cursor is None:
                 # Spec §7.4: first start against a running PhoneGate must not
