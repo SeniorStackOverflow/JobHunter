@@ -78,7 +78,7 @@ async def test_append_turn_is_idempotent(db: AsyncSession) -> None:
 
     entry2 = TranscriptEntry(id=6, speaker="tx", text="ответ", timestamp_ms=2)
     third = await store.append_turn(db, session_id=call.id, entry=entry2)
-    assert third is not None and third.seq == 2 and third.speaker == TurnSpeaker.OPERATOR
+    assert third is not None and third.seq == 2 and third.speaker == TurnSpeaker.ASSISTANT
     assert speaker_from_phonegate("weird") is TurnSpeaker.SYSTEM
 
 
@@ -170,3 +170,62 @@ async def test_open_with_diagnostics_and_note(db: AsyncSession) -> None:
     assert refreshed.diagnostics.get("note") == "test_note"
     assert refreshed.diagnostics.get("daemon_version") == "0.2.1"
     assert refreshed.diagnostics.get("sim_operator") == "Orange"
+
+
+async def test_record_assistant_turn_and_delivery(db: AsyncSession) -> None:
+    from app.models.enums import TurnDeliveryStatus, TurnSpeaker
+
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
+    await db.flush()
+    turn = await store.record_assistant_turn(
+        db,
+        session_id=call.id,
+        phonegate_transcript_id=7,
+        spoken_text="Здравствуйте",
+        delivery_status=TurnDeliveryStatus.ATTEMPTED,
+        occurred_at=now,
+    )
+    assert turn.speaker is TurnSpeaker.ASSISTANT
+    assert turn.spoken_text == "Здравствуйте"
+    assert turn.seq == 1
+    await store.set_turn_delivery(db, turn_id=turn.id, status=TurnDeliveryStatus.DELIVERED)
+    await db.commit()
+    refreshed = await db.get(type(turn), turn.id)
+    assert refreshed is not None and refreshed.delivery_status is TurnDeliveryStatus.DELIVERED
+
+
+async def test_set_script_stage_and_mark_auto_answered(db: AsyncSession) -> None:
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
+    await store.mark_auto_answered(call, now)
+    await store.set_script_stage(call, "greeting")
+    await db.commit()
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.auto_answered is True
+    assert refreshed.answered_at is not None
+    assert refreshed.script_stage == "greeting"
+
+
+def test_speaker_from_phonegate_tx_is_assistant() -> None:
+    from app.models.enums import TurnSpeaker
+    from app.phone.sessions import speaker_from_phonegate
+
+    assert speaker_from_phonegate("tx") is TurnSpeaker.ASSISTANT
