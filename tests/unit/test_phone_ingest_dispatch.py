@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -346,6 +348,84 @@ async def test_audit_synthetic_session_opened(
 
 
 # A4 tests
+async def test_malformed_transcript_event_is_skipped_not_fatal(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F2 / BLOCKER: a transcript event whose payload fails validation is logged
+    and skipped; the call and its good turns are intact and the cursor advances."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.transcript(speaker="rx", text="good one")
+        fake.emit_raw("transcript", {"transcript": {"id": "not-an-int", "speaker": "rx"}})
+        fake.transcript(speaker="tx", text="good two")
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert len(calls) == 1
+    assert calls[0].outcome == CommunicationOutcome.COMPLETED
+    assert sorted(t.text for t in turns) == ["good one", "good two"]
+    # cursor advanced past every event including the poison one
+    assert await redis.get("job-agent:phone:events:cursor") == "7"
+
+
+async def test_poison_event_in_batch_does_not_stop_following_events(
+    profiled_factory: async_sessionmaker[AsyncSession],
+    redis: FakeAsyncRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F2 / BLOCKER: an event whose dispatch raises is isolated in its own
+    savepoint; later events in the same batch still commit and the cursor
+    advances past the poison event."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        real_dispatch = loop._dispatch
+
+        async def _flaky_dispatch(session: Any, event: Any, st: Any) -> None:
+            if (
+                event.type == "transcript"
+                and event.data.get("transcript", {}).get("text") == "BOOM"
+            ):
+                raise RuntimeError("simulated handler failure")
+            await real_dispatch(session, event, st)
+
+        monkeypatch.setattr(loop, "_dispatch", _flaky_dispatch)
+
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.transcript(speaker="rx", text="before")
+        fake.transcript(speaker="rx", text="BOOM")
+        fake.transcript(speaker="rx", text="after")
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert len(calls) == 1
+    assert sorted(t.text for t in turns) == ["after", "before"]
+    assert calls[0].ended_at is not None
+    assert await redis.get("job-agent:phone:events:cursor") == "7"
+
+
 async def test_fast_call_completing_during_restart_is_not_lost(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:

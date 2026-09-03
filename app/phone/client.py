@@ -4,12 +4,16 @@ from types import TracebackType
 from typing import Any
 
 import httpx
+import structlog
+from pydantic import ValidationError
 
-from app.phone.schemas import DeviceStatus, EventsPage, TranscriptPage
+from app.phone.schemas import DeviceStatus, EventsPage, PhoneEvent, TranscriptPage
+
+logger = structlog.get_logger(__name__)
 
 
 class PhoneGateError(RuntimeError):
-    """PhoneGate rejected the request (HTTP 4xx)."""
+    """PhoneGate rejected the request, or answered 200 with a body we cannot use."""
 
 
 class PhoneGateUnavailable(RuntimeError):
@@ -55,7 +59,10 @@ class PhoneGateClient:
             raise PhoneGateUnavailable(f"{path}: HTTP {response.status_code}")
         if response.status_code >= 400:
             raise PhoneGateError(f"{path}: HTTP {response.status_code}")
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PhoneGateError(f"{path}: response body is not JSON") from exc
         if not isinstance(payload, dict):
             raise PhoneGateError(f"{path}: unexpected payload")
         return payload
@@ -64,14 +71,33 @@ class PhoneGateClient:
         return await self._get("/api/health")
 
     async def device_status(self) -> DeviceStatus:
-        return DeviceStatus.model_validate(await self._get("/api/device/status"))
+        data = await self._get("/api/device/status")
+        try:
+            return DeviceStatus.model_validate(data)
+        except ValidationError as exc:
+            raise PhoneGateError("/api/device/status: unexpected response schema") from exc
 
     async def events(self, *, after_id: int, limit: int = 250) -> EventsPage:
-        return EventsPage.model_validate(
-            await self._get("/api/events", {"after_id": after_id, "limit": limit})
-        )
+        data = await self._get("/api/events", {"after_id": after_id, "limit": limit})
+        parsed: list[PhoneEvent] = []
+        for raw in data.get("events") or []:
+            try:
+                parsed.append(PhoneEvent.model_validate(raw))
+            except ValidationError:
+                # One malformed event must not sink the whole page (spec §4.2).
+                logger.warning("phone_event_malformed", raw=repr(raw)[:200])
+        try:
+            return EventsPage(
+                events=parsed,
+                latest_id=int(data.get("latest_id") or 0),
+                last_incoming_call=data.get("last_incoming_call"),
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise PhoneGateError("/api/events: unexpected response schema") from exc
 
     async def transcript(self, *, after_id: int = 0, limit: int = 250) -> TranscriptPage:
-        return TranscriptPage.model_validate(
-            await self._get("/api/call/transcript", {"after_id": after_id, "limit": limit})
-        )
+        data = await self._get("/api/call/transcript", {"after_id": after_id, "limit": limit})
+        try:
+            return TranscriptPage.model_validate(data)
+        except ValidationError as exc:
+            raise PhoneGateError("/api/call/transcript: unexpected response schema") from exc

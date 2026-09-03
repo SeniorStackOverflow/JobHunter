@@ -4,6 +4,7 @@ from datetime import timedelta
 from uuid import UUID
 
 import structlog
+from pydantic import ValidationError
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -240,10 +241,7 @@ class IngestLoop:
             dispatched_max = 0
             if fresh.events:
                 ordered = sorted(fresh.events, key=lambda event: event.id)
-                async with self._session_factory() as session:
-                    for event in ordered:
-                        await self._dispatch(session, event, status)
-                    await session.commit()
+                await self._dispatch_batch(ordered, status)
                 dispatched_max = ordered[-1].id
             await self.reconcile(status)
             await self.save_cursor(max(fresh.latest_id, dispatched_max, 0))
@@ -252,10 +250,7 @@ class IngestLoop:
             if ordered[0].id > self._cursor + 1:
                 logger.warning("phone_events_gap", first=ordered[0].id, cursor=self._cursor)
                 await self._flag_open_session_gap()
-            async with self._session_factory() as session:
-                for event in ordered:
-                    await self._dispatch(session, event, status)
-                await session.commit()
+            await self._dispatch_batch(ordered, status)
             await self.save_cursor(max(self._cursor, page.latest_id, ordered[-1].id))
 
         self._health.mark_poll_ok()
@@ -305,6 +300,25 @@ class IngestLoop:
                 await session.commit()
 
     # ---- event dispatch -----------------------------------------------
+
+    async def _dispatch_batch(self, ordered: list[PhoneEvent], status: DeviceStatus) -> None:
+        """Dispatch events one at a time, each in its own savepoint, so a single
+        malformed or failing event is logged and skipped without poisoning the
+        session or stopping the batch (spec §4.2). The caller still advances the
+        cursor past every event, poison included."""
+        async with self._session_factory() as session:
+            for event in ordered:
+                try:
+                    async with session.begin_nested():
+                        await self._dispatch(session, event, status)
+                except Exception as exc:
+                    logger.warning(
+                        "phone_event_dispatch_failed",
+                        event_id=event.id,
+                        event_type=event.type,
+                        error=type(exc).__name__,
+                    )
+            await session.commit()
 
     async def _dispatch(
         self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
@@ -438,7 +452,11 @@ class IngestLoop:
         payload = event.data.get("transcript")
         if not isinstance(payload, dict):
             return
-        entry = TranscriptEntry.model_validate(payload)
+        try:
+            entry = TranscriptEntry.model_validate(payload)
+        except ValidationError:
+            logger.warning("phone_transcript_malformed", event_id=event.id, raw=repr(payload)[:200])
+            return
         open_row = await self._store.find_open(session)
         if open_row is None:
             if status.call_state == "IDLE":

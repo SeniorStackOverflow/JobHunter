@@ -90,6 +90,10 @@ class FakePhoneGate:
         self._call_state, self._caller = "IDLE", ""
         self._emit("call_state", self._call_state_data())
 
+    def emit_raw(self, event_type: str, data: dict[str, Any]) -> int:
+        """Append an event with an arbitrary type/data shape (for resilience tests)."""
+        return self._emit(event_type, data)
+
     def set_connected(self, value: bool) -> None:
         self._connected = value
 
