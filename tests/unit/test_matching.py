@@ -57,7 +57,6 @@ def test_jobhunter_llmrouter_keeps_preference_and_waits_past_upstream_timeout() 
     assert provider.timeout_seconds == 75.0
 
 
-
 def test_matching_batch_reserves_capacity_for_priority_rematches() -> None:
     regular = [uuid4() for _ in range(4)]
     priority = [uuid4() for _ in range(3)]

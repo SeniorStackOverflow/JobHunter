@@ -50,6 +50,17 @@ class OneTimeDetailFailureFetcher(FixtureSiteFetcher):
         return await super().get(url)
 
 
+class SelectiveAbsenceFetcher(FixtureSiteFetcher):
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        super().__init__(client)
+        self.absent_paths: set[str] = set()
+
+    async def get(self, url: str, **_kwargs: object) -> httpx.Response:
+        if httpx.URL(url).path in self.absent_paths:
+            return httpx.Response(404, request=httpx.Request("GET", url))
+        return await super().get(url)
+
+
 def make_source(
     configuration: dict[str, Any],
     *,
@@ -452,9 +463,7 @@ async def test_recheck_batch_prioritizes_possible_closures_and_oldest_jobs(
         jobs = {
             job.external_job_id: job
             for job in (
-                await session.scalars(
-                    select(SourceJob).where(SourceJob.source_id == source_id)
-                )
+                await session.scalars(select(SourceJob).where(SourceJob.source_id == source_id))
             ).all()
         }
         for job in jobs.values():
@@ -478,9 +487,7 @@ async def test_recheck_batch_prioritizes_possible_closures_and_oldest_jobs(
         jobs = {
             job.external_job_id: job
             for job in (
-                await session.scalars(
-                    select(SourceJob).where(SourceJob.source_id == source_id)
-                )
+                await session.scalars(select(SourceJob).where(SourceJob.source_id == source_id))
             ).all()
         }
         assert jobs["fx-003"].last_checked_at.replace(tzinfo=UTC) > old_possible
@@ -488,6 +495,129 @@ async def test_recheck_batch_prioritizes_possible_closures_and_oldest_jobs(
         assert jobs["fx-005"].last_checked_at.replace(tzinfo=UTC) == other_old
         assert jobs["fx-001"].last_checked_at.replace(tzinfo=UTC) == now
 
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prioritized_closure_batch_does_not_trigger_source_mass_absence(
+    fixture_site_client: httpx.AsyncClient,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    fetcher = SelectiveAbsenceFetcher(fixture_site_client)
+    registry = build_default_registry(client_factory=lambda _source: fetcher)
+    service = ScanService(sqlite_session_factory, registry)
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Closure-heavy recheck fixture"),
+    )
+    full = await run_full_scan(service, source_id)
+    assert full.status == RunStatus.SUCCEEDED
+
+    async with sqlite_session_factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(SourceJob)
+                    .where(
+                        SourceJob.source_id == source_id,
+                        SourceJob.status == JobStatus.ACTIVE,
+                    )
+                    .order_by(SourceJob.id)
+                    .limit(4)
+                )
+            ).all()
+        )
+        assert len(jobs) == 4
+        for job in jobs:
+            job.status = JobStatus.POSSIBLY_CLOSED
+            job.confirmed_absence_count = 2
+            fetcher.absent_paths.add(httpx.URL(job.canonical_url).path)
+        await session.commit()
+
+    result = await service.recheck_active_jobs(
+        source_id,
+        close_after_confirmed_absence_count=3,
+        max_jobs_per_run=4,
+    )
+
+    assert result == {
+        "checked": 4,
+        "updated": 0,
+        "possibly_closed": 0,
+        "closed": 4,
+        "errors": 0,
+    }
+    async with sqlite_session_factory() as session:
+        source = await session.get(JobSource, source_id)
+        assert source is not None
+        assert source.health_status == SourceHealth.HEALTHY
+        assert source.automatic_actions_paused is False
+        alert = await session.scalar(
+            select(Alert).where(
+                Alert.source_id == source_id,
+                Alert.code == "mass_absence_suppressed",
+            )
+        )
+        assert alert is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recent_active_sentinels_still_detect_source_mass_absence(
+    fixture_site_client: httpx.AsyncClient,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    fetcher = SelectiveAbsenceFetcher(fixture_site_client)
+    registry = build_default_registry(client_factory=lambda _source: fetcher)
+    service = ScanService(sqlite_session_factory, registry)
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Sentinel guard fixture"),
+    )
+    full = await run_full_scan(service, source_id)
+    assert full.status == RunStatus.SUCCEEDED
+
+    async with sqlite_session_factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(SourceJob).where(
+                        SourceJob.source_id == source_id,
+                        SourceJob.status == JobStatus.ACTIVE,
+                    )
+                )
+            ).all()
+        )
+        assert len(jobs) >= 4
+        for job in jobs:
+            fetcher.absent_paths.add(httpx.URL(job.canonical_url).path)
+
+    result = await service.recheck_active_jobs(source_id, max_jobs_per_run=4)
+
+    assert result == {
+        "checked": 4,
+        "updated": 0,
+        "possibly_closed": 0,
+        "closed": 0,
+        "errors": 0,
+    }
+    async with sqlite_session_factory() as session:
+        source = await session.get(JobSource, source_id)
+        assert source is not None
+        assert source.health_status == SourceHealth.DEGRADED
+        assert source.automatic_actions_paused is True
+        alert = await session.scalar(
+            select(Alert).where(
+                Alert.source_id == source_id,
+                Alert.code == "mass_absence_suppressed",
+            )
+        )
+        assert alert is not None
+        assert alert.safe_diagnostics["sentinel_checked"] >= 4
+        assert (
+            alert.safe_diagnostics["sentinel_absent"] == alert.safe_diagnostics["sentinel_checked"]
+        )
 
 
 @pytest.mark.integration

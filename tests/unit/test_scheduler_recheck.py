@@ -1,5 +1,10 @@
+from uuid import uuid4
+
+from app.models.enums import SourceHealth
 from app.scheduler.tasks import (
     RecheckPolicy,
+    SourceSchedule,
+    _operation_allowed_for_source,
     _recheck_policy_from_configuration,
 )
 
@@ -44,3 +49,31 @@ def test_recheck_policy_rejects_out_of_range_values_to_safe_defaults() -> None:
     )
 
     assert policy == RecheckPolicy()
+
+
+def test_degraded_source_allows_only_incremental_recovery_probe() -> None:
+    source = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="rabota_md",
+        configuration={},
+        health_status=SourceHealth.DEGRADED,
+        has_successful_full_scan=True,
+    )
+
+    assert _operation_allowed_for_source(source, "incremental") is True
+    assert _operation_allowed_for_source(source, "recheck") is False
+    assert _operation_allowed_for_source(source, "full") is False
+
+
+def test_healthy_source_keeps_normal_scheduled_operations() -> None:
+    source = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="rabota_md",
+        configuration={},
+        health_status=SourceHealth.HEALTHY,
+        has_successful_full_scan=True,
+    )
+
+    assert _operation_allowed_for_source(source, "incremental") is True
+    assert _operation_allowed_for_source(source, "recheck") is True
+    assert _operation_allowed_for_source(source, "full") is True

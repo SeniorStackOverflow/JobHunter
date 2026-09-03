@@ -51,6 +51,7 @@ class SourceSchedule:
     source_id: UUID
     adapter_type: str
     configuration: dict[str, Any]
+    health_status: SourceHealth
     has_successful_full_scan: bool
 
 
@@ -130,7 +131,7 @@ async def _load_enabled_sources() -> list[SourceSchedule]:
                     select(JobSource).where(
                         JobSource.enabled.is_(True),
                         JobSource.health_status.notin_(
-                            [SourceHealth.DEGRADED, SourceHealth.PAUSED, SourceHealth.DISABLED]
+                            [SourceHealth.PAUSED, SourceHealth.DISABLED]
                         ),
                     )
                 )
@@ -151,6 +152,7 @@ async def _load_enabled_sources() -> list[SourceSchedule]:
             source_id=source.id,
             adapter_type=source.adapter_type,
             configuration=dict(source.configuration),
+            health_status=source.health_status,
             has_successful_full_scan=source.id in successful_full_source_ids,
         )
         for source in sources
@@ -230,9 +232,7 @@ def _recheck_policy_from_configuration(configuration: object) -> RecheckPolicy:
                 max_jobs if isinstance(max_jobs, int) and 1 <= max_jobs <= 10_000 else 300
             ),
             min_recheck_interval_hours=(
-                min_interval
-                if isinstance(min_interval, int) and 0 <= min_interval <= 168
-                else 20
+                min_interval if isinstance(min_interval, int) and 0 <= min_interval <= 168 else 20
             ),
         )
     return RecheckPolicy()
@@ -394,12 +394,20 @@ def recheck_source_task(self: Task, source_id: str) -> dict[str, int | str]:
         close_redis_client(client)
 
 
+def _operation_allowed_for_source(source: SourceSchedule, operation: str) -> bool:
+    # A degraded source may run its scheduled incremental scan as a bounded recovery probe.
+    # Rechecks and full scans stay suppressed until a successful scan restores HEALTHY.
+    return source.health_status != SourceHealth.DEGRADED or operation == "incremental"
+
+
 def _dispatch_one(
     client: Redis,
     source: SourceSchedule,
     operation: str,
     now: datetime,
 ) -> str | None:
+    if not _operation_allowed_for_source(source, operation):
+        return None
     # A newly enabled source must complete its initial full scan before Beat can launch
     # incremental/recheck work. This keeps the operator-controlled first scan deterministic.
     if operation in {"incremental", "recheck"} and not source.has_successful_full_scan:

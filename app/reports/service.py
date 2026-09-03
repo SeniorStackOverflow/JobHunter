@@ -104,8 +104,7 @@ async def _daily_matching_metrics(
         "matching_attempts": len(rows),
         "matching_evaluated": len(latest_by_source),
         "matching_jobs": (
-            final_counts[MatchDecision.AUTO_APPLY]
-            + final_counts[MatchDecision.PREPARE_FOR_REVIEW]
+            final_counts[MatchDecision.AUTO_APPLY] + final_counts[MatchDecision.PREPARE_FOR_REVIEW]
         ),
         "matching_decisions": {
             "auto_apply": final_counts[MatchDecision.AUTO_APPLY],
@@ -361,6 +360,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
         **limit_metrics,
     }
     from app.learning.shadow import shadow_scorecard
+
     summary["learning_shadow"] = [
         await shadow_scorecard(session, profile.id)
         for profile in await ProfileService().list_profiles(session)
