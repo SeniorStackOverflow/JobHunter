@@ -1093,9 +1093,12 @@ async def test_periodic_prepare_revives_only_auto_skipped_cancelled_application(
         assert restored.match_evaluation_id != old_evaluation_id
         assert restored.status == ApplicationStatus.AUTO_APPROVED
         assert restored.policy_decision == PolicyDecision.AUTO_APPROVED
-        assert await session.scalar(
-            select(EmailDelivery.id).where(EmailDelivery.application_id == application_id)
-        ) is None
+        assert (
+            await session.scalar(
+                select(EmailDelivery.id).where(EmailDelivery.application_id == application_id)
+            )
+            is None
+        )
 
 
 async def test_periodic_prepare_never_revives_explicitly_cancelled_application(
@@ -1175,7 +1178,13 @@ async def test_periodic_prepare_does_not_revive_historical_auto_skip_without_tod
     async with sqlite_session_factory() as session:
         values = await make_graph(session, tmp_path)
         profile, preference, resume, canonical, job, evaluation, application = (
-            values[1], values[2], values[3], values[4], values[5], values[6], values[8]
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],
+            values[6],
+            values[8],
         )
         application.status = ApplicationStatus.CANCELLED
         application.policy_decision = PolicyDecision.SKIPPED

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -2225,6 +2225,41 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
         assert "jobs.example.test" in serialized_source
         assert "[redacted]" in serialized_source
         assert "visible" in serialized_source
+
+        async with sqlite_session_factory() as session:
+            stored_source = await session.get(JobSource, UUID(source_id))
+            assert stored_source is not None
+            stored_source.health_status = SourceHealth.DEGRADED
+            stored_source.automatic_actions_paused = True
+            session.add(
+                Alert(
+                    source_id=stored_source.id,
+                    severity="critical",
+                    code="mass_absence_suppressed",
+                    message="Recheck guardrail fired",
+                    safe_diagnostics={"checked": 300, "absent": 260},
+                )
+            )
+            await session.commit()
+
+        source_health = await client.post(
+            "/mcp",
+            headers=headers,
+            json=_mcp_request(
+                22,
+                "tools/call",
+                {"name": "get_source_health", "arguments": {"source_id": source_id}},
+            ),
+        )
+        health_payload = _tool_payload(source_health)
+        assert health_payload["health"] == "degraded"
+        assert health_payload["automatic_actions_paused"] is True
+        assert health_payload["latest_alert"]["code"] == "mass_absence_suppressed"
+        assert health_payload["latest_alert"]["severity"] == "critical"
+        assert health_payload["latest_alert"]["safe_diagnostics"] == {
+            "checked": 300,
+            "absent": 260,
+        }
 
         blocked_send = await client.post(
             "/mcp",

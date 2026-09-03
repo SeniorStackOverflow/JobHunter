@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.applications.availability import block_closed_vacancy_applications
 from app.audit import record_audit_event
 from app.crawlers.registry import JobSourceAdapterRegistry
-from app.crawlers.schemas import NormalizedJobData, RawJobReference, ScanCheckpoint
+from app.crawlers.schemas import (
+    JobRecheckResult,
+    NormalizedJobData,
+    RawJobReference,
+    ScanCheckpoint,
+)
 from app.deduplication import DeduplicationService
 from app.matching.source_version import (
     changes_require_rematch,
@@ -842,20 +847,51 @@ class ScanService:
             if max_jobs_per_run is not None:
                 query = query.limit(max_jobs_per_run)
             jobs = list((await session.scalars(query)).all())
+            # The bounded queue intentionally prioritizes POSSIBLY_CLOSED jobs and high absence
+            # counts, so it is not representative enough for a source-wide disappearance guard.
+            # Probe recently seen clean ACTIVE jobs separately and use those as health sentinels.
+            sentinel_jobs = list(
+                (
+                    await session.scalars(
+                        select(SourceJob)
+                        .where(
+                            SourceJob.source_id == source_id,
+                            SourceJob.status == JobStatus.ACTIVE,
+                            SourceJob.confirmed_absence_count == 0,
+                        )
+                        .order_by(SourceJob.last_seen_at.desc(), SourceJob.id)
+                        .limit(10)
+                    )
+                ).all()
+            )
             adapter = self.registry.create(source)
             results: list[tuple[SourceJob, Any]] = []
+            sentinel_results: list[tuple[SourceJob, Any]] = []
+            result_by_job_id: dict[UUID, JobRecheckResult] = {}
             try:
                 for job in jobs:
-                    results.append((job, await adapter.recheck_job(job)))
+                    result = await adapter.recheck_job(job)
+                    results.append((job, result))
+                    result_by_job_id[job.id] = result
+                for job in sentinel_jobs:
+                    sentinel_result = result_by_job_id.get(job.id)
+                    if sentinel_result is None:
+                        sentinel_result = await adapter.recheck_job(job)
+                        result_by_job_id[job.id] = sentinel_result
+                    sentinel_results.append((job, sentinel_result))
             finally:
                 await adapter.aclose()
             absences = sum(result.exists is False for _, result in results)
-            degraded_results = sum(result.adapter_degraded for _, result in results)
+            degraded_results = sum(result.adapter_degraded for result in result_by_job_id.values())
+            sentinel_absences = sum(result.exists is False for _, result in sentinel_results)
             suspicious_mass_absence = bool(
-                results
+                sentinel_results
                 and (
-                    (len(results) >= 2 and absences == len(results))
-                    or (len(results) >= 4 and absences / len(results) > 0.5)
+                    (len(sentinel_results) >= 2 and sentinel_absences == len(sentinel_results))
+                    or (
+                        len(sentinel_results) >= 4
+                        and sentinel_absences / len(sentinel_results) > 0.5
+                    )
                 )
             )
             if degraded_results or suspicious_mass_absence:
@@ -873,6 +909,8 @@ class ScanService:
                         safe_diagnostics={
                             "checked": len(results),
                             "absent": absences,
+                            "sentinel_checked": len(sentinel_results),
+                            "sentinel_absent": sentinel_absences,
                             "adapter_degraded": degraded_results,
                         },
                     )
@@ -884,6 +922,10 @@ class ScanService:
                     "possibly_closed": 0,
                     "closed": 0,
                     "errors": degraded_results,
+                    "guardrail_triggered": 1,
+                    "absent": absences,
+                    "sentinel_checked": len(sentinel_results),
+                    "sentinel_absent": sentinel_absences,
                 }
             counters = {
                 "checked": len(results),
