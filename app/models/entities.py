@@ -44,6 +44,7 @@ from app.models.enums import (
     ScanType,
     ShadowDecision,
     SourceHealth,
+    TurnDeliveryStatus,
     TurnSpeaker,
     VerificationStatus,
 )
@@ -650,6 +651,8 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outcome: Mapped[CommunicationOutcome | None] = mapped_column(enum_column(CommunicationOutcome))
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    auto_answered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    script_stage: Mapped[str | None] = mapped_column(String(32))
     rx_frame_stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -681,6 +684,12 @@ class CommunicationTurn(UUIDPrimaryKeyMixin, Base):
     asr_backend: Mapped[str | None] = mapped_column(String(32))
     asr_confidence: Mapped[float | None] = mapped_column(Float)
     asr_meta: Mapped[str | None] = mapped_column(String(255))
+    delivery_status: Mapped[TurnDeliveryStatus] = mapped_column(
+        enum_column(TurnDeliveryStatus),
+        default=TurnDeliveryStatus.NOT_APPLICABLE,
+        nullable=False,
+    )
+    spoken_text: Mapped[str | None] = mapped_column(Text)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
