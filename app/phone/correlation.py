@@ -81,58 +81,45 @@ class CallerCorrelation:
         contact = contacts[0] if contacts else None
 
         if contact is None:
-            # 2. Scalar public_phone match.
-            job = await session.scalar(
-                select(SourceJob)
-                .where(SourceJob.public_phone == e164)
-                .order_by(SourceJob.last_seen_at.desc())
-                .limit(1)
-            )
-            if job is not None and job.canonical_job_id is not None:
+            # 2. Match SourceJob by phone — the scalar public_phone column AND the
+            # public_phones[] array, gathered together so ambiguity across the two
+            # is caught (one number on two different vacancies -> not attributable).
+            # No status filter (steps 1 & 4 don't filter either; a call-back about
+            # a role that has since closed is the common case). No row cap.
+            # TODO: a normalized, indexed employer-phone table would remove this
+            # full scan (deferred past Phase 1).
+            rows = (
+                await session.execute(
+                    select(
+                        SourceJob.id,
+                        SourceJob.canonical_job_id,
+                        SourceJob.public_phone,
+                        SourceJob.public_phones,
+                        SourceJob.employer_url,
+                        SourceJob.canonical_url,
+                    )
+                    .where(SourceJob.canonical_job_id.is_not(None))
+                    .order_by(SourceJob.last_seen_at.desc())
+                )
+            ).all()
+            matches = [
+                r
+                for r in rows
+                if r.public_phone == e164 or (r.public_phones and e164 in r.public_phones)
+            ]
+            if len({r.canonical_job_id for r in matches}) > 1:
+                return CorrelationResult(default_profile_id, None, None, None, None, ambiguous=True)
+            if matches:
+                r = matches[0]  # rows are already newest-first
                 contact = _contact_from_job(
-                    canonical_job_id=job.canonical_job_id,
-                    source_job_id=job.id,
+                    canonical_job_id=r.canonical_job_id,
+                    source_job_id=r.id,
                     e164=e164,
-                    official_domain=_domain(job.employer_url or job.canonical_url),
-                    evidence_url=job.canonical_url,
+                    official_domain=_domain(r.employer_url or r.canonical_url),
+                    evidence_url=r.canonical_url,
                 )
                 session.add(contact)
                 await session.flush()
-            else:
-                # 3. public_phones[] array scan — minimal columns, NO row cap and
-                # NO status filter (steps 1-2 match regardless of job status; a
-                # call-back about a role that has since closed is the common case).
-                # TODO: a normalized, indexed employer-phone table would remove this
-                # full scan (deferred past Phase 1).
-                rows = (
-                    await session.execute(
-                        select(
-                            SourceJob.id,
-                            SourceJob.canonical_job_id,
-                            SourceJob.public_phones,
-                            SourceJob.employer_url,
-                            SourceJob.canonical_url,
-                        )
-                        .where(SourceJob.canonical_job_id.is_not(None))
-                        .order_by(SourceJob.last_seen_at.desc())
-                    )
-                ).all()
-                matches = [r for r in rows if r.public_phones and e164 in r.public_phones]
-                if len({r.canonical_job_id for r in matches}) > 1:
-                    return CorrelationResult(
-                        default_profile_id, None, None, None, None, ambiguous=True
-                    )
-                if matches:
-                    r = matches[0]
-                    contact = _contact_from_job(
-                        canonical_job_id=r.canonical_job_id,
-                        source_job_id=r.id,
-                        e164=e164,
-                        official_domain=_domain(r.employer_url or r.canonical_url),
-                        evidence_url=r.canonical_url,
-                    )
-                    session.add(contact)
-                    await session.flush()
 
         if contact is None:
             return CorrelationResult(default_profile_id, None, None, None, None)

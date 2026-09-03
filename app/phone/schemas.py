@@ -25,6 +25,10 @@ class DeviceStatus(_Lenient):
     rx_audio_stats: RxAudioStats = Field(default_factory=RxAudioStats)
     device: dict[str, Any] = Field(default_factory=dict)
     latest_event_id: int = 0
+    # Identifier for the current Web Studio process; changes on every restart.
+    # Absent on older PhoneGate builds — the ingest loop then falls back to the
+    # event-id heuristic for restart detection.
+    boot_id: str = ""
 
     @property
     def is_daemon_mode(self) -> bool:
@@ -42,6 +46,7 @@ class EventsPage(_Lenient):
     events: list[PhoneEvent] = Field(default_factory=list)
     latest_id: int = 0
     last_incoming_call: dict[str, Any] | None = None
+    boot_id: str = ""
 
 
 class TranscriptEntry(_Lenient):

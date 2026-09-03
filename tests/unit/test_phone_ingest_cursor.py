@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -10,7 +11,7 @@ from app.models.entities import CommunicationSession, UserProfile
 from app.models.enums import CommunicationChannel, CommunicationDirection
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
-from app.phone.ingest import EVENTS_CURSOR_KEY, IngestLoop
+from app.phone.ingest import EVENTS_STATE_KEY, IngestLoop
 from app.phone.schemas import DeviceStatus, EventsPage, PhoneEvent
 from app.phone.sessions import SessionStore
 from app.settings.config import Settings
@@ -48,7 +49,7 @@ async def test_load_cursor_reports_absent_key_as_none(
     assert loop._cursor_seeded is False  # Still not seeded
     await loop.save_cursor(9)
     assert loop._cursor_seeded is True  # Now seeded after save
-    assert await redis.get(EVENTS_CURSOR_KEY) == "9"
+    assert json.loads(await redis.get(EVENTS_STATE_KEY))["cursor"] == 9
     assert await loop.load_cursor() == 9
     assert loop._cursor_seeded is True  # Still seeded after load
 

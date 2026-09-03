@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from uuid import UUID
 
@@ -25,8 +26,11 @@ from app.settings.config import Settings
 
 logger = structlog.get_logger(__name__)
 
-EVENTS_CURSOR_KEY = "job-agent:phone:events:cursor"
-EVENTS_GENERATION_KEY = "job-agent:phone:events:generation"
+# One key holds {cursor, generation, boot_id} as JSON so the three move together:
+# a generation transition is a single atomic write, and losing the key loses all
+# three at once (the loop then cleanly re-seeds instead of trusting a stale
+# generation against fresh event ids).
+EVENTS_STATE_KEY = "job-agent:phone:events:state"
 
 # A forced cursor replay right after a call re-emits that call's ``incoming_call``
 # event, and the dedup guard must still recognise the session it already opened.
@@ -61,59 +65,123 @@ class IngestLoop:
         self._store = SessionStore()
         self._cursor = 0
         self._generation = 0
+        self._boot_id = ""
         self._open_session_id: UUID | None = None
         self._cursor_seeded = False
 
     async def load_cursor(self) -> int | None:
-        """Return the stored cursor, or ``None`` when the Redis key is absent.
-
-        ``None`` lets the caller seed the cursor from ``status.latest_event_id``
-        on first start instead of replaying PhoneGate's buffered history
-        (spec §7.4).
+        """Load {cursor, generation, boot_id} from Redis; return the cursor, or
+        ``None`` when nothing is stored so the caller seeds from
+        ``status.latest_event_id`` on first start instead of replaying PhoneGate's
+        buffered history (spec §7.4).
         """
-        raw = await self._redis.get(EVENTS_CURSOR_KEY)
+        raw = await self._redis.get(EVENTS_STATE_KEY)
+        if raw is None:
+            return None
         try:
-            value = int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            value = None
-        self._cursor = value or 0
-        if value is not None:
-            self._cursor_seeded = True
-        raw_gen = await self._redis.get(EVENTS_GENERATION_KEY)
-        try:
-            self._generation = int(raw_gen) if raw_gen is not None else 0
-        except (TypeError, ValueError):
-            self._generation = 0
-        return value
+            data = json.loads(raw)
+            cursor = int(data["cursor"])
+        except (ValueError, TypeError, KeyError):
+            return None
+        self._cursor = cursor
+        self._generation = int(data.get("generation") or 0)
+        self._boot_id = str(data.get("boot_id") or "")
+        self._cursor_seeded = True
+        return cursor
+
+    async def _save_state(self) -> None:
+        await self._redis.set(
+            EVENTS_STATE_KEY,
+            json.dumps(
+                {
+                    "cursor": self._cursor,
+                    "generation": self._generation,
+                    "boot_id": self._boot_id,
+                }
+            ),
+        )
 
     async def save_cursor(self, value: int) -> None:
         self._cursor = value
         self._cursor_seeded = True
-        await self._redis.set(EVENTS_CURSOR_KEY, str(value))
+        await self._save_state()
 
-    async def _bump_generation(self) -> None:
+    async def _enter_new_generation(self, boot_id: str) -> None:
+        """Atomically advance to the next generation: one Redis write sets the new
+        generation, resets the cursor to 0, and records the gateway's new boot id.
+        A crash after this write leaves consistent state — the next cycle resumes
+        on the normal path at the new generation (dedup guard still matches) — and
+        a crash before it simply re-detects the reset and retries."""
         self._generation += 1
-        await self._redis.set(EVENTS_GENERATION_KEY, str(self._generation))
+        self._cursor = 0
+        self._cursor_seeded = True
+        if boot_id:
+            self._boot_id = boot_id
+        await self._save_state()
+
+    async def _record_boot_id(self, boot_id: str) -> None:
+        if boot_id and boot_id != self._boot_id:
+            self._boot_id = boot_id
+            await self._save_state()
 
     def _is_reset(self, page: EventsPage) -> bool:
-        """A PhoneGate restart rewinds its event-id counter, so a poll from our
-        (high) cursor returns nothing and the reported max id sits below it. A
-        page that still carries events at or above the cursor is a healthy — if
-        possibly malformed — page, never a reset: acting on it would spuriously
-        bump the generation and force-close the live session."""
+        """Event-id heuristic for a restart (used when PhoneGate reports no
+        ``boot_id``): a poll from our (high) cursor comes back empty with a
+        reported max id below it. A page that still carries events is treated as
+        healthy — possibly malformed — never a reset, so we never spuriously bump
+        the generation and force-close a live session."""
         if page.events:
             return False
         return page.latest_id < self._cursor
+
+    def _detect_reset(self, status: DeviceStatus, page: EventsPage) -> bool:
+        """True when PhoneGate has restarted since our last poll. The definitive
+        signal is a changed ``boot_id`` (per Web Studio process); older PhoneGate
+        builds omit it and fall back to :meth:`_is_reset`."""
+        boot_id = status.boot_id or page.boot_id
+        if boot_id and self._boot_id:
+            return boot_id != self._boot_id
+        return self._is_reset(page)
 
     @property
     def open_session_id(self) -> UUID | None:
         """Public read of the currently open session ID."""
         return self._open_session_id
 
+    async def _open_session_this_generation(
+        self, session: AsyncSession
+    ) -> CommunicationSession | None:
+        """``find_open``, but a session left open by a previous generation is a
+        stale restart boundary — close it and report no open session, so the new
+        generation's turns (transcript ids also restart at 1) land on a fresh row
+        instead of colliding. Makes the generation transition self-healing after
+        a crash anywhere in the reset branch."""
+        open_row = await self._store.find_open(session)
+        if open_row is None:
+            return None
+        if open_row.phonegate_generation != self._generation:
+            await self._store.close(
+                session,
+                open_row,
+                outcome=CommunicationOutcome.UNKNOWN,
+                ended_at=utcnow(),
+                needs_review=True,
+                note="phonegate_generation_boundary",
+            )
+            if self._open_session_id == open_row.id:
+                self._open_session_id = None
+            return None
+        return open_row
+
+    async def _close_stale_generation_session(self) -> None:
+        async with self._session_factory() as session:
+            await self._open_session_this_generation(session)
+            await session.commit()
+
     async def reconcile(self, status: DeviceStatus) -> None:
         """Bring local state in line with PhoneGate after a start or a resync."""
         async with self._session_factory() as session:
-            open_row = await self._store.find_open(session)
+            open_row = await self._open_session_this_generation(session)
             if open_row is None:
                 self._open_session_id = None
                 # A2 + finding #3: open a session on any active call state
@@ -209,6 +277,7 @@ class IngestLoop:
         # A1: seed cursor on first successful status if not yet seeded
         if not self._cursor_seeded:
             await self.save_cursor(status.latest_event_id)
+            await self._record_boot_id(status.boot_id)
             # finding #3: the boot-outage startup path seeds the cursor here
             # instead of in ``agent._run_loop`` — reconcile so an already-active
             # call is still opened.
@@ -223,45 +292,33 @@ class IngestLoop:
             logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
             return status.call_state != "IDLE"
 
-        if self._is_reset(page):  # PhoneGate restarted / event log rotated
+        if self._detect_reset(status, page):  # PhoneGate restarted / event log rotated
             logger.warning(
                 "phone_events_reset",
                 latest_id=page.latest_id,
                 cursor=self._cursor,
                 generation=self._generation,
+                boot_id_changed=bool(status.boot_id or page.boot_id),
             )
-            # Bump the generation and immediately drop the cursor to 0. If the
-            # process dies (or the refetch below raises) before the final
-            # save_cursor, the next cycle sees latest_id >= cursor(0), does NOT
-            # re-detect a reset, and resumes on the normal path at the already
-            # bumped generation — so the incoming_call dedup guard still matches
-            # any session this reset already committed.
-            await self._bump_generation()
-            await self.save_cursor(0)
-            # Close any session still open from the previous generation — its transcript
-            # ids will be reused by the new generation and would collide.
-            async with self._session_factory() as session:
-                open_row = await self._store.find_open(session)
-                if open_row is not None:
-                    await self._store.close(
-                        session,
-                        open_row,
-                        outcome=CommunicationOutcome.UNKNOWN,
-                        ended_at=utcnow(),
-                        needs_review=True,
-                        note="phonegate_generation_boundary",
-                    )
-                await session.commit()
+            # One atomic write: generation += 1, cursor = 0, new boot id. A crash
+            # after it resumes cleanly on the normal path at the new generation
+            # (the dedup guard still matches any session this reset committed); a
+            # crash before it just re-detects the reset next cycle.
+            await self._enter_new_generation(status.boot_id or page.boot_id)
             self._open_session_id = None
+            await self._close_stale_generation_session()
             # Re-read the fresh buffer from the start so a call that completed during the
-            # restart window is still ingested.
+            # restart window is still ingested, and take a fresh device status —
+            # the one from the top of this cycle predates the restart.
             try:
                 fresh = await self._client.events(after_id=0, limit=250)
+                status = await self._client.device_status()
             except (PhoneGateUnavailable, PhoneGateError) as exc:
                 self._health.record_transport_error(type(exc).__name__)
                 await self._persist_health(status=status)
                 logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
                 return status.call_state != "IDLE"
+            self._health.record_status(status)
             dispatched_max = 0
             if fresh.events:
                 ordered = sorted(fresh.events, key=lambda event: event.id)
@@ -277,6 +334,7 @@ class IngestLoop:
             await self._dispatch_batch(ordered, status)
             await self.save_cursor(max(self._cursor, page.latest_id, ordered[-1].id))
 
+        await self._record_boot_id(status.boot_id or page.boot_id)
         self._health.mark_poll_ok()
         await self._persist_health(status=status)
         return status.call_state != "IDLE"
@@ -377,7 +435,7 @@ class IngestLoop:
         # A5 minor: normalize once at the top; reuse for same-caller check and remote_address
         normalized_address = normalize_e164(raw, region=self._settings.phone_caller_region) or ""
 
-        open_row = await self._store.find_open(session)
+        open_row = await self._open_session_this_generation(session)
         if open_row is not None:
             if open_row.remote_raw == raw or (
                 normalized_address and open_row.remote_address == normalized_address
@@ -456,7 +514,7 @@ class IngestLoop:
         self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
     ) -> None:
         state = str(event.data.get("state") or "")
-        open_row = await self._store.find_open(session)
+        open_row = await self._open_session_this_generation(session)
         if open_row is None:
             return
         if state == "RINGING":
@@ -495,7 +553,7 @@ class IngestLoop:
                 fields=sorted(str(k) for k in payload),
             )
             return
-        open_row = await self._store.find_open(session)
+        open_row = await self._open_session_this_generation(session)
         if open_row is None:
             if status.call_state == "IDLE":
                 logger.info("phone_transcript_after_call_end", transcript_id=entry.id)

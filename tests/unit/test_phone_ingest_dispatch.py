@@ -446,7 +446,7 @@ async def test_malformed_transcript_event_is_skipped_not_fatal(
     assert calls[0].outcome == CommunicationOutcome.COMPLETED
     assert sorted(t.text for t in turns) == ["good one", "good two"]
     # cursor advanced past every event including the poison one
-    assert await redis.get("job-agent:phone:events:cursor") == "7"
+    assert loop._cursor == 7
 
 
 async def test_savepoint_rollback_restores_open_session_id(
@@ -529,7 +529,7 @@ async def test_poison_event_in_batch_does_not_stop_following_events(
     assert len(calls) == 1
     assert sorted(t.text for t in turns) == ["after", "before"]
     assert calls[0].ended_at is not None
-    assert await redis.get("job-agent:phone:events:cursor") == "7"
+    assert loop._cursor == 7
 
 
 async def test_fast_call_completing_during_restart_is_not_lost(
@@ -584,6 +584,164 @@ async def test_fast_call_completing_during_restart_is_not_lost(
     assert calls[1].phonegate_generation == 1
     assert calls[1].outcome == CommunicationOutcome.COMPLETED
     assert {t.text for t in turns} == {"one", "two", "three"}
+
+
+async def test_reset_branch_uses_fresh_device_status(
+    profiled_factory: async_sessionmaker[AsyncSession],
+    redis: FakeAsyncRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 review round 3 / HIGH: the status read at the top of the cycle predates
+    the restart. If a call starts during the refetch window, reconcile must run
+    against a FRESH status or it closes the just-opened session as UNKNOWN."""
+    from app.phone.schemas import DeviceStatus, EventsPage, PhoneEvent
+
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        await loop.save_cursor(5)
+        loop._boot_id = "old-boot"
+
+        status_calls = 0
+
+        async def _status() -> DeviceStatus:
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 1:  # top of cycle: nothing happening yet
+                return DeviceStatus(call_state="IDLE", boot_id="new-boot", latest_event_id=0)
+            # refetch inside the reset branch: a call has started
+            return DeviceStatus(
+                call_state="RINGING",
+                boot_id="new-boot",
+                caller_number="+37360111222",
+                latest_event_id=2,
+            )
+
+        async def _events(*, after_id: int, limit: int = 250) -> EventsPage:
+            if after_id == 0:
+                return EventsPage(
+                    events=[
+                        PhoneEvent(id=1, type="call_state", data={"state": "RINGING"}),
+                        PhoneEvent(
+                            id=2, type="incoming_call", data={"caller_number": "+37360111222"}
+                        ),
+                    ],
+                    latest_id=2,
+                    boot_id="new-boot",
+                )
+            return EventsPage(events=[], latest_id=0, boot_id="new-boot")
+
+        monkeypatch.setattr(client, "device_status", _status)
+        monkeypatch.setattr(client, "events", _events)
+
+        active = await loop.run_cycle()
+
+    assert active is True  # computed from the fresh RINGING status
+    async with profiled_factory() as session:
+        call = (await session.scalars(select(CommunicationSession))).one()
+    assert call.ended_at is None  # NOT closed by a stale IDLE reconcile
+    assert call.remote_raw == "+37360111222"
+
+
+async def test_restart_detected_by_boot_id_when_event_ids_realign(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 review round 3 / BLOCKER: if a whole new call lands between polls so the
+    new latest_id equals the old cursor, the event-id heuristic can't see the
+    restart — the changed boot_id must still trigger it."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        # first call: 5 events -> cursor 5
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.transcript(speaker="rx", text="first")
+        fake.hangup()
+        await _drain(loop)
+        assert loop._cursor == 5
+
+        fake.restart()  # new boot_id, ids back to 1
+        # a whole new call, scripted before the next poll -> also exactly 5 events
+        fake.ring("+37361222333")
+        fake.answer()
+        fake.transcript(speaker="rx", text="second")
+        fake.hangup()
+        # single poll: latest_id (5) == old cursor (5), /events?after_id=5 is empty
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (
+            await session.scalars(
+                select(CommunicationSession).order_by(CommunicationSession.started_at)
+            )
+        ).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert [c.remote_raw for c in calls] == ["+37360111222", "+37361222333"]
+    assert calls[1].phonegate_generation == 1
+    assert {t.text for t in turns} == {"first", "second"}
+
+
+async def test_stale_generation_open_session_is_force_closed(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 review round 3 / BLOCKER: a crash mid-transition can leave a session
+    open at the previous generation. reconcile / dispatch must treat it as a
+    boundary and close it so new (id-1) turns don't collide into it."""
+    async with profiled_factory() as session:
+        profile = (await session.scalars(select(UserProfile))).one()
+        session.add(
+            CommunicationSession(
+                profile_id=profile.id,
+                channel=CommunicationChannel.CALL,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                remote_address="+37360111222",
+                remote_raw="+37360111222",
+                phonegate_event_id_start=2,
+                phonegate_generation=0,
+                started_at=datetime.now(UTC),
+                answered_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        loop._generation = 1  # we have moved on; the DB row is from generation 0
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.transcript(speaker="rx", text="new generation turn")
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (
+            await session.scalars(
+                select(CommunicationSession).order_by(CommunicationSession.started_at)
+            )
+        ).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert len(calls) == 2
+    assert calls[0].ended_at is not None
+    assert calls[0].diagnostics.get("close_note") == "phonegate_generation_boundary"
+    assert calls[1].phonegate_generation == 1
+    assert [t.text for t in turns] == ["new generation turn"]
 
 
 async def test_reset_refetch_failure_does_not_double_bump_generation(

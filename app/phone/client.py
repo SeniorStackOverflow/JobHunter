@@ -98,6 +98,7 @@ class PhoneGateClient:
                 events=parsed,
                 latest_id=int(data["latest_id"]),
                 last_incoming_call=data.get("last_incoming_call"),
+                boot_id=str(data.get("boot_id") or ""),
             )
         except (ValidationError, TypeError, ValueError) as exc:
             raise PhoneGateError("/api/events: unexpected response schema") from exc

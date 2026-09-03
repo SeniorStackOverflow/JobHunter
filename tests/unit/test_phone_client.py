@@ -90,6 +90,19 @@ async def test_events_skips_one_malformed_event() -> None:
 
 
 @pytest.mark.asyncio
+async def test_events_carries_boot_id() -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(
+        base_url="http://phonegate", token="t", transport=fake.transport()
+    ) as client:
+        status = await client.device_status()
+        page = await client.events(after_id=0)
+    assert status.boot_id
+    assert page.boot_id == status.boot_id
+
+
+@pytest.mark.asyncio
 async def test_events_rejects_page_without_latest_id() -> None:
     """F1/F2 review / HIGH: latest_id drives reset detection — a page that omits
     it must not be read as 'gateway at id 0' (would force a spurious reset)."""

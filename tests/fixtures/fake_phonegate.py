@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any, cast
 
 import httpx
@@ -18,6 +19,7 @@ class FakePhoneGate:
         self._transcripts: list[dict[str, Any]] = []
         self._next_event_id = 1
         self._next_transcript_id = 1
+        self._boot_id = uuid.uuid4().hex
         self._call_state = "IDLE"
         self._caller = ""
         self._connected = True
@@ -100,11 +102,13 @@ class FakePhoneGate:
     def set_mode(self, value: str) -> None:
         self._mode = value
 
-    def restart(self) -> None:
+    def restart(self, *, new_boot_id: bool = True) -> None:
         self._events.clear()
         self._transcripts.clear()
         self._next_event_id = 1
         self._next_transcript_id = 1
+        if new_boot_id:
+            self._boot_id = uuid.uuid4().hex
 
     def transport(self) -> httpx.ASGITransport:
         return httpx.ASGITransport(app=self.app)
@@ -141,6 +145,7 @@ class FakePhoneGate:
                 "tx_preparing": False,
                 "transcript_count": len(self._transcripts),
                 "latest_event_id": self._next_event_id - 1,
+                "boot_id": self._boot_id,
             }
         )
 
@@ -164,6 +169,7 @@ class FakePhoneGate:
                 "count": len(rows[:limit]),
                 "latest_id": self._next_event_id - 1,
                 "last_incoming_call": last_incoming,
+                "boot_id": self._boot_id,
             }
         )
 

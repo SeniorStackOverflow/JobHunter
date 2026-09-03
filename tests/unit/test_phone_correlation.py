@@ -312,6 +312,42 @@ async def test_public_phones_match_is_not_capped_at_200(db: AsyncSession) -> Non
     assert result.contact_id is not None
 
 
+async def test_two_jobs_with_same_scalar_public_phone_is_ambiguous(db: AsyncSession) -> None:
+    """F3 review round 3 / HIGH: the scalar public_phone branch must also be
+    ambiguity-safe — two vacancies sharing that column is not attributable."""
+    src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
+    db.add(src)
+    await db.flush()
+    job_a, _ = await _canonical(db, source=src)
+    job_b, _ = await _canonical(db, source=src)
+    job_a.public_phone = "+37360111222"
+    job_b.public_phone = "+37360111222"
+    await db.flush()
+
+    result = await CallerCorrelation().resolve(db, "+373 60 111 222")
+    assert result is not None
+    assert result.ambiguous is True
+    assert result.canonical_job_id is None
+    assert result.application_id is None
+
+
+async def test_scalar_and_array_phone_on_different_jobs_is_ambiguous(db: AsyncSession) -> None:
+    """One job carries the number in the scalar column, another in the array —
+    the two are gathered together so the ambiguity is caught."""
+    src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
+    db.add(src)
+    await db.flush()
+    job_a, _ = await _canonical(db, source=src)
+    job_b, _ = await _canonical(db, source=src)
+    job_a.public_phone = "+37360111222"
+    job_b.public_phones = ["+37360111222"]
+    await db.flush()
+
+    result = await CallerCorrelation().resolve(db, "+37360111222")
+    assert result is not None
+    assert result.ambiguous is True
+
+
 async def test_public_phones_match_ignores_job_status(db: AsyncSession) -> None:
     """F3 review / HIGH: a call-back about a role that has since closed must still
     correlate — the array scan no longer filters on JobStatus.ACTIVE."""
