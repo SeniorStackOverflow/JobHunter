@@ -106,6 +106,46 @@ async def test_open_with_diagnostics(db: AsyncSession) -> None:
     assert refreshed.diagnostics.get("sim_operator") == "Orange"
 
 
+async def test_open_stamps_generation_and_answered_at(db: AsyncSession) -> None:
+    """F1: SessionStore.open records the PhoneGate generation and an optional
+    answered_at (used when reconcile opens a session for an already-active call)."""
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+37360111222",
+        remote_address="+37360111222",
+        event_id=0,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+        generation=3,
+        answered_at=now,
+    )
+    await db.commit()
+
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.phonegate_generation == 3
+    assert refreshed.answered_at is not None
+
+
+async def test_open_defaults_generation_to_zero(db: AsyncSession) -> None:
+    store = SessionStore()
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=datetime.now(UTC),
+    )
+    await db.commit()
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.phonegate_generation == 0
+    assert refreshed.answered_at is None
+
+
 async def test_open_with_diagnostics_and_note(db: AsyncSession) -> None:
     """A4: when both diagnostics and note are provided, both are merged."""
     store = SessionStore()

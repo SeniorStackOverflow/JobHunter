@@ -643,6 +643,7 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
     remote_address: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     remote_raw: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     phonegate_event_id_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    phonegate_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ringing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

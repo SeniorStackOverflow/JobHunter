@@ -47,6 +47,8 @@ class SessionStore:
         needs_review: bool = False,
         note: str | None = None,
         diagnostics: dict[str, Any] | None = None,
+        generation: int = 0,
+        answered_at: datetime | None = None,
     ) -> CommunicationSession:
         # A4: merge diagnostics dict (if provided) with note handling
         call_diagnostics: dict[str, Any] = {}
@@ -67,8 +69,10 @@ class SessionStore:
             remote_address=remote_address,
             remote_raw=remote_raw,
             phonegate_event_id_start=event_id,
+            phonegate_generation=generation,
             started_at=opened_at,
             ringing_at=opened_at,
+            answered_at=answered_at,
             needs_review=needs_review,
             diagnostics=call_diagnostics,
         )

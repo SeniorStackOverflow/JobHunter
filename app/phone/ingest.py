@@ -25,13 +25,17 @@ from app.settings.config import Settings
 logger = structlog.get_logger(__name__)
 
 EVENTS_CURSOR_KEY = "job-agent:phone:events:cursor"
+EVENTS_GENERATION_KEY = "job-agent:phone:events:generation"
 
 # A forced cursor replay right after a call re-emits that call's ``incoming_call``
 # event, and the dedup guard must still recognise the session it already opened.
 # But PhoneGate resets its event-id counter to 1 on restart, so a genuinely new
 # low-id ``incoming_call`` must NOT be silenced by an unrelated historical session
-# that happens to share the id. Bounding the guard in time keeps replays
-# idempotent while letting real post-restart calls through.
+# that happens to share the id. The guard therefore requires all three of: same
+# event id, same generation, and a session opened inside this window — the real
+# replay case (process died between commit and ``save_cursor``) satisfies all
+# three; a genuine post-restart call fails either the generation clause (the loop
+# saw the reset) or the time clause (it did not, so the colliding session is old).
 _INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=10)
 
 
@@ -54,6 +58,7 @@ class IngestLoop:
         self._settings = settings
         self._store = SessionStore()
         self._cursor = 0
+        self._generation = 0
         self._open_session_id: UUID | None = None
         self._cursor_seeded = False
 
@@ -72,12 +77,21 @@ class IngestLoop:
         self._cursor = value or 0
         if value is not None:
             self._cursor_seeded = True
+        raw_gen = await self._redis.get(EVENTS_GENERATION_KEY)
+        try:
+            self._generation = int(raw_gen) if raw_gen is not None else 0
+        except (TypeError, ValueError):
+            self._generation = 0
         return value
 
     async def save_cursor(self, value: int) -> None:
         self._cursor = value
         self._cursor_seeded = True
         await self._redis.set(EVENTS_CURSOR_KEY, str(value))
+
+    async def _bump_generation(self) -> None:
+        self._generation += 1
+        await self._redis.set(EVENTS_GENERATION_KEY, str(self._generation))
 
     @property
     def open_session_id(self) -> UUID | None:
@@ -90,8 +104,9 @@ class IngestLoop:
             open_row = await self._store.find_open(session)
             if open_row is None:
                 self._open_session_id = None
-                # A2: open a session on RINGING with no open session
-                if status.call_state == "RINGING":
+                # A2 + finding #3: open a session on any active call state
+                # (RINGING or an already-answered IN_CALL) with no open session.
+                if status.call_state in {"RINGING", "IN_CALL"}:
                     correlation = await self._correlation.resolve(session, status.caller_number)
                     if correlation is not None:
                         normalized_address = (
@@ -101,6 +116,7 @@ class IngestLoop:
                             )
                             or ""
                         )
+                        answered = utcnow() if status.call_state == "IN_CALL" else None
                         call = await self._store.open(
                             session,
                             remote_raw=status.caller_number,
@@ -109,8 +125,10 @@ class IngestLoop:
                             correlation=correlation,
                             opened_at=utcnow(),
                             needs_review=True,
+                            generation=self._generation,
+                            answered_at=answered,
                             diagnostics={
-                                "note": "reconcile_opened_from_ringing",
+                                "note": f"reconcile_opened_from_{status.call_state.lower()}",
                                 "daemon_version": status.daemon_version,
                                 "sim_operator": str(
                                     status.device.get("sim_operator")
@@ -173,6 +191,10 @@ class IngestLoop:
         # A1: seed cursor on first successful status if not yet seeded
         if not self._cursor_seeded:
             await self.save_cursor(status.latest_event_id)
+            # finding #3: the boot-outage startup path seeds the cursor here
+            # instead of in ``agent._run_loop`` — reconcile so an already-active
+            # call is still opened.
+            await self.reconcile(status)
             return status.call_state != "IDLE"
 
         try:
@@ -184,9 +206,47 @@ class IngestLoop:
             return status.call_state != "IDLE"
 
         if page.latest_id < self._cursor:  # PhoneGate restarted / event log rotated
-            logger.warning("phone_events_reset", latest_id=page.latest_id, cursor=self._cursor)
+            logger.warning(
+                "phone_events_reset",
+                latest_id=page.latest_id,
+                cursor=self._cursor,
+                generation=self._generation,
+            )
+            await self._bump_generation()
+            # Close any session still open from the previous generation — its transcript
+            # ids will be reused by the new generation and would collide.
+            async with self._session_factory() as session:
+                open_row = await self._store.find_open(session)
+                if open_row is not None:
+                    await self._store.close(
+                        session,
+                        open_row,
+                        outcome=CommunicationOutcome.UNKNOWN,
+                        ended_at=utcnow(),
+                        needs_review=True,
+                        note="phonegate_generation_boundary",
+                    )
+                await session.commit()
+            self._open_session_id = None
+            # Re-read the fresh buffer from the start so a call that completed during the
+            # restart window is still ingested.
+            try:
+                fresh = await self._client.events(after_id=0, limit=250)
+            except (PhoneGateUnavailable, PhoneGateError) as exc:
+                self._health.record_transport_error(type(exc).__name__)
+                await self._persist_health(status=status)
+                logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
+                return status.call_state != "IDLE"
+            dispatched_max = 0
+            if fresh.events:
+                ordered = sorted(fresh.events, key=lambda event: event.id)
+                async with self._session_factory() as session:
+                    for event in ordered:
+                        await self._dispatch(session, event, status)
+                    await session.commit()
+                dispatched_max = ordered[-1].id
             await self.reconcile(status)
-            await self.save_cursor(page.latest_id)
+            await self.save_cursor(max(fresh.latest_id, dispatched_max, 0))
         elif page.events:
             ordered = sorted(page.events, key=lambda event: event.id)
             if ordered[0].id > self._cursor + 1:
@@ -263,6 +323,7 @@ class IngestLoop:
         already = await session.scalar(
             select(CommunicationSession.id).where(
                 CommunicationSession.phonegate_event_id_start == event.id,
+                CommunicationSession.phonegate_generation == self._generation,
                 CommunicationSession.started_at >= recent_cutoff,
             )
         )
@@ -300,6 +361,7 @@ class IngestLoop:
             event_id=event.id,
             correlation=correlation,
             opened_at=utcnow(),
+            generation=self._generation,
             diagnostics={
                 "daemon_version": status.daemon_version,
                 "sim_operator": str(
@@ -399,6 +461,7 @@ class IngestLoop:
                 correlation=correlation,
                 opened_at=utcnow(),
                 needs_review=True,
+                generation=self._generation,
                 diagnostics={
                     "note": "transcript_before_session_start",
                     "daemon_version": status.daemon_version,

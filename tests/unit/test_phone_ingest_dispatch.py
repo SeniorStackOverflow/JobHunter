@@ -346,6 +346,164 @@ async def test_audit_synthetic_session_opened(
 
 
 # A4 tests
+async def test_fast_call_completing_during_restart_is_not_lost(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 / BLOCKER: a call that completes entirely in the PhoneGate restart
+    window has its events buffered as fresh low ids. The reset branch must
+    re-read the buffer from 0 and ingest that whole call."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        assert await loop.load_cursor() is None
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        await loop.run_cycle()
+        fake.answer()
+        await loop.run_cycle()
+        fake.transcript(speaker="rx", text="one")
+        await loop.run_cycle()
+        fake.hangup()
+        await loop.run_cycle()
+
+        fake.restart()  # PhoneGate bounces; event + transcript ids reset to 1
+
+        fake.ring("+37361222333")
+        await loop.run_cycle()  # first poll sees latest_id < cursor -> reset
+        fake.answer()
+        await loop.run_cycle()
+        fake.transcript(speaker="rx", text="two")
+        await loop.run_cycle()
+        fake.transcript(speaker="rx", text="three")
+        await loop.run_cycle()
+        fake.hangup()
+        await loop.run_cycle()
+
+    async with profiled_factory() as session:
+        calls = (
+            await session.scalars(
+                select(CommunicationSession).order_by(CommunicationSession.started_at)
+            )
+        ).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+
+    assert len(calls) == 2
+    assert calls[0].remote_raw == "+37360111222"
+    assert calls[0].phonegate_generation == 0
+    assert calls[1].remote_raw == "+37361222333"
+    assert calls[1].phonegate_generation == 1
+    assert calls[1].outcome == CommunicationOutcome.COMPLETED
+    assert {t.text for t in turns} == {"one", "two", "three"}
+
+
+async def test_restart_midcall_reuses_transcript_ids_without_dropping_turns(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 / BLOCKER: PhoneGate resets transcript ids to 1 on restart. If the
+    open session were kept, the new turns would collide with its existing
+    (session_id, transcript_id) rows and be silently dropped. The reset branch
+    closes the old session so the new generation's turns land on a fresh one."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        await loop.run_cycle()
+        fake.answer()
+        await loop.run_cycle()
+        fake.transcript(speaker="rx", text="before restart")  # transcript id 1
+        await loop.run_cycle()
+
+        fake.restart()  # call_state stays IN_CALL; transcript ids reset to 1
+
+        fake.transcript(speaker="rx", text="after restart")  # transcript id 1 again
+        await loop.run_cycle()
+        fake.transcript(speaker="tx", text="after restart 2")
+        await loop.run_cycle()
+        fake.hangup()
+        await loop.run_cycle()
+
+    async with profiled_factory() as session:
+        calls = (
+            await session.scalars(
+                select(CommunicationSession).order_by(CommunicationSession.started_at)
+            )
+        ).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+
+    assert len(calls) == 2
+    assert calls[0].outcome == CommunicationOutcome.UNKNOWN
+    assert calls[0].needs_review is True
+    assert calls[0].diagnostics.get("close_note") == "phonegate_generation_boundary"
+    assert calls[1].phonegate_generation == 1
+    assert calls[1].ended_at is not None
+    assert {t.text for t in turns} == {
+        "before restart",
+        "after restart",
+        "after restart 2",
+    }
+
+
+async def test_reconcile_opens_session_on_in_call(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 / finding #3: agent starts while a call is already answered."""
+    from app.models.entities import AuditEvent
+
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        fake.ring("+37360111222")
+        fake.answer()
+        status = await client.device_status()
+        assert status.call_state == "IN_CALL"
+        await loop.reconcile(status)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+        audit = (await session.scalars(select(AuditEvent))).all()
+    assert len(calls) == 1
+    assert calls[0].needs_review is True
+    assert calls[0].answered_at is not None
+    assert calls[0].diagnostics.get("note") == "reconcile_opened_from_in_call"
+    assert any(a.action == "communication_session.opened" for a in audit)
+
+
+async def test_seed_path_reconciles_already_active_call(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 / finding #3: the boot-outage startup path seeds the cursor inside
+    run_cycle; it must also reconcile so an in-progress call is opened."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        assert await loop.load_cursor() is None
+        assert loop._cursor_seeded is False
+        fake.ring("+37360111222")
+        fake.answer()
+        active = await loop.run_cycle()
+
+    assert active is True
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+    assert len(calls) == 1
+    assert calls[0].answered_at is not None
+
+
 async def test_session_diagnostics_populated_on_open(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:
