@@ -549,6 +549,62 @@ async def test_fast_call_completing_during_restart_is_not_lost(
     assert {t.text for t in turns} == {"one", "two", "three"}
 
 
+async def test_reset_refetch_failure_does_not_double_bump_generation(
+    profiled_factory: async_sessionmaker[AsyncSession],
+    redis: FakeAsyncRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 review / HIGH #2: if events(after_id=0) raises after the generation
+    bump, the next cycle must NOT re-detect the reset and bump again (which would
+    let an already-committed session re-open at a new generation)."""
+    from app.phone.client import PhoneGateError
+
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        fake.answer()
+        await loop.run_cycle()
+        await loop.run_cycle()
+
+        fake.restart()
+        fake.ring("+37361222333")
+
+        real_events = client.events
+        calls: list[int] = []
+
+        async def _flaky_events(*, after_id: int, limit: int = 250) -> Any:
+            if after_id == 0:
+                calls.append(after_id)
+                if len(calls) == 1:
+                    raise PhoneGateError("gateway still rebooting")
+            return await real_events(after_id=after_id, limit=limit)
+
+        monkeypatch.setattr(client, "events", _flaky_events)
+
+        await loop.run_cycle()  # detects reset, bumps gen, save_cursor(0), refetch raises
+        assert loop._generation == 1
+        monkeypatch.undo()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        sessions = (
+            await session.scalars(
+                select(CommunicationSession).order_by(CommunicationSession.started_at)
+            )
+        ).all()
+    assert loop._generation == 1  # bumped exactly once for one physical restart
+    new = [s for s in sessions if s.remote_raw == "+37361222333"]
+    assert len(new) == 1
+    assert new[0].phonegate_generation == 1
+
+
 async def test_restart_midcall_reuses_transcript_ids_without_dropping_turns(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:
@@ -595,6 +651,10 @@ async def test_restart_midcall_reuses_transcript_ids_without_dropping_turns(
     assert calls[0].diagnostics.get("close_note") == "phonegate_generation_boundary"
     assert calls[1].phonegate_generation == 1
     assert calls[1].ended_at is not None
+    # the call was already answered before the restart — the post-restart
+    # synthetic session must record that, not close as MISSED
+    assert calls[1].answered_at is not None
+    assert calls[1].outcome == CommunicationOutcome.COMPLETED
     assert {t.text for t in turns} == {
         "before restart",
         "after restart",

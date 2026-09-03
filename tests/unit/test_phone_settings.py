@@ -62,6 +62,13 @@ def test_production_rejects_loopback_phonegate_url_when_agent_enabled() -> None:
         phonegate_auth_token="a-real-token",
         phonegate_url="https://pg.example/",
     )  # no raise
+    # a schemeless URL is reported as such, not as "loopback"
+    with pytest.raises(ValueError, match="absolute http"):
+        Settings(
+            **base,
+            phonegate_auth_token="a-real-token",
+            phonegate_url="phonegate.internal:8888",
+        )
 
 
 def test_non_production_allows_loopback_phonegate_url() -> None:

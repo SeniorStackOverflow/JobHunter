@@ -19,7 +19,7 @@ from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailab
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
 from app.phone.numbers import mask_phone, normalize_e164
-from app.phone.schemas import DeviceStatus, PhoneEvent, TranscriptEntry
+from app.phone.schemas import DeviceStatus, EventsPage, PhoneEvent, TranscriptEntry
 from app.phone.sessions import SessionStore
 from app.settings.config import Settings
 
@@ -32,12 +32,13 @@ EVENTS_GENERATION_KEY = "job-agent:phone:events:generation"
 # event, and the dedup guard must still recognise the session it already opened.
 # But PhoneGate resets its event-id counter to 1 on restart, so a genuinely new
 # low-id ``incoming_call`` must NOT be silenced by an unrelated historical session
-# that happens to share the id. The guard therefore requires all three of: same
-# event id, same generation, and a session opened inside this window — the real
-# replay case (process died between commit and ``save_cursor``) satisfies all
-# three; a genuine post-restart call fails either the generation clause (the loop
-# saw the reset) or the time clause (it did not, so the colliding session is old).
-_INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=10)
+# that happens to share the id. The guard requires all three of: same event id,
+# same generation, and a session opened inside this window. The only real replay
+# case — the process died between the batch commit and ``save_cursor`` — is
+# recovered on the very next poll (~1 s later), so the window only needs to cover
+# a brief crash-restart, not ten minutes; keeping it tight shrinks the chance of
+# suppressing a real call that collides after a Redis generation-state loss.
+_INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=2)
 
 
 class IngestLoop:
@@ -93,6 +94,16 @@ class IngestLoop:
     async def _bump_generation(self) -> None:
         self._generation += 1
         await self._redis.set(EVENTS_GENERATION_KEY, str(self._generation))
+
+    def _is_reset(self, page: EventsPage) -> bool:
+        """A PhoneGate restart rewinds its event-id counter, so a poll from our
+        (high) cursor returns nothing and the reported max id sits below it. A
+        page that still carries events at or above the cursor is a healthy — if
+        possibly malformed — page, never a reset: acting on it would spuriously
+        bump the generation and force-close the live session."""
+        if page.events:
+            return False
+        return page.latest_id < self._cursor
 
     @property
     def open_session_id(self) -> UUID | None:
@@ -170,6 +181,11 @@ class IngestLoop:
                 self._open_session_id = None
             else:
                 self._open_session_id = open_row.id
+                # The answer may have happened in a previous generation (call
+                # spans a PhoneGate restart); no fresh IN_CALL event will arrive,
+                # so stamp answered_at here or the call closes as MISSED.
+                if status.call_state == "IN_CALL":
+                    await self._store.touch_answered(open_row, utcnow())
                 open_row.diagnostics = {
                     **open_row.diagnostics,
                     "reconciled_at": utcnow().isoformat(),
@@ -207,14 +223,21 @@ class IngestLoop:
             logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
             return status.call_state != "IDLE"
 
-        if page.latest_id < self._cursor:  # PhoneGate restarted / event log rotated
+        if self._is_reset(page):  # PhoneGate restarted / event log rotated
             logger.warning(
                 "phone_events_reset",
                 latest_id=page.latest_id,
                 cursor=self._cursor,
                 generation=self._generation,
             )
+            # Bump the generation and immediately drop the cursor to 0. If the
+            # process dies (or the refetch below raises) before the final
+            # save_cursor, the next cycle sees latest_id >= cursor(0), does NOT
+            # re-detect a reset, and resumes on the normal path at the already
+            # bumped generation — so the incoming_call dedup guard still matches
+            # any session this reset already committed.
             await self._bump_generation()
+            await self.save_cursor(0)
             # Close any session still open from the previous generation — its transcript
             # ids will be reused by the new generation and would collide.
             async with self._session_factory() as session:
@@ -309,10 +332,15 @@ class IngestLoop:
         cursor past every event, poison included."""
         async with self._session_factory() as session:
             for event in ordered:
+                # A handler mutates self._open_session_id before it can raise;
+                # if its savepoint rolls back, that id would point at a
+                # non-existent row. Snapshot and restore on failure.
+                prev_open = self._open_session_id
                 try:
                     async with session.begin_nested():
                         await self._dispatch(session, event, status)
                 except Exception as exc:
+                    self._open_session_id = prev_open
                     logger.warning(
                         "phone_event_dispatch_failed",
                         event_id=event.id,
@@ -420,6 +448,7 @@ class IngestLoop:
                         str(correlation.canonical_job_id) if correlation.canonical_job_id else None
                     ),
                     "contact_id": (str(correlation.contact_id) if correlation.contact_id else None),
+                    "ambiguous": correlation.ambiguous,
                 },
             )
 
@@ -458,7 +487,13 @@ class IngestLoop:
         try:
             entry = TranscriptEntry.model_validate(payload)
         except ValidationError:
-            logger.warning("phone_transcript_malformed", event_id=event.id, raw=repr(payload)[:200])
+            # Never log the raw payload — it carries the spoken transcript text
+            # (spec §7.7). Structural facts only.
+            logger.warning(
+                "phone_transcript_malformed",
+                event_id=event.id,
+                fields=sorted(str(k) for k in payload),
+            )
             return
         open_row = await self._store.find_open(session)
         if open_row is None:
@@ -483,6 +518,10 @@ class IngestLoop:
                 opened_at=utcnow(),
                 needs_review=True,
                 generation=self._generation,
+                # A transcript only flows on an answered call; if the gateway
+                # still reports IN_CALL, record the answer so this does not close
+                # as MISSED (e.g. a call that spanned a PhoneGate restart).
+                answered_at=utcnow() if status.call_state == "IN_CALL" else None,
                 diagnostics={
                     "note": "transcript_before_session_start",
                     "daemon_version": status.daemon_version,

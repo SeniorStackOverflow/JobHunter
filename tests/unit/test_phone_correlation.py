@@ -312,6 +312,25 @@ async def test_public_phones_match_is_not_capped_at_200(db: AsyncSession) -> Non
     assert result.contact_id is not None
 
 
+async def test_public_phones_match_ignores_job_status(db: AsyncSession) -> None:
+    """F3 review / HIGH: a call-back about a role that has since closed must still
+    correlate — the array scan no longer filters on JobStatus.ACTIVE."""
+    src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
+    db.add(src)
+    await db.flush()
+    job, canon = await _canonical(db, source=src)
+    job.public_phones = ["+37360111222"]
+    job.status = JobStatus.CLOSED
+    canon.status = JobStatus.CLOSED
+    await db.flush()
+
+    result = await CallerCorrelation().resolve(db, "+373 60 111 222")
+    assert result is not None
+    assert result.ambiguous is False
+    assert result.canonical_job_id == canon.id
+    assert result.contact_id is not None
+
+
 async def test_public_phones_match_on_two_jobs_is_ambiguous(db: AsyncSession) -> None:
     src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
     db.add(src)

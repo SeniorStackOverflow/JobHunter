@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import Application, EmployerContact, SourceJob, UserProfile
-from app.models.enums import ContactType, JobStatus, VerificationStatus
+from app.models.enums import ContactType, VerificationStatus
 from app.phone.numbers import normalize_e164
 
 
@@ -99,9 +99,11 @@ class CallerCorrelation:
                 session.add(contact)
                 await session.flush()
             else:
-                # 3. public_phones[] array scan — active jobs, minimal columns, NO row cap.
-                # TODO: a normalized, indexed employer-phone table would remove this full
-                # scan (deferred past Phase 1).
+                # 3. public_phones[] array scan — minimal columns, NO row cap and
+                # NO status filter (steps 1-2 match regardless of job status; a
+                # call-back about a role that has since closed is the common case).
+                # TODO: a normalized, indexed employer-phone table would remove this
+                # full scan (deferred past Phase 1).
                 rows = (
                     await session.execute(
                         select(
@@ -111,10 +113,7 @@ class CallerCorrelation:
                             SourceJob.employer_url,
                             SourceJob.canonical_url,
                         )
-                        .where(
-                            SourceJob.canonical_job_id.is_not(None),
-                            SourceJob.status == JobStatus.ACTIVE,
-                        )
+                        .where(SourceJob.canonical_job_id.is_not(None))
                         .order_by(SourceJob.last_seen_at.desc())
                     )
                 ).all()

@@ -31,6 +31,16 @@ _SINGLETON_LOCK_TTL = 60
 _DORMANT_HEARTBEAT_SECONDS = 30
 
 
+def _touch_heartbeat() -> None:
+    """Refresh the liveness marker. A bad override path must not crash the loop
+    (that would recreate the very restart storm the dormant loop prevents)."""
+    try:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_PATH.touch()
+    except OSError as exc:
+        logger.warning("phone_agent_heartbeat_touch_failed", error=type(exc).__name__)
+
+
 async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
     """Drive the read-only ingest loop until stop is requested or the lease is lost."""
     settings = get_settings()
@@ -123,11 +133,13 @@ async def run() -> int:
             try:
                 loop.add_signal_handler(sig, stop.set)
                 registered.append(sig)
-            except NotImplementedError:  # e.g. non-main thread / Windows
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows proactor loop, or not the main thread — fall back to the
+                # timeout-only loop (still exits on cancellation).
                 pass
         try:
             while not stop.is_set():
-                HEARTBEAT_PATH.touch()  # noqa: ASYNC240
+                _touch_heartbeat()
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=_DORMANT_HEARTBEAT_SECONDS)
         finally:

@@ -79,17 +79,24 @@ class PhoneGateClient:
 
     async def events(self, *, after_id: int, limit: int = 250) -> EventsPage:
         data = await self._get("/api/events", {"after_id": after_id, "limit": limit})
+        # ``latest_id`` drives reset detection in the ingest loop — a page that
+        # omits it must not be silently read as "gateway at id 0".
+        if data.get("latest_id") is None:
+            raise PhoneGateError("/api/events: response missing latest_id")
         parsed: list[PhoneEvent] = []
         for raw in data.get("events") or []:
             try:
                 parsed.append(PhoneEvent.model_validate(raw))
             except ValidationError:
                 # One malformed event must not sink the whole page (spec §4.2).
-                logger.warning("phone_event_malformed", raw=repr(raw)[:200])
+                logger.warning(
+                    "phone_event_malformed",
+                    raw_id=raw.get("id") if isinstance(raw, dict) else None,
+                )
         try:
             return EventsPage(
                 events=parsed,
-                latest_id=int(data.get("latest_id") or 0),
+                latest_id=int(data["latest_id"]),
                 last_incoming_call=data.get("last_incoming_call"),
             )
         except (ValidationError, TypeError, ValueError) as exc:

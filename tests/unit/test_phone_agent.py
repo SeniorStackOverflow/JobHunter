@@ -31,9 +31,12 @@ async def test_run_is_dormant_when_disabled(
     monkeypatch.setattr(agent_module, "_DORMANT_HEARTBEAT_SECONDS", 0.01)
 
     task = asyncio.create_task(agent_module.run())
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.03)
     assert not task.done()  # still dormant, not exited
-    assert heartbeat.exists()  # heartbeat kept fresh
+    assert heartbeat.exists()
+    first_mtime = heartbeat.stat().st_mtime_ns
+    await asyncio.sleep(0.05)
+    assert heartbeat.stat().st_mtime_ns > first_mtime  # refreshed, not touched once
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

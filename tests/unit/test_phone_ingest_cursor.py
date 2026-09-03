@@ -11,7 +11,7 @@ from app.models.enums import CommunicationChannel, CommunicationDirection
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
 from app.phone.ingest import EVENTS_CURSOR_KEY, IngestLoop
-from app.phone.schemas import DeviceStatus
+from app.phone.schemas import DeviceStatus, EventsPage, PhoneEvent
 from app.phone.sessions import SessionStore
 from app.settings.config import Settings
 from tests.fixtures.fake_redis import FakeAsyncRedis
@@ -51,6 +51,29 @@ async def test_load_cursor_reports_absent_key_as_none(
     assert await redis.get(EVENTS_CURSOR_KEY) == "9"
     assert await loop.load_cursor() == 9
     assert loop._cursor_seeded is True  # Still seeded after load
+
+
+@pytest.mark.asyncio
+async def test_is_reset_requires_empty_page_below_cursor(
+    sqlite_session_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 review / HIGH #1: a page that still carries events at/above the cursor
+    is never a reset, even if its reported latest_id is low (malformed page)."""
+    loop = _loop(sqlite_session_factory, redis)
+    loop._cursor = 100
+
+    # genuine reset: nothing returned from after_id=cursor, reported max below it
+    assert loop._is_reset(EventsPage(events=[], latest_id=5)) is True
+    # malformed/partial page: latest_id looks like a reset but events are present
+    assert (
+        loop._is_reset(EventsPage(events=[PhoneEvent(id=101, type="call_state")], latest_id=0))
+        is False
+    )
+    # healthy page
+    assert (
+        loop._is_reset(EventsPage(events=[PhoneEvent(id=101, type="call_state")], latest_id=101))
+        is False
+    )
 
 
 @pytest.mark.asyncio

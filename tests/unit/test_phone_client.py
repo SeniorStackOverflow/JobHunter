@@ -90,6 +90,21 @@ async def test_events_skips_one_malformed_event() -> None:
 
 
 @pytest.mark.asyncio
+async def test_events_rejects_page_without_latest_id() -> None:
+    """F1/F2 review / HIGH: latest_id drives reset detection — a page that omits
+    it must not be read as 'gateway at id 0' (would force a spurious reset)."""
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"events": [{"id": 7, "type": "call_state", "data": {}}]})
+
+    async with PhoneGateClient(
+        base_url="http://phonegate", token="t", transport=httpx.MockTransport(_handler)
+    ) as client:
+        with pytest.raises(PhoneGateError, match="latest_id"):
+            await client.events(after_id=0)
+
+
+@pytest.mark.asyncio
 async def test_client_maps_transport_failure() -> None:
     def _boom(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")

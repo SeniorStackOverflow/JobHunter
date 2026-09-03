@@ -153,8 +153,13 @@ class Settings(BaseSettings):
         if self.phone_agent_enabled and self.phonegate_auth_token is None:
             raise ValueError("PHONEGATE_AUTH_TOKEN is required when PHONE_AGENT_ENABLED is true")
         if self.phone_agent_enabled:
-            host = (urlsplit(self.phonegate_url).hostname or "").lower()
-            if host in {"127.0.0.1", "localhost", "0.0.0.0", "::1", ""}:
+            parts = urlsplit(self.phonegate_url)
+            if not parts.scheme or not parts.hostname:
+                raise ValueError(
+                    "PHONEGATE_URL must be an absolute http(s) URL when "
+                    "PHONE_AGENT_ENABLED is true in production"
+                )
+            if parts.hostname.lower() in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}:
                 raise ValueError(
                     "PHONEGATE_URL must be a routable address (not loopback) when "
                     "PHONE_AGENT_ENABLED is true in production"
