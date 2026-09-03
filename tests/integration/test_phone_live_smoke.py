@@ -24,3 +24,8 @@ async def test_live_phonegate_health_and_status() -> None:
         assert (await client.health()).get("status") == "ok"
         status = await client.device_status()
         assert status.call_state in {"IDLE", "RINGING", "IN_CALL"}
+        # boot_id drives restart detection — it must be present and consistent
+        # between the two feeds the ingest loop reads.
+        assert status.boot_id
+        page = await client.events(after_id=0, limit=1)
+        assert page.boot_id == status.boot_id
