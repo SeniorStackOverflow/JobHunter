@@ -78,6 +78,62 @@ async def test_is_reset_requires_empty_page_below_cursor(
 
 
 @pytest.mark.asyncio
+async def test_detect_reset_considers_both_boot_ids(
+    sqlite_session_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 review round 4 / HIGH: /device/status and /events are two calls a moment
+    apart. A restart between them yields two different boot ids in one cycle and
+    must still be detected — picking one and ignoring the other misses it."""
+    loop = _loop(sqlite_session_factory, redis)
+    loop._cursor = 100
+
+    def status(boot: str, state: str = "IDLE") -> DeviceStatus:
+        return DeviceStatus(boot_id=boot, call_state=state, latest_event_id=100)
+
+    def page(boot: str) -> EventsPage:
+        return EventsPage(events=[], latest_id=100, boot_id=boot)
+
+    # stored boot A; a fresh (post-restart) boot B on EITHER feed is a reset,
+    # even though the id heuristic here would say "not a reset" (latest_id == cursor)
+    loop._boot_id = "A"
+    assert loop._detect_reset(status("A"), page("A")) is False
+    assert loop._detect_reset(status("A"), page("B")) is True  # restart mid-cycle
+    assert loop._detect_reset(status("B"), page("B")) is True
+    assert loop._detect_reset(status("B"), page("A")) is True
+
+    # no stored boot yet: only a mid-cycle disagreement counts as a reset
+    loop._boot_id = ""
+    assert loop._detect_reset(status("A"), page("A")) is False
+    assert loop._detect_reset(status("A"), page("B")) is True
+
+
+@pytest.mark.asyncio
+async def test_seed_state_persists_boot_id_atomically(
+    sqlite_session_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 review round 4 / BLOCKER: the first-start seed must persist the boot id
+    in the same write as the cursor, or a restart in the startup window (before
+    the boot id is recorded on a later cycle) is invisible."""
+    loop = _loop(sqlite_session_factory, redis)
+    await loop.seed_state(5, "boot-A")
+
+    stored = json.loads(await redis.get(EVENTS_STATE_KEY))
+    assert stored == {"cursor": 5, "generation": 0, "boot_id": "boot-A"}
+
+    # a fresh loop (== restarted agent) loads the boot id and now sees a restart
+    reloaded = _loop(sqlite_session_factory, redis)
+    assert await reloaded.load_cursor() == 5
+    assert reloaded._boot_id == "boot-A"
+    assert (
+        reloaded._detect_reset(
+            DeviceStatus(boot_id="boot-B", latest_event_id=5),
+            EventsPage(events=[], latest_id=5, boot_id="boot-B"),
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
 async def test_reconcile_closes_dangling_open_session_when_idle(
     sqlite_session_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:

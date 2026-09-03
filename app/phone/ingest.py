@@ -106,6 +106,16 @@ class IngestLoop:
         self._cursor_seeded = True
         await self._save_state()
 
+    async def seed_state(self, cursor: int, boot_id: str) -> None:
+        """First-start seed: persist cursor + generation(0) + boot_id in ONE
+        atomic write, so restart detection has a boot id from the very first
+        poll (otherwise a restart in the startup window is invisible)."""
+        self._cursor = cursor
+        self._cursor_seeded = True
+        if boot_id:
+            self._boot_id = boot_id
+        await self._save_state()
+
     async def _enter_new_generation(self, boot_id: str) -> None:
         """Atomically advance to the next generation: one Redis write sets the new
         generation, resets the cursor to 0, and records the gateway's new boot id.
@@ -136,11 +146,21 @@ class IngestLoop:
 
     def _detect_reset(self, status: DeviceStatus, page: EventsPage) -> bool:
         """True when PhoneGate has restarted since our last poll. The definitive
-        signal is a changed ``boot_id`` (per Web Studio process); older PhoneGate
-        builds omit it and fall back to :meth:`_is_reset`."""
-        boot_id = status.boot_id or page.boot_id
-        if boot_id and self._boot_id:
-            return boot_id != self._boot_id
+        signal is ``boot_id`` (per Web Studio process); older PhoneGate builds
+        omit it and fall back to :meth:`_is_reset`.
+
+        ``/device/status`` and ``/events`` are two HTTP calls a moment apart, so a
+        restart can land between them and give two different boot ids in one
+        cycle. Both are considered: a disagreement is itself a boundary, and any
+        boot id we see that differs from the stored one is a restart."""
+        seen = {b for b in (status.boot_id, page.boot_id) if b}
+        if seen:
+            if self._boot_id:
+                return any(b != self._boot_id for b in seen)
+            # No stored boot id yet: a reset only if the gateway restarted
+            # mid-cycle (status and events disagree). Otherwise the caller records
+            # it as the baseline.
+            return len(seen) > 1
         return self._is_reset(page)
 
     @property
@@ -276,8 +296,7 @@ class IngestLoop:
 
         # A1: seed cursor on first successful status if not yet seeded
         if not self._cursor_seeded:
-            await self.save_cursor(status.latest_event_id)
-            await self._record_boot_id(status.boot_id)
+            await self.seed_state(status.latest_event_id, status.boot_id)
             # finding #3: the boot-outage startup path seeds the cursor here
             # instead of in ``agent._run_loop`` — reconcile so an already-active
             # call is still opened.
@@ -303,8 +322,9 @@ class IngestLoop:
             # One atomic write: generation += 1, cursor = 0, new boot id. A crash
             # after it resumes cleanly on the normal path at the new generation
             # (the dedup guard still matches any session this reset committed); a
-            # crash before it just re-detects the reset next cycle.
-            await self._enter_new_generation(status.boot_id or page.boot_id)
+            # crash before it just re-detects the reset next cycle. Prefer the
+            # events boot id — it was fetched last, so it is the most current.
+            await self._enter_new_generation(page.boot_id or status.boot_id)
             self._open_session_id = None
             await self._close_stale_generation_session()
             # Re-read the fresh buffer from the start so a call that completed during the

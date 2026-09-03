@@ -646,6 +646,51 @@ async def test_reset_branch_uses_fresh_device_status(
     assert call.remote_raw == "+37360111222"
 
 
+async def test_restart_in_startup_window_is_detected_on_first_cycle(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F1 review round 4 / BLOCKER: agent._run_loop seeds via seed_state (cursor +
+    boot_id, one write). If PhoneGate restarts between that seed and the very
+    first run_cycle — and the new event ids realign to the seeded cursor — the
+    boot id from the seed still makes the restart visible on cycle 1."""
+    fake = FakePhoneGate()
+    # pre-restart state: 5 events already happened
+    fake.ring("+37360111222")
+    fake.answer()
+    fake.transcript(speaker="rx", text="old")
+    fake.hangup()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        # mimic agent._run_loop's first-start seed
+        await loop.seed_state(status.latest_event_id, status.boot_id)
+        assert loop._cursor == 5
+
+        # PhoneGate restarts, and a whole new call lands before the first poll,
+        # bringing latest_id back to exactly 5
+        fake.restart()
+        fake.ring("+37361222333")
+        fake.answer()
+        fake.transcript(speaker="rx", text="new")
+        fake.hangup()
+
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (
+            await session.scalars(
+                select(CommunicationSession).order_by(CommunicationSession.started_at)
+            )
+        ).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert [c.remote_raw for c in calls] == ["+37361222333"]
+    assert calls[0].phonegate_generation == 1
+    assert [t.text for t in turns] == ["new"]
+
+
 async def test_restart_detected_by_boot_id_when_event_ids_realign(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:

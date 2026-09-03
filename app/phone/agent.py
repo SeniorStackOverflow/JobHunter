@@ -94,8 +94,13 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
         else:
             if cursor is None:
                 # Spec §7.4: first start against a running PhoneGate must not
-                # replay buffered history — resume from the current head.
-                await ingest.save_cursor(status.latest_event_id)
+                # replay buffered history — resume from the current head. Seed the
+                # boot id in the same atomic write so a restart in the startup
+                # window is visible to the first run_cycle. When state already
+                # exists we do NOT record the boot id here — letting the first
+                # run_cycle compare it lets a restart that happened while the
+                # agent was down be handled as a generation boundary.
+                await ingest.seed_state(status.latest_event_id, status.boot_id)
             await ingest.reconcile(status)
             logger.info("phone_agent_started", call_state=status.call_state)
 
