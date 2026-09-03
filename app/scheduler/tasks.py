@@ -386,8 +386,23 @@ def recheck_source_task(self: Task, source_id: str) -> dict[str, int | str]:
             )
         if lease.lease_lost:
             logger.warning("recheck_lock_lease_lost", source_id=source_id)
-        payload: dict[str, int | str] = {**result, "source_id": source_id}
         health = _run_async(_source_health(parsed_source_id))
+        payload: dict[str, int | str] = {
+            **result,
+            "source_id": source_id,
+            "health": health.value if health is not None else "unknown",
+        }
+        if result.get("guardrail_triggered"):
+            logger.warning(
+                "recheck_source_guardrail_triggered",
+                source_id=source_id,
+                health=payload["health"],
+                checked=result.get("checked", 0),
+                absent=result.get("absent", 0),
+                sentinel_checked=result.get("sentinel_checked", 0),
+                sentinel_absent=result.get("sentinel_absent", 0),
+                adapter_errors=result.get("errors", 0),
+            )
         _set_source_health_metric(parsed_source_id, health)
         return payload
     finally:

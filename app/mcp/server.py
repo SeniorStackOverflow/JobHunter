@@ -28,6 +28,7 @@ from app.learning import (
     review_reason_labels,
 )
 from app.models.entities import (
+    Alert,
     Application,
     BatchScanRun,
     JobSource,
@@ -640,11 +641,30 @@ async def get_source_health(source_id: str) -> dict[str, Any]:
             .order_by(desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast())
             .limit(1)
         )
+        alert = await session.scalar(
+            select(Alert)
+            .where(Alert.source_id == source.id)
+            .order_by(desc(Alert.created_at))
+            .limit(1)
+        )
         return {
             "source_id": source_id,
             "health": source.health_status.value,
             "automatic_actions_paused": source.automatic_actions_paused,
             "last_scan": _public(scan, "id", "status", "diagnostics") if scan else None,
+            "latest_alert": (
+                _public(
+                    alert,
+                    "severity",
+                    "code",
+                    "message",
+                    "safe_diagnostics",
+                    "acknowledged",
+                    "created_at",
+                )
+                if alert
+                else None
+            ),
         }
 
 

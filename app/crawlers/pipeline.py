@@ -922,6 +922,10 @@ class ScanService:
                     "possibly_closed": 0,
                     "closed": 0,
                     "errors": degraded_results,
+                    "guardrail_triggered": 1,
+                    "absent": absences,
+                    "sentinel_checked": len(sentinel_results),
+                    "sentinel_absent": sentinel_absences,
                 }
             counters = {
                 "checked": len(results),

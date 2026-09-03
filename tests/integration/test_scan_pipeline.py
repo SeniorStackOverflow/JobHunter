@@ -595,13 +595,15 @@ async def test_recent_active_sentinels_still_detect_source_mass_absence(
 
     result = await service.recheck_active_jobs(source_id, max_jobs_per_run=4)
 
-    assert result == {
-        "checked": 4,
-        "updated": 0,
-        "possibly_closed": 0,
-        "closed": 0,
-        "errors": 0,
-    }
+    assert result["checked"] == 4
+    assert result["updated"] == 0
+    assert result["possibly_closed"] == 0
+    assert result["closed"] == 0
+    assert result["errors"] == 0
+    assert result["guardrail_triggered"] == 1
+    assert result["absent"] == 4
+    assert result["sentinel_checked"] >= 4
+    assert result["sentinel_absent"] == result["sentinel_checked"]
     async with sqlite_session_factory() as session:
         source = await session.get(JobSource, source_id)
         assert source is not None
