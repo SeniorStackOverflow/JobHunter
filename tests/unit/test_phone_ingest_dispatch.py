@@ -347,6 +347,75 @@ async def test_audit_synthetic_session_opened(
     assert len(opened_events) >= 1
 
 
+async def test_ambiguous_correlation_flags_session_for_review(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """F3 / HIGH: when the caller's number maps to more than one job, the opened
+    session is flagged needs_review with an 'ambiguous' correlation note."""
+    from uuid import uuid4
+
+    from app.models.entities import CanonicalJob, EmployerContact, JobSource, SourceJob
+    from app.models.enums import ContactType, JobStatus, VerificationStatus
+
+    async with profiled_factory() as session:
+        src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
+        session.add(src)
+        await session.flush()
+        for _ in range(2):
+            canon = CanonicalJob(
+                normalized_company="ACME",
+                normalized_title="Loader",
+                canonical_fingerprint=uuid4().hex,
+                status=JobStatus.ACTIVE,
+            )
+            session.add(canon)
+            await session.flush()
+            job = SourceJob(
+                source_id=src.id,
+                canonical_job_id=canon.id,
+                external_job_id=uuid4().hex,
+                canonical_url=f"https://x/{uuid4().hex}",
+                title="Loader",
+                content_hash="h",
+                matching_content_hash="m",
+                source_fingerprint="f",
+                status=JobStatus.ACTIVE,
+            )
+            session.add(job)
+            await session.flush()
+            session.add(
+                EmployerContact(
+                    canonical_job_id=canon.id,
+                    source_job_id=job.id,
+                    value="+37360111222",
+                    contact_type=ContactType.PHONE,
+                    discovery_source="test",
+                    verification_status=VerificationStatus.UNVERIFIED,
+                    confidence=0.6,
+                    evidence_url="https://x/1",
+                )
+            )
+        await session.commit()
+
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        call = (await session.scalars(select(CommunicationSession))).one()
+    assert call.needs_review is True
+    assert call.diagnostics.get("correlation") == "ambiguous"
+
+
 # A4 tests
 async def test_malformed_transcript_event_is_skipped_not_fatal(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis

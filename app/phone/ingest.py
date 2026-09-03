@@ -136,6 +136,7 @@ class IngestLoop:
                                     or status.device.get("operator")
                                     or ""
                                 ),
+                                **({"correlation": "ambiguous"} if correlation.ambiguous else {}),
                             },
                         )
                         self._open_session_id = call.id
@@ -376,11 +377,13 @@ class IngestLoop:
             correlation=correlation,
             opened_at=utcnow(),
             generation=self._generation,
+            needs_review=correlation.ambiguous,
             diagnostics={
                 "daemon_version": status.daemon_version,
                 "sim_operator": str(
                     status.device.get("sim_operator") or status.device.get("operator") or ""
                 ),
+                **({"correlation": "ambiguous"} if correlation.ambiguous else {}),
             },
         )
         self._open_session_id = call.id
@@ -486,6 +489,7 @@ class IngestLoop:
                     "sim_operator": str(
                         status.device.get("sim_operator") or status.device.get("operator") or ""
                     ),
+                    **({"correlation": "ambiguous"} if correlation.ambiguous else {}),
                 },
             )
             self._open_session_id = open_row.id
