@@ -13,5 +13,8 @@ class FakeAsyncRedis:
     async def set(self, key: str, value: str) -> None:
         self._data[key] = str(value)
 
+    async def delete(self, key: str) -> None:
+        self._data.pop(key, None)
+
     async def aclose(self) -> None:
         return None

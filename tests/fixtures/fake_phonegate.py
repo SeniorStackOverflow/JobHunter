@@ -26,12 +26,21 @@ class FakePhoneGate:
         self._mode = "Zero-ADB"
         self._daemon_version = "0.2.30"
         self._rx_stats = {"captured_frames": 0, "queued_frames": 0, "dropped_frames": 0}
+        self._tx_preparing = False
+        self._tx_active = False
+        self._tx_stage = 0  # 0 idle, 1 preparing, 2 active
+        self._tx_auto_advance = True
+        self._fail_next_speak: str | None = None
+        self.answered_by_agent = False
         self.app = Starlette(
             routes=[
                 Route("/api/health", self._health),
                 Route("/api/device/status", self._status),
                 Route("/api/events", self._events_route),
                 Route("/api/call/transcript", self._transcript_route),
+                Route("/api/call/answer", self._answer_route, methods=["POST"]),
+                Route("/api/call/speak", self._speak_route, methods=["POST"]),
+                Route("/api/call/hangup", self._hangup_route, methods=["POST"]),
             ]
         )
 
@@ -102,6 +111,18 @@ class FakePhoneGate:
     def set_mode(self, value: str) -> None:
         self._mode = value
 
+    def set_tx_auto_advance(self, value: bool) -> None:
+        self._tx_auto_advance = value
+
+    def advance_tx(self) -> None:
+        # 0 -> 1 (preparing) -> 2 (active) -> 0 (idle)
+        self._tx_stage = (self._tx_stage + 1) % 3
+        self._tx_preparing = self._tx_stage == 1
+        self._tx_active = self._tx_stage == 2
+
+    def fail_next_speak(self, *, mode: str) -> None:
+        self._fail_next_speak = mode
+
     def restart(self, *, new_boot_id: bool = True) -> None:
         self._events.clear()
         self._transcripts.clear()
@@ -124,30 +145,31 @@ class FakePhoneGate:
     async def _status(self, request: Request) -> JSONResponse:
         if not self._auth_ok(request):
             return JSONResponse({"detail": "auth"}, status_code=401)
-        return JSONResponse(
-            {
-                "connected": self._connected,
-                "mode": self._mode if self._connected else "Ожидание daemon",
-                "local_asr_enabled": False,
-                "device": {
-                    "device_name": "A14",
-                    "battery": 87,
-                    "operator": "Orange",
-                    "sim_operator": "Orange",
-                },
-                "daemon_version": self._daemon_version,
-                "rx_audio_stats": dict(self._rx_stats),
-                "call_state": self._call_state,
-                "call_duration_seconds": 0,
-                "caller_number": self._caller,
-                "caller_name": "",
-                "tx_active": False,
-                "tx_preparing": False,
-                "transcript_count": len(self._transcripts),
-                "latest_event_id": self._next_event_id - 1,
-                "boot_id": self._boot_id,
-            }
-        )
+        body = {
+            "connected": self._connected,
+            "mode": self._mode if self._connected else "Ожидание daemon",
+            "local_asr_enabled": False,
+            "device": {
+                "device_name": "A14",
+                "battery": 87,
+                "operator": "Orange",
+                "sim_operator": "Orange",
+            },
+            "daemon_version": self._daemon_version,
+            "rx_audio_stats": dict(self._rx_stats),
+            "call_state": self._call_state,
+            "call_duration_seconds": 0,
+            "caller_number": self._caller,
+            "caller_name": "",
+            "tx_active": self._tx_active,
+            "tx_preparing": self._tx_preparing,
+            "transcript_count": len(self._transcripts),
+            "latest_event_id": self._next_event_id - 1,
+            "boot_id": self._boot_id,
+        }
+        if self._tx_auto_advance and self._tx_stage != 0:
+            self.advance_tx()
+        return JSONResponse(body)
 
     async def _events_route(self, request: Request) -> JSONResponse:
         if not self._auth_ok(request):
@@ -188,3 +210,50 @@ class FakePhoneGate:
                 "rx_audio_stats": dict(self._rx_stats),
             }
         )
+
+    async def _answer_route(self, request: Request) -> JSONResponse:
+        if not self._auth_ok(request):
+            return JSONResponse({"detail": "auth"}, status_code=401)
+        if self._call_state != "RINGING":
+            return JSONResponse({"detail": "not ringing"}, status_code=409)
+        self._call_state = "IN_CALL"
+        self.answered_by_agent = True
+        self._emit("call_state", self._call_state_data())
+        return JSONResponse({"success": True})
+
+    async def _speak_route(self, request: Request) -> JSONResponse:
+        if not self._auth_ok(request):
+            return JSONResponse({"detail": "auth"}, status_code=401)
+        if self._call_state != "IN_CALL":
+            return JSONResponse({"detail": "no active call"}, status_code=409)
+        mode, self._fail_next_speak = self._fail_next_speak, None
+        if mode == "timeout":
+            return JSONResponse({"detail": "gateway timeout"}, status_code=504)
+        if mode in {"409_tx_busy", "409_transitional"}:
+            return JSONResponse({"detail": mode}, status_code=409)
+        payload = await request.json()
+        text = str(payload.get("text", ""))
+        tid = self._next_transcript_id
+        self._next_transcript_id += 1
+        record = {
+            "id": tid,
+            "speaker": "tx",
+            "text": text,
+            "meta": "",
+            "backend": "piper",
+            "confidence": None,
+            "timestamp": "00:00:00",
+            "timestamp_ms": int(time.time() * 1000),
+        }
+        self._transcripts.append(record)
+        self._emit("transcript", {"transcript": record})
+        self._tx_stage, self._tx_preparing, self._tx_active = 1, True, False
+        return JSONResponse({"success": True, "text": text})
+
+    async def _hangup_route(self, request: Request) -> JSONResponse:
+        if not self._auth_ok(request):
+            return JSONResponse({"detail": "auth"}, status_code=401)
+        self._call_state, self._caller = "IDLE", ""
+        self._tx_stage, self._tx_preparing, self._tx_active = 0, False, False  # reset
+        self._emit("call_state", self._call_state_data())
+        return JSONResponse({"success": True})
