@@ -24,19 +24,27 @@ async def test_run_is_dormant_when_disabled(
         def from_url(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("must not connect to Redis when disabled")
 
+    touches = 0
+    real_touch = agent_module._touch_heartbeat
+
+    def _counting_touch() -> None:
+        nonlocal touches
+        touches += 1
+        real_touch()
+
     monkeypatch.setattr(get_settings, "cache_clear", lambda: None, raising=False)
     monkeypatch.setattr(agent_module, "get_settings", lambda: Settings(_env_file=None))
     monkeypatch.setattr(agent_module, "SyncRedis", _MockRedis)
     monkeypatch.setattr(agent_module, "HEARTBEAT_PATH", heartbeat)
     monkeypatch.setattr(agent_module, "_DORMANT_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(agent_module, "_touch_heartbeat", _counting_touch)
 
     task = asyncio.create_task(agent_module.run())
     await asyncio.sleep(0.03)
     assert not task.done()  # still dormant, not exited
     assert heartbeat.exists()
-    first_mtime = heartbeat.stat().st_mtime_ns
     await asyncio.sleep(0.05)
-    assert heartbeat.stat().st_mtime_ns > first_mtime  # refreshed, not touched once
+    assert touches >= 3  # refreshed on a loop, not touched once then busy-slept
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

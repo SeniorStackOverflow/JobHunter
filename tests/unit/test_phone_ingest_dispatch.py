@@ -449,6 +449,43 @@ async def test_malformed_transcript_event_is_skipped_not_fatal(
     assert await redis.get("job-agent:phone:events:cursor") == "7"
 
 
+async def test_savepoint_rollback_restores_open_session_id(
+    profiled_factory: async_sessionmaker[AsyncSession],
+    redis: FakeAsyncRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 review / MEDIUM #5: a handler that sets self._open_session_id and then
+    raises inside its savepoint must not leave the attribute pointing at the
+    rolled-back row."""
+    from app.phone import ingest as ingest_module
+
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        calls: list[int] = []
+
+        async def _boom_audit(*args: Any, **kwargs: Any) -> None:
+            calls.append(1)
+            raise RuntimeError("audit write failed")
+
+        monkeypatch.setattr(ingest_module, "record_audit_event", _boom_audit)
+
+        fake.ring("+37360111222")  # incoming_call handler sets _open_session_id then audits
+        await _drain(loop)
+
+    assert calls  # the failing audit path was exercised
+    assert loop.open_session_id is None  # not left pointing at the rolled-back session
+    async with profiled_factory() as session:
+        rows = (await session.scalars(select(CommunicationSession))).all()
+    assert rows == []  # savepoint rolled the half-open session back
+
+
 async def test_poison_event_in_batch_does_not_stop_following_events(
     profiled_factory: async_sessionmaker[AsyncSession],
     redis: FakeAsyncRedis,

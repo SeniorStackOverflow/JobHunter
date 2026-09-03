@@ -31,11 +31,17 @@ _SINGLETON_LOCK_TTL = 60
 _DORMANT_HEARTBEAT_SECONDS = 30
 
 
+_heartbeat_dir_ready = False
+
+
 def _touch_heartbeat() -> None:
     """Refresh the liveness marker. A bad override path must not crash the loop
-    (that would recreate the very restart storm the dormant loop prevents)."""
+    (that would recreate the very restart storm this guard prevents)."""
+    global _heartbeat_dir_ready
     try:
-        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not _heartbeat_dir_ready:
+            HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _heartbeat_dir_ready = True
         HEARTBEAT_PATH.touch()
     except OSError as exc:
         logger.warning("phone_agent_heartbeat_touch_failed", error=type(exc).__name__)
@@ -48,8 +54,13 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+    registered: list[signal.Signals] = []
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+        try:
+            loop.add_signal_handler(sig, stop.set)
+            registered.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
 
     def should_stop() -> bool:
         return stop.is_set() or lease_lost()
@@ -106,12 +117,12 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
                     await ingest.reconcile(fresh_status)
             # A single near-instant metadata syscall per poll tick; offloading it
             # to a worker thread would cost more than it saves.
-            HEARTBEAT_PATH.touch()  # noqa: ASYNC240
+            _touch_heartbeat()
             await asyncio.sleep(
                 settings.phone_poll_active_seconds if active else settings.phone_poll_idle_seconds
             )
     finally:
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in registered:
             loop.remove_signal_handler(sig)
         await client.aclose()
         await async_redis.aclose()

@@ -35,10 +35,10 @@ EVENTS_GENERATION_KEY = "job-agent:phone:events:generation"
 # that happens to share the id. The guard requires all three of: same event id,
 # same generation, and a session opened inside this window. The only real replay
 # case — the process died between the batch commit and ``save_cursor`` — is
-# recovered on the very next poll (~1 s later), so the window only needs to cover
-# a brief crash-restart, not ten minutes; keeping it tight shrinks the chance of
-# suppressing a real call that collides after a Redis generation-state loss.
-_INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=2)
+# recovered when the process comes back (seconds to a slow container restart),
+# so five minutes is a comfortable margin without the ten-minute window's larger
+# chance of suppressing a real call that collides after a Redis generation loss.
+_INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=5)
 
 
 class IngestLoop:
