@@ -3,7 +3,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
+from app.phone.client import (
+    PhoneGateBusy,
+    PhoneGateClient,
+    PhoneGateError,
+    PhoneGateUnavailable,
+)
 from tests.fixtures.fake_phonegate import FakePhoneGate
 
 
@@ -115,6 +120,37 @@ async def test_events_rejects_page_without_latest_id() -> None:
     ) as client:
         with pytest.raises(PhoneGateError, match="latest_id"):
             await client.events(after_id=0)
+
+
+@pytest.mark.asyncio
+async def test_write_methods_against_fake() -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        await c.answer()
+        assert (await c.device_status()).call_state == "IN_CALL"
+        await c.speak("Здравствуйте")
+        await c.hangup()
+        assert (await c.device_status()).call_state == "IDLE"
+
+
+@pytest.mark.asyncio
+async def test_speak_409_raises_phonegate_busy() -> None:
+    fake = FakePhoneGate()  # IDLE -> speak 409
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        with pytest.raises(PhoneGateBusy):
+            await c.speak("x")
+
+
+@pytest.mark.asyncio
+async def test_speak_504_raises_unavailable() -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        await c.answer()
+        fake.fail_next_speak(mode="timeout")
+        with pytest.raises(PhoneGateUnavailable):
+            await c.speak("x")
 
 
 @pytest.mark.asyncio

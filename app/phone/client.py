@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from types import TracebackType
 from typing import Any
 
@@ -18,6 +19,14 @@ class PhoneGateError(RuntimeError):
 
 class PhoneGateUnavailable(RuntimeError):
     """PhoneGate could not be reached or returned a server error."""
+
+
+class PhoneGateBusy(PhoneGateError):
+    """PhoneGate returned 409 — call-state transition or a TX still in progress."""
+
+    def __init__(self, path: str, detail: str) -> None:
+        self.detail = detail.lower()
+        super().__init__(f"{path}: 409 {detail}")
 
 
 class PhoneGateClient:
@@ -67,6 +76,21 @@ class PhoneGateClient:
             raise PhoneGateError(f"{path}: unexpected payload")
         return payload
 
+    async def _post(self, path: str, json: dict[str, Any] | None = None) -> None:
+        try:
+            response = await self._client.post(path, json=json)
+        except httpx.RequestError as exc:
+            raise PhoneGateUnavailable(f"{path}: {type(exc).__name__}") from exc
+        if response.status_code >= 500:
+            raise PhoneGateUnavailable(f"{path}: HTTP {response.status_code}")
+        if response.status_code == 409:
+            detail = ""
+            with contextlib.suppress(ValueError):
+                detail = str(response.json().get("detail", ""))
+            raise PhoneGateBusy(path, detail)
+        if response.status_code >= 400:
+            raise PhoneGateError(f"{path}: HTTP {response.status_code}")
+
     async def health(self) -> dict[str, Any]:
         return await self._get("/api/health")
 
@@ -109,3 +133,12 @@ class PhoneGateClient:
             return TranscriptPage.model_validate(data)
         except ValidationError as exc:
             raise PhoneGateError("/api/call/transcript: unexpected response schema") from exc
+
+    async def answer(self) -> None:
+        await self._post("/api/call/answer")
+
+    async def speak(self, text: str) -> None:
+        await self._post("/api/call/speak", {"text": text})
+
+    async def hangup(self) -> None:
+        await self._post("/api/call/hangup")
