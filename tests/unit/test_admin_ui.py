@@ -204,6 +204,30 @@ async def test_phone_health_downgrades_stale_agent(sqlite_session_factory: Any) 
     assert result["channel"] == "unavailable"
 
 
+@pytest.mark.asyncio
+async def test_phone_health_device_block_includes_updated_at(sqlite_session_factory: Any) -> None:
+    """F4b: the device line rendered 'never' because the snapshot's updated_at
+    lives on its own column, not in the payload. _phone_health must expose it."""
+    from app.models.entities import PhoneDeviceSnapshot
+
+    stamp = datetime.now(UTC) - timedelta(minutes=5)
+    async with sqlite_session_factory() as session:
+        session.add(
+            PhoneDeviceSnapshot(
+                id="current",
+                payload={"daemon_version": "0.2.1", "battery": 87, "sim_operator": "Orange"},
+                updated_at=stamp,
+            )
+        )
+        await session.commit()
+        result = await _phone_health(session)
+
+    got = result["device"]["updated_at"]
+    assert isinstance(got, datetime)
+    # SQLite drops tzinfo on read; compare the wall-clock value
+    assert got.replace(tzinfo=None) == stamp.replace(tzinfo=None)
+
+
 def test_phone_health_template_exists_and_uses_correct_variables() -> None:
     template_path = Path("app/admin/templates/_phone_health.html")
     assert template_path.exists()

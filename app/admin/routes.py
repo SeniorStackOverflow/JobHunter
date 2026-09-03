@@ -461,7 +461,13 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
             for c in sorted(components, key=lambda c: c.component)
         ],
         "configured": get_settings().phone_agent_enabled,
-        "device": device_snapshot.payload if device_snapshot else {},
+        # ``updated_at`` is the snapshot row's own column, not part of the stored
+        # payload; the template renders it with ``format_dt`` so it stays a datetime.
+        "device": (
+            {**device_snapshot.payload, "updated_at": device_snapshot.updated_at}
+            if device_snapshot
+            else {}
+        ),
     }
 
 

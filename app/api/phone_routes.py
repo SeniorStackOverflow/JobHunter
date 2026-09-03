@@ -49,7 +49,11 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
     device_snapshot = await session.scalar(
         select(PhoneDeviceSnapshot).where(PhoneDeviceSnapshot.id == "current")
     )
-    device_block = device_snapshot.payload if device_snapshot else {}
+    device_block = (
+        {**device_snapshot.payload, "updated_at": device_snapshot.updated_at.isoformat()}
+        if device_snapshot
+        else {}
+    )
 
     # Determine current_call state
     if newest is None or newest.ended_at is not None:

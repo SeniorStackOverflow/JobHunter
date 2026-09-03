@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 from collections.abc import Callable
@@ -27,6 +28,7 @@ HEARTBEAT_PATH = Path(
 )
 
 _SINGLETON_LOCK_TTL = 60
+_DORMANT_HEARTBEAT_SECONDS = 30
 
 
 async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
@@ -109,7 +111,28 @@ async def run() -> int:
     """Run the phone-agent process body. Returns a process exit code."""
     settings = get_settings()
     if not settings.phone_agent_enabled:
-        logger.info("phone_agent_disabled")
+        # Exiting 0 here makes Compose (restart: unless-stopped) respawn the
+        # container every few seconds and its heartbeat healthcheck flap. Hold
+        # the process in a quiet loop that keeps the heartbeat fresh until a
+        # stop signal arrives.
+        logger.info("phone_agent_disabled_dormant")
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        registered: list[signal.Signals] = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+                registered.append(sig)
+            except NotImplementedError:  # e.g. non-main thread / Windows
+                pass
+        try:
+            while not stop.is_set():
+                HEARTBEAT_PATH.touch()  # noqa: ASYNC240
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=_DORMANT_HEARTBEAT_SECONDS)
+        finally:
+            for sig in registered:
+                loop.remove_signal_handler(sig)
         return 0
     if settings.phonegate_auth_token is None:
         logger.error("phone_agent_missing_token")

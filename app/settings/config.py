@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -151,6 +152,13 @@ class Settings(BaseSettings):
                 raise ValueError("TOKEN_ENCRYPTION_KEY must contain at least 32 characters")
         if self.phone_agent_enabled and self.phonegate_auth_token is None:
             raise ValueError("PHONEGATE_AUTH_TOKEN is required when PHONE_AGENT_ENABLED is true")
+        if self.phone_agent_enabled:
+            host = (urlsplit(self.phonegate_url).hostname or "").lower()
+            if host in {"127.0.0.1", "localhost", "0.0.0.0", "::1", ""}:
+                raise ValueError(
+                    "PHONEGATE_URL must be a routable address (not loopback) when "
+                    "PHONE_AGENT_ENABLED is true in production"
+                )
         return self
 
 

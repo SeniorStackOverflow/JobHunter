@@ -203,6 +203,9 @@ async def test_status_device_block_and_idle_call(client, sqlite_session_factory)
     assert body["device"]["battery"] == 87
     assert body["device"]["sim_operator"] == "Orange"
     assert "rx_audio_stats" in body["device"]
+    # F4b: the snapshot's own updated_at column surfaces as an ISO timestamp
+    assert "updated_at" in body["device"]
+    datetime.fromisoformat(body["device"]["updated_at"])
 
     # Verify current_call is idle since session ended
     assert body["current_call"]["state"] == "idle"

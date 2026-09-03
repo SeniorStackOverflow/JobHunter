@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,23 +11,33 @@ from app.settings.config import Settings, get_settings
 
 
 @pytest.mark.asyncio
-async def test_run_exits_zero_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A5: when disabled, run() returns 0 and never attempts Redis connection."""
-    redis_from_url_called = False
+async def test_run_is_dormant_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F4c: when disabled, run() holds the process in a dormant loop that keeps
+    the heartbeat fresh (so Compose does not restart-loop the container) and
+    never connects to Redis; it exits 0 only when signalled/cancelled."""
+    heartbeat = tmp_path / "alive"
 
     class _MockRedis:
         @staticmethod
         def from_url(*args: Any, **kwargs: Any) -> Any:
-            nonlocal redis_from_url_called
-            redis_from_url_called = True
             raise AssertionError("must not connect to Redis when disabled")
 
     monkeypatch.setattr(get_settings, "cache_clear", lambda: None, raising=False)
     monkeypatch.setattr(agent_module, "get_settings", lambda: Settings(_env_file=None))
     monkeypatch.setattr(agent_module, "SyncRedis", _MockRedis)
-    code = await agent_module.run()
-    assert code == 0
-    assert not redis_from_url_called
+    monkeypatch.setattr(agent_module, "HEARTBEAT_PATH", heartbeat)
+    monkeypatch.setattr(agent_module, "_DORMANT_HEARTBEAT_SECONDS", 0.01)
+
+    task = asyncio.create_task(agent_module.run())
+    await asyncio.sleep(0.05)
+    assert not task.done()  # still dormant, not exited
+    assert heartbeat.exists()  # heartbeat kept fresh
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
