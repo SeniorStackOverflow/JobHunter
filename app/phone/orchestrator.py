@@ -125,6 +125,10 @@ class CallOrchestrator:
             logger.warning("phone_orchestrator_connect_failed", error=type(exc).__name__)
             return "aborted_error"
 
+        # Spec §4.1/§13: the hard cap is an absolute ceiling on the ANSWERED
+        # call, so the clock starts here — GREETING counts against it too.
+        answer_start = time.monotonic()
+
         async with self._sf() as db:
             call = await db.get(CommunicationSession, session_id)
             if call is not None:
@@ -136,6 +140,9 @@ class CallOrchestrator:
 
         # GREETING ------------------------------------------------------
         for block in SCRIPT_GREETING:
+            if time.monotonic() - answer_start >= s.phone_call_hard_cap_seconds:
+                await self._finish("aborted_error", needs_review=True)
+                return "aborted_error"
             cmd = await self._cmd()
             terminal = await self._dispatch_command(session_id, cmd)
             if terminal is not None:
@@ -151,8 +158,7 @@ class CallOrchestrator:
 
         # LISTENING ---------------------------------------------------
         await self._set_stage("listening")
-        listen_start = time.monotonic()
-        last_activity = listen_start
+        last_activity = time.monotonic()
         seen_transcript_id = 0
         while True:
             cmd = await self._cmd()
@@ -180,7 +186,7 @@ class CallOrchestrator:
 
             if now - last_activity >= s.phone_listen_silence_timeout_seconds:
                 break
-            if now - listen_start >= s.phone_call_hard_cap_seconds:
+            if now - answer_start >= s.phone_call_hard_cap_seconds:
                 break
             await asyncio.sleep(s.phone_orchestrator_poll_seconds)
 

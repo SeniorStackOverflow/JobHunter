@@ -140,9 +140,12 @@ async def test_hard_cap_cuts_listening(factory: async_sessionmaker[AsyncSession]
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
+    # The cap is measured from answer, not from LISTENING entry (spec §4.1/§13),
+    # so this budget must comfortably outlast GREETING (4 blocks + TX polling)
+    # while still expiring well before the 10s silence timeout.
     settings = _fast_settings(
         phone_listen_silence_timeout_seconds=10.0,
-        phone_call_hard_cap_seconds=0.3,
+        phone_call_hard_cap_seconds=2.0,
     )
     async with _pg(fake) as client:
         orch = CallOrchestrator(client=client, session_factory=factory, settings=settings)
@@ -155,6 +158,30 @@ async def test_hard_cap_cuts_listening(factory: async_sessionmaker[AsyncSession]
     assert call is not None
     assert call.script_stage == "greeting_completed"
     assert fake._call_state == "IDLE"
+
+
+@pytest.mark.asyncio
+async def test_hard_cap_cuts_greeting(factory: async_sessionmaker[AsyncSession]) -> None:
+    """Spec §4.1/§13: the cap is an absolute ceiling on the ANSWERED call, so it
+    must also cut off a GREETING that runs long — not just LISTENING."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    settings = _fast_settings(
+        phone_post_connect_wait_seconds=0.05,
+        phone_call_hard_cap_seconds=0.01,  # already expired by the time GREETING starts
+    )
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=settings)
+        stage = await orch.run(session_id)
+
+    assert stage == "aborted_error"
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.needs_review is True
+    assistant = await _assistant_turns(factory, session_id)
+    assert assistant == []  # cut off before the first block was ever spoken
 
 
 @pytest.mark.asyncio
