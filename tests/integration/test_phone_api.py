@@ -22,6 +22,7 @@ from app.models.enums import (
     PhoneComponentStatus,
     TurnSpeaker,
 )
+from tests.fixtures.fake_redis import FakeAsyncRedis
 
 
 @pytest_asyncio.fixture
@@ -45,6 +46,20 @@ def _settings_with_key():
     from app.settings.config import Settings
 
     return Settings(_env_file=None, mcp_api_keys_hashed=[hash_api_key("secret")])
+
+
+@pytest.fixture(autouse=True)
+def _fake_phone_routes_redis(monkeypatch) -> FakeAsyncRedis:
+    """`/status` opens a short-lived async Redis connection; keep the suite hermetic."""
+    fake = FakeAsyncRedis()
+
+    class _RedisModule:
+        @staticmethod
+        def from_url(*args: object, **kwargs: object) -> FakeAsyncRedis:
+            return fake
+
+    monkeypatch.setattr("app.api.phone_routes.AsyncRedis", _RedisModule)
+    return fake
 
 
 @pytest.mark.asyncio
@@ -211,6 +226,36 @@ async def test_status_device_block_and_idle_call(client, sqlite_session_factory)
     assert body["current_call"]["state"] == "idle"
     assert body["current_call"]["session_id"] is None
     assert body["current_call"]["caller_number"] is None
+
+
+@pytest.mark.asyncio
+async def test_status_auto_answer_block(client, sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as s:
+        profile = UserProfile(name="d", is_default=True)
+        s.add(profile)
+        await s.flush()
+        s.add(
+            CommunicationSession(
+                profile_id=profile.id,
+                channel=CommunicationChannel.CALL,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                remote_address="+37360111222",
+                remote_raw="+37360111222",
+                phonegate_event_id_start=1,
+                started_at=datetime.now(UTC),
+                answered_at=datetime.now(UTC),
+                auto_answered=True,
+                script_stage="listening",
+            )
+        )
+        await s.commit()
+
+    body = (await client.get("/api/v1/phone/status")).json()
+    assert body["auto_answer"]["enabled"] in (True, False)
+    assert body["auto_answer"]["stopped"] is False
+    assert body["current_call"]["auto_answered"] is True
+    assert body["current_call"]["script_stage"] == "listening"
 
 
 @pytest.mark.asyncio

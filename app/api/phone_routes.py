@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +20,7 @@ from app.models.entities import (
 from app.models.enums import PhoneComponentStatus
 from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 from app.phone.numbers import mask_phone
+from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
 from app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1/phone", tags=["phone"])
@@ -55,25 +57,31 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
         else {}
     )
 
+    # Auto-answer state lives in Redis; the API process has no shared async-redis
+    # dependency, so open a short-lived connection (this endpoint is diagnostic, not hot).
+    redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        raw_stopped: str | None = await redis.get(AUTO_ANSWER_STOPPED_KEY)
+    finally:
+        await redis.aclose()
+    stopped = raw_stopped == "1"
+
+    def _call_block(state: str, sess: CommunicationSession | None) -> dict[str, Any]:
+        return {
+            "state": state,
+            "session_id": str(sess.id) if sess else None,
+            "caller_number": mask_phone(sess.remote_address) if sess else None,
+            "auto_answered": bool(sess.auto_answered) if sess else False,
+            "script_stage": sess.script_stage if sess else None,
+        }
+
     # Determine current_call state
     if newest is None or newest.ended_at is not None:
-        current_call = {
-            "state": "idle",
-            "session_id": None,
-            "caller_number": None,
-        }
+        current_call = _call_block("idle", None)
     elif newest.answered_at is not None:
-        current_call = {
-            "state": "connected",
-            "session_id": str(newest.id),
-            "caller_number": mask_phone(newest.remote_address),
-        }
+        current_call = _call_block("connected", newest)
     else:
-        current_call = {
-            "state": "ringing",
-            "session_id": str(newest.id),
-            "caller_number": mask_phone(newest.remote_address),
-        }
+        current_call = _call_block("ringing", newest)
 
     return {
         "channel": channel_status(components).value if components else "unknown",
@@ -95,6 +103,11 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
         ],
         "device": device_block,
         "current_call": current_call,
+        "auto_answer": {
+            "enabled": get_settings().phone_auto_answer_enabled,
+            "stopped": stopped,
+            "last_decision": None,
+        },
     }
 
 
