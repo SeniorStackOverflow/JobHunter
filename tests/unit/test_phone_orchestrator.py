@@ -156,6 +156,58 @@ async def test_call_drops_mid_greeting(factory: async_sessionmaker[AsyncSession]
 
 
 @pytest.mark.asyncio
+async def test_answer_409_is_a_benign_miss_not_a_review(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Spec §10 row 1: ``answer()`` 409 (never rang / another answerer won the
+    race) leaves the session as a plain Phase-1 observed inbound — no
+    ``auto_answered``, no ``script_stage``, no ``needs_review``."""
+    fake = FakePhoneGate()  # NOT ringing -> /api/call/answer returns 409
+    session_id = await _open_ringing_session(factory)
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
+        stage = await orch.run(session_id)
+
+    assert stage == "aborted_error"
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.auto_answered is False
+    assert call.script_stage is None
+    assert call.needs_review is False
+
+
+@pytest.mark.asyncio
+async def test_call_ends_before_in_call_is_a_benign_miss(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Spec §10 row 1: ``answer()`` succeeds but the call goes IDLE before the
+    connect fence reaches IN_CALL — still a benign miss, not a failed autonomous
+    call, so the session stays unmarked."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    async with _pg(fake) as client:
+        real_answer = client.answer
+
+        async def answer_then_drop() -> None:
+            await real_answer()
+            fake.hangup()  # caller gone before IN_CALL is observed
+
+        client.answer = answer_then_drop  # type: ignore[method-assign]
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
+        stage = await orch.run(session_id)
+
+    assert stage == "aborted_error"
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.auto_answered is False
+    assert call.script_stage is None
+    assert call.needs_review is False
+
+
+@pytest.mark.asyncio
 async def test_operator_hangup_command(factory: async_sessionmaker[AsyncSession]) -> None:
     fake = FakePhoneGate()
     fake.ring("+37360111222")

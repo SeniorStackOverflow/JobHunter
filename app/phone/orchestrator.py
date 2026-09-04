@@ -88,11 +88,16 @@ class CallOrchestrator:
         session_id = self._sid
 
         # POST_CONNECT_WAIT ------------------------------------------------
+        # Spec §10 row 1: if ``answer()`` returns 409 or IN_CALL is not reached
+        # before the connect timeout, the call was never ours to drive (it ended,
+        # or another answerer won the race). Exit leaving ``auto_answered=false``,
+        # ``script_stage`` null and NO ``needs_review`` — ``IngestLoop`` then
+        # handles the session as an ordinary Phase-1 observed inbound. Only a
+        # genuine post-answer abort earns ``_finish(..., needs_review=True)``.
         try:
             await self._client.answer()
         except (PhoneGateUnavailable, PhoneGateError):
             logger.warning("phone_orchestrator_answer_failed")
-            await self._finish("aborted_error", needs_review=True)
             return "aborted_error"
 
         try:
@@ -103,7 +108,6 @@ class CallOrchestrator:
             )
         except Exception as exc:
             logger.warning("phone_orchestrator_connect_failed", error=type(exc).__name__)
-            await self._finish("aborted_error", needs_review=True)
             return "aborted_error"
 
         async with self._sf() as db:
