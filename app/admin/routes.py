@@ -12,6 +12,7 @@ from urllib.parse import quote, urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
@@ -80,6 +81,8 @@ from app.settings import get_settings
 router = APIRouter(tags=["admin"])
 templates = Jinja2Templates(directory="app/admin/templates")
 _ADMIN_STATIC_ROOT = Path(__file__).with_name("static")
+
+logger = structlog.get_logger(__name__)
 
 
 @lru_cache
@@ -449,6 +452,32 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
         select(PhoneDeviceSnapshot).where(PhoneDeviceSnapshot.id == "current")
     )
 
+    # Read auto-answer state and active call from Redis
+    from redis.exceptions import RedisError
+
+    from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY, CALL_OWNED_KEY
+
+    redis = None
+    stopped = False
+    owned = None
+    try:
+        redis = _phone_redis()
+        stopped = (await redis.get(AUTO_ANSWER_STOPPED_KEY)) == "1"
+        owned = await redis.get(CALL_OWNED_KEY)
+    except (OSError, RedisError) as exc:
+        logger.warning("phone_health_redis_unreachable", error=type(exc).__name__)
+    finally:
+        if redis is not None:
+            await redis.aclose()
+
+    active_call = None
+    if owned:
+        from app.models.entities import CommunicationSession
+
+        call = await session.get(CommunicationSession, UUID(owned))
+        if call is not None and call.ended_at is None:
+            active_call = {"session_id": owned, "script_stage": call.script_stage}
+
     return {
         "channel": channel_status(components).value if components else "unknown",
         "components": [
@@ -468,6 +497,11 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
             if device_snapshot
             else {}
         ),
+        "auto_answer": {
+            "enabled": get_settings().phone_auto_answer_enabled,
+            "stopped": stopped,
+        },
+        "active_call": active_call,
     }
 
 
@@ -481,6 +515,12 @@ templates.env.globals["application_approval_issue"] = _application_approval_issu
 
 def _signer() -> SessionSigner:
     return SessionSigner(get_settings().secret_key.get_secret_value())
+
+
+def _phone_redis() -> Any:
+    from redis.asyncio import Redis as AsyncRedis
+
+    return AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
 
 
 def _csrf() -> CsrfProtector:
@@ -1613,6 +1653,59 @@ async def set_pause(
     return RedirectResponse(
         f"/?view=overview&profile_id={preferences.profile_id}&notice={notice}", status_code=303
     )
+
+
+@router.post("/admin/phone/auto-answer/{action}")
+async def phone_auto_answer_toggle(
+    action: str,
+    request: Request,
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    if action not in {"stop", "resume"}:
+        raise HTTPException(status_code=404)
+    from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
+
+    redis = _phone_redis()
+    try:
+        if action == "stop":
+            await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
+        else:
+            await redis.delete(AUTO_ANSWER_STOPPED_KEY)
+    finally:
+        await redis.aclose()
+    await _audit_admin(session, f"phone.auto_answer.{action}", "phone_channel", "auto_answer")
+    await session.commit()
+    return RedirectResponse("/?view=diagnostics", status_code=303)
+
+
+@router.post("/admin/phone/call/{session_id}/{action}")
+async def phone_call_action(
+    session_id: UUID,
+    action: str,
+    request: Request,
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    if action not in {"hangup", "mute"}:
+        raise HTTPException(status_code=404)
+    from app.phone.orchestrator import CALL_CMD_KEY, CALL_OWNED_KEY
+
+    redis = _phone_redis()
+    try:
+        owned = await redis.get(CALL_OWNED_KEY)
+        if owned != str(session_id):
+            raise HTTPException(status_code=409, detail="not the active call")
+        await redis.set(CALL_CMD_KEY, f"{action}:{session_id}")
+    finally:
+        await redis.aclose()
+    await _audit_admin(session, f"phone.call.{action}", "communication_session", str(session_id))
+    await session.commit()
+    return RedirectResponse("/?view=diagnostics", status_code=303)
 
 
 @router.post("/admin/resumes")

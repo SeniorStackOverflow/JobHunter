@@ -594,6 +594,113 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert (await forged_client.get("/")).status_code == 303
 
 
+async def test_admin_phone_auto_answer_stop_requires_csrf_and_sets_key(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any, monkeypatch
+) -> None:
+    from app.admin import routes as admin_routes
+    from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    application, _ = interface_app
+    fake_redis = FakeAsyncRedis()
+    monkeypatch.setattr(admin_routes, "_phone_redis", lambda: fake_redis)
+
+    async with sqlite_session_factory() as session:
+        session.add(UserProfile(id=uuid4(), is_default=True, name="Admin Owner"))
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        login_csrf = _csrf_token((await client.get("/login")).text)
+        logged_in = await client.post(
+            "/login",
+            data={
+                "password": ADMIN_PASSWORD,
+                "csrf_token": login_csrf,
+            },
+        )
+        assert logged_in.status_code == 303
+        dashboard = await client.get("/")
+        assert dashboard.status_code == 200
+        dashboard_csrf = _csrf_token(dashboard.text)
+
+        wrong_csrf = await client.post(
+            "/admin/phone/auto-answer/stop", data={"csrf_token": login_csrf}
+        )
+        assert wrong_csrf.status_code == 403
+
+        stopped = await client.post(
+            "/admin/phone/auto-answer/stop", data={"csrf_token": dashboard_csrf}
+        )
+        assert stopped.status_code == 303
+
+    assert await fake_redis.get(AUTO_ANSWER_STOPPED_KEY) == "1"
+
+    async with sqlite_session_factory() as session:
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "phone.auto_answer.stop")
+        )
+        assert audit is not None
+        assert audit.entity_type == "phone_channel"
+
+
+async def test_admin_phone_call_hangup_requires_call_ownership(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any, monkeypatch
+) -> None:
+    from app.admin import routes as admin_routes
+    from app.phone.orchestrator import CALL_CMD_KEY, CALL_OWNED_KEY
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    application, settings = interface_app
+    fake_redis = FakeAsyncRedis()
+    monkeypatch.setattr(admin_routes, "_phone_redis", lambda: fake_redis)
+
+    async with sqlite_session_factory() as session:
+        session.add(UserProfile(id=uuid4(), is_default=True, name="Admin Owner"))
+        await session.commit()
+
+    session_id = uuid4()
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        dashboard_csrf = await _login_admin(client, settings)
+
+        not_owned = await client.post(
+            f"/admin/phone/call/{session_id}/hangup", data={"csrf_token": dashboard_csrf}
+        )
+        assert not_owned.status_code == 409
+
+    await fake_redis.set(CALL_OWNED_KEY, str(session_id))
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+        follow_redirects=False,
+    ) as client:
+        dashboard_csrf = await _login_admin(client, settings)
+
+        hangup = await client.post(
+            f"/admin/phone/call/{session_id}/hangup", data={"csrf_token": dashboard_csrf}
+        )
+        assert hangup.status_code == 303
+
+    assert await fake_redis.get(CALL_CMD_KEY) == f"hangup:{session_id}"
+
+    async with sqlite_session_factory() as session:
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "phone.call.hangup")
+        )
+        assert audit is not None
+        assert audit.entity_type == "communication_session"
+
+
 async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
     interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
 ) -> None:
