@@ -259,6 +259,20 @@ async def test_status_auto_answer_block(client, sqlite_session_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_survives_redis_outage(client, sqlite_session_factory, monkeypatch) -> None:
+    """`/status` is a break-glass diagnostic — a Redis outage must not 500 it."""
+
+    def _boom(*a: object, **k: object) -> None:
+        raise ConnectionError("redis down")
+
+    mock_class = type("M", (), {"from_url": staticmethod(_boom)})
+    monkeypatch.setattr("app.api.phone_routes.AsyncRedis", mock_class)
+    body = await client.get("/api/v1/phone/status")
+    assert body.status_code == 200
+    assert body.json()["auto_answer"]["stopped"] is False
+
+
+@pytest.mark.asyncio
 async def test_status_requires_auth(sqlite_session_factory) -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:

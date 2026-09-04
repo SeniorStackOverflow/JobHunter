@@ -4,8 +4,10 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from redis.asyncio import Redis as AsyncRedis
+from redis.exceptions import RedisError
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +24,8 @@ from app.phone.health import HealthComponent, agent_component_is_stale, channel_
 from app.phone.numbers import mask_phone
 from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
 from app.settings import get_settings
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/phone", tags=["phone"])
 
@@ -59,12 +63,17 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
 
     # Auto-answer state lives in Redis; the API process has no shared async-redis
     # dependency, so open a short-lived connection (this endpoint is diagnostic, not hot).
-    redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    redis = None
     try:
+        redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
         raw_stopped: str | None = await redis.get(AUTO_ANSWER_STOPPED_KEY)
+        stopped = raw_stopped == "1"
+    except (OSError, RedisError) as exc:
+        logger.warning("phone_status_redis_unreachable", error=type(exc).__name__)
+        stopped = False
     finally:
-        await redis.aclose()
-    stopped = raw_stopped == "1"
+        if redis is not None:
+            await redis.aclose()
 
     def _call_block(state: str, sess: CommunicationSession | None) -> dict[str, Any]:
         return {
