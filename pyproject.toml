@@ -73,6 +73,7 @@ markers = [
   "integration: requires local integration services",
   "e2e: end-to-end pipeline test",
   "live: opt-in live network smoke test",
+  "realcall: opt-in tests that place real GSM calls (never in CI)",
 ]
 filterwarnings = ["error"]
 
@@ -87,6 +88,7 @@ ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S105", "S106", "S108", "S311"]
+"tests/realcall/a06_originate.py" = ["S603", "S607"]
 "app/admin/routes.py" = ["RUF001"]
 "app/phone/script.py" = ["RUF001"]
 "app/settings/config.py" = ["S104"]
