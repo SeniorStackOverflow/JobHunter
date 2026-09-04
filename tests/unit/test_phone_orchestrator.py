@@ -386,6 +386,42 @@ async def test_supervisor_respects_runtime_stop(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_decides_once_per_ringing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Spec §3.2: the policy decision is computed (and audited) once per inbound
+    RINGING, not once per ~0.3s poll tick — an IGNORE decision spawns no task, so
+    without the gate a 20-30s ring writes ~100 duplicate audit rows."""
+    from app.models.entities import AuditEvent
+    from app.phone.orchestrator import OrchestratorSupervisor
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    redis = FakeAsyncRedis()
+    async with _pg(fake) as client:
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=factory,
+            redis=redis,
+            settings=Settings(_env_file=None),  # auto-answer OFF -> decision.answer is False
+        )
+        status = await client.device_status()
+        await sup.tick(status, session_id)
+        await sup.tick(status, session_id)
+
+    async with factory() as s:
+        rows = (
+            await s.scalars(
+                select(AuditEvent).where(AuditEvent.action == "communication.auto_answer_decision")
+            )
+        ).all()
+    assert len(rows) == 1
+    assert fake._call_state == "RINGING"  # still not answered
+
+
+@pytest.mark.asyncio
 async def test_supervisor_disabled_by_config_does_not_answer(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:

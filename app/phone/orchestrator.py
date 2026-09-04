@@ -349,6 +349,10 @@ class OrchestratorSupervisor:
         self._s = settings
         self._task: asyncio.Task[str] | None = None
         self._task_session_id: UUID | None = None
+        # The inbound session the auto-answer policy has already been run and
+        # audited for. Spec §3.2: the decision is computed once per RINGING, not
+        # once per ~0.3s poll tick.
+        self._decided_session_id: UUID | None = None
 
     async def _runtime_stopped(self) -> bool:
         raw: str | None = await self._redis.get(AUTO_ANSWER_STOPPED_KEY)
@@ -389,11 +393,16 @@ class OrchestratorSupervisor:
                 logger.warning("phone_orchestrator_task_error", error=type(exc).__name__)
             self._task = None
             self._task_session_id = None
+            self._decided_session_id = None
             await self._redis.delete(CALL_OWNED_KEY)
             return
 
         if status is None or status.call_state != "RINGING" or open_session_id is None:
             return
+
+        if self._decided_session_id == open_session_id:
+            return
+        self._decided_session_id = open_session_id
 
         stopped = await self._runtime_stopped()
         normalized = normalize_e164(status.caller_number, region=self._s.phone_caller_region)
