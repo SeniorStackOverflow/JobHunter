@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from app.phone.client import PhoneGateClient
+from app.phone.client import PhoneGateClient, PhoneGateUnavailable
+from app.phone.schemas import DeviceStatus
 from app.phone.speak import (
     CallEnded,
     SpeakFenceTimeout,
+    SpeakResult,
     observe_tx_delivery,
     speak_block,
     wait_until_speakable,
@@ -74,6 +76,25 @@ async def test_speak_block_409_then_retry_succeeds() -> None:
         fake.fail_next_speak(mode="409_tx_busy")
         res = await speak_block(c, "x", fence_timeout=2.0, poll=0.01)
         assert res.outcome == "ok"
+
+
+@pytest.mark.asyncio
+async def test_speak_block_fence_transport_error_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PhoneGate blip while fencing must degrade, not propagate — an escaping
+    exception would skip the caller's ``_hangup()`` and leave a live GSM call."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        await c.answer()
+
+        async def boom() -> DeviceStatus:
+            raise PhoneGateUnavailable("/api/device/status: ReadTimeout")
+
+        monkeypatch.setattr(c, "device_status", boom)
+        res = await speak_block(c, "x", fence_timeout=2.0, poll=0.01)
+        assert res == SpeakResult(outcome="unknown")
 
 
 @pytest.mark.asyncio

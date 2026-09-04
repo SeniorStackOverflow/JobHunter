@@ -72,6 +72,9 @@ async def speak_block(
     except SpeakFenceTimeout:
         logger.warning("phone_speak_fence_timeout")
         return SpeakResult("unknown")
+    except (PhoneGateUnavailable, PhoneGateError):
+        logger.warning("phone_speak_fence_transport_error")
+        return SpeakResult("unknown")
 
     try:
         await client.speak(text)
@@ -84,6 +87,9 @@ async def speak_block(
             return SpeakResult("ended")
         except SpeakFenceTimeout:
             return SpeakResult("unknown")
+        except (PhoneGateUnavailable, PhoneGateError):
+            logger.warning("phone_speak_fence_transport_error")
+            return SpeakResult("unknown")
         try:
             await client.speak(text)
             return SpeakResult("ok")
@@ -91,6 +97,8 @@ async def speak_block(
             logger.warning("phone_speak_still_busy_after_retry", detail=exc.detail)
             return SpeakResult("unknown")
         except PhoneGateUnavailable:
+            return SpeakResult("unknown")
+        except PhoneGateError:
             return SpeakResult("unknown")
     except PhoneGateUnavailable:
         # Ambiguous: PhoneGate may already have accepted the utterance. Never retry.
