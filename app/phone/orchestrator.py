@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.audit import record_audit_event
 from app.models.entities import CommunicationSession
 from app.models.enums import TurnDeliveryStatus
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
+from app.phone.numbers import mask_phone, normalize_e164
+from app.phone.policy import should_answer
+from app.phone.schemas import DeviceStatus
 from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_INTERRUPTED, SCRIPT_GREETING
 from app.phone.sessions import SessionStore
 from app.phone.speak import observe_tx_delivery, speak_block, wait_until_speakable
@@ -27,6 +33,15 @@ TERMINAL_STAGES = {
     "aborted_error",
     "aborted_restart",
 }
+
+# Redis keys owned by ``OrchestratorSupervisor``. ``AUTO_ANSWER_STOPPED_KEY`` is
+# the operator's runtime kill switch (``"1"`` => stop answering / stop the live
+# call); ``CALL_OWNED_KEY`` holds the ``session_id`` of the call an orchestrator
+# task is currently driving; ``CALL_CMD_KEY`` carries a one-shot per-call command
+# (``"hangup:<sid>"`` | ``"mute:<sid>"``). Imported verbatim by Tasks 12-14.
+AUTO_ANSWER_STOPPED_KEY = "job-agent:phone:auto_answer_stopped"
+CALL_OWNED_KEY = "job-agent:phone:call:owned"
+CALL_CMD_KEY = "job-agent:phone:call:cmd"
 
 # How long a fresh ``/speak`` has to make TX activate before the turn is judged a
 # non-delivery. Kept well above a realistic Piper+downlink startup.
@@ -308,3 +323,121 @@ class CallOrchestrator:
             await self._client.hangup()
         except (PhoneGateUnavailable, PhoneGateError):
             logger.warning("phone_orchestrator_hangup_failed")
+
+
+class OrchestratorSupervisor:
+    """Watch the ingest loop's device status for ``RINGING``, run the auto-answer
+    policy, and drive at most one :class:`CallOrchestrator` at a time as a
+    background ``asyncio.Task``.
+
+    ``tick`` is edge-free and cheap: Task 12 calls it once per phone-agent loop
+    iteration. The supervisor also owns the operator-facing Redis keys — the
+    runtime stop switch and the one-shot per-call command channel.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: PhoneGateClient,
+        session_factory: async_sessionmaker[AsyncSession],
+        redis: Redis,
+        settings: Settings,
+    ) -> None:
+        self._client = client
+        self._sf = session_factory
+        self._redis = redis
+        self._s = settings
+        self._task: asyncio.Task[str] | None = None
+        self._task_session_id: UUID | None = None
+
+    async def _runtime_stopped(self) -> bool:
+        raw: str | None = await self._redis.get(AUTO_ANSWER_STOPPED_KEY)
+        return raw == "1"
+
+    def _command_check_for(self, session_id: UUID) -> Callable[[], Awaitable[str | None]]:
+        """Build the ``command_check`` closure handed to the ``CallOrchestrator``.
+
+        ``"stop"`` when the runtime kill switch is set; ``"hangup"`` / ``"mute"``
+        when ``CALL_CMD_KEY`` names an action for *this* session (consumed on
+        read); ``None`` otherwise.
+        """
+
+        async def check() -> str | None:
+            if await self._runtime_stopped():
+                return "stop"
+            raw: str | None = await self._redis.get(CALL_CMD_KEY)
+            if raw and ":" in raw:
+                action, sid = raw.split(":", 1)
+                if sid == str(session_id) and action in {"hangup", "mute"}:
+                    await self._redis.delete(CALL_CMD_KEY)
+                    return action
+            return None
+
+        return check
+
+    async def tick(self, status: DeviceStatus | None, open_session_id: UUID | None) -> None:
+        if self._task is not None:
+            if not self._task.done():
+                return
+            try:
+                stage = await self._task
+                logger.info("phone_orchestrator_finished", stage=stage)
+            except asyncio.CancelledError:
+                logger.info("phone_orchestrator_task_cancelled")
+            except Exception as exc:
+                # A phone failure must never crash the phone-agent loop.
+                logger.warning("phone_orchestrator_task_error", error=type(exc).__name__)
+            self._task = None
+            self._task_session_id = None
+            await self._redis.delete(CALL_OWNED_KEY)
+            return
+
+        if status is None or status.call_state != "RINGING" or open_session_id is None:
+            return
+
+        stopped = await self._runtime_stopped()
+        normalized = normalize_e164(status.caller_number, region=self._s.phone_caller_region)
+        decision = should_answer(
+            status=status,
+            settings=self._s,
+            runtime_stopped=stopped,
+            normalized_caller=normalized,
+        )
+        async with self._sf() as db:
+            await record_audit_event(
+                db,
+                actor="phone-agent",
+                action="communication.auto_answer_decision",
+                entity_type="communication_session",
+                entity_id=str(open_session_id),
+                correlation_id=str(open_session_id),
+                details={
+                    "answer": decision.answer,
+                    "reason": decision.reason,
+                    "caller": mask_phone(status.caller_number),
+                },
+            )
+            await db.commit()
+        if not decision.answer:
+            return
+
+        orch = CallOrchestrator(
+            client=self._client,
+            session_factory=self._sf,
+            settings=self._s,
+            command_check=self._command_check_for(open_session_id),
+        )
+        self._task = asyncio.create_task(orch.run(open_session_id))
+        self._task_session_id = open_session_id
+        await self._redis.set(CALL_OWNED_KEY, str(open_session_id))
+
+    async def shutdown(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            # Suppress both the cancellation and any teardown error the task
+            # raises on its way out — shutdown must not surface a phone failure.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+        self._task = None
+        self._task_session_id = None
+        await self._redis.delete(CALL_OWNED_KEY)

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
+from app.database.base import Base
+from app.database.session import make_session_factory
 from app.models.entities import CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import TurnDeliveryStatus, TurnSpeaker
 from app.phone.client import PhoneGateClient
@@ -52,6 +61,26 @@ async def factory(
         s.add(UserProfile(name="d", is_default=True))
         await s.commit()
     return sqlite_session_factory
+
+
+@pytest_asyncio.fixture
+async def file_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """A temp-file sqlite session factory.
+
+    The shared in-memory ``sqlite_session_factory`` has no ``StaticPool``, so a
+    ``CallOrchestrator`` running as a concurrent ``asyncio.Task`` and the test
+    body would each get a separate empty database. A file-backed engine is
+    shared across connections, which the supervisor's spawn/monitor path needs.
+    """
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/t.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory_ = make_session_factory(engine)
+    async with factory_() as s:
+        s.add(UserProfile(name="d", is_default=True))
+        await s.commit()
+    yield factory_
+    await engine.dispose()
 
 
 async def _open_ringing_session(factory: async_sessionmaker[AsyncSession]) -> UUID:
@@ -293,3 +322,87 @@ async def test_mute_command_records_diagnostic(
         call = await s.get(CommunicationSession, session_id)
     assert call is not None
     assert call.diagnostics.get("mute_requested") is True
+
+
+@pytest.mark.asyncio
+async def test_supervisor_spawns_on_ringing_and_answers(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.phone.orchestrator import CALL_OWNED_KEY, OrchestratorSupervisor
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+    redis = FakeAsyncRedis()
+    async with _pg(fake) as client:
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=file_factory,
+            redis=redis,
+            settings=_fast_settings(),
+        )
+        await sup.tick(await client.device_status(), session_id)
+        assert await redis.get(CALL_OWNED_KEY) == str(session_id)
+        # let it run to completion
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            await sup.tick(await client.device_status(), session_id)
+            if await redis.get(CALL_OWNED_KEY) is None:
+                break
+        assert fake._call_state == "IDLE"
+    async with file_factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.auto_answered is True
+
+
+@pytest.mark.asyncio
+async def test_supervisor_respects_runtime_stop(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.phone.orchestrator import (
+        AUTO_ANSWER_STOPPED_KEY,
+        CALL_OWNED_KEY,
+        OrchestratorSupervisor,
+    )
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    redis = FakeAsyncRedis()
+    await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
+    async with _pg(fake) as client:
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=factory,
+            redis=redis,
+            settings=_fast_settings(),
+        )
+        await sup.tick(await client.device_status(), session_id)
+        assert await redis.get(CALL_OWNED_KEY) is None
+        assert fake._call_state == "RINGING"  # not answered
+
+
+@pytest.mark.asyncio
+async def test_supervisor_disabled_by_config_does_not_answer(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.phone.orchestrator import CALL_OWNED_KEY, OrchestratorSupervisor
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    redis = FakeAsyncRedis()
+    async with _pg(fake) as client:
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=factory,
+            redis=redis,
+            settings=Settings(_env_file=None),  # auto-answer OFF
+        )
+        await sup.tick(await client.device_status(), session_id)
+        assert await redis.get(CALL_OWNED_KEY) is None
+        assert fake._call_state == "RINGING"
