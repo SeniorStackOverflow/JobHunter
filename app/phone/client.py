@@ -85,7 +85,7 @@ class PhoneGateClient:
             raise PhoneGateUnavailable(f"{path}: HTTP {response.status_code}")
         if response.status_code == 409:
             detail = ""
-            with contextlib.suppress(ValueError):
+            with contextlib.suppress(ValueError, AttributeError):
                 detail = str(response.json().get("detail", ""))
             raise PhoneGateBusy(path, detail)
         if response.status_code >= 400:

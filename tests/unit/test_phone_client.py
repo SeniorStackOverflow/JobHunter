@@ -143,6 +143,21 @@ async def test_speak_409_raises_phonegate_busy() -> None:
 
 
 @pytest.mark.asyncio
+async def test_speak_409_with_non_object_body_still_raises_busy() -> None:
+    """A 409 whose JSON body is not an object must still map to PhoneGateBusy
+    (``.get()`` on a list/str raises AttributeError, not ValueError)."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json=["tx busy"])
+
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=httpx.MockTransport(_handler)
+    ) as c:
+        with pytest.raises(PhoneGateBusy):
+            await c.speak("x")
+
+
+@pytest.mark.asyncio
 async def test_speak_504_raises_unavailable() -> None:
     fake = FakePhoneGate()
     fake.ring("+37360111222")
