@@ -203,6 +203,19 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         assert report.summary["auto_approved"] == 1
         assert report.summary["automatically_sent"] == 1
         assert report.summary["sent_total"] == 1
+        assert report.summary["applications_created_today"] == 1
+        assert report.summary["created_today_auto_approved"] == 1
+        assert report.summary["created_today_pending_review"] == 0
+        assert report.summary["created_today_blocked"] == 0
+        assert report.summary["created_today_skipped"] == 0
+        assert report.summary["created_today_unclassified"] == 0
+        assert report.summary["sent_today"] == 1
+        assert report.summary["sent_today_created_today"] == 1
+        assert report.summary["sent_today_from_backlog"] == 0
+        assert report.summary["sent_today_unclassified_origin"] == 0
+        assert report.summary["unsent_auto_approved_backlog"] == 0
+        assert report.summary["pending_review_backlog"] == 0
+        assert report.summary["data_integrity"] == {"status": "ok", "issues": []}
         assert report.summary["timezone"] == "Europe/Chisinau"
         assert report.summary["period_start"].endswith(("+02:00", "+03:00"))
         assert report.summary["daily_limit"] == 20
@@ -240,6 +253,20 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             "thread_id": "thread-1",
             "automatic": True,
         }
+
+        # Regression: a send event today may drain an application created on an
+        # earlier day. It must not inflate today's created cohort.
+        application.created_at = now - timedelta(days=2)
+        await session.flush()
+        backlog_report = await _generate(session)
+
+        assert backlog_report.summary["applications_created_today"] == 0
+        assert backlog_report.summary["created_today_auto_approved"] == 0
+        assert backlog_report.summary["sent_today"] == 1
+        assert backlog_report.summary["sent_today_created_today"] == 0
+        assert backlog_report.summary["sent_today_from_backlog"] == 1
+        assert backlog_report.summary["sent_today_unclassified_origin"] == 0
+        assert backlog_report.summary["data_integrity"] == {"status": "ok", "issues": []}
 
 
 async def test_daily_report_includes_learning_shadow_block(
