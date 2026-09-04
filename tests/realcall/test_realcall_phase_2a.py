@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import desc, select
 
 from app.database import async_session_factory
 from app.models.entities import CommunicationSession, CommunicationTurn
@@ -76,30 +76,27 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
 
     # Assertion 4: session state
     async with async_session_factory() as session:
-        sessions = await session.execute(select(CommunicationSession))
+        sessions = await session.execute(
+            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+        )
         session_obj = sessions.scalars().first()
-        if session_obj:
-            assert session_obj.auto_answered is True
-            assert session_obj.script_stage == "greeting_completed"
-            assert session_obj.outcome == CommunicationOutcome.COMPLETED
-            # TX turns should have delivery_status="delivered" and spoken_text set
-            turns_result = await session.execute(
-                select(CommunicationTurn).where(
-                    CommunicationTurn.session_id == session_obj.id,
-                    CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
-                )
+        assert session_obj is not None, "no session created by this test"
+        assert session_obj.auto_answered is True
+        assert session_obj.script_stage == "greeting_completed"
+        assert session_obj.outcome == CommunicationOutcome.COMPLETED
+        # TX turns should have delivery_status="delivered" and spoken_text set
+        turns_result = await session.execute(
+            select(CommunicationTurn).where(
+                CommunicationTurn.session_id == session_obj.id,
+                CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
             )
-            tx_turns = turns_result.scalars().all()
-            for turn in tx_turns:
-                assert turn.delivery_status == TurnDeliveryStatus.DELIVERED
-                assert turn.spoken_text is not None
-
-    # Assertion 5: call_state back to IDLE and ended_at set
-    async with async_session_factory() as session:
-        sessions = await session.execute(select(CommunicationSession))
-        session_obj = sessions.scalars().first()
-        if session_obj:
-            assert session_obj.ended_at is not None
+        )
+        tx_turns = turns_result.scalars().all()
+        for turn in tx_turns:
+            assert turn.delivery_status == TurnDeliveryStatus.DELIVERED
+            assert turn.spoken_text is not None
+        # Assertion 5: call ended
+        assert session_obj.ended_at is not None
 
 
 @pytest.mark.realcall
@@ -131,11 +128,13 @@ async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
 
     # Assert: downlink contains the short closing and call ended
     async with async_session_factory() as session:
-        sessions = await session.execute(select(CommunicationSession))
+        sessions = await session.execute(
+            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+        )
         session_obj = sessions.scalars().first()
-        if session_obj:
-            assert session_obj.script_stage == "aborted_operator"
-            assert session_obj.ended_at is not None
+        assert session_obj is not None, "no session created by this test"
+        assert session_obj.script_stage == "aborted_operator"
+        assert session_obj.ended_at is not None
 
 
 @pytest.mark.realcall
@@ -164,11 +163,13 @@ async def test_realcall_per_call_hangup(a06_rig: A06Rig) -> None:
 
     # Assert: call hung up with script_stage="aborted_operator"
     async with async_session_factory() as session:
-        sessions = await session.execute(select(CommunicationSession))
+        sessions = await session.execute(
+            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+        )
         session_obj = sessions.scalars().first()
-        if session_obj:
-            assert session_obj.script_stage == "aborted_operator"
-            assert session_obj.ended_at is not None
+        assert session_obj is not None, "no session created by this test"
+        assert session_obj.script_stage == "aborted_operator"
+        assert session_obj.ended_at is not None
 
 
 @pytest.mark.realcall
@@ -187,10 +188,12 @@ async def test_realcall_disabled_is_observed_only(a06_rig: A06Rig) -> None:
 
     # Assert: inbound event recorded (Phase 1), but no auto_answered=true
     async with async_session_factory() as session:
-        sessions = await session.execute(select(CommunicationSession))
+        sessions = await session.execute(
+            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+        )
         session_obj = sessions.scalars().first()
-        if session_obj:
-            # Phase 1: event is recorded as an inbound observation
-            assert session_obj.direction == CommunicationDirection.INBOUND
-            # But no orchestrator ran (auto_answered should be False or None)
-            assert session_obj.auto_answered is not True
+        assert session_obj is not None, "no session created by this test"
+        # Phase 1: event is recorded as an inbound observation
+        assert session_obj.direction == CommunicationDirection.INBOUND
+        # But no orchestrator ran (auto_answered should be False or None)
+        assert session_obj.auto_answered is not True
