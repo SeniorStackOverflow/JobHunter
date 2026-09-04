@@ -131,3 +131,75 @@ def test_cli_registers_phone_agent_subcommand() -> None:
     parser = build_parser()
     args = parser.parse_args(["phone-agent"])
     assert args.command == "phone-agent"
+
+
+@pytest.mark.asyncio
+async def test_startup_marks_auto_answered_call_aborted_on_restart(
+    monkeypatch: pytest.MonkeyPatch, sqlite_session_factory: Any
+) -> None:
+    """Spec §10 last row: the process restarted while an auto-answered call was
+    still in progress. The half-duplex script cannot be resumed mid-flight, so
+    startup stamps the open session ``aborted_restart`` + ``needs_review``
+    instead of handing it back to the orchestrator."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.models.entities import CommunicationSession, UserProfile
+    from app.phone.client import PhoneGateClient
+    from app.phone.correlation import CorrelationResult
+    from app.phone.sessions import SessionStore
+    from tests.fixtures.fake_phonegate import FakePhoneGate
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    fake.answer()  # device now reports call_state == "IN_CALL"
+
+    async with sqlite_session_factory() as session:
+        session.add(UserProfile(name="d", is_default=True))
+        await session.commit()
+        profile = (await session.scalars(select(UserProfile))).one()
+        call = await SessionStore().open(
+            session,
+            remote_raw="+37360111222",
+            remote_address="+37360111222",
+            event_id=2,
+            correlation=CorrelationResult(profile.id, None, None, None, None),
+            opened_at=datetime.now(UTC),
+            answered_at=datetime.now(UTC),
+        )
+        call.auto_answered = True
+        call.script_stage = "listening"
+        await session.commit()
+        session_id = call.id
+
+    redis = FakeAsyncRedis()
+
+    class _RedisMod:
+        @staticmethod
+        def from_url(*args: Any, **kwargs: Any) -> FakeAsyncRedis:
+            return redis
+
+    monkeypatch.setattr(agent_module, "AsyncRedis", _RedisMod)
+    monkeypatch.setattr(
+        agent_module,
+        "PhoneGateClient",
+        lambda **kw: PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()),
+    )
+    monkeypatch.setattr(agent_module, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(
+        agent_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, phone_agent_enabled=True, phonegate_auth_token="tok"),
+    )
+
+    # Lease already lost => only the startup path runs (no poll loop, no
+    # orchestrator task); the restart-mid-call marking happens there.
+    await agent_module._run_loop(lease_lost=lambda: True)
+
+    async with sqlite_session_factory() as session:
+        row = await session.get(CommunicationSession, session_id)
+    assert row is not None
+    assert row.script_stage == "aborted_restart"
+    assert row.needs_review is True
