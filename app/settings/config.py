@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     phone_listen_silence_timeout_seconds: float = Field(default=20.0, ge=5, le=120)
     phone_call_hard_cap_seconds: float = Field(default=180.0, ge=30, le=1800)
     phone_orchestrator_poll_seconds: float = Field(default=0.15, ge=0.05, le=1)
+    phone_evidence_dir: Path = Path("storage/phone_evidence")
+    phone_evidence_seconds: int = Field(default=8, ge=1, le=10)
+    phone_evidence_min_chars: int = Field(default=60, ge=10, le=500)
+    phone_evidence_max_clips_per_call: int = Field(default=3, ge=0, le=20)
+    phone_evidence_max_clip_bytes: int = Field(default=2_097_152, ge=65_536, le=8_388_608)
 
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
