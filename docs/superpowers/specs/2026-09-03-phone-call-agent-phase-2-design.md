@@ -643,6 +643,7 @@ acceptable to a real employer?"
 | `phone_answer_connect_timeout_seconds` | `8.0` | 2–30 | Max wait for `IN_CALL` after `answer()` |
 | `phone_post_connect_wait_seconds` | `1.5` | 0.5–5 | Silence after `IN_CALL` before the first block |
 | `phone_speak_fence_timeout_seconds` | `5.0` | 1–15 | Max wait in `wait_until_speakable()` |
+| `phone_tx_idle_timeout_seconds` | `30.0` | 5–120 | Max wait in `observe_tx_delivery()` for TX to return to idle after a `/speak` POST — sized for real Piper synthesis + playback (production evidence: up to ~8s synthesis on a cold cache, up to ~14s of audio for one block), not the fence's typically-fast budget |
 | `phone_inter_block_listen_seconds` | `0.8` | 0.2–5 | Listening gap between greeting blocks |
 | `phone_listen_silence_timeout_seconds` | `20.0` | 5–120 | Silence in `LISTENING` that triggers `CLOSING` |
 | `phone_call_hard_cap_seconds` | `180.0` | 30–1800 | Absolute cap on an answered call |

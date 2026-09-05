@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     phone_answer_connect_timeout_seconds: float = Field(default=8.0, ge=2, le=30)
     phone_post_connect_wait_seconds: float = Field(default=1.5, ge=0.5, le=5)
     phone_speak_fence_timeout_seconds: float = Field(default=5.0, ge=1, le=15)
+    phone_tx_idle_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
     phone_inter_block_listen_seconds: float = Field(default=0.8, ge=0.2, le=5)
     phone_listen_silence_timeout_seconds: float = Field(default=20.0, ge=5, le=120)
     phone_call_hard_cap_seconds: float = Field(default=180.0, ge=30, le=1800)
