@@ -37,6 +37,7 @@ from app.models.enums import (
     JobStatus,
     MatchDecision,
     PhoneComponentStatus,
+    PhoneSummaryState,
     PolicyDecision,
     ReviewOutcome,
     ReviewReason,
@@ -653,6 +654,12 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     auto_answered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     script_stage: Mapped[str | None] = mapped_column(String(32))
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    summary_state: Mapped[PhoneSummaryState] = mapped_column(
+        enum_column(PhoneSummaryState),
+        default=PhoneSummaryState.NOT_APPLICABLE,
+        nullable=False,
+    )
     rx_frame_stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -690,6 +697,7 @@ class CommunicationTurn(UUIDPrimaryKeyMixin, Base):
         nullable=False,
     )
     spoken_text: Mapped[str | None] = mapped_column(Text)
+    audio_evidence_path: Mapped[str | None] = mapped_column(String(255))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False

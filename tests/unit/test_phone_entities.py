@@ -110,3 +110,52 @@ async def test_turn_unique_transcript_id_per_session(db: AsyncSession) -> None:
     )
     with pytest.raises(IntegrityError):
         await db.flush()
+
+
+async def test_communication_session_has_summary_columns(db: AsyncSession) -> None:
+    from app.models.enums import PhoneSummaryState
+
+    profile = UserProfile(name="Test Profile", is_default=True)
+    db.add(profile)
+    await db.flush()
+
+    call = CommunicationSession(
+        profile_id=profile.id,
+        channel=CommunicationChannel.CALL,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        phonegate_event_id_start=1,
+        started_at=datetime.now(UTC),
+    )
+    db.add(call)
+    await db.flush()
+    assert call.summary == {}
+    assert call.summary_state is PhoneSummaryState.NOT_APPLICABLE
+
+
+async def test_communication_turn_has_audio_evidence_path(db: AsyncSession) -> None:
+    profile = UserProfile(name="Test Profile", is_default=True)
+    db.add(profile)
+    await db.flush()
+
+    call = CommunicationSession(
+        profile_id=profile.id,
+        channel=CommunicationChannel.CALL,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        phonegate_event_id_start=1,
+        started_at=datetime.now(UTC),
+    )
+    db.add(call)
+    await db.flush()
+
+    turn = CommunicationTurn(
+        session_id=call.id,
+        seq=1,
+        speaker=TurnSpeaker.EMPLOYER,
+        text="Hello",
+        occurred_at=datetime.now(UTC),
+    )
+    db.add(turn)
+    await db.flush()
+    assert turn.audio_evidence_path is None

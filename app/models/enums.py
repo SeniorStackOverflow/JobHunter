@@ -135,6 +135,14 @@ class TurnDeliveryStatus(StrEnum):
     FAILED = "failed"
 
 
+class PhoneSummaryState(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    PENDING = "pending"
+    DONE = "done"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 class CallFactState(StrEnum):
     CANDIDATE = "candidate"
     CONFIRMED = "confirmed"
