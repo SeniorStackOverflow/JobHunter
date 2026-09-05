@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -215,7 +216,7 @@ async def test_startup_clears_stale_call_owned_key(
     startup must clear it — otherwise the admin hangup button would pass its
     ownership check and silently no-op against a stale session."""
     from app.phone.client import PhoneGateUnavailable
-    from app.phone.orchestrator import CALL_OWNED_KEY
+    from app.phone.orchestrator import CALL_OWNED_KEY, OrchestratorSupervisor
     from tests.fixtures.fake_redis import FakeAsyncRedis
 
     fake_redis = FakeAsyncRedis()
@@ -244,6 +245,10 @@ async def test_startup_clears_stale_call_owned_key(
         "get_settings",
         lambda: Settings(_env_file=None, phone_agent_enabled=True, phonegate_auth_token="tok"),
     )
+    # OrchestratorSupervisor.shutdown() ALSO deletes CALL_OWNED_KEY (its own,
+    # unrelated cleanup for a live task). Neutralize it so this test isolates
+    # the startup-time clear instead of passing on shutdown's clear.
+    monkeypatch.setattr(OrchestratorSupervisor, "shutdown", AsyncMock())
 
     await agent_module._run_loop(lease_lost=lambda: True)
 
