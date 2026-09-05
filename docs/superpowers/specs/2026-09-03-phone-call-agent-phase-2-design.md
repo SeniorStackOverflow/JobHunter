@@ -645,7 +645,7 @@ acceptable to a real employer?"
 | `phone_speak_fence_timeout_seconds` | `5.0` | 1–15 | Max wait in `wait_until_speakable()` |
 | `phone_tx_idle_timeout_seconds` | `30.0` | 5–120 | Max wait in `observe_tx_delivery()` for TX to return to idle after a `/speak` POST — sized for real Piper synthesis + playback (production evidence: up to ~8s synthesis on a cold cache, up to ~14s of audio for one block), not the fence's typically-fast budget |
 | `phone_inter_block_listen_seconds` | `0.8` | 0.2–5 | Listening gap between greeting blocks |
-| `phone_listen_silence_timeout_seconds` | `20.0` | 5–120 | Silence in `LISTENING` that triggers `CLOSING` |
+| `phone_listen_silence_timeout_seconds` | `4.0` | 1–120 | Silence in `LISTENING` that triggers `CLOSING` |
 | `phone_call_hard_cap_seconds` | `180.0` | 30–1800 | Absolute cap on an answered call |
 | `phone_orchestrator_poll_seconds` | `0.15` | 0.05–1 | Fast poll cadence during an active call |
 
@@ -690,8 +690,10 @@ top-level `Звонки` admin section.
 ## 16. Open items for the operator to finalize during spec review
 
 1. **Exact phrase wording** (§4.2) — the greeting and closing text the employer hears.
-2. **`phone_listen_silence_timeout_seconds`** default (20 s) — long enough that a
-   thoughtful caller is not cut off, short enough that the call does not drag.
+2. ~~**`phone_listen_silence_timeout_seconds`** default~~ — **decided: `4.0 s`**, per the live
+   acceptance call (2026-09-05): the originally-proposed 20 s left a long, awkward dead-air gap
+   after the employer's last reply, since the timer already correctly resets on every RX/ASR
+   activity and only needs to bridge one natural pause, not accommodate open-ended silence.
 3. **`phone_call_hard_cap_seconds`** default (180 s).
 4. Whether `test_realcall_disabled_is_observed_only` is worth the real minutes, or the
    "disabled" path is trusted to the `FakePhoneGate` integration test alone.

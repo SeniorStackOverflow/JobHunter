@@ -187,6 +187,66 @@ async def test_hard_cap_cuts_greeting(factory: async_sessionmaker[AsyncSession])
 
 
 @pytest.mark.asyncio
+async def test_listening_extends_on_new_rx_activity(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Spec §4.1: the silence timeout is measured from the LATER of (the last
+    transcript line's occurred_at) and (LISTENING's entry) -- fresh RX/ASR
+    activity must reset the clock, not just be observed and ignored. Runs
+    the orchestrator as a background task (per the P3 ruling, needs
+    file_factory, not the shared :memory: factory) so a transcript line can
+    be injected mid-LISTENING, before the original deadline would fire."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+    settings = _fast_settings(phone_listen_silence_timeout_seconds=0.3)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=file_factory, settings=settings)
+        task = asyncio.create_task(orch.run(session_id))
+        try:
+            for _ in range(300):
+                async with file_factory() as s:
+                    call = await s.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "listening":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("never reached LISTENING")
+
+            # Let some silence accumulate, then inject an RX line before the
+            # original 0.3s deadline would have fired.
+            await asyncio.sleep(0.15)
+            fake.transcript(speaker="rx", text="еще не закончил, минутку")
+
+            # script_stage must stay "listening" for a window that would
+            # already have tripped CLOSING under the ORIGINAL (pre-reset)
+            # deadline -- checking task.done() alone isn't enough: even a
+            # closed-out LISTENING keeps the task alive while it runs the
+            # (comparatively slow, fence+observe-bound) CLOSING sequence.
+            for _ in range(20):
+                async with file_factory() as s:
+                    call = await s.get(CommunicationSession, session_id)
+                assert call is not None
+                assert call.script_stage == "listening", (
+                    f"left LISTENING (stage={call.script_stage!r}) despite fresh RX "
+                    "activity that should have reset the silence clock"
+                )
+                await asyncio.sleep(0.01)
+
+            stage = await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert stage == "greeting_completed"
+    async with file_factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.script_stage == "greeting_completed"
+
+
+@pytest.mark.asyncio
 async def test_call_drops_mid_greeting(factory: async_sessionmaker[AsyncSession]) -> None:
     fake = FakePhoneGate()
     fake.ring("+37360111222")
