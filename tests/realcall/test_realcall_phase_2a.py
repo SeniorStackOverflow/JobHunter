@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import time
+from collections.abc import Callable
 from difflib import SequenceMatcher
 
 import pytest
@@ -16,7 +18,37 @@ from app.models.enums import (
     TurnSpeaker,
 )
 from app.phone.script import SCRIPT_CLOSING, SCRIPT_GREETING
+from app.settings import get_settings
 from tests.realcall.a06_originate import A06Rig
+
+
+async def _wait_for_session(
+    predicate: Callable[[CommunicationSession], bool],
+    *,
+    timeout: float,  # noqa: ASYNC109 - deadline-driven poll loop, not a cancel scope
+    poll: float = 0.5,
+) -> CommunicationSession | None:
+    """Poll the most recent CommunicationSession until ``predicate`` holds.
+
+    Real call timing depends on Piper synthesis, GSM latency, and the
+    configured silence/hard-cap settings — a fixed `asyncio.sleep(N)` is
+    either too short (aborts the test before JobHunter finishes) or too long
+    (wastes real call minutes). Polling actual session state is the same
+    approach the orchestrator itself uses.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        async with async_session_factory() as session:
+            rows = await session.execute(
+                select(CommunicationSession)
+                .order_by(desc(CommunicationSession.started_at))
+                .limit(1)
+            )
+            obj = rows.scalars().first()
+        if obj is not None and predicate(obj):
+            return obj
+        await asyncio.sleep(poll)
+    return None
 
 
 @pytest.mark.realcall
@@ -33,20 +65,45 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     # A06 dials A14
     a06_rig.dial(a06_rig.a14_number)
 
-    # Wait for the call to connect and greeting to be played (spec says 4 blocks via /speak)
-    await asyncio.sleep(2)
+    # Wait for JobHunter to answer and reach LISTENING before injecting the
+    # phrase. Greeting duration depends on Piper synthesis + GSM latency for
+    # 4 blocks, not a fixed sleep — budget generously off the real settings:
+    # connect timeout, post-connect wait, and a per-block ceiling (fence +
+    # observe + inter-block gap) x4, plus margin.
+    s = get_settings()
+    greeting_budget = (
+        s.phone_answer_connect_timeout_seconds
+        + s.phone_post_connect_wait_seconds
+        + 4 * (2 * s.phone_speak_fence_timeout_seconds + s.phone_inter_block_listen_seconds)
+        + 15.0
+    )
+    listening = await _wait_for_session(
+        lambda obj: obj.script_stage in {"listening", "closing", "greeting_completed"},
+        timeout=greeting_budget,
+    )
+    assert listening is not None, (
+        f"JobHunter never reached LISTENING within {greeting_budget:.0f}s of dialing"
+    )
 
     # A06 injects a known WAV: "Звоню по вакансии грузчика на склад"
     a06_rig.inject_uplink_wav("/tmp/test_injection.wav")  # NotImplementedError expected here
 
-    # Wait for listening and closing
-    await asyncio.sleep(3)
+    # Wait for the call to actually finish — the silence timeout (default 20s)
+    # plus the closing block — before stopping the recording.
+    finish_budget = (
+        2 * s.phone_speak_fence_timeout_seconds + s.phone_listen_silence_timeout_seconds + 15.0
+    )
+    finished = await _wait_for_session(
+        lambda obj: obj.script_stage == "greeting_completed" or obj.ended_at is not None,
+        timeout=finish_budget,
+    )
+    assert finished is not None, f"call never finished within {finish_budget:.0f}s"
 
     # Stop recording and get downlink audio
     downlink_audio = a06_rig.stop_downlink_recording()
     assert downlink_audio, "downlink audio should not be empty"
 
-    # Hang up
+    # Hang up (idempotent safety net if the orchestrator already did)
     a06_rig.hangup()
     await asyncio.sleep(1)
 
@@ -113,22 +170,38 @@ async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
     from redis.asyncio import Redis as AsyncRedis
 
     from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
-    from app.settings import get_settings
 
-    redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    s = get_settings()
+    redis = AsyncRedis.from_url(s.redis_url, decode_responses=True)
     try:
         a06_rig.start_downlink_recording()
         a06_rig.dial(a06_rig.a14_number)
-        await asyncio.sleep(2)  # let the call connect and the greeting start
+
+        # Let the call actually connect before triggering the stop — waiting
+        # for auto_answered lands reliably inside GREETING (speaking 4 blocks
+        # takes measurably longer than the connect fence).
+        answer_budget = (
+            s.phone_answer_connect_timeout_seconds + s.phone_post_connect_wait_seconds + 10.0
+        )
+        answered = await _wait_for_session(
+            lambda obj: obj.auto_answered is True, timeout=answer_budget
+        )
+        assert answered is not None, f"call was never auto-answered within {answer_budget:.0f}s"
 
         # Trigger the operator kill-switch mid-greeting.
         await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
-        await asyncio.sleep(2)  # let the supervisor observe it and abort
+
+        abort_budget = 2 * s.phone_speak_fence_timeout_seconds + 10.0
+        aborted = await _wait_for_session(
+            lambda obj: obj.script_stage == "aborted_operator" or obj.ended_at is not None,
+            timeout=abort_budget,
+        )
+        assert aborted is not None, f"kill-switch had no effect within {abort_budget:.0f}s"
 
         downlink_audio = a06_rig.stop_downlink_recording()
         assert downlink_audio
 
-        a06_rig.hangup()
+        a06_rig.hangup()  # idempotent safety net if the orchestrator already did
         await asyncio.sleep(1)
     finally:
         # Never leave the real system's kill-switch engaged after this test run.
@@ -160,18 +233,32 @@ async def test_realcall_per_call_hangup(a06_rig: A06Rig) -> None:
     from redis.asyncio import Redis as AsyncRedis
 
     from app.phone.orchestrator import CALL_CMD_KEY, CALL_OWNED_KEY
-    from app.settings import get_settings
 
-    redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    s = get_settings()
+    redis = AsyncRedis.from_url(s.redis_url, decode_responses=True)
     try:
         a06_rig.start_downlink_recording()
         a06_rig.dial(a06_rig.a14_number)
-        await asyncio.sleep(2)  # let the orchestrator pick up and claim the call
 
-        owned = await redis.get(CALL_OWNED_KEY)
-        assert owned, "no orchestrator has claimed this call yet"
+        # Poll for the orchestrator to claim the call rather than a fixed
+        # sleep — claiming happens right after answer(), before GREETING.
+        claim_budget = s.phone_answer_connect_timeout_seconds + 10.0
+        deadline = time.monotonic() + claim_budget
+        owned: str | None = None
+        while time.monotonic() < deadline:
+            owned = await redis.get(CALL_OWNED_KEY)
+            if owned:
+                break
+            await asyncio.sleep(0.5)
+        assert owned, f"no orchestrator claimed this call within {claim_budget:.0f}s"
+
         await redis.set(CALL_CMD_KEY, f"hangup:{owned}", ex=60)
-        await asyncio.sleep(1)  # let the orchestrator consume the command
+
+        hung_up = await _wait_for_session(
+            lambda obj: obj.script_stage == "aborted_operator" or obj.ended_at is not None,
+            timeout=2 * s.phone_speak_fence_timeout_seconds + 10.0,
+        )
+        assert hung_up is not None, "per-call hangup command had no effect in time"
 
         downlink_audio = a06_rig.stop_downlink_recording()
         assert downlink_audio
