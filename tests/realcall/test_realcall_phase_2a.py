@@ -4,6 +4,7 @@ import asyncio
 import io
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 
 import pytest
@@ -25,22 +26,31 @@ from tests.realcall.a06_originate import A06Rig
 async def _wait_for_session(
     predicate: Callable[[CommunicationSession], bool],
     *,
+    since: datetime,
     timeout: float,  # noqa: ASYNC109 - deadline-driven poll loop, not a cancel scope
     poll: float = 0.5,
 ) -> CommunicationSession | None:
-    """Poll the most recent CommunicationSession until ``predicate`` holds.
+    """Poll the most recent CommunicationSession started at/after ``since``
+    until ``predicate`` holds.
 
     Real call timing depends on Piper synthesis, GSM latency, and the
     configured silence/hard-cap settings — a fixed `asyncio.sleep(N)` is
     either too short (aborts the test before JobHunter finishes) or too long
     (wastes real call minutes). Polling actual session state is the same
     approach the orchestrator itself uses.
+
+    ``since`` anchors the query to THIS test's call: the realcall suite runs
+    against the live, never-reset DB, so without an anchor the "most recent
+    session" query can instantly match a stale row left by an earlier test
+    run (e.g. a previous test's already-`ended_at`-set session would satisfy
+    a naive "call ended" predicate before this test's own call even connects).
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         async with async_session_factory() as session:
             rows = await session.execute(
                 select(CommunicationSession)
+                .where(CommunicationSession.started_at >= since)
                 .order_by(desc(CommunicationSession.started_at))
                 .limit(1)
             )
@@ -63,22 +73,31 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     assert downlink_path, "downlink recording path should not be empty"
 
     # A06 dials A14
+    dial_at = datetime.now(UTC)
     a06_rig.dial(a06_rig.a14_number)
 
     # Wait for JobHunter to answer and reach LISTENING before injecting the
     # phrase. Greeting duration depends on Piper synthesis + GSM latency for
     # 4 blocks, not a fixed sleep — budget generously off the real settings:
-    # connect timeout, post-connect wait, and a per-block ceiling (fence +
-    # observe + inter-block gap) x4, plus margin.
+    # connect timeout, post-connect wait, and a per-block ceiling (the fence,
+    # typically fast, plus the TX-idle delivery observation — sized for real
+    # Piper synthesis + playback, up to ~30s by default — plus the
+    # inter-block gap) x4, plus margin.
     s = get_settings()
+    per_block_ceiling = (
+        s.phone_speak_fence_timeout_seconds
+        + s.phone_tx_idle_timeout_seconds
+        + s.phone_inter_block_listen_seconds
+    )
     greeting_budget = (
         s.phone_answer_connect_timeout_seconds
         + s.phone_post_connect_wait_seconds
-        + 4 * (2 * s.phone_speak_fence_timeout_seconds + s.phone_inter_block_listen_seconds)
+        + 4 * per_block_ceiling
         + 15.0
     )
     listening = await _wait_for_session(
         lambda obj: obj.script_stage in {"listening", "closing", "greeting_completed"},
+        since=dial_at,
         timeout=greeting_budget,
     )
     assert listening is not None, (
@@ -90,11 +109,10 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
 
     # Wait for the call to actually finish — the silence timeout (default 20s)
     # plus the closing block — before stopping the recording.
-    finish_budget = (
-        2 * s.phone_speak_fence_timeout_seconds + s.phone_listen_silence_timeout_seconds + 15.0
-    )
+    finish_budget = per_block_ceiling + s.phone_listen_silence_timeout_seconds + 15.0
     finished = await _wait_for_session(
         lambda obj: obj.script_stage == "greeting_completed" or obj.ended_at is not None,
+        since=dial_at,
         timeout=finish_budget,
     )
     assert finished is not None, f"call never finished within {finish_budget:.0f}s"
@@ -132,7 +150,10 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     # Assertion 3: CommunicationTurn exists for the injected phrase
     async with async_session_factory() as session:
         turns = await session.execute(
-            select(CommunicationTurn).where(CommunicationTurn.speaker == TurnSpeaker.EMPLOYER)
+            select(CommunicationTurn).where(
+                CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
+                CommunicationTurn.occurred_at >= dial_at,
+            )
         )
         employer_turns = turns.scalars().all()
         # Fuzzy match one of the turns against the injected phrase
@@ -142,7 +163,10 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     # Assertion 4: session state
     async with async_session_factory() as session:
         sessions = await session.execute(
-            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+            select(CommunicationSession)
+            .where(CommunicationSession.started_at >= dial_at)
+            .order_by(desc(CommunicationSession.started_at))
+            .limit(1)
         )
         session_obj = sessions.scalars().first()
         assert session_obj is not None, "no session created by this test"
@@ -175,6 +199,7 @@ async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
     redis = AsyncRedis.from_url(s.redis_url, decode_responses=True)
     try:
         a06_rig.start_downlink_recording()
+        dial_at = datetime.now(UTC)
         a06_rig.dial(a06_rig.a14_number)
 
         # Let the call actually connect before triggering the stop — waiting
@@ -184,16 +209,21 @@ async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
             s.phone_answer_connect_timeout_seconds + s.phone_post_connect_wait_seconds + 10.0
         )
         answered = await _wait_for_session(
-            lambda obj: obj.auto_answered is True, timeout=answer_budget
+            lambda obj: obj.auto_answered is True, since=dial_at, timeout=answer_budget
         )
         assert answered is not None, f"call was never auto-answered within {answer_budget:.0f}s"
 
         # Trigger the operator kill-switch mid-greeting.
         await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
 
-        abort_budget = 2 * s.phone_speak_fence_timeout_seconds + 10.0
+        # Worst case: the in-flight block finishes its own fence+TX-idle
+        # observation, then the interrupted closing does the same again,
+        # before the aborted_operator stage is persisted.
+        per_block = s.phone_speak_fence_timeout_seconds + s.phone_tx_idle_timeout_seconds
+        abort_budget = 2 * per_block + s.phone_inter_block_listen_seconds + 15.0
         aborted = await _wait_for_session(
             lambda obj: obj.script_stage == "aborted_operator" or obj.ended_at is not None,
+            since=dial_at,
             timeout=abort_budget,
         )
         assert aborted is not None, f"kill-switch had no effect within {abort_budget:.0f}s"
@@ -211,7 +241,10 @@ async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
     # Assert: downlink contains the short closing and call ended
     async with async_session_factory() as session:
         sessions = await session.execute(
-            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+            select(CommunicationSession)
+            .where(CommunicationSession.started_at >= dial_at)
+            .order_by(desc(CommunicationSession.started_at))
+            .limit(1)
         )
         session_obj = sessions.scalars().first()
         assert session_obj is not None, "no session created by this test"
@@ -238,6 +271,7 @@ async def test_realcall_per_call_hangup(a06_rig: A06Rig) -> None:
     redis = AsyncRedis.from_url(s.redis_url, decode_responses=True)
     try:
         a06_rig.start_downlink_recording()
+        dial_at = datetime.now(UTC)
         a06_rig.dial(a06_rig.a14_number)
 
         # Poll for the orchestrator to claim the call rather than a fixed
@@ -254,9 +288,15 @@ async def test_realcall_per_call_hangup(a06_rig: A06Rig) -> None:
 
         await redis.set(CALL_CMD_KEY, f"hangup:{owned}", ex=60)
 
+        # Unlike the runtime-stop path, a per-call hangup speaks no closing
+        # (spec §9.3) — worst case is the in-flight block's own fence +
+        # TX-idle observation finishing before the next _cmd() check catches
+        # the command.
+        per_block = s.phone_speak_fence_timeout_seconds + s.phone_tx_idle_timeout_seconds
         hung_up = await _wait_for_session(
             lambda obj: obj.script_stage == "aborted_operator" or obj.ended_at is not None,
-            timeout=2 * s.phone_speak_fence_timeout_seconds + 10.0,
+            since=dial_at,
+            timeout=per_block + s.phone_inter_block_listen_seconds + 15.0,
         )
         assert hung_up is not None, "per-call hangup command had no effect in time"
 
@@ -271,7 +311,10 @@ async def test_realcall_per_call_hangup(a06_rig: A06Rig) -> None:
     # Assert: call hung up with script_stage="aborted_operator"
     async with async_session_factory() as session:
         sessions = await session.execute(
-            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+            select(CommunicationSession)
+            .where(CommunicationSession.started_at >= dial_at)
+            .order_by(desc(CommunicationSession.started_at))
+            .limit(1)
         )
         session_obj = sessions.scalars().first()
         assert session_obj is not None, "no session created by this test"
@@ -284,6 +327,7 @@ async def test_realcall_disabled_is_observed_only(a06_rig: A06Rig) -> None:
     """phone_auto_answer_enabled=false -> A14 does NOT auto-answer (ringing), but event recorded."""
     # This test requires the app to be running with phone_auto_answer_enabled=false
     # A06 dials A14, A14 rings but doesn't answer
+    dial_at = datetime.now(UTC)
     a06_rig.dial(a06_rig.a14_number)
 
     # Wait for ringing (no answer)
@@ -296,7 +340,10 @@ async def test_realcall_disabled_is_observed_only(a06_rig: A06Rig) -> None:
     # Assert: inbound event recorded (Phase 1), but no auto_answered=true
     async with async_session_factory() as session:
         sessions = await session.execute(
-            select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
+            select(CommunicationSession)
+            .where(CommunicationSession.started_at >= dial_at)
+            .order_by(desc(CommunicationSession.started_at))
+            .limit(1)
         )
         session_obj = sessions.scalars().first()
         assert session_obj is not None, "no session created by this test"
