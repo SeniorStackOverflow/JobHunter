@@ -203,3 +203,48 @@ async def test_startup_marks_auto_answered_call_aborted_on_restart(
     assert row is not None
     assert row.script_stage == "aborted_restart"
     assert row.needs_review is True
+
+
+@pytest.mark.asyncio
+async def test_startup_clears_stale_call_owned_key(
+    monkeypatch: pytest.MonkeyPatch, sqlite_session_factory: Any
+) -> None:
+    """A prior process can die mid-call without reaching
+    OrchestratorSupervisor.shutdown(), leaving CALL_OWNED_KEY set for a call no
+    orchestrator is driving anymore. A fresh process owns no live call, so
+    startup must clear it — otherwise the admin hangup button would pass its
+    ownership check and silently no-op against a stale session."""
+    from app.phone.client import PhoneGateUnavailable
+    from app.phone.orchestrator import CALL_OWNED_KEY
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake_redis = FakeAsyncRedis()
+    await fake_redis.set(CALL_OWNED_KEY, "00000000-0000-0000-0000-000000000000")
+
+    class _RedisModule:
+        @staticmethod
+        def from_url(*args: Any, **kwargs: Any) -> FakeAsyncRedis:
+            return fake_redis
+
+    class _DownClient:
+        async def device_status(self) -> Any:
+            raise PhoneGateUnavailable("boot-time outage")
+
+        async def events(self, *args: Any, **kwargs: Any) -> Any:
+            raise PhoneGateUnavailable("boot-time outage")
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(agent_module, "AsyncRedis", _RedisModule)
+    monkeypatch.setattr(agent_module, "PhoneGateClient", lambda **kwargs: _DownClient())
+    monkeypatch.setattr(agent_module, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(
+        agent_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, phone_agent_enabled=True, phonegate_auth_token="tok"),
+    )
+
+    await agent_module._run_loop(lease_lost=lambda: True)
+
+    assert await fake_redis.get(CALL_OWNED_KEY) is None

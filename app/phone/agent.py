@@ -80,7 +80,7 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
         settings=settings,
     )
 
-    from app.phone.orchestrator import TERMINAL_STAGES, OrchestratorSupervisor
+    from app.phone.orchestrator import CALL_OWNED_KEY, TERMINAL_STAGES, OrchestratorSupervisor
 
     supervisor = OrchestratorSupervisor(
         client=client,
@@ -88,6 +88,10 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
         redis=async_redis,
         settings=settings,
     )
+
+    # A fresh process owns no live call; a stale key here means a prior process
+    # died mid-call without reaching OrchestratorSupervisor.shutdown().
+    await async_redis.delete(CALL_OWNED_KEY)
 
     try:
         cursor = await ingest.load_cursor()

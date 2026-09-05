@@ -10,7 +10,10 @@ class FakeAsyncRedis:
     async def get(self, key: str) -> str | None:
         return self._data.get(key)
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        # ``ex`` (seconds-to-live) is accepted for signature compatibility with
+        # redis.asyncio.Redis.set but not enforced — no test in this suite
+        # depends on real key expiry.
         self._data[key] = str(value)
 
     async def delete(self, key: str) -> None:

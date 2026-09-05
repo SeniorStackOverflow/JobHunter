@@ -474,7 +474,10 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
     if owned:
         from app.models.entities import CommunicationSession
 
-        call = await session.get(CommunicationSession, UUID(owned))
+        try:
+            call = await session.get(CommunicationSession, UUID(owned))
+        except ValueError:
+            call = None
         if call is not None and call.ended_at is None:
             active_call = {"session_id": owned, "script_stage": call.script_stage}
 
@@ -1700,7 +1703,7 @@ async def phone_call_action(
         owned = await redis.get(CALL_OWNED_KEY)
         if owned != str(session_id):
             raise HTTPException(status_code=409, detail="not the active call")
-        await redis.set(CALL_CMD_KEY, f"{action}:{session_id}")
+        await redis.set(CALL_CMD_KEY, f"{action}:{session_id}", ex=60)
     finally:
         await redis.aclose()
     await _audit_admin(session, f"phone.call.{action}", "communication_session", str(session_id))
