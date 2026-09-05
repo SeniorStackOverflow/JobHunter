@@ -91,6 +91,17 @@ class CallOrchestrator:
             return await self._drive()
         except Exception as exc:
             logger.warning("phone_orchestrator_crashed", error=type(exc).__name__)
+            # An unexpected crash anywhere in _drive() (e.g. a DB write
+            # failure right after a successful answer()) must not leave a
+            # real GSM call connected and silent — best-effort hang up before
+            # recording the outcome. _hangup() already swallows PhoneGate
+            # errors (including a benign 409 if no call was ever answered),
+            # and the extra try/except here means a truly unexpected failure
+            # in it still can't mask this handler's own aborted_error return.
+            try:
+                await self._hangup()
+            except Exception:
+                logger.warning("phone_orchestrator_crash_hangup_failed")
             try:
                 await self._finish("aborted_error", needs_review=True)
             except Exception:

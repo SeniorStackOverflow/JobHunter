@@ -278,6 +278,34 @@ async def test_say_ended_from_fence_records_failed_turn(
 
 
 @pytest.mark.asyncio
+async def test_unexpected_crash_after_answer_hangs_up(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash anywhere after a successful answer() must not leave the real
+    GSM call connected and silent — run()'s crash handler now attempts a
+    best-effort hangup before recording aborted_error."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("DB write failed")
+
+    monkeypatch.setattr(SessionStore, "mark_auto_answered", boom)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
+        stage = await orch.run(session_id)
+
+    assert stage == "aborted_error"
+    assert fake._call_state == "IDLE"  # hung up, not left connected and silent
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.needs_review is True
+
+
+@pytest.mark.asyncio
 async def test_answer_409_is_a_benign_miss_not_a_review(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
