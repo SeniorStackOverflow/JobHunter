@@ -572,7 +572,7 @@ stub ("доступно после Phase 4").
 - `GET /api/v1/phone/calls/{id}` — one session incl. `summary` and turns.
 
 Keeps parity with the "REST + admin + MCP over one set of services" principle and gives
-programmatic access. Additive, small.
+programmatic access. Additive, small. **Decided (2026-09-05): in scope for this cycle.**
 
 ---
 
@@ -694,12 +694,16 @@ llmRouter / Telegram / PhoneGate in CI. Tests must not read the operator's `.env
 
 ---
 
-## 11. Open items for the operator to confirm during spec review
+## 11. Open items
 
-1. Evidence capture on by default (`phone_evidence_max_clips_per_call=3`) the moment
-   auto‑answer is enabled — acceptable, or default to `0` and let the operator opt in?
+**Decided 2026-09-05:**
+
+1. Evidence capture **on by default** (`phone_evidence_max_clips_per_call=3`) once
+   auto‑answer is enabled. Operator can set `0`.
+5. The thin `GET /api/v1/phone/calls[/{id}]` API is **in scope** for this cycle.
+
+**Still open — operator may adjust; the plan proceeds with the spec defaults otherwise:**
+
 2. The importance‑heuristic token set (§4.3) — enough, or add/remove tokens?
 3. `phone_evidence_retention_days` (30) and `phone_evidence_max_total_mb` (500).
 4. The Telegram message wording (§6.3).
-5. Whether the thin `GET /api/v1/phone/calls[/{id}]` API is worth adding now or can wait
-   for an MCP‑tools cycle.
