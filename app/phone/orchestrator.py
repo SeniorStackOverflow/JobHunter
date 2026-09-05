@@ -15,6 +15,7 @@ from app.audit import record_audit_event
 from app.models.entities import CommunicationSession
 from app.models.enums import TurnDeliveryStatus
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
+from app.phone.evidence import EvidenceCapturer
 from app.phone.numbers import mask_phone, normalize_e164
 from app.phone.policy import should_answer
 from app.phone.schemas import DeviceStatus
@@ -73,6 +74,8 @@ class CallOrchestrator:
         self._store = SessionStore()
         self._session_id: UUID | None = None
         self._last_tx_transcript_id = 0
+        # Built per call in run(); _drive() (its only caller) always runs after.
+        self._evidence: EvidenceCapturer
 
     @property
     def _sid(self) -> UUID:
@@ -87,6 +90,9 @@ class CallOrchestrator:
         failure must never crash the hosting process.
         """
         self._session_id = session_id
+        self._evidence = EvidenceCapturer(
+            client=self._client, settings=self._s, session_id=session_id
+        )
         try:
             return await self._drive()
         except Exception as exc:
@@ -215,8 +221,10 @@ class CallOrchestrator:
             now = time.monotonic()
             if page.entries:
                 seen_transcript_id = max(seen_transcript_id, max(e.id for e in page.entries))
-                if any(e.speaker == "rx" for e in page.entries):
+                rx_entries = [e for e in page.entries if e.speaker == "rx"]
+                if rx_entries:
                     last_activity = now
+                    await self._evidence.maybe_capture(rx_entries)
 
             if now - last_activity >= s.phone_listen_silence_timeout_seconds:
                 break

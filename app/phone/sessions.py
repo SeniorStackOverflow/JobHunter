@@ -13,6 +13,7 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    PhoneSummaryState,
     TurnDeliveryStatus,
     TurnSpeaker,
 )
@@ -108,6 +109,12 @@ class SessionStore:
             call.rx_frame_stats = rx_stats
         if note:
             call.diagnostics = {**call.diagnostics, "close_note": note}
+        # An autonomously-answered call earns a post-call summary; the summariser
+        # picks up sessions in PENDING. Only ever promote from the NOT_APPLICABLE
+        # default — never downgrade a state a later stage already resolved, and
+        # never mark a call JobHunter did not answer itself.
+        if call.auto_answered and call.summary_state is PhoneSummaryState.NOT_APPLICABLE:
+            call.summary_state = PhoneSummaryState.PENDING
         call.updated_at = utcnow()
         await session.flush()
 

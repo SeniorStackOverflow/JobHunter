@@ -6,7 +6,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import UserProfile
-from app.models.enums import CommunicationOutcome
+from app.models.enums import CommunicationOutcome, PhoneSummaryState
 from app.phone.correlation import CorrelationResult
 from app.phone.sessions import SessionStore
 
@@ -222,6 +222,71 @@ async def test_set_script_stage_and_mark_auto_answered(db: AsyncSession) -> None
     assert refreshed.auto_answered is True
     assert refreshed.answered_at is not None
     assert refreshed.script_stage == "greeting"
+
+
+async def test_close_marks_auto_answered_session_summary_pending(db: AsyncSession) -> None:
+    """An auto-answered call needs a post-call summary — close() flips its
+    summary_state from NOT_APPLICABLE to PENDING for the summariser to pick up."""
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
+    await store.mark_auto_answered(call, now)
+    await store.close(db, call, outcome=CommunicationOutcome.COMPLETED, ended_at=now)
+    await db.commit()
+
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.summary_state is PhoneSummaryState.PENDING
+
+
+async def test_close_leaves_non_auto_answered_summary_not_applicable(db: AsyncSession) -> None:
+    """A call JobHunter never answered autonomously has nothing to summarise."""
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
+    await store.close(db, call, outcome=CommunicationOutcome.MISSED, ended_at=now)
+    await db.commit()
+
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.summary_state is PhoneSummaryState.NOT_APPLICABLE
+
+
+async def test_close_never_downgrades_a_resolved_summary_state(db: AsyncSession) -> None:
+    """close() only ever promotes NOT_APPLICABLE -> PENDING; an already-resolved
+    state (a re-close, or a summariser that already ran) must be left alone."""
+    store = SessionStore()
+    now = datetime.now(UTC)
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
+    await store.mark_auto_answered(call, now)
+    call.summary_state = PhoneSummaryState.DONE
+    await store.close(db, call, outcome=CommunicationOutcome.COMPLETED, ended_at=now)
+    await db.commit()
+
+    refreshed = await db.get(type(call), call.id)
+    assert refreshed is not None
+    assert refreshed.summary_state is PhoneSummaryState.DONE
 
 
 def test_speaker_from_phonegate_tx_is_assistant() -> None:

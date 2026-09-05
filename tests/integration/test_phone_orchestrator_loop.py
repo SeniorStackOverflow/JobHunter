@@ -57,27 +57,29 @@ async def profiled_factory(
     await engine.dispose()
 
 
-def _settings() -> Settings:
+def _settings(**overrides: object) -> Settings:
     """Sub-second call timings for a fast full-loop test.
 
     The production fields carry ``ge=`` floors (silence timeout ``>= 5s`` etc.)
     that reject test-scale values, so this bypasses field validation via
     ``model_construct`` -- the same approach as the unit suite's ``_fast_settings``.
     """
-    return Settings.model_construct(
-        phone_agent_enabled=True,
-        phonegate_auth_token=SecretStr("tok"),
-        phone_auto_answer_enabled=True,
-        phone_poll_idle_seconds=0.02,
-        phone_poll_active_seconds=0.02,
-        phone_post_connect_wait_seconds=0.01,
-        phone_speak_fence_timeout_seconds=2.0,
-        phone_tx_idle_timeout_seconds=2.0,
-        phone_inter_block_listen_seconds=0.01,
-        phone_listen_silence_timeout_seconds=0.2,
-        phone_call_hard_cap_seconds=5.0,
-        phone_orchestrator_poll_seconds=0.01,
-    )
+    values: dict[str, object] = {
+        "phone_agent_enabled": True,
+        "phonegate_auth_token": SecretStr("tok"),
+        "phone_auto_answer_enabled": True,
+        "phone_poll_idle_seconds": 0.02,
+        "phone_poll_active_seconds": 0.02,
+        "phone_post_connect_wait_seconds": 0.01,
+        "phone_speak_fence_timeout_seconds": 2.0,
+        "phone_tx_idle_timeout_seconds": 2.0,
+        "phone_inter_block_listen_seconds": 0.01,
+        "phone_listen_silence_timeout_seconds": 0.2,
+        "phone_call_hard_cap_seconds": 5.0,
+        "phone_orchestrator_poll_seconds": 0.01,
+    }
+    values.update(overrides)
+    return Settings.model_construct(**values)
 
 
 @pytest.mark.asyncio
@@ -138,3 +140,85 @@ async def test_agent_auto_answers_and_runs_the_script(
     assert call.script_stage == "greeting_completed"
     assert any(t.speaker is TurnSpeaker.ASSISTANT for t in turns)
     assert any(t.speaker is TurnSpeaker.EMPLOYER and "грузчика" in t.text for t in turns)
+
+
+@pytest.mark.asyncio
+async def test_agent_captures_evidence_clip_during_listening(
+    monkeypatch: pytest.MonkeyPatch,
+    profiled_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """An important caller line heard during LISTENING is backed by a GSM-downlink
+    clip written under ``phone_evidence_dir/<session_id>/<transcript_id>.wav``."""
+    fake = FakePhoneGate()
+    fake.set_call_audio(b"RIFFclip")
+    redis = FakeAsyncRedis()
+
+    class _RedisMod:
+        @staticmethod
+        def from_url(*a: Any, **k: Any) -> FakeAsyncRedis:
+            return redis
+
+    evidence_dir = tmp_path / "phone_evidence"
+    monkeypatch.setattr(agent_module, "AsyncRedis", _RedisMod)
+    monkeypatch.setattr(
+        agent_module,
+        "PhoneGateClient",
+        lambda **kw: PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()),
+    )
+    monkeypatch.setattr(agent_module, "async_session_factory", profiled_factory)
+    monkeypatch.setattr(
+        agent_module,
+        "get_settings",
+        lambda: _settings(
+            phone_evidence_dir=evidence_dir,
+            # Widen the LISTENING window so the test reliably injects the caller
+            # line while the orchestrator is still polling, even under the
+            # single-connection sqlite contention this fixture imposes.
+            phone_listen_silence_timeout_seconds=1.0,
+        ),
+    )
+
+    async def _stage(session_id: Any) -> str | None:
+        async with profiled_factory() as s:
+            row = await s.get(CommunicationSession, session_id)
+        return row.script_stage if row is not None else None
+
+    async def _open_session_id() -> Any:
+        async with profiled_factory() as s:
+            row = (await s.scalars(select(CommunicationSession))).first()
+        return row.id if row is not None else None
+
+    task = asyncio.create_task(agent_module._run_loop(lease_lost=lambda: False))
+    rx_id = 0
+    try:
+        await asyncio.sleep(0.05)
+        fake.ring("+37360111222")
+
+        # Wait until the orchestrator is actually in LISTENING, then inject one
+        # important caller line so it is polled (and captured) mid-LISTENING.
+        session_id = None
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            session_id = session_id or await _open_session_id()
+            if session_id is not None and await _stage(session_id) == "listening":
+                break
+        else:  # pragma: no cover - only hit on a hang
+            pytest.fail("orchestrator never reached LISTENING")
+
+        rx_id = fake.transcript(speaker="rx", text="в четверг в 14:00 на Индустриальной 12")
+        assert rx_id > 0
+
+        for _ in range(400):
+            await asyncio.sleep(0.02)
+            if fake._call_state == "IDLE" and await _stage(session_id) == "greeting_completed":
+                break
+        else:  # pragma: no cover - only hit on a hang
+            pytest.fail("agent did not complete the scripted call in time")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    clip = evidence_dir / str(session_id) / f"{rx_id}.wav"
+    assert clip.read_bytes() == b"RIFFclip"
