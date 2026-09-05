@@ -53,6 +53,16 @@ class Settings(BaseSettings):
     phone_http_timeout_seconds: float = Field(default=10.0, ge=1, le=30)
     phone_caller_region: str = "MD"
     phone_health_stale_after_seconds: int = Field(default=90, ge=10, le=3600)
+    phone_auto_answer_enabled: bool = False
+    phone_answer_blocklist: list[str] = Field(default_factory=list)
+    phone_answer_connect_timeout_seconds: float = Field(default=8.0, ge=2, le=30)
+    phone_post_connect_wait_seconds: float = Field(default=1.5, ge=0.5, le=5)
+    phone_speak_fence_timeout_seconds: float = Field(default=5.0, ge=1, le=15)
+    phone_tx_idle_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
+    phone_inter_block_listen_seconds: float = Field(default=0.8, ge=0.2, le=5)
+    phone_listen_silence_timeout_seconds: float = Field(default=4.0, ge=1, le=120)
+    phone_call_hard_cap_seconds: float = Field(default=180.0, ge=30, le=1800)
+    phone_orchestrator_poll_seconds: float = Field(default=0.15, ge=0.05, le=1)
 
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
@@ -98,6 +108,18 @@ class Settings(BaseSettings):
         if any("@" not in item or len(item) > 320 for item in normalized):
             raise ValueError("GOOGLE_ADMIN_EMAILS must contain valid email addresses")
         return normalized
+
+    @field_validator("phone_answer_blocklist", mode="after")
+    @classmethod
+    def _normalize_blocklist(cls, value: list[str]) -> list[str]:
+        from app.phone.numbers import normalize_e164
+
+        out: list[str] = []
+        for item in value:
+            e164 = normalize_e164(item, region="MD")
+            if e164:
+                out.append(e164)
+        return out
 
     @model_validator(mode="after")
     def validate_secure_production(self) -> "Settings":

@@ -228,6 +228,41 @@ async def test_phone_health_device_block_includes_updated_at(sqlite_session_fact
     assert got.replace(tzinfo=None) == stamp.replace(tzinfo=None)
 
 
+@pytest.mark.asyncio
+async def test_phone_health_auto_answer_block(sqlite_session_factory: Any, monkeypatch) -> None:
+    from app.admin import routes as admin_routes
+    from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    redis = FakeAsyncRedis()
+    await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
+    monkeypatch.setattr(admin_routes, "_phone_redis", lambda: redis)
+
+    async with sqlite_session_factory() as session:
+        result = await _phone_health(session)
+    assert result["auto_answer"]["stopped"] is True
+    assert "enabled" in result["auto_answer"]
+
+
+@pytest.mark.asyncio
+async def test_phone_health_tolerates_malformed_call_owned_key(
+    sqlite_session_factory: Any, monkeypatch
+) -> None:
+    """A corrupted CALL_OWNED_KEY value must degrade, not 500 the diagnostics view —
+    same "diagnostic endpoint must not crash" principle as the Redis-unreachable case."""
+    from app.admin import routes as admin_routes
+    from app.phone.orchestrator import CALL_OWNED_KEY
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    redis = FakeAsyncRedis()
+    await redis.set(CALL_OWNED_KEY, "not-a-uuid")
+    monkeypatch.setattr(admin_routes, "_phone_redis", lambda: redis)
+
+    async with sqlite_session_factory() as session:
+        result = await _phone_health(session)
+    assert result["active_call"] is None
+
+
 def test_phone_health_template_exists_and_uses_correct_variables() -> None:
     template_path = Path("app/admin/templates/_phone_health.html")
     assert template_path.exists()

@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass
+
+import structlog
+
+from app.phone.client import (
+    PhoneGateBusy,
+    PhoneGateClient,
+    PhoneGateError,
+    PhoneGateUnavailable,
+)
+
+logger = structlog.get_logger(__name__)
+
+_ACTIVE_STATES = {"IN_CALL"}
+
+# Default: any call_state other than IN_CALL means the call has genuinely
+# ended (RINGING included — during GREETING/CLOSING the call is already
+# established, so seeing RINGING there is a real anomaly, not a transitional
+# state). The connect-fence call site overrides this to {"IDLE"} — see
+# wait_until_speakable's docstring.
+_DEFAULT_ENDED_STATES: frozenset[str] = frozenset({"RINGING", "IDLE"})
+
+
+class CallEnded(Exception):
+    """The call left IN_CALL while we were waiting to speak."""
+
+
+class SpeakFenceTimeout(Exception):
+    """TX did not become idle within the fence timeout."""
+
+
+async def wait_until_speakable(
+    client: PhoneGateClient,
+    *,
+    timeout: float,  # noqa: ASYNC109 - deadline-driven poll fence, not a cancel scope
+    poll: float,
+    ended_states: frozenset[str] = _DEFAULT_ENDED_STATES,
+) -> None:
+    """Block until PhoneGate is ready for a fresh utterance.
+
+    Returns when the call is IN_CALL and no TX is active or preparing. Raises
+    :class:`CallEnded` as soon as ``call_state`` lands in ``ended_states``, or
+    :class:`SpeakFenceTimeout` if IN_CALL (with TX idle) is never reached
+    before the deadline.
+
+    ``ended_states`` defaults to "anything but IN_CALL" for the GREETING/
+    CLOSING fence, where the call is already established. The connect fence
+    right after ``answer()`` passes ``ended_states={"IDLE"}`` instead: a real
+    PhoneGate accepts ``/api/call/answer`` and returns immediately while A14
+    can keep reporting RINGING for a short window before it actually reaches
+    IN_CALL — that transient RINGING must be polled through, not treated as
+    the call having ended.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        status = await client.device_status()
+        if status.call_state in ended_states:
+            raise CallEnded(status.call_state)
+        if status.call_state in _ACTIVE_STATES and not status.tx_active and not status.tx_preparing:
+            return
+        if time.monotonic() >= deadline:
+            raise SpeakFenceTimeout
+        await asyncio.sleep(poll)
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakResult:
+    outcome: str  # "ok" | "ended" | "unknown" | "not_sent"
+
+
+async def speak_block(
+    client: PhoneGateClient, text: str, *, fence_timeout: float, poll: float
+) -> SpeakResult:
+    """Fence on TX state, then POST the utterance with idempotent 409 handling.
+
+    A 409 (``PhoneGateBusy``) buys exactly one bounded retry: re-fence, then one
+    more ``speak``. An ambiguous transport timeout (``PhoneGateUnavailable``) on
+    an actually-issued ``speak()`` POST is never retried — a duplicate assistant
+    utterance is worse than a missed one — and yields ``SpeakResult("unknown")``.
+
+    A FENCE failure (before ``speak()`` is ever POSTed) is a different,
+    non-ambiguous case: we know with certainty the text was never sent. That
+    yields ``SpeakResult("not_sent")`` instead of ``"unknown"`` — spec §6.3
+    reserves ``delivery_unknown`` for a genuine post-POST network timeout.
+    """
+    try:
+        await wait_until_speakable(client, timeout=fence_timeout, poll=poll)
+    except CallEnded:
+        return SpeakResult("ended")
+    except SpeakFenceTimeout:
+        logger.warning("phone_speak_fence_timeout")
+        return SpeakResult("not_sent")
+    except (PhoneGateUnavailable, PhoneGateError):
+        logger.warning("phone_speak_fence_transport_error")
+        return SpeakResult("not_sent")
+
+    try:
+        await client.speak(text)
+        return SpeakResult("ok")
+    except PhoneGateBusy as exc:
+        # Re-fence and take exactly one bounded retry. A 409 is itself a
+        # deterministic non-delivery of THIS attempt, and none of the
+        # re-fence failure paths below ever reach a second speak() POST
+        # either — the whole retry sequence stays a known non-delivery
+        # unless the retry's speak() call is actually issued.
+        try:
+            await wait_until_speakable(client, timeout=fence_timeout, poll=poll)
+        except CallEnded:
+            return SpeakResult("ended")
+        except SpeakFenceTimeout:
+            return SpeakResult("not_sent")
+        except (PhoneGateUnavailable, PhoneGateError):
+            logger.warning("phone_speak_fence_transport_error")
+            return SpeakResult("not_sent")
+        try:
+            await client.speak(text)
+            return SpeakResult("ok")
+        except PhoneGateBusy:
+            # A 409 means PhoneGate rejected the POST before doing anything
+            # (record_transcript/synthesis never ran) — a known non-delivery,
+            # same as the first attempt's 409, not an ambiguous one.
+            logger.warning("phone_speak_still_busy_after_retry", detail=exc.detail)
+            return SpeakResult("not_sent")
+        except PhoneGateUnavailable:
+            return SpeakResult("unknown")
+        except PhoneGateError:
+            # A definite non-409 HTTP rejection (not a timeout) — the request
+            # was answered, just refused; no ambiguity about delivery.
+            return SpeakResult("not_sent")
+    except PhoneGateUnavailable:
+        # Ambiguous: PhoneGate may already have accepted the utterance. Never retry.
+        logger.warning("phone_speak_ambiguous_timeout")
+        return SpeakResult("unknown")
+    except PhoneGateError:
+        # Same reasoning as the retry's PhoneGateError above: a definite
+        # rejection, not a timeout — known non-delivery.
+        return SpeakResult("not_sent")
+
+
+async def observe_tx_delivery(
+    client: PhoneGateClient,
+    *,
+    timeout: float,  # noqa: ASYNC109 - deadline-driven poll loop, not a cancel scope
+    poll: float,
+    start_grace: float,
+) -> str:
+    """After a 200 from ``/speak``, watch the TX state to decide the turn's fate.
+
+    Returns one of ``"delivered"`` (TX activated then returned to idle),
+    ``"failed"`` (call ended, or TX never activated within ``start_grace``), or
+    ``"delivery_unknown"`` (TX stuck past ``timeout``, or PhoneGate went away).
+    These strings are the exact ``TurnDeliveryStatus`` enum values.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    saw_active = False
+    while True:
+        try:
+            status = await client.device_status()
+        except (PhoneGateUnavailable, PhoneGateError):
+            return "delivery_unknown"
+        if status.call_state not in _ACTIVE_STATES:
+            return "delivered" if saw_active else "failed"
+        if status.tx_active or status.tx_preparing:
+            saw_active = True
+        elif saw_active:
+            return "delivered"
+        elif time.monotonic() - start >= start_grace:
+            return "failed"
+        if time.monotonic() >= deadline:
+            return "delivery_unknown"
+        await asyncio.sleep(poll)

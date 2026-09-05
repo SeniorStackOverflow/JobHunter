@@ -28,4 +28,32 @@
     <li class="muted">Нет данных — агент ещё не опрашивал PhoneGate.</li>
     {% endif %}
   </ul>
+  {% if phone_health.auto_answer %}
+  <div class="phone-auto-answer">
+    <span class="badge badge-{{ 'success' if phone_health.auto_answer.enabled else 'muted' }}">
+      Авто-ответ: {{ 'вкл' if phone_health.auto_answer.enabled else 'выкл' }}</span>
+    {% if phone_health.auto_answer.stopped %}
+    <span class="badge badge-danger">остановлен оператором</span>
+    <form method="post" action="/admin/phone/auto-answer/resume">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn-sm">Возобновить</button></form>
+    {% else %}
+    <form method="post" action="/admin/phone/auto-answer/stop"
+          data-confirm-title="Остановить авто-ответ?" data-confirm="Новые звонки не будут подниматься. Текущий активный звонок будет завершён." data-confirm-tone="danger" data-confirm-action="Остановить">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn-sm btn-danger">Остановить</button></form>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% if phone_health.active_call %}
+  <div class="phone-active-call muted">
+    Активный звонок · сценарий: {{ phone_health.active_call.script_stage or '—' }}
+    <form method="post" action="/admin/phone/call/{{ phone_health.active_call.session_id }}/hangup" style="display:inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn-sm btn-danger">Завершить</button></form>
+    <form method="post" action="/admin/phone/call/{{ phone_health.active_call.session_id }}/mute" style="display:inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn-sm">Замолчать</button></form>
+  </div>
+  {% endif %}
 </section>

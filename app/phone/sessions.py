@@ -13,6 +13,7 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    TurnDeliveryStatus,
     TurnSpeaker,
 )
 from app.phone.correlation import CorrelationResult
@@ -20,7 +21,7 @@ from app.phone.schemas import TranscriptEntry
 
 
 def speaker_from_phonegate(value: str) -> TurnSpeaker:
-    return {"rx": TurnSpeaker.EMPLOYER, "tx": TurnSpeaker.OPERATOR}.get(value, TurnSpeaker.SYSTEM)
+    return {"rx": TurnSpeaker.EMPLOYER, "tx": TurnSpeaker.ASSISTANT}.get(value, TurnSpeaker.SYSTEM)
 
 
 class SessionStore:
@@ -147,3 +148,49 @@ class SessionStore:
         session.add(turn)
         await session.flush()
         return turn
+
+    async def record_assistant_turn(
+        self,
+        session: AsyncSession,
+        *,
+        session_id: UUID,
+        phonegate_transcript_id: int | None,
+        spoken_text: str,
+        delivery_status: TurnDeliveryStatus,
+        occurred_at: datetime,
+    ) -> CommunicationTurn:
+        count = await session.scalar(
+            select(func.count(CommunicationTurn.id)).where(
+                CommunicationTurn.session_id == session_id
+            )
+        )
+        turn = CommunicationTurn(
+            session_id=session_id,
+            phonegate_transcript_id=phonegate_transcript_id,
+            seq=int(count or 0) + 1,
+            speaker=TurnSpeaker.ASSISTANT,
+            text=spoken_text,
+            raw_text=spoken_text,
+            spoken_text=spoken_text,
+            delivery_status=delivery_status,
+            occurred_at=occurred_at,
+        )
+        session.add(turn)
+        await session.flush()
+        return turn
+
+    async def set_turn_delivery(
+        self, session: AsyncSession, *, turn_id: UUID, status: TurnDeliveryStatus
+    ) -> None:
+        turn = await session.get(CommunicationTurn, turn_id)
+        if turn is not None:
+            turn.delivery_status = status
+            await session.flush()
+
+    async def set_script_stage(self, call: CommunicationSession, stage: str) -> None:
+        call.script_stage = stage
+
+    async def mark_auto_answered(self, call: CommunicationSession, when: datetime) -> None:
+        call.auto_answered = True
+        if call.answered_at is None:
+            call.answered_at = when

@@ -68,6 +68,7 @@ class IngestLoop:
         self._boot_id = ""
         self._open_session_id: UUID | None = None
         self._cursor_seeded = False
+        self._last_status: DeviceStatus | None = None
 
     async def load_cursor(self) -> int | None:
         """Load {cursor, generation, boot_id} from Redis; return the cursor, or
@@ -167,6 +168,11 @@ class IngestLoop:
     def open_session_id(self) -> UUID | None:
         """Public read of the currently open session ID."""
         return self._open_session_id
+
+    @property
+    def last_status(self) -> DeviceStatus | None:
+        """Public read of the status from the most recent successful device_status() call."""
+        return self._last_status
 
     async def _open_session_this_generation(
         self, session: AsyncSession
@@ -293,6 +299,7 @@ class IngestLoop:
             return False
 
         self._health.record_status(status)
+        self._last_status = status
 
         # A1: seed cursor on first successful status if not yet seeded
         if not self._cursor_seeded:
@@ -339,6 +346,7 @@ class IngestLoop:
                 logger.warning("phone_events_poll_failed", error_type=type(exc).__name__)
                 return status.call_state != "IDLE"
             self._health.record_status(status)
+            self._last_status = status
             dispatched_max = 0
             if fresh.events:
                 ordered = sorted(fresh.events, key=lambda event: event.id)
@@ -572,6 +580,10 @@ class IngestLoop:
                 event_id=event.id,
                 fields=sorted(str(k) for k in payload),
             )
+            return
+        if entry.speaker == "tx":
+            # Assistant speech — CallOrchestrator (phase 2a) owns these turns and
+            # is the only writer that knows the spoken_text / delivery status.
             return
         open_row = await self._open_session_this_generation(session)
         if open_row is None:

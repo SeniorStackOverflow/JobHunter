@@ -80,6 +80,19 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
         settings=settings,
     )
 
+    from app.phone.orchestrator import CALL_OWNED_KEY, TERMINAL_STAGES, OrchestratorSupervisor
+
+    supervisor = OrchestratorSupervisor(
+        client=client,
+        session_factory=async_session_factory,
+        redis=async_redis,
+        settings=settings,
+    )
+
+    # A fresh process owns no live call; a stale key here means a prior process
+    # died mid-call without reaching OrchestratorSupervisor.shutdown().
+    await async_redis.delete(CALL_OWNED_KEY)
+
     try:
         cursor = await ingest.load_cursor()
         # Spec §5.1.3: confirm device status once, but never block startup on a
@@ -102,6 +115,20 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
                 # agent was down be handled as a generation boundary.
                 await ingest.seed_state(status.latest_event_id, status.boot_id)
             await ingest.reconcile(status)
+            # Spec §10 last row: the process restarted while an auto-answered call
+            # was still in progress. The half-duplex script cannot be resumed
+            # mid-flight, so stop driving it and hand the live call to a human.
+            if status.call_state == "IN_CALL":
+                async with async_session_factory() as db:
+                    open_row = await ingest._store.find_open(db)
+                    if (
+                        open_row is not None
+                        and open_row.auto_answered
+                        and (open_row.script_stage or "") not in TERMINAL_STAGES
+                    ):
+                        open_row.script_stage = "aborted_restart"
+                        open_row.needs_review = True
+                        await db.commit()
             logger.info("phone_agent_started", call_state=status.call_state)
 
         while not should_stop():
@@ -120,6 +147,9 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
                     )
                 else:
                     await ingest.reconcile(fresh_status)
+            # Edge-free: spawn / monitor / retire the auto-answer orchestrator for
+            # the current device status. Cheap when there is nothing to do.
+            await supervisor.tick(ingest.last_status, ingest.open_session_id)
             # A single near-instant metadata syscall per poll tick; offloading it
             # to a worker thread would cost more than it saves.
             _touch_heartbeat()
@@ -129,6 +159,7 @@ async def _run_loop(*, lease_lost: Callable[[], bool]) -> None:
     finally:
         for sig in registered:
             loop.remove_signal_handler(sig)
+        await supervisor.shutdown()
         await client.aclose()
         await async_redis.aclose()
 

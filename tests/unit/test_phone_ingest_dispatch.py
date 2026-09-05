@@ -444,7 +444,8 @@ async def test_malformed_transcript_event_is_skipped_not_fatal(
         turns = (await session.scalars(select(CommunicationTurn))).all()
     assert len(calls) == 1
     assert calls[0].outcome == CommunicationOutcome.COMPLETED
-    assert sorted(t.text for t in turns) == ["good one", "good two"]
+    # tx speaker turns are skipped by ingest loop; only rx turns are persisted
+    assert sorted(t.text for t in turns) == ["good one"]
     # cursor advanced past every event including the poison one
     assert loop._cursor == 7
 
@@ -895,10 +896,10 @@ async def test_restart_midcall_reuses_transcript_ids_without_dropping_turns(
     # synthetic session must record that, not close as MISSED
     assert calls[1].answered_at is not None
     assert calls[1].outcome == CommunicationOutcome.COMPLETED
+    # tx speaker turns are skipped by ingest loop; only rx turns are persisted
     assert {t.text for t in turns} == {
         "before restart",
         "after restart",
-        "after restart 2",
     }
 
 
@@ -978,3 +979,41 @@ async def test_session_diagnostics_populated_on_open(
     # Diagnostics should contain correct daemon_version and sim_operator values
     assert call.diagnostics["daemon_version"] == "0.2.30"
     assert call.diagnostics["sim_operator"] == "Orange"
+
+
+async def test_last_status_is_exposed_after_run_cycle(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        assert loop.last_status is None
+        await loop.load_cursor()
+        await loop.run_cycle()
+        assert loop.last_status is not None
+        assert loop.last_status.call_state == "IDLE"
+
+
+async def test_tx_transcript_lines_are_not_persisted_by_ingest(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.transcript(speaker="rx", text="по вакансии грузчика")
+        fake.transcript(speaker="tx", text="Здравствуйте")  # assistant line -> ingest must skip
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert [t.text for t in turns] == ["по вакансии грузчика"]

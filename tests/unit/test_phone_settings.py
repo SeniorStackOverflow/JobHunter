@@ -80,3 +80,22 @@ def test_non_production_allows_loopback_phonegate_url() -> None:
         phonegate_auth_token="tok",
         phonegate_url="http://127.0.0.1:8888",
     )
+
+
+def test_phase_2a_defaults() -> None:
+    s = Settings(_env_file=None)
+    assert s.phone_auto_answer_enabled is False
+    assert s.phone_answer_blocklist == []
+    assert s.phone_answer_connect_timeout_seconds == 8.0
+    assert s.phone_post_connect_wait_seconds == 1.5
+    assert s.phone_speak_fence_timeout_seconds == 5.0
+    assert s.phone_tx_idle_timeout_seconds == 30.0
+    assert s.phone_inter_block_listen_seconds == 0.8
+    assert s.phone_listen_silence_timeout_seconds == 4.0
+    assert s.phone_call_hard_cap_seconds == 180.0
+    assert s.phone_orchestrator_poll_seconds == 0.15
+
+
+def test_blocklist_is_normalized() -> None:
+    s = Settings(_env_file=None, phone_answer_blocklist=["+373 60 111 222", "060999888"])
+    assert s.phone_answer_blocklist == ["+37360111222", "+37360999888"]

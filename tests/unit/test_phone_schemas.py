@@ -53,3 +53,10 @@ def test_telephony_state_mapping() -> None:
     assert telephony_state_from_call_state("RINGING") is TelephonyState.RINGING
     assert telephony_state_from_call_state("IDLE") is TelephonyState.IDLE
     assert telephony_state_from_call_state("weird") is TelephonyState.IDLE
+
+
+def test_device_status_tx_fields_default_false() -> None:
+    st = DeviceStatus.model_validate({})
+    assert st.tx_active is False and st.tx_preparing is False
+    st = DeviceStatus.model_validate({"tx_active": True, "tx_preparing": True})
+    assert st.tx_active is True and st.tx_preparing is True

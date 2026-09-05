@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from enum import StrEnum
 
 
@@ -123,6 +125,14 @@ class TurnSpeaker(StrEnum):
     ASSISTANT = "assistant"
     OPERATOR = "operator"
     SYSTEM = "system"
+
+
+class TurnDeliveryStatus(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    ATTEMPTED = "attempted"
+    DELIVERED = "delivered"
+    DELIVERY_UNKNOWN = "delivery_unknown"
+    FAILED = "failed"
 
 
 class CallFactState(StrEnum):
