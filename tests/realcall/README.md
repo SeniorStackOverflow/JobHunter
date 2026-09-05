@@ -4,11 +4,17 @@
 
 ## Prerequisites
 
-- SSH to the VPS reachable; `adb` there sees A14 and A06 over Tailscale.
-- A06: active SIM with minutes, screen unlocked, proven `.dex` present.
+- SSH to the VPS reachable; `adb` there sees A14 and A06 over Tailscale
+  (`adb devices -l` — both serials present).
+- A06: active SIM with minutes, screen unlocked. `check_preconditions()`
+  cannot detect this — pkill/keyevent/app_process all "succeed" against a
+  locked screen too.
 - A14: PhoneGate running, daemon connected (`connected=true`, `mode=Zero-ADB`).
 - JobHunter `call-agent` running against the same PhoneGate with
   `PHONE_AUTO_ANSWER_ENABLED=true`.
+- PhoneGate's own venv on the rig has `edge-tts` and `ffmpeg` available
+  (`/srv/phonegate/venv/bin/edge-tts`) — `inject_uplink_speech` synthesizes
+  on the rig itself, not on whatever machine invokes the harness.
 
 ## Run
 
@@ -28,10 +34,25 @@ uv run pytest -q -m realcall tests/realcall/
       speaks, hears the closing, call ends — sounds acceptable to a real employer)
 - [ ] Full CI sweep green (ruff, mypy, pytest, alembic check on DEV Postgres, docker compose config)
 
-## Incomplete pieces to finish on the rig
+## Hardware notes
 
-`a06_originate.py` `inject_uplink_wav` / `start_downlink_recording` / `stop_downlink_recording`
-raise NotImplementedError — wire them from
-`/srv/phonegate/WORKING_DO_NOT_TOUCH_PROVEN/` (a06_call_record.py, a14_call_inject.py,
-CallStreamer, ParamSetter, ReceiverRecorder) for the A06->A14 direction. Do NOT edit
-that protected directory.
+`A06Rig`'s `inject_uplink_speech` / `start_downlink_recording` /
+`stop_downlink_recording` are wired to the proven, immutable toolkit at
+`/srv/phonegate/WORKING_DO_NOT_TOUCH_PROVEN/` (`ReceiverRecorder` for
+recording, `CallStreamer` + `ParamSetter` for injection, edge-tts + ffmpeg
+for synthesis) — that directory is never edited, only read in place over
+SSH. The dial direction here (A06 -> A14) is the reverse of the proven
+scripts' own A14 -> A06 flow, so both the recorder and the injector run on
+A06 instead of A14.
+
+`ReceiverRecorder` has no "stop now" signal — it records for a fixed
+duration and exits on its own; `stop_downlink_recording()` kills the
+process early and pulls whatever was captured. Every multi-step call
+(injection, recording) raises `RuntimeError` with the failing step's
+stderr on the first non-zero exit, rather than continuing silently —
+unlike `dial()`/`hangup()`, which a human could just retry by hand.
+
+This has been implemented and exercised for code correctness (unit tests,
+lint, type-check) but the actual `pytest -m realcall` live-hardware run
+against a real GSM call is a separate, explicit step — see the checklist
+above.

@@ -104,8 +104,9 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
         f"JobHunter never reached LISTENING within {greeting_budget:.0f}s of dialing"
     )
 
-    # A06 injects a known WAV: "Звоню по вакансии грузчика на склад"
-    a06_rig.inject_uplink_wav("/tmp/test_injection.wav")  # NotImplementedError expected here
+    # A06 injects the phrase into its own uplink -- reaches A14's downlink,
+    # where PhoneGate/Groq ASR picks it up as an employer turn.
+    a06_rig.inject_uplink_speech("Звоню по вакансии грузчика на склад")
 
     # Wait for the call to actually finish — the silence timeout (default 20s)
     # plus the closing block — before stopping the recording.
