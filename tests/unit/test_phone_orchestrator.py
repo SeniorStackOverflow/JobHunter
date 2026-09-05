@@ -213,6 +213,38 @@ async def test_call_drops_mid_greeting(factory: async_sessionmaker[AsyncSession]
 
 
 @pytest.mark.asyncio
+async def test_say_not_sent_records_failed_without_transcript_id(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §6.3: delivery_unknown means an AMBIGUOUS post-POST timeout. A
+    fence failure never even POSTs /speak — that's a known non-delivery, so
+    it must record FAILED (with spoken_text, but no phonegate_transcript_id),
+    never delivery_unknown."""
+    import app.phone.orchestrator as orchestrator_module
+    from app.phone.speak import SpeakResult
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+
+    async def fake_speak_block(*args: object, **kwargs: object) -> SpeakResult:
+        return SpeakResult("not_sent")
+
+    monkeypatch.setattr(orchestrator_module, "speak_block", fake_speak_block)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
+        outcome = await orch._say(session_id, "Здравствуйте")
+
+    assert outcome == "ok"
+    turns = await _assistant_turns(factory, session_id)
+    assert len(turns) == 1
+    assert turns[0].delivery_status is TurnDeliveryStatus.FAILED
+    assert turns[0].spoken_text == "Здравствуйте"
+    assert turns[0].phonegate_transcript_id is None
+
+
+@pytest.mark.asyncio
 async def test_answer_409_is_a_benign_miss_not_a_review(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -265,11 +297,72 @@ async def test_call_ends_before_in_call_is_a_benign_miss(
 
 
 @pytest.mark.asyncio
+async def test_connect_fence_tolerates_transient_ringing_after_answer(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A real PhoneGate accepts /api/call/answer and returns immediately while
+    A14 can still report RINGING for a short window before IN_CALL — the
+    connect fence must poll through that, not treat it as CallEnded."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    fake.set_ring_polls_after_answer(1)  # first status poll: RINGING, second: IN_CALL
+    session_id = await _open_ringing_session(factory)
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
+        stage = await orch.run(session_id)
+
+    assert stage == "greeting_completed"
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.auto_answered is True
+    assert call.script_stage == "greeting_completed"
+
+
+@pytest.mark.asyncio
+async def test_stop_before_answer_never_touches_the_call(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Spec §9.2: the runtime stop is re-checked immediately before answer(),
+    closing the race between the supervisor's own (already-passed) check and
+    this orchestrator actually calling answer(). If the operator stopped in
+    that window, PhoneGate must never see /api/call/answer at all."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+
+    async def command_check() -> str | None:
+        return "stop"
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(
+            client=client,
+            session_factory=factory,
+            settings=_fast_settings(),
+            command_check=command_check,
+        )
+        stage = await orch.run(session_id)
+
+    assert stage == "aborted_error"
+    assert fake.answered_by_agent is False  # PhoneGate never saw /api/call/answer
+    assert fake._call_state == "RINGING"  # still ringing, untouched
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.auto_answered is False
+    assert call.script_stage is None
+    assert call.needs_review is False
+
+
+@pytest.mark.asyncio
 async def test_operator_hangup_command(factory: async_sessionmaker[AsyncSession]) -> None:
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
-    cmds = ["hangup"]
+    # The pre-answer stop/hangup check (spec §9.2) consumes the first
+    # command_check() call before the greeting loop's own; the leading None
+    # lets answer() proceed, so "hangup" still lands mid-greeting.
+    cmds = ["hangup", None]
 
     async def command_check() -> str | None:
         return cmds.pop() if cmds else None
@@ -451,6 +544,58 @@ async def test_supervisor_decides_once_per_ringing(
         ).all()
     assert len(rows) == 1
     assert fake._call_state == "RINGING"  # still not answered
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_redecide_after_a_failed_answer_attempt(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Spec §3.2: the decision is computed once per inbound RINGING — even
+    across an orchestrator retry. If answer() fails transiently while the
+    call is still RINGING, a later tick() for the same session must not
+    re-decide, re-audit, or re-spawn (that would retry the same inbound call
+    every ~poll-interval until it resolves)."""
+    from app.models.entities import AuditEvent
+    from app.phone.client import PhoneGateUnavailable
+    from app.phone.orchestrator import CALL_OWNED_KEY, OrchestratorSupervisor
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+    redis = FakeAsyncRedis()
+
+    async def failing_answer() -> None:
+        raise PhoneGateUnavailable("transient")
+
+    async with _pg(fake) as client:
+        client.answer = failing_answer  # type: ignore[method-assign]
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=file_factory,
+            redis=redis,
+            settings=_fast_settings(),
+        )
+        try:
+            status = await client.device_status()
+            await sup.tick(status, session_id)  # spawns; answer() fails fast -> aborted_error
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                await sup.tick(status, session_id)
+                if await redis.get(CALL_OWNED_KEY) is None:
+                    break
+            assert await redis.get(CALL_OWNED_KEY) is None, "task never reaped"
+            await sup.tick(status, session_id)  # the call is STILL RINGING
+        finally:
+            await sup.shutdown()
+
+    async with file_factory() as s:
+        rows = (
+            await s.scalars(
+                select(AuditEvent).where(AuditEvent.action == "communication.auto_answer_decision")
+            )
+        ).all()
+    assert len(rows) == 1
 
 
 @pytest.mark.asyncio

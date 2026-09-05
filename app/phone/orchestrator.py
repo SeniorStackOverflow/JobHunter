@@ -103,6 +103,16 @@ class CallOrchestrator:
         session_id = self._sid
 
         # POST_CONNECT_WAIT ------------------------------------------------
+        # Spec §9.2: the runtime stop switch is re-checked immediately before
+        # answer() — in addition to the supervisor's own check before this
+        # orchestrator was even spawned — closing the race window between
+        # "policy decided ANSWER" and "we actually call answer()". A stop (or
+        # a per-call hangup landing before we've even answered) means we never
+        # touch the call: same outcome as spec §10 row 1 below.
+        if await self._cmd() in {"stop", "hangup"}:
+            logger.info("phone_orchestrator_command_before_answer")
+            return "aborted_error"
+
         # Spec §10 row 1: if ``answer()`` returns 409 or IN_CALL is not reached
         # before the connect timeout, the call was never ours to drive (it ended,
         # or another answerer won the race). Exit leaving ``auto_answered=false``,
@@ -116,10 +126,15 @@ class CallOrchestrator:
             return "aborted_error"
 
         try:
+            # A real PhoneGate accepts /api/call/answer and returns immediately
+            # while A14 can still report RINGING for a short window before it
+            # actually reaches IN_CALL — poll through that transient state
+            # instead of treating it as the call having ended.
             await wait_until_speakable(
                 self._client,
                 timeout=s.phone_answer_connect_timeout_seconds,
                 poll=s.phone_orchestrator_poll_seconds,
+                ended_states=frozenset({"IDLE"}),
             )
         except Exception as exc:
             logger.warning("phone_orchestrator_connect_failed", error=type(exc).__name__)
@@ -235,6 +250,22 @@ class CallOrchestrator:
         )
         if res.outcome == "ended":
             return "ended"
+
+        if res.outcome == "not_sent":
+            # The fence never let /speak get POSTed — unlike "unknown" (a
+            # genuine ambiguous timeout AFTER a real POST), this is a known
+            # non-delivery: no tx transcript line exists for this attempt.
+            async with self._sf() as db:
+                await self._store.record_assistant_turn(
+                    db,
+                    session_id=session_id,
+                    phonegate_transcript_id=None,
+                    spoken_text=text,
+                    delivery_status=TurnDeliveryStatus.FAILED,
+                    occurred_at=datetime.now(UTC),
+                )
+                await db.commit()
+            return "ok"
 
         tx_id = await self._latest_tx_transcript_id()
         initial = (
@@ -402,7 +433,14 @@ class OrchestratorSupervisor:
                 logger.warning("phone_orchestrator_task_error", error=type(exc).__name__)
             self._task = None
             self._task_session_id = None
-            self._decided_session_id = None
+            # Deliberately NOT resetting _decided_session_id: spec §3.2 wants
+            # the policy decision computed once per inbound RINGING, full
+            # stop — including when the orchestrator's own answer() attempt
+            # failed while the call is still RINGING (a transient PhoneGate
+            # error, not a state change). Re-deciding here would re-audit and
+            # re-attempt the same inbound call every ~poll-interval until it
+            # resolves. A genuinely new inbound call gets a different
+            # open_session_id and is decided normally.
             await self._redis.delete(CALL_OWNED_KEY)
             return
 

@@ -32,6 +32,12 @@ class FakePhoneGate:
         self._tx_auto_advance = True
         self._fail_next_speak: str | None = None
         self.answered_by_agent = False
+        # 0 = old/default behaviour: /api/call/answer flips call_state straight
+        # to IN_CALL. A real A14 accepts the answer command immediately but can
+        # keep reporting RINGING for a few more /api/device/status polls while
+        # the telephony stack completes the pickup — set_ring_polls_after_answer
+        # simulates that transient window for regression tests.
+        self._ring_polls_after_answer = 0
         self.app = Starlette(
             routes=[
                 Route("/api/health", self._health),
@@ -123,6 +129,11 @@ class FakePhoneGate:
     def fail_next_speak(self, *, mode: str) -> None:
         self._fail_next_speak = mode
 
+    def set_ring_polls_after_answer(self, n: int) -> None:
+        """After the next accepted /api/call/answer, report RINGING for ``n``
+        more /api/device/status polls before call_state flips to IN_CALL."""
+        self._ring_polls_after_answer = n
+
     def restart(self, *, new_boot_id: bool = True) -> None:
         self._events.clear()
         self._transcripts.clear()
@@ -169,6 +180,15 @@ class FakePhoneGate:
         }
         if self._tx_auto_advance and self._tx_stage != 0:
             self.advance_tx()
+        if (
+            self.answered_by_agent
+            and self._call_state == "RINGING"
+            and self._ring_polls_after_answer > 0
+        ):
+            self._ring_polls_after_answer -= 1
+            if self._ring_polls_after_answer == 0:
+                self._call_state = "IN_CALL"
+                self._emit("call_state", self._call_state_data())
         return JSONResponse(body)
 
     async def _events_route(self, request: Request) -> JSONResponse:
@@ -216,8 +236,12 @@ class FakePhoneGate:
             return JSONResponse({"detail": "auth"}, status_code=401)
         if self._call_state != "RINGING":
             return JSONResponse({"detail": "not ringing"}, status_code=409)
-        self._call_state = "IN_CALL"
         self.answered_by_agent = True
+        if self._ring_polls_after_answer > 0:
+            # Accepted, but call_state stays RINGING for a few more polls —
+            # see set_ring_polls_after_answer.
+            return JSONResponse({"success": True})
+        self._call_state = "IN_CALL"
         self._emit("call_state", self._call_state_data())
         return JSONResponse({"success": True})
 
