@@ -55,7 +55,8 @@ closing. No LLM, no fact extraction, no scheduling. Phase 2b is **additive** on 
   `build_calls_context(...)` and the evidence WAV stream endpoint.
 - `app/admin/templates/calls/*.html` *(new)* + `Звонки` nav link + badge in
   `base.html`; `dashboard()` gains `elif view == "calls":`.
-- `app/api/phone_routes.py`: `GET /api/v1/phone/calls`, `GET /api/v1/phone/calls/{id}`.
+- `app/api/phone_routes.py`: extend the existing `GET /api/v1/phone/sessions` and
+  `/sessions/{id}` with the 2b fields + list filters.
 - `FakePhoneGate` gains `GET /api/call/audio` + scripting helpers.
 - Unit + integration tests on `FakePhoneGate` / `httpx.MockTransport` (CI); one
   optional real‑call assertion (opt‑in, never CI).
@@ -266,7 +267,7 @@ Modelled on `LLMRouterProvider` (`app/matching/providers.py`) — an OpenAI‑ch
 | `phone_summary_llm_enabled` | `false` | master switch for the LLM summary + Telegram |
 | `phone_summary_llm_base_url` | `http://127.0.0.1:4000` | same local llmRouter as matching |
 | `phone_summary_llm_api_key` | `None` → falls back to `llmrouter_api_key` | one local service, avoid configuring the key twice |
-| `phone_summary_llm_model` | `""` | empty ⇒ llmRouter picks by `prefer` (confirm the exact request field against `providers.py` during planning) |
+| `phone_summary_llm_model` | `""` | `LLMRouterProvider` rejects an empty `model`; when unset, fall back to `settings.openai_model`. If both are empty and `phone_summary_llm_enabled=true`, production validation errors ("an explicit summary model is required") — mirrors matching's `_provider_from_settings`. |
 | `phone_summary_llm_prefer` | `"quality"` | architecture §25 "stronger smart/quality model" |
 | `phone_summary_llm_timeout_seconds` | `60.0` | a background job, not latency‑sensitive; §40.3 explicitly allows a matching‑style long timeout here |
 | `phone_summary_max_attempts` | `3` | after which the session goes `failed` |
@@ -566,13 +567,18 @@ stub ("доступно после Phase 4").
   must match `\d+`, and the resolved path must be inside `phone_evidence_dir` (no
   traversal). Missing file → `404` + "запись недоступна". `Content-Type: audio/wav`.
 
-### 8.5 API (`app/api/phone_routes.py`) — thin
+### 8.5 API (`app/api/phone_routes.py`) — extend the existing endpoints
 
-- `GET /api/v1/phone/calls` — paginated session list (masked numbers).
-- `GET /api/v1/phone/calls/{id}` — one session incl. `summary` and turns.
+`GET /api/v1/phone/sessions` and `GET /api/v1/phone/sessions/{session_id}` already
+exist. Extend them rather than add parallel `/calls` routes:
 
-Keeps parity with the "REST + admin + MCP over one set of services" principle and gives
-programmatic access. Additive, small. **Decided (2026-09-05): in scope for this cycle.**
+- list: add `auto_answered`, `script_stage`, `summary_state` to each row; add optional
+  query filters `filter` (`all` / `needs_review` / `interview_proposed` /
+  `missed_dropped` / `unknown_caller`) and `q` (company / vacancy / masked phone).
+- detail: add `summary` (the full JSON), `summary_state`, and `audio_evidence_path`
+  per turn.
+
+Masked numbers throughout. **Decided (2026-09-05): in scope for this cycle.**
 
 ---
 
