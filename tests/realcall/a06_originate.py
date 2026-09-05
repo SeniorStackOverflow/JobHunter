@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import shlex
@@ -125,78 +126,84 @@ class A06Rig:
         remote_pcm = f"/tmp/realcall_inject_{run_id}.pcm"
         device_pcm = "/data/local/tmp/realcall_inject.pcm"
 
-        self._run_or_raise(
-            f"{_EDGE_TTS_BIN} --voice ru-RU-DmitryNeural --text {shlex.quote(text)} "
-            f"--write-media {remote_mp3}",
-            what="edge-tts synthesis",
-            timeout=30,
-        )
-        self._run_or_raise(
-            f"ffmpeg -y -i {remote_mp3} -ar 48000 -ac 2 -f s16le {remote_pcm}",
-            what="ffmpeg PCM conversion",
-            timeout=30,
-        )
-
-        if duration_seconds is None:
-            size_result = self._run_or_raise(
-                f"wc -c < {remote_pcm}", what="measuring injection PCM size", timeout=10
-            )
-            pcm_bytes = int(size_result.stdout.strip() or 0)
-            # 48000 Hz, 16-bit, stereo = 4 bytes/sample-frame. CallStreamer
-            # takes an integer-second duration and LOOPS the PCM back to the
-            # start if that duration exceeds the actual audio length (see
-            # "Seamless loop across full speech track" in CallStreamer.java)
-            # -- so truncating (int()) undershoots and clips the last word,
-            # while padding with a multi-second margin overshoots and makes
-            # the phrase audibly repeat from the top. ceil() is the minimum
-            # integer that can't undershoot; no extra margin on top of it.
-            duration_seconds = max(2, math.ceil(pcm_bytes / (48000 * 4)))
-
-        self._run_or_raise(
-            f"adb -s {self.a06_serial} push {remote_pcm} {device_pcm}",
-            what="pushing injection audio to A06",
-            timeout=30,
-        )
-        self._run_or_raise(
-            f"adb -s {self.a06_serial} push {_PROVEN_DIR}/param_setter.dex "
-            f"/data/local/tmp/param_setter.dex",
-            what="pushing param_setter.dex to A06",
-            timeout=15,
-        )
-        self._run_or_raise(
-            f"adb -s {self.a06_serial} push {_PROVEN_DIR}/call_streamer.dex "
-            f"/data/local/tmp/call_streamer.dex",
-            what="pushing call_streamer.dex to A06",
-            timeout=15,
-        )
-
-        def _set_param(kv: str) -> None:
-            self._adb(
-                self.a06_serial,
-                "/system/bin/app_process "
-                "-Djava.class.path=/data/local/tmp/param_setter.dex /data/local/tmp "
-                f"com.callbridge.param.ParamSetter '{kv}'",
-                timeout=10,
-            )
-
         try:
-            _set_param("g_call_forwarding_enable=true")
-            _set_param("incall_music=1")
-            self._adb(
-                self.a06_serial,
-                "/system/bin/app_process "
-                "-Djava.class.path=/data/local/tmp/call_streamer.dex /data/local/tmp "
-                f"com.callbridge.streamer.CallStreamer {device_pcm} {duration_seconds} "
-                "48000 2 MEDIA",
-                timeout=duration_seconds + 15,
+            self._run_or_raise(
+                f"{_EDGE_TTS_BIN} --voice ru-RU-DmitryNeural --text {shlex.quote(text)} "
+                f"--write-media {remote_mp3}",
+                what="edge-tts synthesis",
+                timeout=30,
             )
-        finally:
-            # Always reset the hardware mixer flag, even if streaming failed —
-            # leaving it enabled would bleed media audio into every call
-            # after this one.
-            _set_param("g_call_forwarding_enable=false")
+            self._run_or_raise(
+                f"ffmpeg -y -i {remote_mp3} -ar 48000 -ac 2 -f s16le {remote_pcm}",
+                what="ffmpeg PCM conversion",
+                timeout=30,
+            )
 
-        self._ssh(f"rm -f {remote_mp3} {remote_pcm}", timeout=10)
+            if duration_seconds is None:
+                size_result = self._run_or_raise(
+                    f"wc -c < {remote_pcm}", what="measuring injection PCM size", timeout=10
+                )
+                pcm_bytes = int(size_result.stdout.strip() or 0)
+                # 48000 Hz, 16-bit, stereo = 4 bytes/sample-frame. CallStreamer
+                # takes an integer-second duration and LOOPS the PCM back to the
+                # start if that duration exceeds the actual audio length (see
+                # "Seamless loop across full speech track" in CallStreamer.java)
+                # -- so truncating (int()) undershoots and clips the last word,
+                # while padding with a multi-second margin overshoots and makes
+                # the phrase audibly repeat from the top. ceil() is the minimum
+                # integer that can't undershoot; no extra margin on top of it.
+                duration_seconds = max(2, math.ceil(pcm_bytes / (48000 * 4)))
+
+            self._run_or_raise(
+                f"adb -s {self.a06_serial} push {remote_pcm} {device_pcm}",
+                what="pushing injection audio to A06",
+                timeout=30,
+            )
+            self._run_or_raise(
+                f"adb -s {self.a06_serial} push {_PROVEN_DIR}/param_setter.dex "
+                f"/data/local/tmp/param_setter.dex",
+                what="pushing param_setter.dex to A06",
+                timeout=15,
+            )
+            self._run_or_raise(
+                f"adb -s {self.a06_serial} push {_PROVEN_DIR}/call_streamer.dex "
+                f"/data/local/tmp/call_streamer.dex",
+                what="pushing call_streamer.dex to A06",
+                timeout=15,
+            )
+
+            def _set_param(kv: str) -> None:
+                self._adb(
+                    self.a06_serial,
+                    "/system/bin/app_process "
+                    "-Djava.class.path=/data/local/tmp/param_setter.dex /data/local/tmp "
+                    f"com.callbridge.param.ParamSetter '{kv}'",
+                    timeout=10,
+                )
+
+            try:
+                _set_param("g_call_forwarding_enable=true")
+                _set_param("incall_music=1")
+                self._adb(
+                    self.a06_serial,
+                    "/system/bin/app_process "
+                    "-Djava.class.path=/data/local/tmp/call_streamer.dex /data/local/tmp "
+                    f"com.callbridge.streamer.CallStreamer {device_pcm} {duration_seconds} "
+                    "48000 2 MEDIA",
+                    timeout=duration_seconds + 15,
+                )
+            finally:
+                # Always reset the hardware mixer flag, even if streaming failed —
+                # leaving it enabled would bleed media audio into every call
+                # after this one.
+                _set_param("g_call_forwarding_enable=false")
+
+        finally:
+            # Temp synthesis artifacts live on the VPS, not in pytest's local tmpdir.
+            # Clean them even when synthesis/conversion/push/streaming fails midway.
+            # Cleanup itself is best-effort and must never mask the original failure.
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                self._ssh(f"rm -f {remote_mp3} {remote_pcm}", timeout=10)
 
     def start_downlink_recording(self) -> str:
         """Launch ReceiverRecorder on A06 (VOICE_DOWNLINK, source 3) in the
