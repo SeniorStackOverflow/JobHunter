@@ -61,13 +61,15 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
         io.BytesIO(downlink_audio), language="ru", task="transcribe", beam_size=5
     )
     transcribed = " ".join(seg.text for seg in segments).lower()
-    expected_blocks = [*SCRIPT_GREETING, SCRIPT_CLOSING]
-    best_ratio = max(
-        SequenceMatcher(None, transcribed, block.lower()).ratio() for block in expected_blocks
-    )
-    assert best_ratio >= 0.4, (
-        f"downlink transcript does not resemble any script block (best ratio {best_ratio:.2f}): "
-        f"{transcribed!r}"
+    # The downlink carries all 4 greeting blocks plus the closing back to back,
+    # so compare against their concatenation — comparing the whole transcript
+    # against one block at a time inflates the denominator and makes even a
+    # perfect transcript score well under any reasonable threshold.
+    expected_full = " ".join([*SCRIPT_GREETING, SCRIPT_CLOSING]).lower()
+    ratio = SequenceMatcher(None, transcribed, expected_full).ratio()
+    assert ratio >= 0.4, (
+        f"downlink transcript does not resemble the greeting+closing script "
+        f"(ratio {ratio:.2f}): {transcribed!r}"
     )
 
     # Assertion 3: CommunicationTurn exists for the injected phrase
