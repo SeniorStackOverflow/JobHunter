@@ -79,11 +79,15 @@ async def test_speak_block_409_then_retry_succeeds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_speak_block_fence_transport_error_is_unknown(
+async def test_speak_block_fence_transport_error_is_not_sent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A PhoneGate blip while fencing must degrade, not propagate — an escaping
-    exception would skip the caller's ``_hangup()`` and leave a live GSM call."""
+    exception would skip the caller's ``_hangup()`` and leave a live GSM call.
+
+    Unlike a genuine post-POST ambiguous timeout ("unknown"), a fence failure
+    means ``/speak`` was never even attempted — a known non-delivery, not an
+    ambiguous one (spec §6.3)."""
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
@@ -94,7 +98,22 @@ async def test_speak_block_fence_transport_error_is_unknown(
 
         monkeypatch.setattr(c, "device_status", boom)
         res = await speak_block(c, "x", fence_timeout=2.0, poll=0.01)
-        assert res == SpeakResult(outcome="unknown")
+        assert res == SpeakResult(outcome="not_sent")
+
+
+@pytest.mark.asyncio
+async def test_speak_block_plain_fence_timeout_is_not_sent() -> None:
+    """A fence timeout (TX stuck busy, no transport error at all) never
+    reaches ``/speak`` either — same known-non-delivery outcome as a fence
+    transport error, not the ambiguous "unknown"."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    fake.set_tx_auto_advance(False)  # TX stays busy forever
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        await c.answer()
+        await c.speak("priming")  # sets tx_preparing, never advances
+        res = await speak_block(c, "x", fence_timeout=0.2, poll=0.01)
+        assert res == SpeakResult(outcome="not_sent")
 
 
 @pytest.mark.asyncio
