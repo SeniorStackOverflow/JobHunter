@@ -44,6 +44,7 @@ def _fast_settings(**overrides: object) -> Settings:
         "phone_answer_connect_timeout_seconds": 2.0,
         "phone_post_connect_wait_seconds": 0.01,
         "phone_speak_fence_timeout_seconds": 2.0,
+        "phone_tx_idle_timeout_seconds": 2.0,
         "phone_inter_block_listen_seconds": 0.01,
         "phone_listen_silence_timeout_seconds": 0.2,
         "phone_call_hard_cap_seconds": 5.0,
@@ -237,6 +238,38 @@ async def test_say_not_sent_records_failed_without_transcript_id(
         outcome = await orch._say(session_id, "Здравствуйте")
 
     assert outcome == "ok"
+    turns = await _assistant_turns(factory, session_id)
+    assert len(turns) == 1
+    assert turns[0].delivery_status is TurnDeliveryStatus.FAILED
+    assert turns[0].spoken_text == "Здравствуйте"
+    assert turns[0].phonegate_transcript_id is None
+
+
+@pytest.mark.asyncio
+async def test_say_ended_from_fence_records_failed_turn(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §6.3's IDLE/call-ended sub-branch says "record turn failed" — the
+    call ending during the fence (speak_block's own CallEnded detection) is
+    the same known non-delivery, just discovered a different way than a
+    fence timeout/transport error, and must not go unrecorded."""
+    import app.phone.orchestrator as orchestrator_module
+    from app.phone.speak import SpeakResult
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+
+    async def fake_speak_block(*args: object, **kwargs: object) -> SpeakResult:
+        return SpeakResult("ended")
+
+    monkeypatch.setattr(orchestrator_module, "speak_block", fake_speak_block)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
+        outcome = await orch._say(session_id, "Здравствуйте")
+
+    assert outcome == "ended"
     turns = await _assistant_turns(factory, session_id)
     assert len(turns) == 1
     assert turns[0].delivery_status is TurnDeliveryStatus.FAILED
@@ -446,6 +479,42 @@ async def test_mute_command_records_diagnostic(
 
 
 @pytest.mark.asyncio
+async def test_mute_command_during_listening_records_diagnostic(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A mute arriving during LISTENING (not GREETING) has nothing to skip —
+    JobHunter isn't speaking — but the operator's action must still be
+    recorded (spec §9.3), not silently consumed and dropped."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    calls = {"n": 0}
+
+    async def command_check() -> str | None:
+        calls["n"] += 1
+        # Call 1 = the pre-answer check, calls 2-5 = the 4 greeting blocks —
+        # call 6+ is safely inside LISTENING.
+        return "mute" if calls["n"] >= 6 else None
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(
+            client=client,
+            session_factory=factory,
+            settings=_fast_settings(),
+            command_check=command_check,
+        )
+        stage = await orch.run(session_id)
+
+    assert stage == "greeting_completed"
+    async with factory() as s:
+        call = await s.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.diagnostics.get("mute_requested") is True
+    assistant = await _assistant_turns(factory, session_id)
+    assert len(assistant) == len(SCRIPT_GREETING) + 1  # every block still spoken, none skipped
+
+
+@pytest.mark.asyncio
 async def test_supervisor_spawns_on_ringing_and_answers(
     file_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -596,6 +665,47 @@ async def test_supervisor_does_not_redecide_after_a_failed_answer_attempt(
             )
         ).all()
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_redecides_after_a_genuine_call_boundary(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """_decided_session_id must reset at a real call boundary (any tick where
+    the device isn't RINGING), not only on a different session_id — otherwise
+    a session whose closing IDLE event was lost (so IngestLoop keeps handing
+    back the same open_session_id) would never be decided again for a second,
+    genuinely distinct ring from the same caller."""
+    from app.models.entities import AuditEvent
+    from app.phone.orchestrator import OrchestratorSupervisor
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    redis = FakeAsyncRedis()
+    async with _pg(fake) as client:
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=factory,
+            redis=redis,
+            settings=Settings(_env_file=None),  # auto-answer OFF -> decision.answer is False
+        )
+        ringing = await client.device_status()
+        await sup.tick(ringing, session_id)  # decision #1
+
+        idle = ringing.model_copy(update={"call_state": "IDLE"})
+        await sup.tick(idle, session_id)  # genuine call boundary -> resets
+
+        await sup.tick(ringing, session_id)  # same session_id rings again -> decision #2
+
+    async with factory() as s:
+        rows = (
+            await s.scalars(
+                select(AuditEvent).where(AuditEvent.action == "communication.auto_answer_decision")
+            )
+        ).all()
+    assert len(rows) == 2
 
 
 @pytest.mark.asyncio

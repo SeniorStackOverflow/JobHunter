@@ -72,6 +72,7 @@ def _settings() -> Settings:
         phone_poll_active_seconds=0.02,
         phone_post_connect_wait_seconds=0.01,
         phone_speak_fence_timeout_seconds=2.0,
+        phone_tx_idle_timeout_seconds=2.0,
         phone_inter_block_listen_seconds=0.01,
         phone_listen_silence_timeout_seconds=0.2,
         phone_call_hard_cap_seconds=5.0,

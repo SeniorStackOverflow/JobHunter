@@ -183,6 +183,11 @@ class CallOrchestrator:
             terminal = await self._dispatch_command(session_id, cmd)
             if terminal is not None:
                 return terminal
+            if cmd == "mute":
+                # Nothing to skip during LISTENING (JobHunter isn't speaking),
+                # but the operator's action must still leave a trace (spec
+                # §9.3: "Recorded in session diagnostics as mute_requested").
+                await self._mark_mute_requested(session_id)
 
             try:
                 status = await self._client.device_status()
@@ -249,22 +254,17 @@ class CallOrchestrator:
             poll=self._s.phone_orchestrator_poll_seconds,
         )
         if res.outcome == "ended":
+            # Spec §6.3's IDLE/call-ended 409 sub-branch: "drop this block, no
+            # retry, record turn failed" -- the call ending mid-fence is the
+            # same known non-delivery, just discovered a different way.
+            await self._record_unsent_block(session_id, text)
             return "ended"
 
         if res.outcome == "not_sent":
             # The fence never let /speak get POSTed — unlike "unknown" (a
             # genuine ambiguous timeout AFTER a real POST), this is a known
             # non-delivery: no tx transcript line exists for this attempt.
-            async with self._sf() as db:
-                await self._store.record_assistant_turn(
-                    db,
-                    session_id=session_id,
-                    phonegate_transcript_id=None,
-                    spoken_text=text,
-                    delivery_status=TurnDeliveryStatus.FAILED,
-                    occurred_at=datetime.now(UTC),
-                )
-                await db.commit()
+            await self._record_unsent_block(session_id, text)
             return "ok"
 
         tx_id = await self._latest_tx_transcript_id()
@@ -288,9 +288,17 @@ class CallOrchestrator:
         if res.outcome == "unknown":
             return "ok"
 
+        # Real PhoneGate utterances run several seconds of synthesis (cold TTS
+        # cache) plus the full playback duration before TX returns to idle --
+        # confirmed against production logs (up to ~8s synthesis + ~14s audio
+        # for a single block). phone_speak_fence_timeout_seconds is sized for
+        # the FENCE (typically resolves fast, since this same observation
+        # already waited out the prior block's TX before the fence is even
+        # checked) -- reusing it here as the delivery-confirmation budget
+        # would misclassify a normal-length utterance as delivery_unknown.
         result = await observe_tx_delivery(
             self._client,
-            timeout=self._s.phone_speak_fence_timeout_seconds,
+            timeout=self._s.phone_tx_idle_timeout_seconds,
             poll=self._s.phone_orchestrator_poll_seconds,
             start_grace=_TX_START_GRACE,
         )
@@ -324,6 +332,22 @@ class CallOrchestrator:
         except (PhoneGateUnavailable, PhoneGateError):
             return True
         return status.call_state == "IN_CALL"
+
+    async def _record_unsent_block(self, session_id: UUID, text: str) -> None:
+        """Record a block that is certain to have never been sent (fence
+        failure or the call ending before/during the fence) — no tx
+        transcript line exists for it, so ``phonegate_transcript_id`` is
+        ``None``."""
+        async with self._sf() as db:
+            await self._store.record_assistant_turn(
+                db,
+                session_id=session_id,
+                phonegate_transcript_id=None,
+                spoken_text=text,
+                delivery_status=TurnDeliveryStatus.FAILED,
+                occurred_at=datetime.now(UTC),
+            )
+            await db.commit()
 
     # ---- side-effect helpers --------------------------------------
     async def _cmd(self) -> str | None:
@@ -445,6 +469,15 @@ class OrchestratorSupervisor:
             return
 
         if status is None or status.call_state != "RINGING" or open_session_id is None:
+            # A genuine call boundary (not RINGING, or no open session) — safe
+            # to reset here, unlike the reap branch above. Covers a narrow
+            # edge case: if a session's closing IDLE event was ever lost so
+            # IngestLoop keeps reusing the same open_session_id across two
+            # distinct ring episodes from the same caller, the device still
+            # passes through a real non-RINGING state in between (observed by
+            # some poll even if the session-close bookkeeping missed it), so
+            # the second ring is still decided instead of permanently skipped.
+            self._decided_session_id = None
             return
 
         if self._decided_session_id == open_session_id:
