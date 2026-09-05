@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import require_api_actor
 from app.database import get_session
 from app.models.entities import (
+    AuditEvent,
     CommunicationSession,
     CommunicationTurn,
     PhoneChannelHealth,
@@ -92,6 +93,25 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
     else:
         current_call = _call_block("ringing", newest)
 
+    # Spec §9.4: the most recent auto-answer policy decision, as recorded by
+    # OrchestratorSupervisor.tick() (audit is the durable record; not mirrored
+    # to Redis).
+    last_decision_event = await session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.action == "communication.auto_answer_decision")
+        .order_by(desc(AuditEvent.timestamp))
+        .limit(1)
+    )
+    last_decision = (
+        {
+            "answer": last_decision_event.sanitized_details.get("answer"),
+            "reason": last_decision_event.sanitized_details.get("reason"),
+            "at": last_decision_event.timestamp.isoformat(),
+        }
+        if last_decision_event is not None
+        else None
+    )
+
     return {
         "channel": channel_status(components).value if components else "unknown",
         "agent": {
@@ -115,7 +135,7 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
         "auto_answer": {
             "enabled": get_settings().phone_auto_answer_enabled,
             "stopped": stopped,
-            "last_decision": None,
+            "last_decision": last_decision,
         },
     }
 

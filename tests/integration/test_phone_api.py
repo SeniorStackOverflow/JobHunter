@@ -254,8 +254,49 @@ async def test_status_auto_answer_block(client, sqlite_session_factory) -> None:
     body = (await client.get("/api/v1/phone/status")).json()
     assert body["auto_answer"]["enabled"] in (True, False)
     assert body["auto_answer"]["stopped"] is False
+    assert body["auto_answer"]["last_decision"] is None  # no decision audited yet
     assert body["current_call"]["auto_answered"] is True
     assert body["current_call"]["script_stage"] == "listening"
+
+
+@pytest.mark.asyncio
+async def test_status_last_decision_reflects_the_audit_log(client, sqlite_session_factory) -> None:
+    """Spec §9.4: `auto_answer.last_decision` surfaces the most recent
+    ``communication.auto_answer_decision`` audit row (the durable record
+    OrchestratorSupervisor.tick() writes) — the newest one wins."""
+    from app.audit import record_audit_event
+
+    async with sqlite_session_factory() as s:
+        await record_audit_event(
+            s,
+            actor="phone-agent",
+            action="communication.auto_answer_decision",
+            entity_type="communication_session",
+            entity_id="11111111-1111-1111-1111-111111111111",
+            correlation_id="11111111-1111-1111-1111-111111111111",
+            details={"answer": False, "reason": "not_ringing", "caller": "+373••••111"},
+        )
+        await s.commit()
+        newer = await record_audit_event(
+            s,
+            actor="phone-agent",
+            action="communication.auto_answer_decision",
+            entity_type="communication_session",
+            entity_id="22222222-2222-2222-2222-222222222222",
+            correlation_id="22222222-2222-2222-2222-222222222222",
+            details={"answer": True, "reason": "answer", "caller": "+373••••222"},
+        )
+        await s.commit()
+        newer_at = newer.timestamp
+
+    body = (await client.get("/api/v1/phone/status")).json()
+    last_decision = body["auto_answer"]["last_decision"]
+    assert last_decision is not None
+    assert last_decision["answer"] is True
+    assert last_decision["reason"] == "answer"
+    # SQLite drops tzinfo on read; compare the wall-clock value.
+    got_at = datetime.fromisoformat(last_decision["at"]).replace(tzinfo=None)
+    assert got_at == newer_at.replace(tzinfo=None)
 
 
 @pytest.mark.asyncio
