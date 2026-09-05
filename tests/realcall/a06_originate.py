@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import subprocess
@@ -141,10 +142,15 @@ class A06Rig:
                 f"wc -c < {remote_pcm}", what="measuring injection PCM size", timeout=10
             )
             pcm_bytes = int(size_result.stdout.strip() or 0)
-            # 48000 Hz, 16-bit, stereo = 4 bytes/sample-frame; +2s margin so
-            # CallStreamer's playback loop (see CallStreamer.java) doesn't cut
-            # the last word by wrapping back to the start early.
-            duration_seconds = max(2, int(pcm_bytes / (48000 * 4)) + 2)
+            # 48000 Hz, 16-bit, stereo = 4 bytes/sample-frame. CallStreamer
+            # takes an integer-second duration and LOOPS the PCM back to the
+            # start if that duration exceeds the actual audio length (see
+            # "Seamless loop across full speech track" in CallStreamer.java)
+            # -- so truncating (int()) undershoots and clips the last word,
+            # while padding with a multi-second margin overshoots and makes
+            # the phrase audibly repeat from the top. ceil() is the minimum
+            # integer that can't undershoot; no extra margin on top of it.
+            duration_seconds = max(2, math.ceil(pcm_bytes / (48000 * 4)))
 
         self._run_or_raise(
             f"adb -s {self.a06_serial} push {remote_pcm} {device_pcm}",

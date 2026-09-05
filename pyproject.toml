@@ -91,6 +91,7 @@ ignore = ["S101"]
 "tests/realcall/a06_originate.py" = ["S603", "S607"]
 "app/admin/routes.py" = ["RUF001"]
 "app/phone/script.py" = ["RUF001"]
+"tests/realcall/test_realcall_phase_2a.py" = ["RUF001"]
 "app/settings/config.py" = ["S104"]
 
 [tool.mypy]

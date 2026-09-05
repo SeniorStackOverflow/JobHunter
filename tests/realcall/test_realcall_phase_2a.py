@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
+import re
 import time
+import wave
 from collections.abc import Callable
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 
+import httpx
 import pytest
 from sqlalchemy import desc, select
 
@@ -21,6 +25,52 @@ from app.models.enums import (
 from app.phone.script import SCRIPT_CLOSING, SCRIPT_GREETING
 from app.settings import get_settings
 from tests.realcall.a06_originate import A06Rig
+
+
+async def _transcribe_via_groq(pcm_bytes: bytes, *, api_key: str) -> str:
+    """Transcribe raw 16-bit mono 16000 Hz PCM (ReceiverRecorder's output
+    format) via Groq's cloud Whisper API.
+
+    Deliberately NOT a local faster-whisper/WhisperModel load: this rig runs
+    the full production JobHunter stack alongside PhoneGate on a
+    memory-constrained VPS, and loading a local ASR model here once got the
+    test process OOM-killed. Groq is also what PhoneGate's own daemon uses
+    for the employer's speech, so this reuses the same ASR the production
+    system already depends on rather than adding a second one.
+    """
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm_bytes)
+    wav_buf.seek(0)
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": ("downlink.wav", wav_buf, "audio/wav")},
+            data={"model": "whisper-large-v3-turbo", "language": "ru", "response_format": "text"},
+        )
+        response.raise_for_status()
+        return response.text
+
+
+def _words(text: str) -> list[str]:
+    """Lowercase, strip punctuation, split into words.
+
+    Comparing raw transcript characters against the script is too fragile:
+    a live run's real transcript ("здравствуйте! ... вы позвонили по
+    адресу." with a Whisper end-of-audio hallucination like "продолжение
+    следует..." tacked on) matched the actual greeting+closing almost
+    word-for-word but scored a character-level SequenceMatcher ratio of
+    only ~0.19 — a single shifted punctuation mark early in the string
+    throws off every character alignment after it. Comparing word lists
+    instead means punctuation/case noise and a few genuinely wrong or
+    extra words cost only themselves, not the whole downstream alignment.
+    """
+    return re.findall(r"[a-zа-яё0-9]+", text.lower())
 
 
 async def _wait_for_session(
@@ -64,8 +114,9 @@ async def _wait_for_session(
 @pytest.mark.realcall
 async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     """Happy path: A06 dials A14 -> auto-answer -> greeting + capture -> closing."""
-    pytest.importorskip("faster_whisper")
-    from faster_whisper import WhisperModel
+    groq_api_key = os.getenv("REALCALL_GROQ_API_KEY", "")
+    if not groq_api_key:
+        pytest.skip("REALCALL_GROQ_API_KEY not set -- needed to verify the downlink transcript")
 
     # Preconditions: A14 is idle, PhoneGate connected, JobHunter running with auto-answer enabled
     # Start downlink recording on A06
@@ -129,23 +180,21 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     # Assertion 1: downlink audio presence, duration, RMS/spectrum checks
     # (In a real run: verify audio has non-silence content, inter-block pauses)
 
-    # Assertion 2: ASR of downlink (Faster-Whisper) fuzzy-matches the script blocks.
+    # Assertion 2: ASR of downlink (Groq cloud Whisper — the same ASR
+    # PhoneGate's own daemon uses) fuzzy-matches the script blocks.
     # The downlink is what A06 *hears* — JobHunter's own TTS output — so it must
     # resemble SCRIPT_GREETING/SCRIPT_CLOSING, not the phrase injected on the uplink.
-    model = WhisperModel("base")
-    segments, _ = model.transcribe(
-        io.BytesIO(downlink_audio), language="ru", task="transcribe", beam_size=5
-    )
-    transcribed = " ".join(seg.text for seg in segments).lower()
+    transcribed = await _transcribe_via_groq(downlink_audio, api_key=groq_api_key)
     # The downlink carries all 4 greeting blocks plus the closing back to back,
-    # so compare against their concatenation — comparing the whole transcript
-    # against one block at a time inflates the denominator and makes even a
-    # perfect transcript score well under any reasonable threshold.
-    expected_full = " ".join([*SCRIPT_GREETING, SCRIPT_CLOSING]).lower()
-    ratio = SequenceMatcher(None, transcribed, expected_full).ratio()
-    assert ratio >= 0.4, (
+    # so compare against their concatenation. Word-level (not character-level,
+    # see _words' docstring) — a real run's transcript matched the script
+    # almost word-for-word but scored under 0.2 on raw character diffing.
+    expected_words = _words(" ".join([*SCRIPT_GREETING, SCRIPT_CLOSING]))
+    transcribed_words = _words(transcribed)
+    ratio = SequenceMatcher(None, expected_words, transcribed_words).ratio()
+    assert ratio >= 0.6, (
         f"downlink transcript does not resemble the greeting+closing script "
-        f"(ratio {ratio:.2f}): {transcribed!r}"
+        f"(word-level ratio {ratio:.2f}): {transcribed!r}"
     )
 
     # Assertion 3: CommunicationTurn exists for the injected phrase
