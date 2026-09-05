@@ -182,6 +182,7 @@ async def test_hard_cap_cuts_greeting(factory: async_sessionmaker[AsyncSession])
     assert call.needs_review is True
     assistant = await _assistant_turns(factory, session_id)
     assert assistant == []  # cut off before the first block was ever spoken
+    assert fake._call_state == "IDLE"  # hung up, not left connected and silent
 
 
 @pytest.mark.asyncio

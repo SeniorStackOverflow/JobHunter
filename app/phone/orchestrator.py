@@ -141,6 +141,9 @@ class CallOrchestrator:
         # GREETING ------------------------------------------------------
         for block in SCRIPT_GREETING:
             if time.monotonic() - answer_start >= s.phone_call_hard_cap_seconds:
+                # Unlike the "ended" outcome below, the call is still IN_CALL
+                # here — the cap alone doesn't end it, so we must.
+                await self._hangup()
                 await self._finish("aborted_error", needs_review=True)
                 return "aborted_error"
             cmd = await self._cmd()
