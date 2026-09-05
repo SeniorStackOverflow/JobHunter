@@ -369,15 +369,19 @@ async def test_supervisor_spawns_on_ringing_and_answers(
             redis=redis,
             settings=_fast_settings(),
         )
-        await sup.tick(await client.device_status(), session_id)
-        assert await redis.get(CALL_OWNED_KEY) == str(session_id)
-        # let it run to completion
-        for _ in range(500):
-            await asyncio.sleep(0.01)
+        try:
             await sup.tick(await client.device_status(), session_id)
-            if await redis.get(CALL_OWNED_KEY) is None:
-                break
-        assert fake._call_state == "IDLE"
+            assert await redis.get(CALL_OWNED_KEY) == str(session_id)
+            # let it run to completion
+            for _ in range(500):
+                await asyncio.sleep(0.01)
+                await sup.tick(await client.device_status(), session_id)
+                if await redis.get(CALL_OWNED_KEY) is None:
+                    break
+            assert fake._call_state == "IDLE"
+        finally:
+            # A failed assertion above must not leak the background orchestrator task.
+            await sup.shutdown()
     async with file_factory() as s:
         call = await s.get(CommunicationSession, session_id)
     assert call is not None
