@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.phone.client import PhoneGateClient, PhoneGateUnavailable
+from app.phone.client import PhoneGateBusy, PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.schemas import DeviceStatus
 from app.phone.speak import (
     CallEnded,
@@ -76,6 +76,47 @@ async def test_speak_block_409_then_retry_succeeds() -> None:
         fake.fail_next_speak(mode="409_tx_busy")
         res = await speak_block(c, "x", fence_timeout=2.0, poll=0.01)
         assert res.outcome == "ok"
+
+
+@pytest.mark.asyncio
+async def test_speak_block_still_busy_after_retry_is_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PhoneGate rejects /speak with 409 BEFORE any transcript/synthesis side
+    effect (real PhoneGate's own check runs ahead of record_transcript()) —
+    if both the first attempt and the one-shot retry hit 409, that is two
+    known non-deliveries, not an ambiguous one."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        await c.answer()
+
+        async def always_busy(text: str) -> None:
+            raise PhoneGateBusy("/api/call/speak", "busy")
+
+        monkeypatch.setattr(c, "speak", always_busy)
+        res = await speak_block(c, "x", fence_timeout=2.0, poll=0.01)
+        assert res == SpeakResult(outcome="not_sent")
+
+
+@pytest.mark.asyncio
+async def test_speak_block_definite_rejection_is_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-409, non-timeout HTTP rejection of /speak is a definite response
+    (PhoneGate answered, just refused) — not an ambiguous timeout, so it's a
+    known non-delivery too."""
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c:
+        await c.answer()
+
+        async def rejected(text: str) -> None:
+            raise PhoneGateError("/api/call/speak: HTTP 422")
+
+        monkeypatch.setattr(c, "speak", rejected)
+        res = await speak_block(c, "x", fence_timeout=2.0, poll=0.01)
+        assert res == SpeakResult(outcome="not_sent")
 
 
 @pytest.mark.asyncio

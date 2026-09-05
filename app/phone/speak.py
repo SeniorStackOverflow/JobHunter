@@ -120,18 +120,25 @@ async def speak_block(
             await client.speak(text)
             return SpeakResult("ok")
         except PhoneGateBusy:
+            # A 409 means PhoneGate rejected the POST before doing anything
+            # (record_transcript/synthesis never ran) — a known non-delivery,
+            # same as the first attempt's 409, not an ambiguous one.
             logger.warning("phone_speak_still_busy_after_retry", detail=exc.detail)
-            return SpeakResult("unknown")
+            return SpeakResult("not_sent")
         except PhoneGateUnavailable:
             return SpeakResult("unknown")
         except PhoneGateError:
-            return SpeakResult("unknown")
+            # A definite non-409 HTTP rejection (not a timeout) — the request
+            # was answered, just refused; no ambiguity about delivery.
+            return SpeakResult("not_sent")
     except PhoneGateUnavailable:
         # Ambiguous: PhoneGate may already have accepted the utterance. Never retry.
         logger.warning("phone_speak_ambiguous_timeout")
         return SpeakResult("unknown")
     except PhoneGateError:
-        return SpeakResult("unknown")
+        # Same reasoning as the retry's PhoneGateError above: a definite
+        # rejection, not a timeout — known non-delivery.
+        return SpeakResult("not_sent")
 
 
 async def observe_tx_delivery(
