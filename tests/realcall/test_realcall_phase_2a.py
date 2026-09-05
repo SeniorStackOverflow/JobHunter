@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+from difflib import SequenceMatcher
 
 import pytest
 from sqlalchemy import desc, select
@@ -13,6 +15,7 @@ from app.models.enums import (
     TurnDeliveryStatus,
     TurnSpeaker,
 )
+from app.phone.script import SCRIPT_CLOSING, SCRIPT_GREETING
 from tests.realcall.a06_originate import A06Rig
 
 
@@ -20,6 +23,7 @@ from tests.realcall.a06_originate import A06Rig
 async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     """Happy path: A06 dials A14 -> auto-answer -> greeting + capture -> closing."""
     pytest.importorskip("faster_whisper")
+    from faster_whisper import WhisperModel
 
     # Preconditions: A14 is idle, PhoneGate connected, JobHunter running with auto-answer enabled
     # Start downlink recording on A06
@@ -49,20 +53,22 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
     # Assertion 1: downlink audio presence, duration, RMS/spectrum checks
     # (In a real run: verify audio has non-silence content, inter-block pauses)
 
-    # Assertion 2: ASR of downlink (Faster-Whisper) fuzzy-matches the script blocks
-    try:
-        from faster_whisper import WhisperModel
-
-        model = WhisperModel("base")
-        segments, _ = model.transcribe(
-            downlink_audio, language="ru", task="transcribe", beam_size=5
-        )
-        transcribed = " ".join([seg.text for seg in segments])
-        # Fuzzy match against expected greeting/closing blocks
-        assert "трузчика" in transcribed.lower() or "грузчика" in transcribed.lower()
-    except NotImplementedError:
-        # If downlink recording is not implemented, skip ASR
-        pass
+    # Assertion 2: ASR of downlink (Faster-Whisper) fuzzy-matches the script blocks.
+    # The downlink is what A06 *hears* — JobHunter's own TTS output — so it must
+    # resemble SCRIPT_GREETING/SCRIPT_CLOSING, not the phrase injected on the uplink.
+    model = WhisperModel("base")
+    segments, _ = model.transcribe(
+        io.BytesIO(downlink_audio), language="ru", task="transcribe", beam_size=5
+    )
+    transcribed = " ".join(seg.text for seg in segments).lower()
+    expected_blocks = [*SCRIPT_GREETING, SCRIPT_CLOSING]
+    best_ratio = max(
+        SequenceMatcher(None, transcribed, block.lower()).ratio() for block in expected_blocks
+    )
+    assert best_ratio >= 0.4, (
+        f"downlink transcript does not resemble any script block (best ratio {best_ratio:.2f}): "
+        f"{transcribed!r}"
+    )
 
     # Assertion 3: CommunicationTurn exists for the injected phrase
     async with async_session_factory() as session:
@@ -88,7 +94,7 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
         turns_result = await session.execute(
             select(CommunicationTurn).where(
                 CommunicationTurn.session_id == session_obj.id,
-                CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
+                CommunicationTurn.speaker == TurnSpeaker.ASSISTANT,
             )
         )
         tx_turns = turns_result.scalars().all()
@@ -102,29 +108,30 @@ async def test_realcall_greeting_and_capture(a06_rig: A06Rig) -> None:
 @pytest.mark.realcall
 async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
     """Set Redis stop during active call -> downlink contains short closing, hangup occurs."""
-    pytest.importorskip("faster_whisper")
+    from redis.asyncio import Redis as AsyncRedis
 
-    # Start downlink recording
-    a06_rig.start_downlink_recording()
+    from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
+    from app.settings import get_settings
 
-    # A06 dials A14
-    a06_rig.dial(a06_rig.a14_number)
-    await asyncio.sleep(2)
+    redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        a06_rig.start_downlink_recording()
+        a06_rig.dial(a06_rig.a14_number)
+        await asyncio.sleep(2)  # let the call connect and the greeting start
 
-    # Set Redis stop key (needs access to Redis, mocked or real)
-    # During the greeting, the supervisor should detect stop and move to closing
-    await asyncio.sleep(1)
+        # Trigger the operator kill-switch mid-greeting.
+        await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
+        await asyncio.sleep(2)  # let the supervisor observe it and abort
 
-    # Wait for abort to take effect
-    await asyncio.sleep(2)
+        downlink_audio = a06_rig.stop_downlink_recording()
+        assert downlink_audio
 
-    # Stop recording
-    downlink_audio = a06_rig.stop_downlink_recording()
-    assert downlink_audio
-
-    # Hang up
-    a06_rig.hangup()
-    await asyncio.sleep(1)
+        a06_rig.hangup()
+        await asyncio.sleep(1)
+    finally:
+        # Never leave the real system's kill-switch engaged after this test run.
+        await redis.delete(AUTO_ANSWER_STOPPED_KEY)
+        await redis.aclose()
 
     # Assert: downlink contains the short closing and call ended
     async with async_session_factory() as session:
@@ -139,27 +146,38 @@ async def test_realcall_runtime_stop_aborts(a06_rig: A06Rig) -> None:
 
 @pytest.mark.realcall
 async def test_realcall_per_call_hangup(a06_rig: A06Rig) -> None:
-    """POST /admin/phone/call/{id}/hangup during greeting -> immediate hang-up."""
-    pytest.importorskip("faster_whisper")
+    """A per-call hangup command during greeting -> immediate hang-up.
 
-    # Start downlink recording
-    a06_rig.start_downlink_recording()
+    Writes directly to CALL_CMD_KEY (the same key the admin
+    POST /admin/phone/call/{id}/hangup route writes) rather than driving the
+    HTTP endpoint end-to-end — the CSRF/auth/ownership-check layer already has
+    dedicated coverage in tests/integration/test_interfaces.py; this test's job
+    is to prove the orchestrator's *consumption* side of the command channel
+    against a real live call.
+    """
+    from redis.asyncio import Redis as AsyncRedis
 
-    # A06 dials A14
-    a06_rig.dial(a06_rig.a14_number)
-    await asyncio.sleep(2)
+    from app.phone.orchestrator import CALL_CMD_KEY, CALL_OWNED_KEY
+    from app.settings import get_settings
 
-    # Simulate POST /admin/phone/call/{id}/hangup by setting the command in Redis
-    # (or by mocking the supervisor's command channel)
-    await asyncio.sleep(0.5)
+    redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        a06_rig.start_downlink_recording()
+        a06_rig.dial(a06_rig.a14_number)
+        await asyncio.sleep(2)  # let the orchestrator pick up and claim the call
 
-    # Stop recording
-    downlink_audio = a06_rig.stop_downlink_recording()
-    assert downlink_audio
+        owned = await redis.get(CALL_OWNED_KEY)
+        assert owned, "no orchestrator has claimed this call yet"
+        await redis.set(CALL_CMD_KEY, f"hangup:{owned}", ex=60)
+        await asyncio.sleep(1)  # let the orchestrator consume the command
 
-    # Hang up (should already be hung up by the endpoint)
-    a06_rig.hangup()
-    await asyncio.sleep(1)
+        downlink_audio = a06_rig.stop_downlink_recording()
+        assert downlink_audio
+
+        a06_rig.hangup()  # idempotent safety net if the call already ended
+        await asyncio.sleep(1)
+    finally:
+        await redis.aclose()
 
     # Assert: call hung up with script_stage="aborted_operator"
     async with async_session_factory() as session:
