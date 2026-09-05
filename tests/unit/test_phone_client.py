@@ -178,3 +178,37 @@ async def test_client_maps_transport_failure() -> None:
     ) as client:
         with pytest.raises(PhoneGateUnavailable):
             await client.health()
+
+
+@pytest.mark.asyncio
+async def test_recent_call_audio_returns_wav_bytes():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/call/audio"
+        assert request.url.params["seconds"] == "8"
+        return httpx.Response(200, content=b"RIFFfake", headers={"content-type": "audio/wav"})
+    client = PhoneGateClient(base_url="http://pg", token="t",
+                             transport=httpx.MockTransport(handler))
+    assert await client.recent_call_audio(8) == b"RIFFfake"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recent_call_audio_409_raises_phonegate_error():
+    client = PhoneGateClient(base_url="http://pg", token="t",
+        transport=httpx.MockTransport(lambda r: httpx.Response(409, json={"success": False})))
+    with pytest.raises(PhoneGateError):
+        await client.recent_call_audio(5)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recent_call_audio_clamps_seconds():
+    seen = {}
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["seconds"] = request.url.params["seconds"]
+        return httpx.Response(200, content=b"x")
+    client = PhoneGateClient(base_url="http://pg", token="t",
+                             transport=httpx.MockTransport(handler))
+    await client.recent_call_audio(99)
+    assert seen["seconds"] == "10"
+    await client.aclose()

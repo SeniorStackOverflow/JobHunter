@@ -134,6 +134,18 @@ class PhoneGateClient:
         except ValidationError as exc:
             raise PhoneGateError("/api/call/transcript: unexpected response schema") from exc
 
+    async def recent_call_audio(self, seconds: int) -> bytes:
+        clamped = max(1, min(int(seconds), 10))
+        try:
+            response = await self._client.get("/api/call/audio", params={"seconds": clamped})
+        except httpx.RequestError as exc:
+            raise PhoneGateUnavailable(f"/api/call/audio: {type(exc).__name__}") from exc
+        if response.status_code >= 500:
+            raise PhoneGateUnavailable(f"/api/call/audio: HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raise PhoneGateError(f"/api/call/audio: HTTP {response.status_code}")
+        return response.content
+
     async def answer(self) -> None:
         await self._post("/api/call/answer")
 

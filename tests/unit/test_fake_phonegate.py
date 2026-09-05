@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.phone.client import PhoneGateClient, PhoneGateError
 from tests.fixtures.fake_phonegate import FakePhoneGate
 from tests.fixtures.fake_redis import FakeAsyncRedis
 
@@ -150,3 +151,17 @@ async def test_restart_resets_event_ids() -> None:
     ) as client:
         events = (await client.get("/api/events", params={"after_id": 0})).json()
         assert events["latest_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fake_phonegate_serves_recent_call_audio():
+    fake = FakePhoneGate()
+    fake.ring("+37360000000")
+    fake.answer()
+    fake.set_call_audio(b"RIFF....WAVEdata")
+    client = PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport())
+    assert await client.recent_call_audio(5) == b"RIFF....WAVEdata"
+    fake.fail_next_audio()
+    with pytest.raises(PhoneGateError):
+        await client.recent_call_audio(5)
+    await client.aclose()

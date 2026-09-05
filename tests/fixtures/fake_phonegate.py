@@ -7,7 +7,7 @@ from typing import Any, cast
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 _CALL_STATES = {"IDLE", "RINGING", "IN_CALL"}
@@ -38,6 +38,8 @@ class FakePhoneGate:
         # the telephony stack completes the pickup — set_ring_polls_after_answer
         # simulates that transient window for regression tests.
         self._ring_polls_after_answer = 0
+        self._call_audio: bytes | None = None
+        self._fail_next_audio = False
         self.app = Starlette(
             routes=[
                 Route("/api/health", self._health),
@@ -47,6 +49,7 @@ class FakePhoneGate:
                 Route("/api/call/answer", self._answer_route, methods=["POST"]),
                 Route("/api/call/speak", self._speak_route, methods=["POST"]),
                 Route("/api/call/hangup", self._hangup_route, methods=["POST"]),
+                Route("/api/call/audio", self._audio_route),
             ]
         )
 
@@ -128,6 +131,12 @@ class FakePhoneGate:
 
     def fail_next_speak(self, *, mode: str) -> None:
         self._fail_next_speak = mode
+
+    def set_call_audio(self, wav_bytes: bytes) -> None:
+        self._call_audio = wav_bytes
+
+    def fail_next_audio(self) -> None:
+        self._fail_next_audio = True
 
     def set_ring_polls_after_answer(self, n: int) -> None:
         """After the next accepted /api/call/answer, report RINGING for ``n``
@@ -281,3 +290,13 @@ class FakePhoneGate:
         self._tx_stage, self._tx_preparing, self._tx_active = 0, False, False  # reset
         self._emit("call_state", self._call_state_data())
         return JSONResponse({"success": True})
+
+    async def _audio_route(self, request: Request) -> Response:
+        if not self._auth_ok(request):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        if self._fail_next_audio:
+            self._fail_next_audio = False
+            return JSONResponse({"success": False, "message": "нет аудио"}, status_code=409)
+        if not self._call_audio:
+            return JSONResponse({"success": False}, status_code=409)
+        return Response(self._call_audio, media_type="audio/wav")
