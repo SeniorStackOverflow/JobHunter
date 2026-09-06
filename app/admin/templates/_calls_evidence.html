@@ -1,0 +1,25 @@
+<div class="queue-list panel">
+  {% for session_id, rows in (evidence_rows or [])|groupby('session_id') %}
+  {% set first = rows|first %}
+  <div class="queue-card" style="display:block">
+    <div>
+      <strong>{{ first.company or 'Компания не указана' }}</strong>
+      <span>{{ format_dt(first.started_at) }} · <a href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history&session={{ session_id }}">детали звонка</a></span>
+    </div>
+    <div class="evidence-clips">
+      {% for row in rows %}
+      <div class="evidence-clip">
+        <audio controls preload="none" src="{{ row.url }}"></audio>
+        <p>{{ row.text }}</p>
+        <span>
+          {% if row.asr_confidence is not none %}ASR {{ '%.2f'|format(row.asr_confidence) }} · {% endif %}
+          создан {{ format_dt(row.created_at) }} · истекает {{ format_dt(row.expires_at) }}
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% else %}
+  <div class="empty-state">Аудио-доказательства пока не сохранялись.</div>
+  {% endfor %}
+</div>

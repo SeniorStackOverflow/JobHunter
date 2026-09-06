@@ -214,6 +214,116 @@ async def admin_client(
         yield client
 
 
+class _TmpEvidence:
+    def __init__(self, root: Any) -> None:
+        self.root = root
+
+    def write(self, session_id: str, *, tid: int, data: bytes) -> None:
+        folder = self.root / str(session_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{tid}.wav").write_bytes(data)
+
+
+@pytest.fixture
+def tmp_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> _TmpEvidence:
+    from app.admin import phone_routes
+
+    root = tmp_path / "phone_evidence"
+    root.mkdir()
+    settings = _settings(tmp_path).model_copy(update={"phone_evidence_dir": root})
+    monkeypatch.setattr(phone_routes, "get_settings", lambda: settings)
+    return _TmpEvidence(root)
+
+
+@pytest_asyncio.fixture
+async def unauth_client(
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> AsyncIterator[httpx.AsyncClient]:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(admin_routes, "_phone_redis", lambda: FakeAsyncRedis())
+
+    application = FastAPI()
+    application.include_router(admin_routes.router)
+
+    async def override_session() -> AsyncIterator[Any]:
+        async with sqlite_session_factory() as session:
+            yield session
+
+    application.dependency_overrides[get_session] = override_session
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver", follow_redirects=False
+    ) as client:
+        yield client
+
+
+@pytest.mark.asyncio
+async def test_evidence_stream_returns_wav(
+    admin_client: httpx.AsyncClient, seeded_calls: SeededCalls, tmp_evidence: _TmpEvidence
+) -> None:
+    tmp_evidence.write(seeded_calls.summarized_id, tid=7, data=b"RIFFxx")
+    resp = await admin_client.get(f"/admin/phone/evidence/{seeded_calls.summarized_id}/7.wav")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("audio/wav")
+    assert resp.content == b"RIFFxx"
+    assert resp.headers["cache-control"] == "private, max-age=60"
+
+
+@pytest.mark.asyncio
+async def test_evidence_stream_404_when_missing(
+    admin_client: httpx.AsyncClient, seeded_calls: SeededCalls, tmp_evidence: _TmpEvidence
+) -> None:
+    resp = await admin_client.get(f"/admin/phone/evidence/{seeded_calls.summarized_id}/999.wav")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_evidence_stream_rejects_path_traversal(
+    admin_client: httpx.AsyncClient, tmp_evidence: _TmpEvidence
+) -> None:
+    resp = await admin_client.get("/admin/phone/evidence/..%2f..%2fetc/0.wav")
+    assert resp.status_code in (404, 422)
+    resp2 = await admin_client.get("/admin/phone/evidence/not-a-uuid/0.wav")
+    assert resp2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_evidence_stream_requires_auth(
+    unauth_client: httpx.AsyncClient, seeded_calls: SeededCalls, tmp_evidence: _TmpEvidence
+) -> None:
+    resp = await unauth_client.get(f"/admin/phone/evidence/{seeded_calls.summarized_id}/7.wav")
+    assert resp.status_code in (302, 401, 403)
+
+
+@pytest.mark.asyncio
+async def test_evidence_tab_lists_clips(
+    seeded_calls: SeededCalls, tmp_evidence: _TmpEvidence
+) -> None:
+    tmp_evidence.write(seeded_calls.summarized_id, tid=2, data=b"RIFFxx")
+    ctx = await build_calls_context(
+        seeded_calls.db, tab="evidence", page=1, filter_="all", query=""
+    )
+    assert ctx["tab"] == "evidence"
+    assert ctx["evidence_rows"]
+    row = ctx["evidence_rows"][0]
+    assert row["url"].endswith("/2.wav")
+    assert row["company"] == "Example Corp"
+    assert row["expires_at"] > row["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_evidence_tab_skips_missing_files(
+    seeded_calls: SeededCalls, tmp_evidence: _TmpEvidence
+) -> None:
+    ctx = await build_calls_context(
+        seeded_calls.db, tab="evidence", page=1, filter_="all", query=""
+    )
+    assert ctx["evidence_rows"] == []
+
+
 @pytest.mark.asyncio
 async def test_calls_context_history_lists_sessions_newest_first(
     seeded_calls: SeededCalls,

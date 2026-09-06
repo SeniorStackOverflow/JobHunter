@@ -2,12 +2,15 @@ from __future__ import annotations
 
 # FastAPI's declarative dependency/form parameters intentionally call Depends/Form.
 # ruff: noqa: B008
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import Select
@@ -237,6 +240,62 @@ async def _call_detail_context(session: AsyncSession, session_id: str) -> dict[s
     }
 
 
+async def _evidence_rows(session: AsyncSession) -> list[dict[str, Any]]:
+    """List every retained audio-evidence clip, newest sessions' turns first.
+
+    Rows whose backing ``.wav`` file no longer exists on disk (retention sweep,
+    manual cleanup) are silently skipped.
+    """
+    from app.models.entities import CanonicalJob, CommunicationSession, CommunicationTurn
+
+    settings = get_settings()
+    root = Path(settings.phone_evidence_dir)
+    retention = timedelta(days=settings.phone_evidence_retention_days)
+
+    turns = list(
+        (
+            await session.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.audio_evidence_path.is_not(None))
+                .order_by(CommunicationTurn.session_id, CommunicationTurn.seq)
+            )
+        ).all()
+    )
+
+    rows: list[dict[str, Any]] = []
+    for turn in turns:
+        target = root / str(turn.session_id) / f"{turn.phonegate_transcript_id}.wav"
+        try:
+            mtime = target.stat().st_mtime
+        except OSError:
+            continue
+        created_at = datetime.fromtimestamp(mtime, tz=UTC)
+
+        call = await session.get(CommunicationSession, turn.session_id)
+        company: str | None = None
+        if call is not None and call.canonical_job_id is not None:
+            job = await session.get(CanonicalJob, call.canonical_job_id)
+            if job is not None:
+                company = job.normalized_company
+
+        rows.append(
+            {
+                "session_id": str(turn.session_id),
+                "company": company,
+                "started_at": call.started_at if call is not None else None,
+                "seq": turn.seq,
+                "text": turn.text,
+                "asr_confidence": turn.asr_confidence,
+                "created_at": created_at,
+                "expires_at": created_at + retention,
+                "url": (
+                    f"/admin/phone/evidence/{turn.session_id}/{turn.phonegate_transcript_id}.wav"
+                ),
+            }
+        )
+    return rows
+
+
 async def build_calls_context(
     session: AsyncSession,
     *,
@@ -264,6 +323,10 @@ async def build_calls_context(
     }
     if session_id is not None:
         ctx["detail"] = await _call_detail_context(session, session_id)
+
+    if valid_tab == "evidence":
+        ctx["evidence_rows"] = await _evidence_rows(session)
+        return ctx
 
     if valid_tab != "history":
         return ctx
@@ -333,6 +396,38 @@ async def phone_auto_answer_toggle(
     )
     await session.commit()
     return RedirectResponse("/?view=diagnostics", status_code=303)
+
+
+@router.get("/admin/phone/evidence/{session_id}/{transcript_id}.wav")
+async def stream_evidence_clip(
+    session_id: str,
+    transcript_id: str,
+    request: Request,
+) -> Response:
+    """Stream one retained audio-evidence clip to an authenticated admin.
+
+    Both path params are validated structurally (UUID / digits) and the
+    resolved file path is confirmed to live inside the evidence root before a
+    single byte is read — a missing or escaping path is a 404, never a 500.
+    """
+    require_admin(request)
+    try:
+        sid = uuid.UUID(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="запись недоступна") from exc
+    if not transcript_id.isdigit():
+        raise HTTPException(status_code=404, detail="запись недоступна")
+
+    root = Path(get_settings().phone_evidence_dir).resolve()  # noqa: ASYNC240
+    target = (root / str(sid) / f"{transcript_id}.wav").resolve()
+    if root not in target.parents or not target.is_file():
+        raise HTTPException(status_code=404, detail="запись недоступна")
+
+    return Response(
+        target.read_bytes(),
+        media_type="audio/wav",
+        headers={"Cache-Control": "private, max-age=60"},
+    )
 
 
 @router.post("/admin/phone/call/{session_id}/{action}")

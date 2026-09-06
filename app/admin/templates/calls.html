@@ -11,6 +11,6 @@
     </div>
   </div>
   {% if tab == 'history' %}{% include "_calls_history.html" %}
-  {% elif tab == 'evidence' %}<div class="panel"><div class="empty-state">Просмотр доказательной базы появится в следующей задаче.</div></div>
+  {% elif tab == 'evidence' %}{% include "_calls_evidence.html" %}
   {% else %}{% include "_calls_live.html" %}{% endif %}
 </section>
