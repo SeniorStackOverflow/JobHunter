@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     phone_verification_processing_lease_seconds: int = Field(default=300, ge=1, le=86_400)
     phone_verification_batch: int = Field(default=10, ge=1, le=100)
 
+    # PhoneGate SMS is read-only and polled independently from call processing.
+    phone_sms_batch: int = Field(default=150, ge=1, le=150)
+    phone_sms_poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    phone_sms_sync_stale_after_seconds: int = Field(default=300, ge=60, le=86_400)
+    phone_sms_correlation_pre_skew_seconds: int = Field(default=300, ge=0, le=3600)
+    phone_sms_correlation_post_window_hours: int = Field(default=24, ge=1, le=168)
+
     telegram_enabled: bool = False
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None

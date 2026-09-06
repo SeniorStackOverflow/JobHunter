@@ -110,6 +110,15 @@ def test_summary_and_telegram_defaults() -> None:
     assert s.effective_summary_model == ""
 
 
+def test_sms_polling_defaults() -> None:
+    s = Settings(_env_file=None)
+    assert s.phone_sms_batch == 150
+    assert s.phone_sms_poll_interval_seconds == 60
+    assert s.phone_sms_sync_stale_after_seconds == 300
+    assert s.phone_sms_correlation_pre_skew_seconds == 300
+    assert s.phone_sms_correlation_post_window_hours == 24
+
+
 def test_summary_model_falls_back_to_openai_model() -> None:
     s = Settings(_env_file=None, openai_model="gpt-x")
     assert s.effective_summary_model == "gpt-x"

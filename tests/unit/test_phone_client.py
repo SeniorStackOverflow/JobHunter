@@ -9,6 +9,7 @@ from app.phone.client import (
     PhoneGateError,
     PhoneGateUnavailable,
 )
+from app.phone.schemas import PhoneSmsPage
 from tests.fixtures.fake_phonegate import FakePhoneGate
 
 
@@ -186,16 +187,21 @@ async def test_recent_call_audio_returns_wav_bytes():
         assert request.url.path == "/api/call/audio"
         assert request.url.params["seconds"] == "8"
         return httpx.Response(200, content=b"RIFFfake", headers={"content-type": "audio/wav"})
-    client = PhoneGateClient(base_url="http://pg", token="t",
-                             transport=httpx.MockTransport(handler))
+
+    client = PhoneGateClient(
+        base_url="http://pg", token="t", transport=httpx.MockTransport(handler)
+    )
     assert await client.recent_call_audio(8) == b"RIFFfake"
     await client.aclose()
 
 
 @pytest.mark.asyncio
 async def test_recent_call_audio_409_raises_phonegate_error():
-    client = PhoneGateClient(base_url="http://pg", token="t",
-        transport=httpx.MockTransport(lambda r: httpx.Response(409, json={"success": False})))
+    client = PhoneGateClient(
+        base_url="http://pg",
+        token="t",
+        transport=httpx.MockTransport(lambda r: httpx.Response(409, json={"success": False})),
+    )
     with pytest.raises(PhoneGateError):
         await client.recent_call_audio(5)
     await client.aclose()
@@ -204,11 +210,97 @@ async def test_recent_call_audio_409_raises_phonegate_error():
 @pytest.mark.asyncio
 async def test_recent_call_audio_clamps_seconds():
     seen = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
         seen["seconds"] = request.url.params["seconds"]
         return httpx.Response(200, content=b"x")
-    client = PhoneGateClient(base_url="http://pg", token="t",
-                             transport=httpx.MockTransport(handler))
+
+    client = PhoneGateClient(
+        base_url="http://pg", token="t", transport=httpx.MockTransport(handler)
+    )
     await client.recent_call_audio(99)
     assert seen["seconds"] == "10"
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sms_history_uses_bearer_query_and_lenient_message_enrichment() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers["authorization"]
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {
+                        "id": "m-1",
+                        "address": "+373 60 111 222",
+                        "text": "Встреча завтра",
+                        "timestamp": 1_720_000_000_000,
+                        "direction": "incoming",
+                        "status": "received",
+                        "contact_name": "Employer enrichment",
+                    }
+                ],
+                "count": 1,
+                "synced_at": 1_720_000_000_000,
+                "syncing": False,
+            },
+        )
+
+    async with PhoneGateClient(
+        base_url="http://phonegate", token="secret", transport=httpx.MockTransport(handler)
+    ) as client:
+        page = await client.sms_history(limit=999, number="+37360000000")
+
+    assert isinstance(page, PhoneSmsPage)
+    assert seen["authorization"] == "Bearer secret"
+    assert seen["query"] == {"limit": "150", "number": "+37360000000"}
+    assert page.messages[0].id == "m-1"
+
+
+@pytest.mark.asyncio
+async def test_sms_history_rejects_unknown_top_level_keys() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"messages": [], "count": 0, "unexpected": "reject me"},
+        )
+
+    async with PhoneGateClient(
+        base_url="http://phonegate", token="secret", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(PhoneGateError):
+            await client.sms_history()
+
+
+@pytest.mark.asyncio
+async def test_sync_sms_posts_without_outbound_sms_method() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        return httpx.Response(202, json={"success": True})
+
+    async with PhoneGateClient(
+        base_url="http://phonegate", token="secret", transport=httpx.MockTransport(handler)
+    ) as client:
+        await client.sync_sms()
+
+    assert seen == {"method": "POST", "path": "/api/sms/sync"}
+    assert not hasattr(client, "send_sms")
+
+
+@pytest.mark.asyncio
+async def test_sms_history_preserves_existing_error_classification() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    async with PhoneGateClient(
+        base_url="http://phonegate", token="secret", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(PhoneGateUnavailable):
+            await client.sms_history()

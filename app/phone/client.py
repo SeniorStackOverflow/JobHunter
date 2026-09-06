@@ -8,9 +8,18 @@ import httpx
 import structlog
 from pydantic import ValidationError
 
-from app.phone.schemas import DeviceStatus, EventsPage, PhoneEvent, TranscriptPage
+from app.phone.schemas import (
+    DeviceStatus,
+    EventsPage,
+    PhoneEvent,
+    PhoneSmsPage,
+    TranscriptPage,
+)
 
 logger = structlog.get_logger(__name__)
+
+# PhoneGate's Web Studio and daemon both cap SMS history at 150 records.
+PHONEGATE_SMS_MAX_LIMIT = 150
 
 
 class PhoneGateError(RuntimeError):
@@ -133,6 +142,21 @@ class PhoneGateClient:
             return TranscriptPage.model_validate(data)
         except ValidationError as exc:
             raise PhoneGateError("/api/call/transcript: unexpected response schema") from exc
+
+    async def sms_history(self, *, limit: int = 200, number: str | None = None) -> PhoneSmsPage:
+        """Read inbound/outbound SMS history without exposing a send operation."""
+        clamped_limit = max(1, min(int(limit), PHONEGATE_SMS_MAX_LIMIT))
+        params: dict[str, Any] = {"limit": clamped_limit}
+        if number is not None:
+            params["number"] = number
+        data = await self._get("/api/sms", params)
+        try:
+            return PhoneSmsPage.model_validate(data)
+        except ValidationError as exc:
+            raise PhoneGateError("/api/sms: unexpected response schema") from exc
+
+    async def sync_sms(self) -> None:
+        await self._post("/api/sms/sync")
 
     async def recent_call_audio(self, seconds: int) -> bytes:
         clamped = max(1, min(int(seconds), 10))

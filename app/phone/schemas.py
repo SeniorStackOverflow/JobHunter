@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -66,3 +66,27 @@ class TranscriptPage(_Lenient):
     latest_id: int = 0
     call_state: str = "IDLE"
     caller_number: str = ""
+
+
+class PhoneSmsMessage(BaseModel):
+    """A single message returned by PhoneGate's read-only SMS API."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1, max_length=96)
+    address: str
+    text: str = Field(min_length=1, max_length=2000)
+    timestamp: int = Field(ge=0)
+    direction: Literal["incoming", "outgoing"]
+    status: Literal["received", "sending", "sent", "failed", "unknown"]
+
+
+class PhoneSmsPage(BaseModel):
+    """Strict envelope for PhoneGate SMS history."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[PhoneSmsMessage]
+    count: int
+    synced_at: int | None = None
+    syncing: bool = False

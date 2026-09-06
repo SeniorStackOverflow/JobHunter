@@ -607,6 +607,13 @@ def prune_phone_evidence_task() -> dict[str, Any]:
     return _run_locked_periodic("phone-evidence-prune", prune_phone_evidence(), ttl_seconds=900)
 
 
+@celery_app.task(name="job_agent.scheduler.ingest_phonegate_sms")
+def ingest_phonegate_sms_task() -> dict[str, int] | dict[str, str]:
+    from app.phone.sms import ingest_phonegate_sms
+
+    return _run_locked_periodic("phone-sms", ingest_phonegate_sms(), ttl_seconds=120)
+
+
 __all__ = [
     "DEFAULT_SOURCE_SCHEDULES",
     "close_task_event_loop",
@@ -614,6 +621,7 @@ __all__ = [
     "dispatch_due_sources_task",
     "finalize_pending_calls_task",
     "generate_daily_report_task",
+    "ingest_phonegate_sms_task",
     "prepare_pending_applications_task",
     "process_unprocessed_jobs_task",
     "prune_phone_evidence_task",

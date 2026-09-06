@@ -40,6 +40,10 @@ class FakePhoneGate:
         self._ring_polls_after_answer = 0
         self._call_audio: bytes | None = None
         self._fail_next_audio = False
+        self._sms_messages: list[dict[str, Any]] = []
+        self._sms_synced_at: int | None = None
+        self._sms_syncing = False
+        self.sms_sync_requests = 0
         self.app = Starlette(
             routes=[
                 Route("/api/health", self._health),
@@ -50,6 +54,8 @@ class FakePhoneGate:
                 Route("/api/call/speak", self._speak_route, methods=["POST"]),
                 Route("/api/call/hangup", self._hangup_route, methods=["POST"]),
                 Route("/api/call/audio", self._audio_route),
+                Route("/api/sms", self._sms_route),
+                Route("/api/sms/sync", self._sms_sync_route, methods=["POST"]),
             ]
         )
 
@@ -137,6 +143,40 @@ class FakePhoneGate:
 
     def fail_next_audio(self) -> None:
         self._fail_next_audio = True
+
+    def add_sms(
+        self,
+        *,
+        id: str,
+        address: str,
+        text: str,
+        timestamp: int,
+        direction: str = "incoming",
+        status: str = "received",
+        **enrichment: Any,
+    ) -> None:
+        self._sms_messages.append(
+            {
+                "id": id,
+                "address": address,
+                "text": text,
+                "timestamp": timestamp,
+                "direction": direction,
+                "status": status,
+                **enrichment,
+            }
+        )
+
+    def replace_sms_history(self, messages: list[dict[str, Any]]) -> None:
+        self._sms_messages = [dict(message) for message in messages]
+
+    def upsert_sms_message(self, message: dict[str, Any]) -> None:
+        message_id = str(message.get("id", ""))
+        self._sms_messages = [m for m in self._sms_messages if str(m.get("id")) != message_id]
+        self._sms_messages.append(dict(message))
+
+    def set_sms_synced_at(self, timestamp: int | None) -> None:
+        self._sms_synced_at = timestamp
 
     def set_ring_polls_after_answer(self, n: int) -> None:
         """After the next accepted /api/call/answer, report RINGING for ``n``
@@ -300,3 +340,29 @@ class FakePhoneGate:
         if not self._call_audio:
             return JSONResponse({"success": False}, status_code=409)
         return Response(self._call_audio, media_type="audio/wav")
+
+    async def _sms_route(self, request: Request) -> JSONResponse:
+        if not self._auth_ok(request):
+            return JSONResponse({"detail": "auth"}, status_code=401)
+        limit = min(int(request.query_params.get("limit", "200")), 150)
+        number = request.query_params.get("number")
+        messages = self._sms_messages
+        if number:
+            messages = [m for m in messages if m["address"] == number]
+        rows = messages[:limit]
+        return JSONResponse(
+            {
+                "messages": rows,
+                "count": len(rows),
+                "synced_at": self._sms_synced_at,
+                "syncing": self._sms_syncing,
+            }
+        )
+
+    async def _sms_sync_route(self, request: Request) -> JSONResponse:
+        if not self._auth_ok(request):
+            return JSONResponse({"detail": "auth"}, status_code=401)
+        self.sms_sync_requests += 1
+        self._sms_synced_at = int(time.time() * 1000)
+        self._sms_syncing = False
+        return JSONResponse({"success": True})
