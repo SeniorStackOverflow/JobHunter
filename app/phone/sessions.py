@@ -194,6 +194,32 @@ class SessionStore:
             turn.delivery_status = status
             await session.flush()
 
+    async def set_summary(
+        self,
+        call: CommunicationSession,
+        payload: dict[str, Any],
+        state: PhoneSummaryState,
+    ) -> None:
+        call.summary = payload
+        call.summary_state = state
+
+    async def set_turn_evidence_path(
+        self,
+        session: AsyncSession,
+        *,
+        session_id: UUID,
+        phonegate_transcript_id: int,
+        path: str,
+    ) -> None:
+        turn = await session.scalar(
+            select(CommunicationTurn).where(
+                CommunicationTurn.session_id == session_id,
+                CommunicationTurn.phonegate_transcript_id == phonegate_transcript_id,
+            )
+        )
+        if turn is not None and turn.audio_evidence_path is None:
+            turn.audio_evidence_path = path
+
     async def set_script_stage(self, call: CommunicationSession, stage: str) -> None:
         call.script_stage = stage
 

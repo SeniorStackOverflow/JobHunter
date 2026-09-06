@@ -6,6 +6,21 @@ from typing import Any, Literal
 import httpx
 import structlog
 from pydantic import BaseModel, ValidationError
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database.base import utcnow
+from app.models.entities import (
+    Application,
+    CanonicalJob,
+    CommunicationSession,
+    CommunicationTurn,
+    UserProfile,
+)
+from app.models.enums import PhoneSummaryState, TurnSpeaker
+from app.phone.evidence import link_session_evidence
+from app.phone.sessions import SessionStore
+from app.settings.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
 
@@ -56,8 +71,13 @@ def _strip_fence(text: str) -> str:
 
 class PhoneSummaryProvider:
     def __init__(
-        self, *, base_url: str, api_key: str, model: str,
-        prefer: str = "quality", timeout_seconds: float = 60.0,
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        prefer: str = "quality",
+        timeout_seconds: float = 60.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not model.strip():
@@ -92,8 +112,11 @@ class PhoneSummaryProvider:
             "max_tokens": 700,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "call_summary", "strict": True,
-                                "schema": CallSummary.model_json_schema()},
+                "json_schema": {
+                    "name": "call_summary",
+                    "strict": True,
+                    "schema": CallSummary.model_json_schema(),
+                },
             },
         }
 
@@ -126,3 +149,222 @@ class PhoneSummaryProvider:
             return CallSummary.model_validate_json(_strip_fence(content))
         except ValidationError as exc:
             raise PhoneSummaryUnavailable("schema_mismatch") from exc
+
+
+async def build_summary_context(
+    db: AsyncSession, session: CommunicationSession
+) -> CallSummaryContext:
+    turns = list(
+        (
+            await db.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.session_id == session.id)
+                .order_by(CommunicationTurn.seq)
+            )
+        ).all()
+    )
+    transcript: list[tuple[str, str]] = [
+        (
+            turn.speaker.value,
+            (turn.spoken_text or turn.text) if turn.speaker is TurnSpeaker.ASSISTANT else turn.text,
+        )
+        for turn in turns
+        if turn.speaker in (TurnSpeaker.ASSISTANT, TurnSpeaker.EMPLOYER)
+    ]
+
+    company, vacancy = await _job_company_vacancy(db, session)
+
+    application_status: str | None = None
+    if session.application_id is not None:
+        application = await db.get(Application, session.application_id)
+        if application is not None:
+            application_status = application.status.value
+
+    confirmed_facts: dict[str, Any] = {}
+    if session.profile_id is not None:
+        profile = await db.get(UserProfile, session.profile_id)
+        raw_facts = profile.confirmed_facts if profile is not None else None
+        if raw_facts:
+            # UserProfile.confirmed_facts is a JSON list[dict]; expose it under a
+            # single key so it still fits CallSummaryContext's dict shape.
+            confirmed_facts = {"confirmed_facts": list(raw_facts)}
+
+    return CallSummaryContext(
+        transcript=transcript,
+        company=company,
+        vacancy=vacancy,
+        application_status=application_status,
+        confirmed_facts=confirmed_facts,
+    )
+
+
+async def _job_company_vacancy(
+    db: AsyncSession, session: CommunicationSession
+) -> tuple[str | None, str | None]:
+    if session.canonical_job_id is None:
+        return None, None
+    job = await db.get(CanonicalJob, session.canonical_job_id)
+    if job is None:
+        return None, None
+    return job.normalized_company, job.normalized_title
+
+
+def _build_provider(settings: Settings) -> PhoneSummaryProvider:
+    api_key = settings.phone_summary_llm_api_key or settings.llmrouter_api_key
+    return PhoneSummaryProvider(
+        base_url=settings.phone_summary_llm_base_url,
+        api_key=api_key.get_secret_value() if api_key is not None else "",
+        model=settings.effective_summary_model,
+        prefer=settings.phone_summary_llm_prefer,
+        timeout_seconds=settings.phone_summary_llm_timeout_seconds,
+    )
+
+
+async def finalize_pending_calls() -> dict[str, int]:
+    """Beat entry point: link evidence, summarise and notify pending calls.
+
+    Runs in the Celery worker against ``async_session_factory``. Commits once per
+    session so a mid-batch failure never loses completed work.
+    """
+    from app.database.session import async_session_factory
+
+    settings = get_settings()
+    counters = {"picked": 0, "done": 0, "failed": 0, "skipped": 0}
+    store = SessionStore()
+    provider: PhoneSummaryProvider | None = None
+
+    async with async_session_factory() as db:
+        pending = list(
+            (
+                await db.scalars(
+                    select(CommunicationSession)
+                    .where(CommunicationSession.summary_state == PhoneSummaryState.PENDING)
+                    .order_by(CommunicationSession.ended_at)
+                    .limit(settings.phone_summary_batch)
+                )
+            ).all()
+        )
+
+        for session in pending:
+            counters["picked"] += 1
+            await link_session_evidence(db, session.id, settings.phone_evidence_dir)
+
+            employer_turns = int(
+                await db.scalar(
+                    select(func.count(CommunicationTurn.id)).where(
+                        CommunicationTurn.session_id == session.id,
+                        CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
+                    )
+                )
+                or 0
+            )
+
+            if not settings.phone_summary_llm_enabled or employer_turns == 0:
+                session.summary_state = PhoneSummaryState.SKIPPED
+                counters["skipped"] += 1
+                await db.commit()
+                continue
+
+            if provider is None:
+                provider = _build_provider(settings)
+
+            current = session.summary or {}
+            attempts = int(current.get("model_meta", {}).get("attempts", 0)) + 1
+
+            try:
+                result = await provider.summarize(await build_summary_context(db, session))
+            except PhoneSummaryUnavailable as exc:
+                meta = {
+                    **current.get("model_meta", {}),
+                    "attempts": attempts,
+                    "last_error": str(exc),
+                }
+                session.summary = {**current, "model_meta": meta}
+                if attempts >= settings.phone_summary_max_attempts:
+                    session.summary_state = PhoneSummaryState.FAILED
+                    counters["failed"] += 1
+                    logger.warning(
+                        "phone_summary_failed", session_id=str(session.id), error=str(exc)
+                    )
+                await db.commit()
+                continue
+
+            payload: dict[str, Any] = {
+                "summary_text": result.summary_text,
+                "hints": {
+                    "mentioned_vacancy": result.mentioned_vacancy,
+                    "proposed_datetime_text": result.proposed_datetime_text,
+                    "proposed_address_text": result.proposed_address_text,
+                    "contact_person_text": result.contact_person_text,
+                    "outcome_guess": result.outcome_guess,
+                },
+                "model_meta": {
+                    "provider": "llmrouter",
+                    "model": settings.effective_summary_model,
+                    "attempts": attempts,
+                },
+                "telegram": {"state": "pending"},
+            }
+            await store.set_summary(session, payload, PhoneSummaryState.DONE)
+            if result.needs_review:
+                session.needs_review = True
+            counters["done"] += 1
+            await _notify(db, session, result, settings)
+            await db.commit()
+
+    return counters
+
+
+async def _notify(
+    db: AsyncSession,
+    session: CommunicationSession,
+    result: CallSummary,
+    settings: Settings,
+) -> None:
+    """Send the post-call Telegram notification. Never raises."""
+    try:
+        if (
+            not settings.telegram_enabled
+            or settings.telegram_bot_token is None
+            or not settings.telegram_chat_id
+        ):
+            session.summary = {**session.summary, "telegram": {"state": "disabled"}}
+            return
+
+        from app.phone.telegram import (
+            TelegramDeliveryError,
+            render_call_notification,
+            send_telegram_message,
+        )
+
+        company, vacancy = await _job_company_vacancy(db, session)
+        text = render_call_notification(
+            result,
+            company=company,
+            vacancy=vacancy,
+            session_id=str(session.id),
+            base_url=settings.public_base_url,
+        )
+        try:
+            await send_telegram_message(
+                token=settings.telegram_bot_token.get_secret_value(),
+                chat_id=settings.telegram_chat_id,
+                text=text,
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning(
+                "phone_telegram_delivery_failed",
+                session_id=str(session.id),
+                error=str(exc),
+            )
+            session.summary = {
+                **session.summary,
+                "telegram": {"state": "failed", "error": str(exc)},
+            }
+            return
+        session.summary = {
+            **session.summary,
+            "telegram": {"state": "sent", "sent_at": utcnow().isoformat()},
+        }
+    except Exception as exc:  # _notify must never propagate
+        logger.warning("phone_notify_failed", session_id=str(session.id), error=type(exc).__name__)

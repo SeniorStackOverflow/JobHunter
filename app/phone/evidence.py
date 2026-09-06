@@ -8,9 +8,11 @@ from pathlib import Path
 from uuid import UUID
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.schemas import TranscriptEntry
+from app.phone.sessions import SessionStore
 from app.settings.config import Settings
 
 logger = structlog.get_logger(__name__)
@@ -36,12 +38,36 @@ def is_important_utterance(text: str, *, min_chars: int) -> bool:
     return _KEYWORD_RE.search(stripped) is not None
 
 
+async def link_session_evidence(db: AsyncSession, session_id: UUID, evidence_dir: Path) -> int:
+    """Link captured ``<tid>.wav`` clips to their turns; returns the count linked.
+
+    A clip whose stem is not an integer is skipped; an orphan clip with no
+    matching turn is left on disk untouched.
+    """
+    session_dir = Path(evidence_dir) / str(session_id)
+    if not session_dir.is_dir():
+        return 0
+    store = SessionStore()
+    linked = 0
+    for clip in sorted(session_dir.glob("*.wav")):
+        try:
+            transcript_id = int(clip.stem)
+        except ValueError:
+            continue
+        await store.set_turn_evidence_path(
+            db,
+            session_id=session_id,
+            phonegate_transcript_id=transcript_id,
+            path=f"{session_id}/{clip.name}",
+        )
+        linked += 1
+    return linked
+
+
 class EvidenceCapturer:
     """Best-effort mid-call GSM-downlink clip capture. Never raises."""
 
-    def __init__(
-        self, *, client: PhoneGateClient, settings: Settings, session_id: UUID
-    ) -> None:
+    def __init__(self, *, client: PhoneGateClient, settings: Settings, session_id: UUID) -> None:
         self._client = client
         self._s = settings
         self._session_id = session_id
@@ -57,9 +83,7 @@ class EvidenceCapturer:
                 return
             if entry.speaker != "rx":
                 continue
-            if not is_important_utterance(
-                entry.text, min_chars=self._s.phone_evidence_min_chars
-            ):
+            if not is_important_utterance(entry.text, min_chars=self._s.phone_evidence_min_chars):
                 continue
             if await self._capture_one(entry.id):
                 self._captured += 1
