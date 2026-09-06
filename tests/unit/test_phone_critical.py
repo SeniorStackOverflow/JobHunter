@@ -39,6 +39,18 @@ def test_normalize_critical_value(field: str, raw: str, expected: str | None) ->
     assert actual == expected
 
 
+def test_unsupported_timezone_key_returns_none() -> None:
+    assert (
+        normalize_critical_value(
+            "interview_date",
+            "завтра",
+            reference_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+            timezone="/etc/passwd",
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "raw"),
     [

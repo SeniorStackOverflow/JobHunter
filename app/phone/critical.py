@@ -131,7 +131,7 @@ def _clean(raw: str) -> str:
 def _local_date(reference_at: datetime, timezone: str) -> date | None:
     try:
         zone = ZoneInfo(timezone)
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         return None
     aware = reference_at
     if aware.tzinfo is None:
@@ -250,7 +250,7 @@ def _parse_timezone(raw: str) -> str | None:
         return None
     try:
         ZoneInfo(text)
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         return None
     return text
 
