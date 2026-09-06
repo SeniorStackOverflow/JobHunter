@@ -21,6 +21,7 @@ from app.models.entities import CommunicationSession, CommunicationTurn, UserPro
 from app.models.enums import TurnDeliveryStatus, TurnSpeaker
 from app.phone.client import PhoneGateClient
 from app.phone.correlation import CorrelationResult
+from app.phone.evidence import EvidenceCapturer
 from app.phone.orchestrator import CallOrchestrator
 from app.phone.script import SCRIPT_GREETING
 from app.phone.sessions import SessionStore
@@ -134,6 +135,44 @@ async def test_happy_path_greeting_listen_closing(
     assert len(assistant) == len(SCRIPT_GREETING) + 1  # greeting blocks + one closing
     assert all(t.delivery_status is TurnDeliveryStatus.DELIVERED for t in assistant)
     assert fake._call_state == "IDLE"  # hung up
+
+
+@pytest.mark.asyncio
+async def test_unexpected_evidence_error_does_not_abort_call(
+    file_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+
+    async def _boom(self: EvidenceCapturer, entries: object) -> None:
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(EvidenceCapturer, "maybe_capture", _boom)
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(
+            client=client, session_factory=file_factory, settings=_fast_settings()
+        )
+        task = asyncio.create_task(orch.run(session_id))
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                async with file_factory() as db:
+                    call = await db.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "listening":
+                    break
+            else:
+                pytest.fail("orchestrator never reached LISTENING")
+            fake.transcript(speaker="rx", text="важная реплика работодателя")
+            stage = await task
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert stage == "greeting_completed"
+    assert fake._call_state == "IDLE"
 
 
 @pytest.mark.asyncio

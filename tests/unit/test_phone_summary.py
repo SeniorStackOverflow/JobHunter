@@ -1,9 +1,19 @@
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
+from app.models.entities import CommunicationSession, CommunicationTurn, UserProfile
+from app.models.enums import (
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
+    PhoneSummaryState,
+    TurnSpeaker,
+)
+from app.phone import summary as summary_module
 from app.phone.summary import (
     CallSummary,
     CallSummaryContext,
@@ -77,6 +87,78 @@ async def test_summarize_parses_valid_json():
     assert result.proposed_datetime_text == "в четверг в 14"
     assert seen["prefer"] == "quality"
     assert seen["url"].endswith("/v1/chat/completions")
+    assert p.last_latency_ms is not None
+    assert p.last_latency_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_persists_provider_latency_metadata(
+    sqlite_session_factory, tmp_path, monkeypatch
+) -> None:
+    settings = summary_module.Settings(
+        _env_file=None,
+        phone_evidence_dir=tmp_path,
+        phone_summary_llm_enabled=True,
+        phone_summary_llm_model="summary-model",
+        phone_summary_llm_api_key=SecretStr("router-key"),
+        phone_summary_batch=10,
+        telegram_enabled=False,
+    )
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="default", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            remote_raw="+37360111222",
+            phonegate_event_id_start=1,
+            started_at=now,
+            ended_at=now,
+            outcome=CommunicationOutcome.COMPLETED,
+            auto_answered=True,
+            summary_state=PhoneSummaryState.PENDING,
+        )
+        db.add(call)
+        await db.flush()
+        db.add(
+            CommunicationTurn(
+                session_id=call.id,
+                phonegate_transcript_id=1,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="Звоню по вакансии",
+                occurred_at=now,
+            )
+        )
+        await db.commit()
+        session_id = call.id
+
+    provider = PhoneSummaryProvider(
+        base_url="http://router",
+        api_key="router-key",
+        model="summary-model",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: _ok_response({"summary_text": "Итог звонка"})
+            )
+        ),
+    )
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(summary_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(summary_module, "_build_provider", lambda _: provider)
+
+    await summary_module.finalize_pending_calls()
+
+    async with sqlite_session_factory() as db:
+        call = await db.get(CommunicationSession, session_id)
+    assert call is not None
+    assert call.summary["model_meta"]["latency_ms"] is not None
+    assert isinstance(call.summary["model_meta"]["latency_ms"], int)
 
 
 @pytest.mark.asyncio
