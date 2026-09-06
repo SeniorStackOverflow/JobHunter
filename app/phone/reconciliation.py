@@ -217,10 +217,15 @@ def reconcile_verification(
             if not arbiter.accepted or actual != expected:
                 field_reasons.append("arbiter value mismatch")
             arbiter_quote = _normalized_text(arbiter.supporting_quote)
-            if not any(
-                arbiter_quote in _normalized_text(turn.text)
-                for turn in context.transcript
-                if turn.speaker.casefold() == "employer"
+            selected = max(accepted_group, key=lambda item: item.turn_seq)
+            selected_turn = next(
+                (turn for turn in context.transcript if turn.seq == selected.turn_seq),
+                None,
+            )
+            if (
+                not arbiter_quote
+                or selected_turn is None
+                or arbiter_quote not in _normalized_text(selected_turn.text)
             ):
                 field_reasons.append("arbiter quote not found")
         if correction_applied:

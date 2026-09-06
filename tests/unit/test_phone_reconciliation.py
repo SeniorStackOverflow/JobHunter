@@ -150,6 +150,66 @@ def test_missing_arbiter_decision_is_unknown_for_review() -> None:
     assert "arbiter" in decision.facts[0].reason
 
 
+def test_blank_arbiter_quote_is_unknown_for_review() -> None:
+    decision = _decide(
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-07",
+                supporting_quote="  \n\t",
+                accepted=True,
+                reason="совпадает",
+            )
+        ]
+    )
+    assert decision.facts[0].state is CallFactState.UNKNOWN
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert "arbiter quote" in decision.facts[0].reason
+
+
+def test_arbiter_quote_from_different_turn_is_unknown_for_review() -> None:
+    other_turn_id = uuid4()
+    context, extracted, verified, _, evidence = _inputs(
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                speaker="employer",
+                text="Собеседование завтра в 14:30",
+                asr_confidence=0.95,
+                evidence_reference=str(TURN_ID),
+            ),
+            VerificationTurn(
+                seq=2,
+                speaker="employer",
+                text="Это отдельная фраза для другой проверки",
+                asr_confidence=0.95,
+                evidence_reference=str(other_turn_id),
+            ),
+        ],
+    )
+    decision = reconcile_verification(
+        context=context,
+        extracted=extracted,
+        verified=verified,
+        arbitration=ArbitrationResult(
+            decisions=[
+                ArbitrationItem(
+                    field="interview_date",
+                    accepted_value="2026-09-07",
+                    supporting_quote="Это отдельная фраза для другой проверки",
+                    accepted=True,
+                    reason="совпадает",
+                )
+            ]
+        ),
+        asr_floor=0.8,
+        evidence_turn_ids=[*evidence, other_turn_id],
+    )
+    assert decision.facts[0].state is CallFactState.UNKNOWN
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert "arbiter quote" in decision.facts[0].reason
+
+
 def test_candidate_ambiguity_is_unknown_for_review() -> None:
     ambiguous = _candidate()
     ambiguous.ambiguity = "возможны два времени"
