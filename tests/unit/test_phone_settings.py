@@ -99,3 +99,50 @@ def test_phase_2a_defaults() -> None:
 def test_blocklist_is_normalized() -> None:
     s = Settings(_env_file=None, phone_answer_blocklist=["+373 60 111 222", "060999888"])
     assert s.phone_answer_blocklist == ["+37360111222", "+37360999888"]
+
+
+def test_summary_and_telegram_defaults() -> None:
+    s = Settings(_env_file=None)
+    assert s.phone_summary_llm_enabled is False
+    assert s.telegram_enabled is False
+    assert s.phone_summary_llm_prefer == "quality"
+    assert s.phone_evidence_retention_days == 30
+    assert s.effective_summary_model == ""
+
+
+def test_summary_model_falls_back_to_openai_model() -> None:
+    s = Settings(_env_file=None, openai_model="gpt-x")
+    assert s.effective_summary_model == "gpt-x"
+    s2 = Settings(_env_file=None, openai_model="gpt-x", phone_summary_llm_model="qwen")
+    assert s2.effective_summary_model == "qwen"
+
+
+def _production_settings(**overrides: object) -> Settings:
+    """Build a production Settings with all required fields."""
+    base = dict(
+        _env_file=None,
+        environment="production",
+        secret_key="x" * 40,
+        public_base_url="https://jobs.example.com",
+        database_url="postgresql+asyncpg://job_agent:real-pass@db/job_agent",
+        admin_password_hash="$argon2id$dummy",
+        llm_provider="openai",
+        openai_api_key="sk-test",
+        openai_model="gpt-x",
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_production_requires_telegram_creds_when_enabled() -> None:
+    with pytest.raises(ValueError, match="TELEGRAM"):
+        _production_settings(telegram_enabled=True)
+
+
+def test_production_requires_summary_model_when_enabled() -> None:
+    with pytest.raises(ValueError, match="summary model"):
+        _production_settings(phone_summary_llm_enabled=True, openai_model=None)
+
+
+def test_empty_telegram_token_is_unset() -> None:
+    assert Settings(_env_file=None, telegram_bot_token="  ").telegram_bot_token is None

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -68,6 +70,21 @@ class Settings(BaseSettings):
     phone_evidence_min_chars: int = Field(default=60, ge=10, le=500)
     phone_evidence_max_clips_per_call: int = Field(default=3, ge=0, le=20)
     phone_evidence_max_clip_bytes: int = Field(default=2_097_152, ge=65_536, le=8_388_608)
+    phone_evidence_retention_days: int = Field(default=30, ge=1, le=365)
+    phone_evidence_max_total_mb: int = Field(default=500, ge=10, le=10_000)
+
+    phone_summary_llm_enabled: bool = False
+    phone_summary_llm_base_url: str = "http://127.0.0.1:4000"
+    phone_summary_llm_api_key: SecretStr | None = None
+    phone_summary_llm_model: str = ""
+    phone_summary_llm_prefer: Literal["fast", "cheap", "quality", "balanced"] = "quality"
+    phone_summary_llm_timeout_seconds: float = Field(default=60.0, ge=10.0, le=300.0)
+    phone_summary_max_attempts: int = Field(default=3, ge=1, le=10)
+    phone_summary_batch: int = Field(default=10, ge=1, le=100)
+
+    telegram_enabled: bool = False
+    telegram_bot_token: SecretStr | None = None
+    telegram_chat_id: str | None = None
 
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
@@ -97,6 +114,8 @@ class Settings(BaseSettings):
         "gemini_api_key",
         "llmrouter_api_key",
         "phonegate_auth_token",
+        "phone_summary_llm_api_key",
+        "telegram_bot_token",
         mode="before",
     )
     @classmethod
@@ -126,8 +145,12 @@ class Settings(BaseSettings):
                 out.append(e164)
         return out
 
+    @property
+    def effective_summary_model(self) -> str:
+        return self.phone_summary_llm_model.strip() or (self.openai_model or "").strip()
+
     @model_validator(mode="after")
-    def validate_secure_production(self) -> "Settings":
+    def validate_secure_production(self) -> Settings:
         if self.environment != "production":
             return self
         secret = self.secret_key.get_secret_value()
@@ -156,7 +179,7 @@ class Settings(BaseSettings):
             raise ValueError("Google admin login requires Gmail credentials and token encryption")
         if self.llm_provider == "mock":
             raise ValueError("LLM_PROVIDER=mock is forbidden in production")
-        if not self.openai_model:
+        if not self.phone_summary_llm_enabled and not self.openai_model:
             raise ValueError("an explicit model name is required in production")
         if self.llm_provider == "openai" and self.openai_api_key is None:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
@@ -191,6 +214,26 @@ class Settings(BaseSettings):
                     "PHONEGATE_URL must be a routable address (not loopback) when "
                     "PHONE_AGENT_ENABLED is true in production"
                 )
+        if self.telegram_enabled and (
+            self.telegram_bot_token is None or not self.telegram_chat_id
+        ):
+            raise ValueError(
+                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required "
+                "when TELEGRAM_ENABLED is true"
+            )
+        if self.phone_summary_llm_enabled and not self.effective_summary_model:
+            raise ValueError(
+                "an explicit summary model is required "
+                "when PHONE_SUMMARY_LLM_ENABLED is true"
+            )
+        if (
+            self.phone_summary_llm_enabled
+            and self.phone_summary_llm_api_key is None
+            and self.llmrouter_api_key is None
+        ):
+            raise ValueError(
+                "a summary LLM API key is required when PHONE_SUMMARY_LLM_ENABLED is true"
+            )
         return self
 
 
