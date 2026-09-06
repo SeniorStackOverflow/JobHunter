@@ -139,10 +139,5 @@ def test_production_requires_telegram_creds_when_enabled() -> None:
         _production_settings(telegram_enabled=True)
 
 
-def test_production_requires_summary_model_when_enabled() -> None:
-    with pytest.raises(ValueError, match="summary model"):
-        _production_settings(phone_summary_llm_enabled=True, openai_model=None)
-
-
 def test_empty_telegram_token_is_unset() -> None:
     assert Settings(_env_file=None, telegram_bot_token="  ").telegram_bot_token is None

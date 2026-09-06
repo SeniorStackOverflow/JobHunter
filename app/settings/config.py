@@ -179,7 +179,7 @@ class Settings(BaseSettings):
             raise ValueError("Google admin login requires Gmail credentials and token encryption")
         if self.llm_provider == "mock":
             raise ValueError("LLM_PROVIDER=mock is forbidden in production")
-        if not self.phone_summary_llm_enabled and not self.openai_model:
+        if not self.openai_model:
             raise ValueError("an explicit model name is required in production")
         if self.llm_provider == "openai" and self.openai_api_key is None:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
@@ -220,11 +220,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required "
                 "when TELEGRAM_ENABLED is true"
-            )
-        if self.phone_summary_llm_enabled and not self.effective_summary_model:
-            raise ValueError(
-                "an explicit summary model is required "
-                "when PHONE_SUMMARY_LLM_ENABLED is true"
             )
         if (
             self.phone_summary_llm_enabled
