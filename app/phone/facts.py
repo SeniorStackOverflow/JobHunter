@@ -95,6 +95,7 @@ async def replace_current_facts(
         "pass_metadata": {name: _meta_json(meta) for name, meta in pass_metadata.items()},
         "pass_results": {name: _result_json(result) for name, result in pass_results.items()},
         "history": history,
+        "attempt_history": list(old_verification.get("attempt_history", [])),
         "stored_at": datetime.now(UTC).isoformat(),
     }
     current["verification"] = verification

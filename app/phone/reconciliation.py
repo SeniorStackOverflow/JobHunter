@@ -52,15 +52,6 @@ def _comparison_value(field: CriticalField, value: str | None) -> str | None:
     return value.casefold() if field == "address" else value
 
 
-def _turn_id(turn_reference: str | None) -> UUID | None:
-    if not turn_reference:
-        return None
-    try:
-        return UUID(turn_reference)
-    except (ValueError, AttributeError):
-        return None
-
-
 def _correction_text(text: str) -> bool:
     folded = _normalized_text(text).casefold()
     return bool(
@@ -113,7 +104,7 @@ def _inspect_candidate(
         reasons.append("source turn unresolved")
     else:
         asr_confidence = turn.asr_confidence
-        source_id = turn.turn_id or _turn_id(turn.evidence_reference)
+        source_id = turn.turn_id
         if _normalized_text(candidate.quote) not in _normalized_text(turn.text):
             reasons.append("quote not found")
         if source_id is None or source_id not in evidence_turn_ids:

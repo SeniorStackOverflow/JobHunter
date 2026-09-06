@@ -20,6 +20,12 @@ from app.phone.summary import (
     PhoneSummaryProvider,
     PhoneSummaryUnavailable,
 )
+from app.phone.verification import (
+    ArbitrationResult,
+    ExtractionResult,
+    ModelCallMeta,
+    VerificationResult,
+)
 
 _CTX = CallSummaryContext(
     transcript=[
@@ -138,19 +144,28 @@ async def test_finalize_persists_provider_latency_metadata(
         await db.commit()
         session_id = call.id
 
-    provider = PhoneSummaryProvider(
-        base_url="http://router",
-        api_key="router-key",
-        model="summary-model",
-        client=httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                lambda request: _ok_response({"summary_text": "Итог звонка"})
+    class Provider:
+        async def extract(self, context):
+            return ExtractionResult(
+                summary_text="Итог звонка",
+                outcome_guess="info_request",
+                facts=[],
+                review_reasons=[],
+            ), ModelCallMeta("llmrouter", "summary-model", 12, 1)
+
+        async def verify(self, context):
+            return VerificationResult(facts=[], review_reasons=[]), ModelCallMeta(
+                "llmrouter", "summary-model", 9, 1
             )
-        ),
-    )
+
+        async def arbitrate(self, context, extracted, verified):
+            return ArbitrationResult(decisions=[]), ModelCallMeta(
+                "llmrouter", "summary-model", 7, 1
+            )
+
     monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
     monkeypatch.setattr(summary_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(summary_module, "_build_provider", lambda _: provider)
+    monkeypatch.setattr(summary_module, "_build_verification_provider", lambda _: Provider())
 
     await summary_module.finalize_pending_calls()
 

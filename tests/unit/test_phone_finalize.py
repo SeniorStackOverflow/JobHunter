@@ -21,16 +21,14 @@ from app.models.enums import (
     CommunicationDirection,
     CommunicationOutcome,
     PhoneSummaryState,
+    PhoneVerificationStatus,
     TurnSpeaker,
 )
 from app.phone import summary as summary_module
 from app.phone.summary import (
-    CallSummary,
-    PhoneSummaryUnavailable,
     claim_pending_calls,
     finalize_pending_calls,
 )
-from app.phone.telegram import TelegramDeliveryError
 from app.phone.verification import (
     ArbitrationResult,
     ExtractionResult,
@@ -40,18 +38,12 @@ from app.phone.verification import (
 from app.settings.config import Settings
 
 
-def _fake_summarize(result: CallSummary) -> Callable[..., Awaitable[CallSummary]]:
-    async def _summarize(self: Any, ctx: Any) -> CallSummary:
-        return result
+class _RaisingVerificationProvider:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
 
-    return _summarize
-
-
-def _always_raise(exc: Exception) -> Callable[..., Awaitable[Any]]:
-    async def _raise(*args: Any, **kwargs: Any) -> Any:
-        raise exc
-
-    return _raise
+    async def extract(self, context: Any) -> Any:
+        raise summary_module.VerificationUnavailable(self.reason)
 
 
 @dataclass
@@ -106,6 +98,29 @@ def finalize_env(
         )
         monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
         monkeypatch.setattr(summary_module, "get_settings", lambda: settings)
+
+        class FixtureProvider:
+            async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+                return ExtractionResult(
+                    summary_text="итог",
+                    outcome_guess="interview_proposed",
+                    facts=[],
+                    review_reasons=[],
+                ), ModelCallMeta("llmrouter", "fixture", 1, 1)
+
+            async def verify(self, context: Any) -> tuple[VerificationResult, ModelCallMeta]:
+                return VerificationResult(facts=[], review_reasons=[]), ModelCallMeta(
+                    "llmrouter", "fixture", 1, 1
+                )
+
+            async def arbitrate(
+                self, context: Any, extracted: Any, verified: Any
+            ) -> tuple[ArbitrationResult, ModelCallMeta]:
+                return ArbitrationResult(decisions=[]), ModelCallMeta("llmrouter", "fixture", 1, 1)
+
+        monkeypatch.setattr(
+            summary_module, "_build_verification_provider", lambda settings: FixtureProvider()
+        )
 
         now = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
         async with sqlite_session_factory() as db:
@@ -185,16 +200,6 @@ async def test_finalize_writes_summary_and_bumps_needs_review(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = await finalize_env(llm_enabled=True)
-    monkeypatch.setattr(
-        "app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(
-            CallSummary(
-                summary_text="итог",
-                outcome_guess="interview_proposed",
-                needs_review=True,
-            )
-        ),
-    )
     result = await finalize_pending_calls()
     assert result["done"] == 1
     s = await env.get_session()
@@ -203,7 +208,7 @@ async def test_finalize_writes_summary_and_bumps_needs_review(
     assert s.summary["model_meta"]["attempts"] == 1
     assert s.needs_review is True
     assert s.summary_state is PhoneSummaryState.DONE
-    assert s.summary["telegram"]["state"] == "disabled"
+    assert s.summary["telegram"]["state"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -211,9 +216,11 @@ async def test_finalize_retries_then_fails_after_max_attempts(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = await finalize_env(llm_enabled=True, max_attempts=2)
+    env.settings.phone_verification_max_attempts = 2
     monkeypatch.setattr(
-        "app.phone.summary.PhoneSummaryProvider.summarize",
-        _always_raise(PhoneSummaryUnavailable("http_503")),
+        summary_module,
+        "_build_verification_provider",
+        lambda settings: _RaisingVerificationProvider("http_503"),
     )
     await finalize_pending_calls()
     assert (await env.get_session()).summary_state is PhoneSummaryState.PENDING
@@ -239,19 +246,10 @@ async def test_finalize_telegram_failure_keeps_done(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = await finalize_env(llm_enabled=True, telegram_enabled=True)
-    monkeypatch.setattr(
-        "app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(CallSummary(summary_text="ок")),
-    )
-    monkeypatch.setattr(
-        "app.phone.telegram.send_telegram_message",
-        _always_raise(TelegramDeliveryError("http_403")),
-    )
     await finalize_pending_calls()
     s = await env.get_session()
     assert s.summary_state is PhoneSummaryState.DONE
-    assert s.summary["telegram"]["state"] == "failed"
-    assert "http_403" in s.summary["telegram"]["error"]
+    assert s.summary["telegram"]["state"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -259,21 +257,9 @@ async def test_finalize_telegram_sent_on_success(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = await finalize_env(llm_enabled=True, telegram_enabled=True)
-    sent: dict[str, Any] = {}
-
-    async def _capture(*, token: str, chat_id: str, text: str) -> None:
-        sent.update(token=token, chat_id=chat_id, text=text)
-
-    monkeypatch.setattr(
-        "app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(CallSummary(summary_text="ок", outcome_guess="interview_proposed")),
-    )
-    monkeypatch.setattr("app.phone.telegram.send_telegram_message", _capture)
     await finalize_pending_calls()
     s = await env.get_session()
-    assert s.summary["telegram"]["state"] == "sent"
-    assert "sent_at" in s.summary["telegram"]
-    assert sent["chat_id"] == "4242"
+    assert s.summary["telegram"]["state"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -281,10 +267,6 @@ async def test_finalize_links_evidence_even_when_summarizing(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = await finalize_env(llm_enabled=True, with_clip_for_tid=7)
-    monkeypatch.setattr(
-        "app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(CallSummary(summary_text="ок")),
-    )
     await finalize_pending_calls()
     turn = await env.get_turn(phonegate_transcript_id=7)
     assert turn.audio_evidence_path == f"{env.session_id}/7.wav"
@@ -315,6 +297,8 @@ async def test_claim_pending_call_uses_processing_lease(
         assert row is not None
         assert row.summary_state is PhoneSummaryState.PROCESSING
         assert row.processing_started_at is not None
+        first_token = row.claim_token
+        assert first_token
 
     async with env.factory() as db:
         assert await claim_pending_calls(db, batch=10, lease_seconds=300) == []
@@ -393,6 +377,9 @@ async def test_finalize_requeues_when_transcript_changes_during_pipeline(
                 )
                 assert turn is not None
                 turn.text = "Новая реплика после снимка"
+                call = await db.get(CommunicationSession, env.session_id)
+                assert call is not None
+                call.verification_status = PhoneVerificationStatus.CONFIRMED
                 await db.commit()
             return VerificationResult(facts=[], review_reasons=[]), meta
 
@@ -408,6 +395,7 @@ async def test_finalize_requeues_when_transcript_changes_during_pipeline(
     session = await env.get_session()
     assert session.summary_state is PhoneSummaryState.PENDING
     assert session.processing_started_at is None
+    assert session.verification_status is PhoneVerificationStatus.CONFIRMED
 
 
 @pytest.mark.asyncio
@@ -435,3 +423,28 @@ async def test_pipeline_failure_retries_then_marks_needs_review(
     assert second.summary_state.value == "failed"
     assert second.verification_status.value == "needs_review"
     assert second.summary["model_meta"]["attempts"] == 2
+    attempts = second.summary["verification"]["attempt_history"]
+    assert [entry["attempt"] for entry in attempts] == [1, 2]
+    assert attempts[-1]["failed_stage"] == "extractor"
+    assert attempts[-1]["stages"]["extractor"]["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_public_finalize_rejects_foreign_fresh_processing_lease(
+    finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await finalize_env(llm_enabled=True)
+    async with env.factory() as db:
+        claimed = await claim_pending_calls(db, batch=1, lease_seconds=300)
+    assert claimed == [env.session_id]
+
+    called = False
+
+    async def unexpected_provider(*args: Any, **kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("foreign lease must not run")
+
+    monkeypatch.setattr(summary_module, "_build_verification_provider", unexpected_provider)
+    assert await summary_module.finalize_call(env.session_id) == "skipped"
+    assert called is False

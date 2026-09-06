@@ -680,6 +680,7 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
     )
     verification_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(96))
     rx_frame_stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

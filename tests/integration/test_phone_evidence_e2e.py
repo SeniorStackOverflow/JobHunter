@@ -27,7 +27,13 @@ from app.phone.client import PhoneGateClient
 from app.phone.correlation import CorrelationResult
 from app.phone.orchestrator import CallOrchestrator
 from app.phone.sessions import SessionStore
-from app.phone.summary import CallSummary, finalize_pending_calls
+from app.phone.summary import finalize_pending_calls
+from app.phone.verification import (
+    ArbitrationResult,
+    ExtractionResult,
+    ModelCallMeta,
+    VerificationResult,
+)
 from app.settings.config import Settings
 from tests.fixtures.fake_phonegate import FakePhoneGate
 
@@ -160,11 +166,27 @@ async def test_evidence_capture_then_finalize_links_and_summarizes(
     monkeypatch.setattr(summary_module, "get_settings", lambda: settings)
     calls: list[Any] = []
 
-    async def _summarize(self: Any, ctx: Any) -> CallSummary:
-        calls.append(ctx)
-        return CallSummary(summary_text="Работодатель предложил собеседование.")
+    class Provider:
+        async def extract(self, ctx: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+            calls.append(ctx)
+            return ExtractionResult(
+                summary_text="Работодатель предложил собеседование.",
+                outcome_guess="interview_proposed",
+                facts=[],
+                review_reasons=[],
+            ), ModelCallMeta("llmrouter", "fixture", 1, 1)
 
-    monkeypatch.setattr(summary_module.PhoneSummaryProvider, "summarize", _summarize)
+        async def verify(self, ctx: Any) -> tuple[VerificationResult, ModelCallMeta]:
+            return VerificationResult(facts=[], review_reasons=[]), ModelCallMeta(
+                "llmrouter", "fixture", 1, 1
+            )
+
+        async def arbitrate(
+            self, ctx: Any, extracted: Any, verified: Any
+        ) -> tuple[ArbitrationResult, ModelCallMeta]:
+            return ArbitrationResult(decisions=[]), ModelCallMeta("llmrouter", "fixture", 1, 1)
+
+    monkeypatch.setattr(summary_module, "_build_verification_provider", lambda _: Provider())
     result = await finalize_pending_calls()
 
     assert result == {"picked": 1, "done": 1, "failed": 0, "skipped": 0}

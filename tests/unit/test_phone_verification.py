@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import traceback
 from datetime import UTC, datetime
+from uuid import UUID
 
 import httpx
 import pytest
@@ -30,6 +31,7 @@ def _context() -> VerificationContext:
         transcript=[
             VerificationTurn(
                 seq=1,
+                turn_id=UUID("11111111-1111-1111-1111-111111111111"),
                 speaker="employer",
                 text="Собеседование завтра в 14:00.",
                 asr_confidence=0.95,

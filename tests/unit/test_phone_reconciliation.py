@@ -58,6 +58,7 @@ def _inputs(
         or [
             VerificationTurn(
                 seq=1,
+                turn_id=TURN_ID,
                 speaker="employer",
                 text="Собеседование завтра в 14:30",
                 asr_confidence=0.95,
@@ -173,6 +174,7 @@ def test_arbiter_quote_from_different_turn_is_unknown_for_review() -> None:
         transcript=[
             VerificationTurn(
                 seq=1,
+                turn_id=TURN_ID,
                 speaker="employer",
                 text="Собеседование завтра в 14:30",
                 asr_confidence=0.95,
@@ -180,6 +182,7 @@ def test_arbiter_quote_from_different_turn_is_unknown_for_review() -> None:
             ),
             VerificationTurn(
                 seq=2,
+                turn_id=other_turn_id,
                 speaker="employer",
                 text="Это отдельная фраза для другой проверки",
                 asr_confidence=0.95,
@@ -238,6 +241,7 @@ def test_explicit_low_asr_confidence_is_unknown() -> None:
     transcript = [
         VerificationTurn(
             seq=1,
+            turn_id=TURN_ID,
             speaker="employer",
             text="Собеседование завтра в 14:30",
             asr_confidence=0.2,
@@ -253,6 +257,7 @@ def test_missing_asr_confidence_is_eligible_with_complete_evidence() -> None:
     transcript = [
         VerificationTurn(
             seq=1,
+            turn_id=TURN_ID,
             speaker="employer",
             text="Собеседование завтра в 14:30",
             evidence_reference=str(TURN_ID),
@@ -274,6 +279,7 @@ def test_last_unambiguous_correction_wins_and_prior_expression_is_diagnostic() -
     transcript = [
         VerificationTurn(
             seq=1,
+            turn_id=first_id,
             speaker="employer",
             text="Собеседование завтра в 14:30",
             asr_confidence=0.95,
@@ -281,6 +287,7 @@ def test_last_unambiguous_correction_wins_and_prior_expression_is_diagnostic() -
         ),
         VerificationTurn(
             seq=2,
+            turn_id=second_id,
             speaker="employer",
             text="Нет, точнее послезавтра в 14:30",
             asr_confidence=0.95,
@@ -320,6 +327,7 @@ def test_supported_correction_wins_over_unsupported_earlier_expression() -> None
     transcript = [
         VerificationTurn(
             seq=1,
+            turn_id=first_id,
             speaker="employer",
             text="Собеседование завтра, но фраза неразборчива",
             asr_confidence=0.2,
@@ -327,6 +335,7 @@ def test_supported_correction_wins_over_unsupported_earlier_expression() -> None
         ),
         VerificationTurn(
             seq=2,
+            turn_id=second_id,
             speaker="employer",
             text="Нет, точнее послезавтра в 14:30",
             asr_confidence=0.95,
@@ -382,6 +391,7 @@ def test_address_difference_in_case_and_whitespace_is_equal() -> None:
             "transcript": [
                 VerificationTurn(
                     seq=1,
+                    turn_id=TURN_ID,
                     speaker="employer",
                     text="ул. Пушкина, 5",
                     evidence_reference=str(TURN_ID),

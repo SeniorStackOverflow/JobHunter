@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import time
 from datetime import timedelta
 from typing import Any, Literal, cast
@@ -29,8 +30,8 @@ from app.models.enums import (
     TurnSpeaker,
 )
 from app.phone.evidence import link_session_evidence
-from app.phone.sessions import SessionStore
 from app.phone.verification import (
+    ModelCallMeta,
     PersistedFact,
     PostCallVerificationProvider,
     VerificationContext,
@@ -360,9 +361,6 @@ def _build_verification_provider(settings: Settings) -> PostCallVerificationProv
     )
 
 
-_ORIGINAL_BUILD_PROVIDER = _build_provider
-
-
 async def claim_pending_calls(db: AsyncSession, *, batch: int, lease_seconds: int) -> list[UUID]:
     """Atomically reserve a bounded batch of completed, auto-answered calls.
 
@@ -370,6 +368,14 @@ async def claim_pending_calls(db: AsyncSession, *, batch: int, lease_seconds: in
     so each candidate is conditionally updated and only rows whose update wins
     are returned.  Both paths make the lease transition in one short commit.
     """
+    claimed = await _claim_pending_calls_with_tokens(db, batch=batch, lease_seconds=lease_seconds)
+    return [call_id for call_id, _token in claimed]
+
+
+async def _claim_pending_calls_with_tokens(
+    db: AsyncSession, *, batch: int, lease_seconds: int
+) -> list[tuple[UUID, str]]:
+    """Claim calls and retain their opaque ownership token for the worker."""
     if batch < 1 or lease_seconds < 1:
         return []
     if db.in_transaction():
@@ -386,7 +392,7 @@ async def claim_pending_calls(db: AsyncSession, *, batch: int, lease_seconds: in
         CommunicationSession.auto_answered.is_(True),
         CommunicationSession.ended_at.is_not(None),
     )
-    claimed: list[UUID] = []
+    claimed: list[tuple[UUID, str]] = []
     async with db.begin():
         dialect = db.bind.dialect.name if db.bind is not None else ""
         if dialect == "postgresql":
@@ -402,10 +408,12 @@ async def claim_pending_calls(db: AsyncSession, *, batch: int, lease_seconds: in
                 ).all()
             )
             for call in rows:
+                token = secrets.token_urlsafe(48)
                 call.summary_state = PhoneSummaryState.PROCESSING
                 call.verification_status = PhoneVerificationStatus.PENDING
                 call.processing_started_at = now
-                claimed.append(call.id)
+                call.claim_token = token
+                claimed.append((call.id, token))
         else:
             ids = list(
                 (
@@ -418,6 +426,7 @@ async def claim_pending_calls(db: AsyncSession, *, batch: int, lease_seconds: in
                 ).all()
             )
             for call_id in ids:
+                token = secrets.token_urlsafe(48)
                 result = await db.execute(
                     update(CommunicationSession)
                     .where(CommunicationSession.id == call_id, *where)
@@ -425,110 +434,12 @@ async def claim_pending_calls(db: AsyncSession, *, batch: int, lease_seconds: in
                         summary_state=PhoneSummaryState.PROCESSING,
                         verification_status=PhoneVerificationStatus.PENDING,
                         processing_started_at=now,
+                        claim_token=token,
                     )
                 )
                 if cast(int, getattr(result, "rowcount", 0)) == 1:
-                    claimed.append(call_id)
+                    claimed.append((call_id, token))
     return claimed
-
-
-_ORIGINAL_SUMMARIZE = PhoneSummaryProvider.summarize
-
-
-async def _legacy_finalize_pending_calls() -> dict[str, int]:
-    """Beat entry point: link evidence, summarise and notify pending calls.
-
-    Runs in the Celery worker against ``async_session_factory``. Commits once per
-    session so a mid-batch failure never loses completed work.
-    """
-    from app.database.session import async_session_factory
-
-    settings = get_settings()
-    counters = {"picked": 0, "done": 0, "failed": 0, "skipped": 0}
-    store = SessionStore()
-    provider: PhoneSummaryProvider | None = None
-
-    async with async_session_factory() as db:
-        pending = list(
-            (
-                await db.scalars(
-                    select(CommunicationSession)
-                    .where(CommunicationSession.summary_state == PhoneSummaryState.PENDING)
-                    .order_by(CommunicationSession.ended_at)
-                    .limit(settings.phone_summary_batch)
-                )
-            ).all()
-        )
-
-        for session in pending:
-            counters["picked"] += 1
-            await link_session_evidence(db, session.id, settings.phone_evidence_dir)
-
-            employer_turns = int(
-                await db.scalar(
-                    select(func.count(CommunicationTurn.id)).where(
-                        CommunicationTurn.session_id == session.id,
-                        CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
-                    )
-                )
-                or 0
-            )
-
-            if not settings.phone_summary_llm_enabled or employer_turns == 0:
-                session.summary_state = PhoneSummaryState.SKIPPED
-                counters["skipped"] += 1
-                await db.commit()
-                continue
-
-            if provider is None:
-                provider = _build_provider(settings)
-
-            current = session.summary or {}
-            attempts = int(current.get("model_meta", {}).get("attempts", 0)) + 1
-
-            try:
-                result = await provider.summarize(await build_summary_context(db, session))
-            except PhoneSummaryUnavailable as exc:
-                meta = {
-                    **current.get("model_meta", {}),
-                    "attempts": attempts,
-                    "last_error": str(exc),
-                }
-                session.summary = {**current, "model_meta": meta}
-                if attempts >= settings.phone_summary_max_attempts:
-                    session.summary_state = PhoneSummaryState.FAILED
-                    counters["failed"] += 1
-                    logger.warning(
-                        "phone_summary_failed", session_id=str(session.id), error=str(exc)
-                    )
-                await db.commit()
-                continue
-
-            payload: dict[str, Any] = {
-                "summary_text": result.summary_text,
-                "hints": {
-                    "mentioned_vacancy": result.mentioned_vacancy,
-                    "proposed_datetime_text": result.proposed_datetime_text,
-                    "proposed_address_text": result.proposed_address_text,
-                    "contact_person_text": result.contact_person_text,
-                    "outcome_guess": result.outcome_guess,
-                },
-                "model_meta": {
-                    "provider": "llmrouter",
-                    "model": settings.effective_summary_model,
-                    "attempts": attempts,
-                    "latency_ms": provider.last_latency_ms,
-                },
-                "telegram": {"state": "pending"},
-            }
-            await store.set_summary(session, payload, PhoneSummaryState.DONE)
-            if result.needs_review:
-                session.needs_review = True
-            counters["done"] += 1
-            await _notify(db, session, result, settings)
-            await db.commit()
-
-    return counters
 
 
 def _input_fingerprint(context: VerificationContext) -> str:
@@ -538,7 +449,7 @@ def _input_fingerprint(context: VerificationContext) -> str:
 
 async def _confirmation_signature(
     db: AsyncSession, call_id: UUID
-) -> tuple[tuple[str, str, str | None], ...]:
+) -> tuple[tuple[str, str | None, str, str | None, str | None], ...]:
     facts = list(
         (
             await db.scalars(
@@ -553,6 +464,8 @@ async def _confirmation_signature(
         sorted(
             (
                 fact.field,
+                fact.normalized_value,
+                fact.state.value,
                 fact.confirmation_source.value if fact.confirmation_source is not None else "",
                 str(fact.confirmed_by_turn_id) if fact.confirmed_by_turn_id else None,
             )
@@ -561,12 +474,13 @@ async def _confirmation_signature(
     )
 
 
-async def _claim_call(call_id: UUID, *, lease_seconds: int) -> bool:
+async def _claim_call(call_id: UUID, *, lease_seconds: int) -> str | None:
     """Claim one call for direct ``finalize_call`` callers."""
     from app.database.session import async_session_factory
 
     now = utcnow()
     stale_before = now - timedelta(seconds=lease_seconds)
+    token = secrets.token_urlsafe(48)
     eligible = (CommunicationSession.summary_state == PhoneSummaryState.PENDING) | (
         (CommunicationSession.summary_state == PhoneSummaryState.PROCESSING)
         & (CommunicationSession.processing_started_at < stale_before)
@@ -588,29 +502,26 @@ async def _claim_call(call_id: UUID, *, lease_seconds: int) -> bool:
                     summary_state=PhoneSummaryState.PROCESSING,
                     verification_status=PhoneVerificationStatus.PENDING,
                     processing_started_at=now,
+                    claim_token=token,
                 )
             )
             if cast(int, getattr(result, "rowcount", 0)) == 1:
-                return True
-            # ``finalize_call`` is also a public worker interface and may be
-            # handed an ID returned by ``claim_pending_calls``.  In that case
-            # the fresh processing lease is already ours.
-            existing = await db.scalar(
-                select(CommunicationSession.id).where(
-                    CommunicationSession.id == call_id,
-                    CommunicationSession.summary_state == PhoneSummaryState.PROCESSING,
-                    CommunicationSession.processing_started_at >= stale_before,
-                    CommunicationSession.channel == CommunicationChannel.CALL,
-                    CommunicationSession.auto_answered.is_(True),
-                    CommunicationSession.ended_at.is_not(None),
-                )
-            )
-            return existing is not None
+                return token
+            return None
 
 
 async def _snapshot_call(
-    call_id: UUID, settings: Settings
-) -> tuple[VerificationContext, str, int, tuple[tuple[str, str, str | None], ...], int] | None:
+    call_id: UUID, token: str, settings: Settings
+) -> (
+    tuple[
+        VerificationContext,
+        str,
+        int,
+        tuple[tuple[str, str | None, str, str | None, str | None], ...],
+        int,
+    ]
+    | None
+):
     from app.database.session import async_session_factory
 
     async with async_session_factory() as db:
@@ -621,6 +532,7 @@ async def _snapshot_call(
             or not call.auto_answered
             or call.ended_at is None
             or call.summary_state is not PhoneSummaryState.PROCESSING
+            or call.claim_token != token
         ):
             return None
         await link_session_evidence(db, call.id, settings.phone_evidence_dir)
@@ -647,6 +559,28 @@ def _safe_failure_reason(exc: BaseException) -> str:
     return "internal_error"
 
 
+def _meta_record(metadata: ModelCallMeta | None, model: str, state: str) -> dict[str, object]:
+    if metadata is None:
+        return {"state": state, "provider": "llmrouter", "model": model}
+    return {
+        "state": state,
+        "provider": metadata.provider,
+        "model": metadata.model,
+        "latency_ms": metadata.latency_ms,
+        "attempts": metadata.attempts,
+    }
+
+
+def _append_attempt_history(call: CommunicationSession, record: dict[str, object]) -> None:
+    summary = dict(call.summary or {})
+    verification = dict(summary.get("verification", {}))
+    history = list(verification.get("attempt_history", []))
+    history.append(record)
+    verification["attempt_history"] = history
+    summary["verification"] = verification
+    call.summary = summary
+
+
 async def _record_pipeline_failure(
     call_id: UUID,
     *,
@@ -654,13 +588,24 @@ async def _record_pipeline_failure(
     reason: str,
     claimed_revision: int,
     claimed_fingerprint: str,
-    claimed_confirmations: tuple[tuple[str, str, str | None], ...],
+    claimed_confirmations: tuple[tuple[str, str | None, str, str | None, str | None], ...],
+    claim_token: str,
+    failed_stage: str,
+    completed_metadata: dict[str, ModelCallMeta],
+    failed_metadata: ModelCallMeta | None,
 ) -> Literal["failed", "skipped"]:
     from app.database.session import async_session_factory
 
     async with async_session_factory() as db:
-        call = await db.get(CommunicationSession, call_id)
+        if db.in_transaction():
+            await db.commit()
+        query = select(CommunicationSession).where(CommunicationSession.id == call_id)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        call = await db.scalar(query)
         if call is None:
+            return "skipped"
+        if call.claim_token != claim_token:
             return "skipped"
         current_context = await build_verification_context(db, call)
         stale = (
@@ -670,13 +615,35 @@ async def _record_pipeline_failure(
         )
         if stale:
             call.summary_state = PhoneSummaryState.PENDING
-            call.verification_status = PhoneVerificationStatus.PENDING
             call.processing_started_at = None
+            call.claim_token = None
             await db.commit()
             return "skipped"
         current = dict(call.summary or {})
         model_meta = dict(current.get("model_meta", {}))
         attempts = int(model_meta.get("attempts", 0)) + 1
+        models = {
+            "extractor": settings.effective_phone_verification_extractor_model,
+            "verifier": settings.effective_phone_verification_verifier_model,
+            "arbiter": settings.effective_phone_verification_arbiter_model,
+        }
+        stage_records = {
+            name: _meta_record(meta, models[name], "completed")
+            for name, meta in completed_metadata.items()
+        }
+        stage_records[failed_stage] = _meta_record(
+            failed_metadata, models.get(failed_stage, settings.effective_summary_model), "failed"
+        )
+        _append_attempt_history(
+            call,
+            {
+                "attempt": attempts,
+                "pipeline_version": settings.phone_verification_pipeline_version,
+                "stages": stage_records,
+                "failed_stage": failed_stage,
+                "reason": reason,
+            },
+        )
         model_meta.update(
             {
                 "provider": "llmrouter",
@@ -686,8 +653,9 @@ async def _record_pipeline_failure(
                 "last_error": reason,
             }
         )
-        call.summary = {**current, "model_meta": model_meta}
+        call.summary = {**call.summary, "model_meta": model_meta}
         call.processing_started_at = None
+        call.claim_token = None
         terminal = attempts >= settings.phone_verification_max_attempts
         if terminal:
             call.summary_state = PhoneSummaryState.FAILED
@@ -700,10 +668,12 @@ async def _record_pipeline_failure(
         return "failed" if terminal else "skipped"
 
 
-async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "skipped"]:
+async def _finalize_claimed_call(
+    call_id: UUID, claim_token: str
+) -> Literal["done", "failed", "skipped"]:
     """Run the immutable Extractor → Verifier → Arbiter pipeline for one claim."""
     settings = get_settings()
-    snapshot = await _snapshot_call(call_id, settings)
+    snapshot = await _snapshot_call(call_id, claim_token, settings)
     if snapshot is None:
         return "skipped"
     context, fingerprint, revision, confirmations, employer_turns = snapshot
@@ -711,17 +681,29 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
         from app.database.session import async_session_factory
 
         async with async_session_factory() as db:
-            call = await db.get(CommunicationSession, call_id)
-            if call is not None:
+            if db.in_transaction():
+                await db.commit()
+            query = select(CommunicationSession).where(CommunicationSession.id == call_id)
+            if db.bind is not None and db.bind.dialect.name == "postgresql":
+                query = query.with_for_update()
+            call = await db.scalar(query)
+            if call is not None and call.claim_token == claim_token:
                 call.summary_state = PhoneSummaryState.SKIPPED
                 call.processing_started_at = None
+                call.claim_token = None
                 await db.commit()
         return "skipped"
 
+    stage = "extractor"
+    completed_metadata: dict[str, ModelCallMeta] = {}
     try:
         provider = _build_verification_provider(settings)
         extracted, extractor_meta = await provider.extract(context)
+        completed_metadata["extractor"] = extractor_meta
+        stage = "verifier"
         verified, verifier_meta = await provider.verify(context)
+        completed_metadata["verifier"] = verifier_meta
+        stage = "arbiter"
         arbitration, arbiter_meta = await provider.arbitrate(context, extracted, verified)
     except Exception as exc:
         return await _record_pipeline_failure(
@@ -731,6 +713,10 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
             claimed_revision=revision,
             claimed_fingerprint=fingerprint,
             claimed_confirmations=confirmations,
+            claim_token=claim_token,
+            failed_stage=stage,
+            completed_metadata=completed_metadata,
+            failed_metadata=(exc.metadata if isinstance(exc, VerificationUnavailable) else None),
         )
 
     from app.database.session import async_session_factory
@@ -738,8 +724,15 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
     from app.phone.reconciliation import reconcile_verification
 
     async with async_session_factory() as db:
-        call = await db.get(CommunicationSession, call_id)
+        if db.in_transaction():
+            await db.commit()
+        query = select(CommunicationSession).where(CommunicationSession.id == call_id)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        call = await db.scalar(query)
         if call is None:
+            return "skipped"
+        if call.claim_token != claim_token:
             return "skipped"
         current_context = await build_verification_context(db, call)
         stale = (
@@ -749,8 +742,8 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
         )
         if stale:
             call.summary_state = PhoneSummaryState.PENDING
-            call.verification_status = PhoneVerificationStatus.PENDING
             call.processing_started_at = None
+            call.claim_token = None
             await db.commit()
             return "skipped"
 
@@ -773,6 +766,7 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
             asr_floor=settings.phone_verification_asr_floor,
             evidence_turn_ids=evidence_turn_ids,
         )
+        attempt_no = int(call.summary.get("model_meta", {}).get("attempts", 0)) + 1
         await replace_current_facts(
             db,
             call=call,
@@ -790,6 +784,30 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
                 "arbiter": arbitration,
             },
         )
+        _append_attempt_history(
+            call,
+            {
+                "attempt": attempt_no,
+                "pipeline_version": settings.phone_verification_pipeline_version,
+                "stages": {
+                    "extractor": _meta_record(
+                        extractor_meta,
+                        settings.effective_phone_verification_extractor_model,
+                        "completed",
+                    ),
+                    "verifier": _meta_record(
+                        verifier_meta,
+                        settings.effective_phone_verification_verifier_model,
+                        "completed",
+                    ),
+                    "arbiter": _meta_record(
+                        arbiter_meta,
+                        settings.effective_phone_verification_arbiter_model,
+                        "completed",
+                    ),
+                },
+            },
+        )
         call.summary = {
             **call.summary,
             "summary_text": extracted.summary_text,
@@ -798,9 +816,7 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
                 "provider": "llmrouter",
                 "model": settings.effective_summary_model,
                 "pipeline_version": settings.phone_verification_pipeline_version,
-                "attempts": max(
-                    extractor_meta.attempts, verifier_meta.attempts, arbiter_meta.attempts
-                ),
+                "attempts": attempt_no,
                 "latency_ms": max(
                     extractor_meta.latency_ms,
                     verifier_meta.latency_ms,
@@ -811,6 +827,7 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
         }
         call.summary_state = PhoneSummaryState.DONE
         call.processing_started_at = None
+        call.claim_token = None
         await db.commit()
     return "done"
 
@@ -818,34 +835,28 @@ async def _finalize_claimed_call(call_id: UUID) -> Literal["done", "failed", "sk
 async def finalize_call(call_id: UUID) -> Literal["done", "failed", "skipped"]:
     """Claim and run the immutable Extractor → Verifier → Arbiter pipeline."""
     settings = get_settings()
-    if not await _claim_call(
+    claim_token = await _claim_call(
         call_id, lease_seconds=settings.phone_verification_processing_lease_seconds
-    ):
+    )
+    if claim_token is None:
         return "skipped"
-    return await _finalize_claimed_call(call_id)
+    return await _finalize_claimed_call(call_id, claim_token)
 
 
 async def finalize_pending_calls() -> dict[str, int]:
     settings = get_settings()
-    # Existing callers that replace the summary method retain the baseline
-    # summary-only behavior.  Normal workers always use the versioned pipeline.
-    if (
-        PhoneSummaryProvider.summarize is not _ORIGINAL_SUMMARIZE
-        or _build_provider is not _ORIGINAL_BUILD_PROVIDER
-    ):
-        return await _legacy_finalize_pending_calls()
     from app.database.session import async_session_factory
 
     counters = {"picked": 0, "done": 0, "failed": 0, "skipped": 0}
     async with async_session_factory() as db:
-        claimed = await claim_pending_calls(
+        claimed = await _claim_pending_calls_with_tokens(
             db,
             batch=settings.phone_verification_batch,
             lease_seconds=settings.phone_verification_processing_lease_seconds,
         )
     counters["picked"] = len(claimed)
-    for call_id in claimed:
-        result = await _finalize_claimed_call(call_id)
+    for call_id, token in claimed:
+        result = await _finalize_claimed_call(call_id, token)
         counters[result] += 1
     return counters
 

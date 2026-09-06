@@ -35,7 +35,7 @@ class VerificationTurn(BaseModel):
     # The persisted CommunicationTurn identity is separate from the display
     # path used to retrieve an audio clip.  Keeping both prevents a file path
     # from ever being mistaken for an evidence identity.
-    turn_id: UUID | None = None
+    turn_id: UUID
     speaker: str
     text: str
     asr_confidence: float | None = Field(default=None, ge=0, le=1)
