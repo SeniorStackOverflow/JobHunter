@@ -21,6 +21,12 @@ from app.models.entities import (
 from app.models.enums import PhoneSummaryState, TurnSpeaker
 from app.phone.evidence import link_session_evidence
 from app.phone.sessions import SessionStore
+from app.phone.verification import (
+    PersistedFact,
+    PostCallVerificationProvider,
+    VerificationContext,
+    VerificationTurn,
+)
 from app.settings.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
@@ -225,6 +231,85 @@ async def build_summary_context(
     )
 
 
+async def build_verification_context(
+    db: AsyncSession, session: CommunicationSession
+) -> VerificationContext:
+    """Build one typed snapshot shared by independent verification passes."""
+    turns = list(
+        (
+            await db.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.session_id == session.id)
+                .order_by(CommunicationTurn.seq)
+            )
+        ).all()
+    )
+    transcript = [
+        VerificationTurn(
+            seq=turn.seq,
+            speaker=turn.speaker.value,
+            text=(turn.spoken_text or turn.text)
+            if turn.speaker is TurnSpeaker.ASSISTANT
+            else turn.text,
+            asr_confidence=turn.asr_confidence,
+            evidence_reference=turn.audio_evidence_path,
+        )
+        for turn in turns
+        if turn.speaker in (TurnSpeaker.ASSISTANT, TurnSpeaker.EMPLOYER)
+    ]
+
+    company, vacancy = await _job_company_vacancy(db, session)
+    application_status: str | None = None
+    if session.application_id is not None:
+        application = await db.get(Application, session.application_id)
+        if application is not None:
+            application_status = application.status.value
+
+    confirmed_facts: list[PersistedFact] = []
+    if session.profile_id is not None:
+        profile = await db.get(UserProfile, session.profile_id)
+        for raw in profile.confirmed_facts if profile is not None else []:
+            field = raw.get("field")
+            state = raw.get("state", "confirmed")
+            if field not in {
+                "interview_date",
+                "interview_time",
+                "timezone",
+                "format",
+                "address",
+                "meeting_url",
+                "company",
+                "vacancy",
+            }:
+                continue
+            try:
+                confirmed_facts.append(
+                    PersistedFact(
+                        field=field,
+                        raw_expression=str(raw.get("raw_expression", raw.get("value", ""))),
+                        normalized_value=(
+                            str(raw["normalized_value"])
+                            if raw.get("normalized_value") is not None
+                            else None
+                        ),
+                        state=state,
+                    )
+                )
+            except (TypeError, ValueError, ValidationError):
+                continue
+
+    return VerificationContext(
+        call_id=str(session.id),
+        call_started_at=session.started_at,
+        timezone="Europe/Chisinau",
+        transcript=transcript,
+        company=company,
+        vacancy=vacancy,
+        application_status=application_status,
+        confirmed_facts=confirmed_facts,
+    )
+
+
 async def _job_company_vacancy(
     db: AsyncSession, session: CommunicationSession
 ) -> tuple[str | None, str | None]:
@@ -244,6 +329,23 @@ def _build_provider(settings: Settings) -> PhoneSummaryProvider:
         model=settings.effective_summary_model,
         prefer=settings.phone_summary_llm_prefer,
         timeout_seconds=settings.phone_summary_llm_timeout_seconds,
+    )
+
+
+def _build_verification_provider(settings: Settings) -> PostCallVerificationProvider:
+    """Construct the independent pass provider from typed application settings."""
+    api_key = settings.phone_summary_llm_api_key or settings.llmrouter_api_key
+    return PostCallVerificationProvider(
+        base_url=settings.phone_summary_llm_base_url,
+        api_key=api_key.get_secret_value() if api_key is not None else "",
+        model=settings.effective_summary_model,
+        extractor_model=settings.effective_phone_verification_extractor_model,
+        verifier_model=settings.effective_phone_verification_verifier_model,
+        arbiter_model=settings.effective_phone_verification_arbiter_model,
+        sms_model=settings.effective_phone_verification_sms_model,
+        prefer=settings.phone_summary_llm_prefer,
+        timeout_seconds=settings.phone_verification_llm_timeout_seconds,
+        max_attempts=settings.phone_verification_max_attempts,
     )
 
 

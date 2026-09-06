@@ -117,6 +117,33 @@ def test_summary_model_falls_back_to_openai_model() -> None:
     assert s2.effective_summary_model == "qwen"
 
 
+def test_phone_verification_defaults_and_model_fallbacks() -> None:
+    s = Settings(_env_file=None, openai_model="gpt-x")
+    assert s.phone_verification_pipeline_version == "phone-2b-v1"
+    assert s.phone_verification_llm_timeout_seconds == 60.0
+    assert s.phone_verification_max_attempts == 3
+    assert s.phone_verification_asr_floor == 0.70
+    assert s.phone_verification_processing_lease_seconds == 300
+    assert s.phone_verification_batch == 10
+    assert s.effective_phone_verification_extractor_model == "gpt-x"
+    assert s.effective_phone_verification_verifier_model == "gpt-x"
+    assert s.effective_phone_verification_arbiter_model == "gpt-x"
+    assert s.effective_phone_verification_sms_model == "gpt-x"
+
+
+def test_production_enabled_verification_requires_effective_models() -> None:
+    base = _prod_base() | {
+        "phone_summary_llm_enabled": True,
+        "phone_summary_llm_api_key": "router-key",
+        "phone_summary_llm_model": "summary-model",
+        "phonegate_auth_token": "phonegate-token",
+        "phonegate_url": "https://phonegate.example.com",
+    }
+    Settings(**base)
+    with pytest.raises(ValueError, match="explicit model"):
+        Settings(**(base | {"phone_summary_llm_model": "", "openai_model": ""}))
+
+
 def _production_settings(**overrides: object) -> Settings:
     """Build a production Settings with all required fields."""
     base = dict(

@@ -81,6 +81,16 @@ class Settings(BaseSettings):
     phone_summary_llm_timeout_seconds: float = Field(default=60.0, ge=10.0, le=300.0)
     phone_summary_max_attempts: int = Field(default=3, ge=1, le=10)
     phone_summary_batch: int = Field(default=10, ge=1, le=100)
+    phone_verification_pipeline_version: str = "phone-2b-v1"
+    phone_verification_extractor_model: str = ""
+    phone_verification_verifier_model: str = ""
+    phone_verification_arbiter_model: str = ""
+    phone_verification_sms_model: str = ""
+    phone_verification_llm_timeout_seconds: float = Field(default=60.0, ge=10.0, le=300.0)
+    phone_verification_max_attempts: int = Field(default=3, ge=1, le=10)
+    phone_verification_asr_floor: float = Field(default=0.70, ge=0.0, le=1.0)
+    phone_verification_processing_lease_seconds: int = Field(default=300, ge=1, le=86_400)
+    phone_verification_batch: int = Field(default=10, ge=1, le=100)
 
     telegram_enabled: bool = False
     telegram_bot_token: SecretStr | None = None
@@ -149,6 +159,22 @@ class Settings(BaseSettings):
     def effective_summary_model(self) -> str:
         return self.phone_summary_llm_model.strip() or (self.openai_model or "").strip()
 
+    @property
+    def effective_phone_verification_extractor_model(self) -> str:
+        return self.phone_verification_extractor_model.strip() or self.effective_summary_model
+
+    @property
+    def effective_phone_verification_verifier_model(self) -> str:
+        return self.phone_verification_verifier_model.strip() or self.effective_summary_model
+
+    @property
+    def effective_phone_verification_arbiter_model(self) -> str:
+        return self.phone_verification_arbiter_model.strip() or self.effective_summary_model
+
+    @property
+    def effective_phone_verification_sms_model(self) -> str:
+        return self.phone_verification_sms_model.strip() or self.effective_summary_model
+
     @model_validator(mode="after")
     def validate_secure_production(self) -> Settings:
         if self.environment != "production":
@@ -214,12 +240,9 @@ class Settings(BaseSettings):
                     "PHONEGATE_URL must be a routable address (not loopback) when "
                     "PHONE_AGENT_ENABLED is true in production"
                 )
-        if self.telegram_enabled and (
-            self.telegram_bot_token is None or not self.telegram_chat_id
-        ):
+        if self.telegram_enabled and (self.telegram_bot_token is None or not self.telegram_chat_id):
             raise ValueError(
-                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required "
-                "when TELEGRAM_ENABLED is true"
+                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required when TELEGRAM_ENABLED is true"
             )
         if (
             self.phone_summary_llm_enabled
@@ -228,6 +251,20 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "a summary LLM API key is required when PHONE_SUMMARY_LLM_ENABLED is true"
+            )
+        if self.phone_summary_llm_enabled and any(
+            not model
+            for model in (
+                self.effective_summary_model,
+                self.effective_phone_verification_extractor_model,
+                self.effective_phone_verification_verifier_model,
+                self.effective_phone_verification_arbiter_model,
+                self.effective_phone_verification_sms_model,
+            )
+        ):
+            raise ValueError(
+                "an effective summary and phone verification model is required when "
+                "PHONE_SUMMARY_LLM_ENABLED is true"
             )
         return self
 
