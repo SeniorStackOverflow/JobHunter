@@ -38,9 +38,7 @@ def test_is_important_true(text):
     assert is_important_utterance(text, min_chars=60) is True
 
 
-@pytest.mark.parametrize(
-    "text", ["да", "хорошо, спасибо", "алло вы меня слышите"]
-)
+@pytest.mark.parametrize("text", ["да", "хорошо, спасибо", "алло вы меня слышите"])
 def test_is_important_false(text):
     assert is_important_utterance(text, min_chars=60) is False
 
@@ -54,6 +52,18 @@ class _FakeClient:
         if self.exc:
             raise self.exc
         return self.audio
+
+
+@pytest.mark.asyncio
+async def test_capturer_swallows_unexpected_capture_error(tmp_path, monkeypatch) -> None:
+    settings = get_settings().model_copy(update={"phone_evidence_dir": tmp_path})
+    cap = EvidenceCapturer(client=_FakeClient(), settings=settings, session_id=uuid4())
+
+    async def _boom(transcript_id: int) -> bool:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(cap, "_capture_one", _boom)
+    await cap.maybe_capture([_entry(1, "важная реплика")])
 
 
 def _entry(i, text, speaker="rx"):
@@ -86,9 +96,7 @@ async def test_capturer_respects_per_call_cap(tmp_path):
         update={"phone_evidence_dir": tmp_path, "phone_evidence_max_clips_per_call": 2}
     )
     cap = EvidenceCapturer(client=_FakeClient(), settings=settings, session_id=uuid4())
-    await cap.maybe_capture(
-        [_entry(i, f"важная реплика номер {i}") for i in (1, 2, 3, 4)]
-    )
+    await cap.maybe_capture([_entry(i, f"важная реплика номер {i}") for i in (1, 2, 3, 4)])
     assert len(list(tmp_path.rglob("*.wav"))) == 2
 
 
@@ -276,6 +284,7 @@ async def prune_env(
         monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
         monkeypatch.setattr("app.database.async_session_factory", sqlite_session_factory)
         import app.phone.evidence as evidence_module
+
         monkeypatch.setattr(evidence_module, "async_session_factory", sqlite_session_factory)
         monkeypatch.setattr("app.phone.evidence.get_settings", lambda: settings)
         return env

@@ -20,6 +20,7 @@ from app.models.enums import (
     CommunicationDirection,
     CommunicationOutcome,
     PhoneComponentStatus,
+    PhoneSummaryState,
     TurnSpeaker,
 )
 from tests.fixtures.fake_redis import FakeAsyncRedis
@@ -171,6 +172,90 @@ async def test_sessions_list_and_detail(client, sqlite_session_factory) -> None:
 
     detail = (await client.get(f"/api/v1/phone/sessions/{call_id}")).json()
     assert detail["turns"][0]["text"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_sessions_filters_and_returns_summary_and_evidence_metadata(
+    client, sqlite_session_factory
+) -> None:
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="filters", is_default=True)
+        session.add(profile)
+        await session.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            remote_raw="+37360111222",
+            phonegate_event_id_start=1,
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+            outcome=CommunicationOutcome.COMPLETED,
+            needs_review=True,
+            auto_answered=True,
+            script_stage="greeting_completed",
+            summary={"summary_text": "Итог звонка"},
+            summary_state=PhoneSummaryState.DONE,
+        )
+        sms = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.SMS,
+            transport="sms",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360000000",
+            remote_raw="+37360000000",
+            phonegate_event_id_start=2,
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+            outcome=CommunicationOutcome.COMPLETED,
+        )
+        session.add_all([call, sms])
+        await session.flush()
+        session.add(
+            CommunicationTurn(
+                session_id=call.id,
+                phonegate_transcript_id=7,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="важная реплика",
+                audio_evidence_path=f"{call.id}/7.wav",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+        call_id = call.id
+
+    response = await client.get(
+        "/api/v1/phone/sessions",
+        params={"summary_state": "done", "needs_review": "true", "outcome": "completed"},
+    )
+    assert response.status_code == 200
+    rows = response.json()["sessions"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["summary_state"] == "done"
+    assert row["summary"]["summary_text"] == "Итог звонка"
+    assert row["script_stage"] == "greeting_completed"
+    assert row["auto_answered"] is True
+
+    detail = (await client.get(f"/api/v1/phone/sessions/{call_id}")).json()
+    assert detail["summary_state"] == "done"
+    assert detail["summary"]["summary_text"] == "Итог звонка"
+    assert detail["turns"][0]["audio_evidence_url"] == (f"/admin/phone/evidence/{call_id}/7.wav")
+    assert "audio_evidence_path" not in detail["turns"][0]
+
+
+@pytest.mark.asyncio
+async def test_sessions_filters_reject_invalid_enum_and_limit(client) -> None:
+    assert (
+        await client.get("/api/v1/phone/sessions", params={"summary_state": "bogus"})
+    ).status_code == 422
+    assert (
+        await client.get("/api/v1/phone/sessions", params={"outcome": "bogus"})
+    ).status_code == 422
+    assert (await client.get("/api/v1/phone/sessions", params={"limit": 0})).status_code == 422
 
 
 @pytest.mark.asyncio

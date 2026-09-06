@@ -143,18 +143,27 @@ class EvidenceCapturer:
         self._captured = 0
 
     async def maybe_capture(self, rx_entries: list[TranscriptEntry]) -> None:
-        cap = self._s.phone_evidence_max_clips_per_call
-        if cap <= 0:
-            return
-        for entry in rx_entries:
-            if self._captured >= cap:
+        try:
+            cap = self._s.phone_evidence_max_clips_per_call
+            if cap <= 0:
                 return
-            if entry.speaker != "rx":
-                continue
-            if not is_important_utterance(entry.text, min_chars=self._s.phone_evidence_min_chars):
-                continue
-            if await self._capture_one(entry.id):
-                self._captured += 1
+            for entry in rx_entries:
+                if self._captured >= cap:
+                    return
+                if entry.speaker != "rx":
+                    continue
+                if not is_important_utterance(
+                    entry.text, min_chars=self._s.phone_evidence_min_chars
+                ):
+                    continue
+                if await self._capture_one(entry.id):
+                    self._captured += 1
+        except Exception as exc:
+            logger.warning(
+                "phone_evidence_capture_failed",
+                error=type(exc).__name__,
+                session_id=str(self._session_id),
+            )
 
     async def _capture_one(self, transcript_id: int) -> bool:
         try:

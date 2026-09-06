@@ -2,8 +2,10 @@ import json
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from app.phone.summary import (
+    CallSummary,
     CallSummaryContext,
     PhoneSummaryProvider,
     PhoneSummaryUnavailable,
@@ -24,12 +26,26 @@ _CTX = CallSummaryContext(
 def _ok_response(payload: dict) -> httpx.Response:
     return httpx.Response(
         200,
-        json={
-            "choices": [
-                {"finish_reason": "stop", "message": {"content": json.dumps(payload)}}
-            ]
-        },
+        json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(payload)}}]},
     )
+
+
+def test_call_summary_forbids_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        CallSummary.model_validate({"summary_text": "Итог", "unexpected": True})
+
+
+def test_summary_body_includes_confirmed_profile_facts() -> None:
+    provider = PhoneSummaryProvider(base_url="http://r", api_key="k", model="m")
+    body = provider._body(
+        CallSummaryContext(
+            transcript=[("employer", "Звоню по вакансии")],
+            confirmed_facts={"confirmed_facts": [{"field": "name", "value": "Андрей"}]},
+        )
+    )
+    content = body["messages"][1]["content"]
+    assert "Подтверждённые данные кандидата" in content
+    assert "Андрей" in content
 
 
 @pytest.mark.asyncio
@@ -92,9 +108,7 @@ async def test_summarize_maps_5xx_and_timeout():
         base_url="http://r",
         api_key="k",
         model="m",
-        client=httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda r: httpx.Response(503))
-        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503))),
     )
     with pytest.raises(PhoneSummaryUnavailable):
         await p.summarize(_CTX)
@@ -111,11 +125,7 @@ async def test_summarize_strips_markdown_fence():
             transport=httpx.MockTransport(
                 lambda r: httpx.Response(
                     200,
-                    json={
-                        "choices": [
-                            {"finish_reason": "stop", "message": {"content": fenced}}
-                        ]
-                    },
+                    json={"choices": [{"finish_reason": "stop", "message": {"content": fenced}}]},
                 )
             )
         ),

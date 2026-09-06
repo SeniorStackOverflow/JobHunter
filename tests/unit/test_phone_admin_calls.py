@@ -291,6 +291,26 @@ async def test_evidence_stream_rejects_path_traversal(
 
 
 @pytest.mark.asyncio
+async def test_evidence_stream_404_when_file_deleted_after_check(
+    admin_client: httpx.AsyncClient,
+    seeded_calls: SeededCalls,
+    tmp_evidence: _TmpEvidence,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_evidence.write(seeded_calls.summarized_id, tid=7, data=b"RIFFxx")
+
+    from pathlib import Path as _Path
+
+    def _boom(self: _Path) -> bytes:
+        raise FileNotFoundError(self)
+
+    # Simulate prune_phone_evidence() unlinking the clip between is_file() and read.
+    monkeypatch.setattr(_Path, "read_bytes", _boom)
+    resp = await admin_client.get(f"/admin/phone/evidence/{seeded_calls.summarized_id}/7.wav")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_evidence_stream_requires_auth(
     unauth_client: httpx.AsyncClient, seeded_calls: SeededCalls, tmp_evidence: _TmpEvidence
 ) -> None:

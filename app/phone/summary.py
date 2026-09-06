@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Literal
 
 import httpx
 import structlog
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +36,8 @@ _SYSTEM = (
 
 
 class CallSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     summary_text: str
     mentioned_vacancy: str = ""
     proposed_datetime_text: str = ""
@@ -47,11 +50,13 @@ class CallSummary(BaseModel):
 
 
 class CallSummaryContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     transcript: list[tuple[str, str]]
     company: str | None = None
     vacancy: str | None = None
     application_status: str | None = None
-    confirmed_facts: dict[str, Any] = {}
+    confirmed_facts: dict[str, Any] = Field(default_factory=dict)
 
 
 class PhoneSummaryUnavailable(RuntimeError):
@@ -90,6 +95,11 @@ class PhoneSummaryProvider:
         self._prefer = prefer
         self._timeout = timeout_seconds
         self._client = client
+        self._last_latency_ms: int | None = None
+
+    @property
+    def last_latency_ms(self) -> int | None:
+        return self._last_latency_ms
 
     def _body(self, ctx: CallSummaryContext) -> dict[str, Any]:
         header = []
@@ -100,7 +110,18 @@ class PhoneSummaryProvider:
         if ctx.application_status:
             header.append(f"Статус отклика: {ctx.application_status}")
         lines = [f"{who}: {text}" for who, text in ctx.transcript]
-        user = "\n".join([*header, "", "Транскрипт:", *lines])
+        confirmed = json.dumps(ctx.confirmed_facts, ensure_ascii=False, sort_keys=True)
+        user = "\n".join(
+            [
+                *header,
+                "",
+                "Подтверждённые данные кандидата:",
+                confirmed,
+                "",
+                "Транскрипт:",
+                *lines,
+            ]
+        )
         return {
             "model": self._model,
             "messages": [
@@ -130,12 +151,18 @@ class PhoneSummaryProvider:
         self, client: httpx.AsyncClient, ctx: CallSummaryContext
     ) -> CallSummary:
         headers = {"Authorization": f"Bearer {self._api_key}", "X-LLMRouter-Prefer": self._prefer}
+        started = time.perf_counter()
         try:
-            response = await client.post(
-                f"{self._base_url}/v1/chat/completions", headers=headers, json=self._body(ctx)
-            )
-        except httpx.RequestError as exc:
-            raise PhoneSummaryUnavailable(f"transport:{type(exc).__name__}") from exc
+            try:
+                response = await client.post(
+                    f"{self._base_url}/v1/chat/completions",
+                    headers=headers,
+                    json=self._body(ctx),
+                )
+            except httpx.RequestError as exc:
+                raise PhoneSummaryUnavailable(f"transport:{type(exc).__name__}") from exc
+        finally:
+            self._last_latency_ms = round((time.perf_counter() - started) * 1000)
         if response.status_code >= 400:
             raise PhoneSummaryUnavailable(f"http_{response.status_code}")
         try:
@@ -302,6 +329,7 @@ async def finalize_pending_calls() -> dict[str, int]:
                     "provider": "llmrouter",
                     "model": settings.effective_summary_model,
                     "attempts": attempts,
+                    "latency_ms": provider.last_latency_ms,
                 },
                 "telegram": {"state": "pending"},
             }

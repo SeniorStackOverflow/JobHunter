@@ -224,7 +224,14 @@ class CallOrchestrator:
                 rx_entries = [e for e in page.entries if e.speaker == "rx"]
                 if rx_entries:
                     last_activity = now
-                    await self._evidence.maybe_capture(rx_entries)
+                    try:
+                        await self._evidence.maybe_capture(rx_entries)
+                    except Exception as exc:
+                        logger.warning(
+                            "phone_evidence_capture_failed",
+                            error=type(exc).__name__,
+                            session_id=str(session_id),
+                        )
 
             if now - last_activity >= s.phone_listen_silence_timeout_seconds:
                 break

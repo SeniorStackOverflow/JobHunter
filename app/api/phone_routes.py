@@ -5,7 +5,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from redis.asyncio import Redis as AsyncRedis
 from redis.exceptions import RedisError
 from sqlalchemy import desc, func, select
@@ -20,7 +20,12 @@ from app.models.entities import (
     PhoneChannelHealth,
     PhoneDeviceSnapshot,
 )
-from app.models.enums import PhoneComponentStatus
+from app.models.enums import (
+    CommunicationChannel,
+    CommunicationOutcome,
+    PhoneComponentStatus,
+    PhoneSummaryState,
+)
 from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 from app.phone.numbers import mask_phone
 from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY
@@ -153,21 +158,33 @@ def _session_row(call: CommunicationSession, turn_count: int) -> dict[str, Any]:
         "outcome": call.outcome.value if call.outcome else None,
         "needs_review": call.needs_review,
         "turn_count": turn_count,
+        "summary": call.summary,
+        "summary_state": call.summary_state.value,
+        "script_stage": call.script_stage,
+        "auto_answered": call.auto_answered,
     }
 
 
 @router.get("/sessions", dependencies=[Depends(require_api_actor)])
 async def list_sessions(
-    limit: int = 50, session: AsyncSession = Depends(get_session)
+    limit: int = Query(50, ge=1, le=200),
+    summary_state: PhoneSummaryState | None = None,
+    needs_review: bool | None = None,
+    outcome: CommunicationOutcome | None = None,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    limit = max(1, min(limit, 200))
+    stmt = select(CommunicationSession).where(
+        CommunicationSession.channel == CommunicationChannel.CALL
+    )
+    if summary_state is not None:
+        stmt = stmt.where(CommunicationSession.summary_state == summary_state)
+    if needs_review is not None:
+        stmt = stmt.where(CommunicationSession.needs_review.is_(needs_review))
+    if outcome is not None:
+        stmt = stmt.where(CommunicationSession.outcome == outcome)
     calls = list(
         (
-            await session.scalars(
-                select(CommunicationSession)
-                .order_by(desc(CommunicationSession.started_at))
-                .limit(limit)
-            )
+            await session.scalars(stmt.order_by(desc(CommunicationSession.started_at)).limit(limit))
         ).all()
     )
     counts: dict[UUID, int] = {
@@ -188,7 +205,7 @@ async def session_detail(
     session_id: UUID, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
     call = await session.get(CommunicationSession, session_id)
-    if call is None:
+    if call is None or call.channel is not CommunicationChannel.CALL:
         raise HTTPException(status_code=404, detail="session not found")
     turns = list(
         (
@@ -211,6 +228,11 @@ async def session_detail(
                 "asr_backend": t.asr_backend,
                 "asr_confidence": t.asr_confidence,
                 "occurred_at": t.occurred_at.isoformat(),
+                "audio_evidence_url": (
+                    f"/admin/phone/evidence/{call.id}/{t.phonegate_transcript_id}.wav"
+                    if t.audio_evidence_path and t.phonegate_transcript_id is not None
+                    else None
+                ),
             }
             for t in turns
         ],

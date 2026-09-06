@@ -423,8 +423,15 @@ async def stream_evidence_clip(
     if root not in target.parents or not target.is_file():
         raise HTTPException(status_code=404, detail="запись недоступна")
 
+    try:
+        payload = target.read_bytes()
+    except OSError as exc:
+        # TOCTOU: prune_phone_evidence() (same ``phone`` queue) may unlink the
+        # file between the is_file() check and this read — 404, never a 500.
+        raise HTTPException(status_code=404, detail="запись недоступна") from exc
+
     return Response(
-        target.read_bytes(),
+        payload,
         media_type="audio/wav",
         headers={"Cache-Control": "private, max-age=60"},
     )
