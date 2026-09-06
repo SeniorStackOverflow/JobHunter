@@ -138,6 +138,7 @@ class TurnDeliveryStatus(StrEnum):
 class PhoneSummaryState(StrEnum):
     NOT_APPLICABLE = "not_applicable"
     PENDING = "pending"
+    PROCESSING = "processing"
     DONE = "done"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -148,6 +149,19 @@ class CallFactState(StrEnum):
     CONFIRMED = "confirmed"
     CONFLICT = "conflict"
     UNKNOWN = "unknown"
+
+
+class PhoneVerificationStatus(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    HIGH_CONFIDENCE = "high_confidence"
+    NEEDS_REVIEW = "needs_review"
+
+
+class CallFactConfirmationSource(StrEnum):
+    SMS = "sms"
+    MANUAL = "manual"
 
 
 class InterviewFormat(StrEnum):

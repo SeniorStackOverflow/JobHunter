@@ -17,6 +17,7 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     PhoneComponentStatus,
+    PhoneVerificationStatus,
     TurnSpeaker,
 )
 
@@ -159,3 +160,44 @@ async def test_communication_turn_has_audio_evidence_path(db: AsyncSession) -> N
     db.add(turn)
     await db.flush()
     assert turn.audio_evidence_path is None
+
+
+async def test_call_verification_defaults(db: AsyncSession) -> None:
+    profile = UserProfile(name="Test Profile", is_default=True)
+    db.add(profile)
+    await db.flush()
+
+    call = CommunicationSession(
+        profile_id=profile.id,
+        channel=CommunicationChannel.CALL,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        phonegate_event_id_start=1,
+        started_at=datetime.now(UTC),
+    )
+    db.add(call)
+    await db.flush()
+    assert call.verification_status is PhoneVerificationStatus.NOT_APPLICABLE
+    assert call.verification_revision == 0
+
+
+async def test_sms_session_accepts_string_transport_id(db: AsyncSession) -> None:
+    profile = UserProfile(name="Test Profile", is_default=True)
+    db.add(profile)
+    await db.flush()
+
+    sms = CommunicationSession(
+        profile_id=profile.id,
+        channel=CommunicationChannel.SMS,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        remote_address="+37360000000",
+        remote_raw="+37360000000",
+        phonegate_event_id_start=None,
+        transport_external_id="incoming:1720000000000:+37360000000",
+        started_at=datetime.now(UTC),
+        ended_at=datetime.now(UTC),
+    )
+    db.add(sms)
+    await db.flush()
+    assert sms.phonegate_event_id_start is None

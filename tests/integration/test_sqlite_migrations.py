@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,10 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
 from sqlalchemy.engine import create_engine
+from sqlalchemy.orm import Session
 
+from app.models.entities import CommunicationSession, UserProfile
+from app.models.enums import CommunicationChannel, CommunicationDirection
 from app.settings import get_settings
 
 
@@ -27,7 +31,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("e171bb9f241e",)
+    assert revision == ("f2a3b4c5d6e7",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -57,6 +61,38 @@ def test_fresh_sqlite_database_migrations_round_trip(
         assert {"summary", "summary_state"} <= {
             column["name"] for column in database.get_columns("communication_sessions")
         }
+        session_columns = {
+            column["name"]: column for column in database.get_columns("communication_sessions")
+        }
+        assert session_columns["phonegate_event_id_start"]["nullable"] is True
+        assert session_columns["transport_external_id"]["nullable"] is True
+        assert session_columns["related_session_id"]["nullable"] is True
+        assert session_columns["processing_started_at"]["nullable"] is True
+        assert session_columns["verification_revision"]["nullable"] is False
+        assert session_columns["verification_status"]["nullable"] is False
+        assert {
+            "verification_status",
+            "verification_revision",
+            "processing_started_at",
+            "transport_external_id",
+            "related_session_id",
+        } <= {column["name"] for column in database.get_columns("communication_sessions")}
+        assert {"confirmation_source", "confirmed_at"} <= {
+            column["name"] for column in database.get_columns("call_facts")
+        }
+        assert "ix_communication_sessions_verification_status" in {
+            index["name"] for index in database.get_indexes("communication_sessions")
+        }
+        assert "ix_communication_sessions_related_session_id" in {
+            index["name"] for index in database.get_indexes("communication_sessions")
+        }
+        assert "uq_communication_sessions_transport_channel_external_id" in {
+            constraint["name"]
+            for constraint in database.get_unique_constraints("communication_sessions")
+        }
+        assert "uq_call_facts_session_field" in {
+            constraint["name"] for constraint in database.get_unique_constraints("call_facts")
+        }
         assert {
             "review_feedback_events",
             "review_learning_settings",
@@ -70,6 +106,42 @@ def test_fresh_sqlite_database_migrations_round_trip(
     finally:
         engine.dispose()
 
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with Session(engine) as session:
+            profile = UserProfile(name="Migration profile", is_default=True)
+            session.add(profile)
+            session.flush()
+            started_at = datetime.now(UTC)
+            session.add(
+                CommunicationSession(
+                    profile_id=profile.id,
+                    channel=CommunicationChannel.CALL,
+                    transport="phonegate",
+                    direction=CommunicationDirection.INBOUND,
+                    phonegate_event_id_start=1,
+                    started_at=started_at,
+                )
+            )
+            session.add(
+                CommunicationSession(
+                    profile_id=profile.id,
+                    channel=CommunicationChannel.SMS,
+                    transport="phonegate",
+                    direction=CommunicationDirection.INBOUND,
+                    remote_address="+37360000000",
+                    remote_raw="+37360000000",
+                    phonegate_event_id_start=None,
+                    transport_external_id="incoming:1720000000000:+37360000000",
+                    started_at=started_at,
+                    ended_at=started_at,
+                )
+            )
+            session.commit()
+            assert session.query(CommunicationSession).count() == 2
+    finally:
+        engine.dispose()
+
     get_settings.cache_clear()
     try:
         command.downgrade(Config("alembic.ini"), "base")
@@ -79,4 +151,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("e171bb9f241e",)
+    assert revision == ("f2a3b4c5d6e7",)

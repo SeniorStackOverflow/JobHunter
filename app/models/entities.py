@@ -26,6 +26,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
 from app.models.enums import (
     ApplicationStatus,
+    CallFactConfirmationSource,
     CallFactState,
     CommunicationChannel,
     CommunicationDirection,
@@ -38,6 +39,7 @@ from app.models.enums import (
     MatchDecision,
     PhoneComponentStatus,
     PhoneSummaryState,
+    PhoneVerificationStatus,
     PolicyDecision,
     ReviewOutcome,
     ReviewReason,
@@ -618,6 +620,13 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
         Index("ix_communication_sessions_profile_started", "profile_id", "started_at"),
         Index("ix_communication_sessions_remote_started", "remote_address", "started_at"),
         Index("ix_communication_sessions_ended_at", "ended_at"),
+        Index("ix_communication_sessions_verification_status", "verification_status"),
+        UniqueConstraint(
+            "transport",
+            "channel",
+            "transport_external_id",
+            name="uq_communication_sessions_transport_channel_external_id",
+        ),
     )
 
     profile_id: Mapped[UUID] = mapped_column(
@@ -644,7 +653,11 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
     )
     remote_address: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     remote_raw: Mapped[str] = mapped_column(String(64), default="", nullable=False)
-    phonegate_event_id_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    phonegate_event_id_start: Mapped[int | None] = mapped_column(Integer)
+    transport_external_id: Mapped[str | None] = mapped_column(String(96))
+    related_session_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("communication_sessions.id", ondelete="SET NULL"), index=True
+    )
     phonegate_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ringing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -660,6 +673,13 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
         default=PhoneSummaryState.NOT_APPLICABLE,
         nullable=False,
     )
+    verification_status: Mapped[PhoneVerificationStatus] = mapped_column(
+        enum_column(PhoneVerificationStatus),
+        default=PhoneVerificationStatus.NOT_APPLICABLE,
+        nullable=False,
+    )
+    verification_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rx_frame_stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -706,6 +726,7 @@ class CommunicationTurn(UUIDPrimaryKeyMixin, Base):
 
 class CallFact(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "call_facts"
+    __table_args__ = (UniqueConstraint("session_id", "field", name="uq_call_facts_session_field"),)
 
     session_id: Mapped[UUID] = mapped_column(
         ForeignKey("communication_sessions.id", ondelete="CASCADE"), index=True
@@ -722,6 +743,10 @@ class CallFact(UUIDPrimaryKeyMixin, Base):
     confirmed_by_turn_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("communication_turns.id", ondelete="SET NULL")
     )
+    confirmation_source: Mapped[CallFactConfirmationSource | None] = mapped_column(
+        enum_column(CallFactConfirmationSource)
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
