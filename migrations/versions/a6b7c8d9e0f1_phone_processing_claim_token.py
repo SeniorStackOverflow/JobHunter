@@ -23,12 +23,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    sms_count = int(
-        bind.execute(
-            sa.text("SELECT COUNT(*) FROM communication_sessions WHERE channel = 'sms'")
-        ).scalar_one()
-    )
-    if sms_count:
-        raise RuntimeError("Cannot downgrade phone processing schema while SMS sessions exist")
     op.drop_column("communication_sessions", "claim_token")

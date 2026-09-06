@@ -266,6 +266,29 @@ async def test_provider_retries_rate_limit_then_returns_result() -> None:
     assert metadata.attempts == 2
 
 
+@pytest.mark.asyncio
+async def test_provider_uses_bounded_exponential_backoff_for_transient_failures() -> None:
+    responses = iter(
+        [httpx.Response(503), httpx.Response(429), _response({"facts": [], "review_reasons": []})]
+    )
+    delays: list[float] = []
+
+    async def sleeper(delay: float) -> None:
+        delays.append(delay)
+
+    provider = PostCallVerificationProvider(
+        base_url="http://router",
+        api_key="secret-token",
+        model="model",
+        max_attempts=3,
+        sleeper=sleeper,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _: next(responses))),
+    )
+    _, metadata = await provider.verify(_context())
+    assert metadata.attempts == 3
+    assert delays == [0.25, 0.5]
+
+
 def test_model_metadata_is_immutable() -> None:
     metadata = ModelCallMeta(provider="llmrouter", model="model", latency_ms=1, attempts=1)
     with pytest.raises((AttributeError, TypeError)):

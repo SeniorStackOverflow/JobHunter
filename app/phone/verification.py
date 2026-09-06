@@ -9,9 +9,10 @@ allowed to see another model's output.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, TypeVar
@@ -206,6 +207,7 @@ class PostCallVerificationProvider:
         timeout_seconds: float = 60.0,
         max_attempts: int = 3,
         client: httpx.AsyncClient | None = None,
+        sleeper: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
@@ -227,6 +229,7 @@ class PostCallVerificationProvider:
         self._timeout = timeout_seconds
         self._max_attempts = max_attempts
         self._client = client
+        self._sleeper = sleeper or asyncio.sleep
 
     @property
     def models(self) -> dict[str, str]:
@@ -314,6 +317,7 @@ class PostCallVerificationProvider:
                 if request_reason is not None:
                     terminal_reason = request_reason
                     if attempts < self._max_attempts:
+                        await self._sleeper(min(4.0, 0.25 * (2 ** (attempts - 1))))
                         continue
                     break
 
@@ -325,6 +329,7 @@ class PostCallVerificationProvider:
                     if attempts < self._max_attempts and (
                         response.status_code == 429 or response.status_code >= 500
                     ):
+                        await self._sleeper(min(4.0, 0.25 * (2 ** (attempts - 1))))
                         continue
                     break
 

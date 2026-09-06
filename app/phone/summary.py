@@ -11,7 +11,7 @@ from uuid import UUID
 import httpx
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import case, exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import utcnow
@@ -392,6 +392,12 @@ async def _claim_pending_calls_with_tokens(
         CommunicationSession.auto_answered.is_(True),
         CommunicationSession.ended_at.is_not(None),
     )
+    confirmed_fact = exists(
+        select(CallFact.id).where(
+            CallFact.session_id == CommunicationSession.id,
+            CallFact.confirmation_source.is_not(None),
+        )
+    )
     claimed: list[tuple[UUID, str]] = []
     async with db.begin():
         dialect = db.bind.dialect.name if db.bind is not None else ""
@@ -410,7 +416,11 @@ async def _claim_pending_calls_with_tokens(
             for call in rows:
                 token = secrets.token_urlsafe(48)
                 call.summary_state = PhoneSummaryState.PROCESSING
-                call.verification_status = PhoneVerificationStatus.PENDING
+                has_confirmation = await db.scalar(
+                    select(confirmed_fact).where(CommunicationSession.id == call.id)
+                )
+                if not has_confirmation:
+                    call.verification_status = PhoneVerificationStatus.PENDING
                 call.processing_started_at = now
                 call.claim_token = token
                 claimed.append((call.id, token))
@@ -432,7 +442,10 @@ async def _claim_pending_calls_with_tokens(
                     .where(CommunicationSession.id == call_id, *where)
                     .values(
                         summary_state=PhoneSummaryState.PROCESSING,
-                        verification_status=PhoneVerificationStatus.PENDING,
+                        verification_status=case(
+                            (confirmed_fact, CommunicationSession.verification_status),
+                            else_=PhoneVerificationStatus.PENDING,
+                        ),
                         processing_started_at=now,
                         claim_token=token,
                     )
@@ -485,6 +498,12 @@ async def _claim_call(call_id: UUID, *, lease_seconds: int) -> str | None:
         (CommunicationSession.summary_state == PhoneSummaryState.PROCESSING)
         & (CommunicationSession.processing_started_at < stale_before)
     )
+    confirmed_fact = exists(
+        select(CallFact.id).where(
+            CallFact.session_id == CommunicationSession.id,
+            CallFact.confirmation_source.is_not(None),
+        )
+    )
     async with async_session_factory() as db:
         if db.in_transaction():
             await db.commit()
@@ -500,7 +519,10 @@ async def _claim_call(call_id: UUID, *, lease_seconds: int) -> str | None:
                 )
                 .values(
                     summary_state=PhoneSummaryState.PROCESSING,
-                    verification_status=PhoneVerificationStatus.PENDING,
+                    verification_status=case(
+                        (confirmed_fact, CommunicationSession.verification_status),
+                        else_=PhoneVerificationStatus.PENDING,
+                    ),
                     processing_started_at=now,
                     claim_token=token,
                 )

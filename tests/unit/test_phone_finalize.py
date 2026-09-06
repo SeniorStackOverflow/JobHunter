@@ -9,14 +9,18 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import (
+    CallFact,
     CommunicationSession,
     CommunicationTurn,
     UserProfile,
 )
 from app.models.enums import (
+    CallFactConfirmationSource,
+    CallFactState,
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
@@ -30,8 +34,10 @@ from app.phone.summary import (
     finalize_pending_calls,
 )
 from app.phone.verification import (
+    ArbitrationItem,
     ArbitrationResult,
     ExtractionResult,
+    FactCandidate,
     ModelCallMeta,
     VerificationResult,
 )
@@ -305,6 +311,37 @@ async def test_claim_pending_call_uses_processing_lease(
 
 
 @pytest.mark.asyncio
+async def test_direct_finalize_claim_preserves_confirmed_sms_trust(
+    finalize_env: Callable[..., Awaitable[_Env]],
+) -> None:
+    env = await finalize_env(llm_enabled=False)
+    async with env.factory() as db:
+        call = await db.get(CommunicationSession, env.session_id)
+        assert call is not None
+        call.verification_status = PhoneVerificationStatus.CONFIRMED
+        db.add(
+            CallFact(
+                session_id=call.id,
+                field="interview_date",
+                raw_expression="завтра",
+                normalized_value="2026-09-06",
+                state=CallFactState.CONFIRMED,
+                confirmation_source=CallFactConfirmationSource.SMS,
+            )
+        )
+        await db.commit()
+
+    from app.phone.summary import finalize_call
+
+    assert await finalize_call(env.session_id) == "skipped"
+    async with env.factory() as db:
+        call = await db.get(CommunicationSession, env.session_id)
+    assert call is not None
+    assert call.verification_status is PhoneVerificationStatus.CONFIRMED
+    assert call.summary_state is PhoneSummaryState.SKIPPED
+
+
+@pytest.mark.asyncio
 async def test_concurrent_claimers_return_a_call_once(
     finalize_env: Callable[..., Awaitable[_Env]],
 ) -> None:
@@ -352,6 +389,77 @@ async def test_finalize_runs_independent_passes_in_order(
     assert session.summary_state is PhoneSummaryState.DONE
     assert session.verification_status.value == "needs_review"
     assert session.summary["verification"]["pipeline_version"] == "phone-2b-v1"
+
+
+@pytest.mark.asyncio
+async def test_finalize_persists_evidence_backed_critical_fact(
+    finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await finalize_env(llm_enabled=True, with_clip_for_tid=7)
+    async with env.factory() as db:
+        turn = await db.scalar(
+            select(CommunicationTurn).where(
+                CommunicationTurn.session_id == env.session_id,
+                CommunicationTurn.phonegate_transcript_id == 7,
+            )
+        )
+        assert turn is not None
+        turn.text = "Собеседование завтра в 14:00 на ул. Пушкина, 5"
+        await db.commit()
+
+    candidate = FactCandidate(
+        field="interview_date",
+        raw_expression="завтра",
+        normalized_value="2026-09-06",
+        quote="Собеседование завтра в 14:00 на ул. Пушкина, 5",
+        turn_seq=2,
+        confidence=0.98,
+    )
+    meta = ModelCallMeta("llmrouter", "fixture", 1, 1)
+
+    class Provider:
+        async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+            return ExtractionResult(
+                summary_text="интервью",
+                outcome_guess="interview_proposed",
+                facts=[candidate],
+                review_reasons=[],
+            ), meta
+
+        async def verify(self, context: Any) -> tuple[VerificationResult, ModelCallMeta]:
+            return VerificationResult(facts=[candidate], review_reasons=[]), meta
+
+        async def arbitrate(
+            self, context: Any, extracted: Any, verified: Any
+        ) -> tuple[ArbitrationResult, ModelCallMeta]:
+            return ArbitrationResult(
+                decisions=[
+                    ArbitrationItem(
+                        field="interview_date",
+                        accepted_value="2026-09-06",
+                        supporting_quote=candidate.quote,
+                        accepted=True,
+                        reason="совпадает",
+                    )
+                ]
+            ), meta
+
+    monkeypatch.setattr(summary_module, "_build_verification_provider", lambda _: Provider())
+    assert await summary_module.finalize_call(env.session_id) == "done"
+    async with env.factory() as db:
+        fact = await db.scalar(select(CallFact).where(CallFact.session_id == env.session_id))
+        turn = await db.scalar(
+            select(CommunicationTurn).where(
+                CommunicationTurn.session_id == env.session_id,
+                CommunicationTurn.phonegate_transcript_id == 7,
+            )
+        )
+        call = await db.get(CommunicationSession, env.session_id)
+    assert fact is not None and turn is not None and call is not None
+    assert fact.state is CallFactState.CANDIDATE
+    assert fact.source_turn_id == turn.id
+    assert turn.audio_evidence_path == f"{env.session_id}/7.wav"
+    assert call.verification_status.value == "high_confidence"
 
 
 @pytest.mark.asyncio
@@ -448,3 +556,20 @@ async def test_public_finalize_rejects_foreign_fresh_processing_lease(
     monkeypatch.setattr(summary_module, "_build_verification_provider", unexpected_provider)
     assert await summary_module.finalize_call(env.session_id) == "skipped"
     assert called is False
+
+
+def test_postgres_claim_and_finalize_queries_use_row_locks() -> None:
+    claim_sql = str(
+        select(CommunicationSession)
+        .where(CommunicationSession.summary_state == PhoneSummaryState.PENDING)
+        .with_for_update(skip_locked=True)
+        .compile(dialect=postgresql.dialect())
+    )
+    finalize_sql = str(
+        select(CommunicationSession)
+        .where(CommunicationSession.id == UUID("00000000-0000-0000-0000-000000000001"))
+        .with_for_update()
+        .compile(dialect=postgresql.dialect())
+    )
+    assert "FOR UPDATE SKIP LOCKED" in claim_sql
+    assert "FOR UPDATE" in finalize_sql

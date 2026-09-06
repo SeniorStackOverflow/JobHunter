@@ -142,16 +142,21 @@ def test_fresh_sqlite_database_migrations_round_trip(
     finally:
         engine.dispose()
 
-    # Legacy schema cannot represent an SMS session's nullable PhoneGate cursor;
-    # downgrade must reject it before changing any schema or data.
+    # The claim-token migration is independently reversible and must preserve
+    # the SMS row while moving to the preceding verification schema.
     engine = create_engine(f"sqlite:///{database_path}")
     try:
-        with pytest.raises(RuntimeError, match="SMS sessions"):
-            command.downgrade(Config("alembic.ini"), "e171bb9f241e")
-        with Session(engine) as session:
-            assert session.query(CommunicationSession).count() == 2
-            session.query(CommunicationSession).delete()
-            session.commit()
+        command.downgrade(Config("alembic.ini"), "f2a3b4c5d6e7")
+        with closing(sqlite3.connect(database_path)) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM communication_sessions WHERE channel = 'sms'"
+            ).fetchone() == (1,)
+            assert "claim_token" not in {
+                row[1] for row in connection.execute("PRAGMA table_info(communication_sessions)")
+            }
+        with closing(sqlite3.connect(database_path)) as connection:
+            connection.execute("DELETE FROM communication_sessions WHERE channel = 'sms'")
+            connection.commit()
     finally:
         engine.dispose()
 

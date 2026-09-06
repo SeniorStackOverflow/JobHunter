@@ -5,8 +5,10 @@ from datetime import UTC, datetime, timedelta
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.entities import CommunicationSession, UserProfile
+from app.models.entities import CallFact, CommunicationSession, UserProfile
 from app.models.enums import (
+    CallFactConfirmationSource,
+    CallFactState,
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
@@ -92,6 +94,7 @@ async def test_claim_leases_stale_calls_and_excludes_ineligible_sessions(
         state=PhoneSummaryState.PROCESSING,
         processing_started_at=now - timedelta(seconds=301),
     )
+    stale.verification_status = PhoneVerificationStatus.CONFIRMED
     fresh = call(
         state=PhoneSummaryState.PROCESSING,
         processing_started_at=now,
@@ -99,16 +102,29 @@ async def test_claim_leases_stale_calls_and_excludes_ineligible_sessions(
     unanswered = call(state=PhoneSummaryState.PENDING, auto_answered=False)
     sms = call(state=PhoneSummaryState.PENDING, channel=CommunicationChannel.SMS)
     db.add_all([pending, stale, fresh, unanswered, sms])
+    await db.flush()
+    db.add(
+        CallFact(
+            session_id=stale.id,
+            field="interview_date",
+            raw_expression="завтра",
+            normalized_value="2026-09-08",
+            state=CallFactState.CONFIRMED,
+            confirmation_source=CallFactConfirmationSource.SMS,
+        )
+    )
     await db.commit()
 
     claimed = await claim_pending_calls(db, batch=10, lease_seconds=300)
     assert set(claimed) == {pending.id, stale.id}
+    await db.refresh(stale)
     await db.refresh(fresh)
     await db.refresh(unanswered)
     await db.refresh(sms)
     assert fresh.summary_state is PhoneSummaryState.PROCESSING
     assert unanswered.summary_state is PhoneSummaryState.PENDING
     assert sms.summary_state is PhoneSummaryState.PENDING
+    assert stale.verification_status is PhoneVerificationStatus.CONFIRMED
 
 
 async def test_append_turn_is_idempotent(db: AsyncSession) -> None:
