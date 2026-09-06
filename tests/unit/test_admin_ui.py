@@ -8,11 +8,11 @@ from typing import Any
 import httpx
 import pytest
 
+from app.admin.phone_routes import phone_health_context as _phone_health
 from app.admin.routes import (
     _admin_asset_url,
     _application_approval_issue,
     _daily_application_rules,
-    _phone_health,
 )
 from app.main import app
 from app.models.entities import PhoneChannelHealth
