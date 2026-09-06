@@ -25,6 +25,16 @@ _SUMMARY_STATE = sa.Enum(
 )
 
 
+def _communication_sessions_without_summary_check(bind: sa.Connection) -> sa.Table:
+    table = sa.Table("communication_sessions", sa.MetaData(), autoload_with=bind)
+    for constraint in list(table.constraints):
+        if isinstance(constraint, sa.CheckConstraint) and "summary_state" in str(
+            constraint.sqltext
+        ):
+            table.constraints.remove(constraint)
+    return table
+
+
 def upgrade() -> None:
     with op.batch_alter_table("communication_sessions") as batch_op:
         batch_op.add_column(sa.Column("summary", sa.JSON(), nullable=False, server_default="{}"))
@@ -46,6 +56,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     with op.batch_alter_table("communication_turns") as batch_op:
         batch_op.drop_column("audio_evidence_path")
-    with op.batch_alter_table("communication_sessions") as batch_op:
+    with op.batch_alter_table(
+        "communication_sessions",
+        copy_from=_communication_sessions_without_summary_check(op.get_bind()),
+    ) as batch_op:
         batch_op.drop_column("summary_state")
         batch_op.drop_column("summary")

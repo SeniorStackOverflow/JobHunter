@@ -41,6 +41,12 @@ _CONFIRMATION_SOURCE = sa.Enum(
     name="callfactconfirmationsource",
     native_enum=False,
 )
+_SUMMARY_STATE_CHECK_SQL = (
+    "summary_state IN ('not_applicable', 'pending', 'processing', 'done', 'failed', 'skipped')"
+)
+_LEGACY_SUMMARY_STATE_CHECK_SQL = (
+    "summary_state IN ('not_applicable', 'pending', 'done', 'failed', 'skipped')"
+)
 
 
 def _find_duplicate_facts(bind: sa.Connection) -> list[dict[str, object]]:
@@ -78,12 +84,48 @@ def _communication_sessions_without_summary_check(bind: sa.Connection) -> sa.Tab
     return table
 
 
-def upgrade() -> None:
-    bind = op.get_bind()
-    # This check intentionally happens before any schema mutation. Existing facts
-    # are preserved for an operator to resolve instead of selecting a winner.
-    _abort_for_duplicate_facts(bind)
+def _communication_sessions_with_legacy_summary_check(bind: sa.Connection) -> sa.Table:
+    table = _communication_sessions_without_summary_check(bind)
+    table.append_constraint(
+        sa.CheckConstraint(
+            _LEGACY_SUMMARY_STATE_CHECK_SQL,
+            name="ck_communication_sessions_phonesummarystate",
+        )
+    )
+    return table
 
+
+def _find_duplicate_transport_groups(bind: sa.Connection) -> int:
+    return int(
+        bind.execute(
+            sa.text(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT transport, channel, transport_external_id
+                    FROM communication_sessions
+                    WHERE transport_external_id IS NOT NULL
+                    GROUP BY transport, channel, transport_external_id
+                    HAVING COUNT(*) > 1
+                ) AS duplicate_groups
+                """
+            )
+        ).scalar_one()
+    )
+
+
+def _assert_no_duplicate_transport_ids(bind: sa.Connection) -> None:
+    duplicate_groups = _find_duplicate_transport_groups(bind)
+    if duplicate_groups:
+        raise RuntimeError(
+            "Cannot add uq_communication_sessions_transport_channel_external_id: "
+            "duplicate session transport ID groups exist; resolve the rows before "
+            "retrying the migration. Values are redacted from this diagnostic. "
+            f"Duplicate groups: {duplicate_groups}"
+        )
+
+
+def _upgrade_sqlite() -> None:
     with op.batch_alter_table("communication_sessions", recreate="always") as batch_op:
         batch_op.add_column(
             sa.Column(
@@ -130,34 +172,7 @@ def upgrade() -> None:
         batch_op.add_column(sa.Column("confirmation_source", _CONFIRMATION_SOURCE))
         batch_op.add_column(sa.Column("confirmed_at", sa.DateTime(timezone=True)))
 
-    bind = op.get_bind()
-    # transport_external_id did not exist in the parent revision, so all values
-    # are necessarily NULL at this point. Keep this guard next to the constraint
-    # creation to protect future schema variants that may already contain values.
-    duplicate_transport = (
-        bind.execute(
-            sa.text(
-                """
-            SELECT transport, channel, transport_external_id, COUNT(*) AS row_count
-            FROM communication_sessions
-            WHERE transport_external_id IS NOT NULL
-            GROUP BY transport, channel, transport_external_id
-            HAVING COUNT(*) > 1
-            ORDER BY transport, channel, transport_external_id
-            """
-            )
-        )
-        .mappings()
-        .all()
-    )
-    if duplicate_transport:
-        raise RuntimeError(
-            "Cannot add uq_communication_sessions_transport_channel_external_id: "
-            "duplicate session transport IDs exist for (transport, channel, "
-            "transport_external_id); resolve these rows before retrying the migration. "
-            f"Duplicates: {[dict(row) for row in duplicate_transport]}"
-        )
-
+    _assert_no_duplicate_transport_ids(op.get_bind())
     op.create_index(
         "ix_communication_sessions_verification_status",
         "communication_sessions",
@@ -179,36 +194,122 @@ def upgrade() -> None:
         batch_op.create_unique_constraint("uq_call_facts_session_field", ["session_id", "field"])
 
 
-def downgrade() -> None:
+def _upgrade_postgresql() -> None:
+    op.add_column(
+        "communication_sessions",
+        sa.Column(
+            "verification_status",
+            _VERIFICATION_STATUS,
+            nullable=False,
+            server_default="not_applicable",
+        ),
+    )
+    op.add_column(
+        "communication_sessions",
+        sa.Column("verification_revision", sa.Integer(), nullable=False, server_default="0"),
+    )
+    op.add_column(
+        "communication_sessions", sa.Column("processing_started_at", sa.DateTime(timezone=True))
+    )
+    op.add_column(
+        "communication_sessions", sa.Column("transport_external_id", sa.String(length=96))
+    )
+    op.add_column(
+        "communication_sessions",
+        sa.Column(
+            "related_session_id",
+            sa.Uuid(),
+            sa.ForeignKey(
+                "communication_sessions.id",
+                name="fk_communication_sessions_related_session_id_communication_sessions",
+                ondelete="SET NULL",
+            ),
+        ),
+    )
+    op.alter_column(
+        "communication_sessions",
+        "phonegate_event_id_start",
+        existing_type=sa.Integer(),
+        existing_nullable=False,
+        nullable=True,
+    )
+    op.execute(
+        sa.text(
+            "ALTER TABLE communication_sessions ADD CONSTRAINT "
+            "ck_communication_sessions_phonesummarystate CHECK ("
+            f"{_SUMMARY_STATE_CHECK_SQL})"
+        )
+    )
+    op.alter_column("communication_sessions", "verification_status", server_default=None)
+    op.alter_column("communication_sessions", "verification_revision", server_default=None)
+    op.add_column("call_facts", sa.Column("confirmation_source", _CONFIRMATION_SOURCE))
+    op.add_column("call_facts", sa.Column("confirmed_at", sa.DateTime(timezone=True)))
+    op.create_index(
+        "ix_communication_sessions_verification_status",
+        "communication_sessions",
+        ["verification_status"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_communication_sessions_related_session_id",
+        "communication_sessions",
+        ["related_session_id"],
+        unique=False,
+    )
+    _assert_no_duplicate_transport_ids(op.get_bind())
+    op.create_unique_constraint(
+        "uq_communication_sessions_transport_channel_external_id",
+        "communication_sessions",
+        ["transport", "channel", "transport_external_id"],
+    )
+    op.create_unique_constraint(
+        "uq_call_facts_session_field", "call_facts", ["session_id", "field"]
+    )
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    # This check intentionally happens before any schema mutation. Existing facts
+    # are preserved for an operator to resolve instead of selecting a winner.
+    _abort_for_duplicate_facts(bind)
+
+    if bind.dialect.name == "sqlite":
+        _upgrade_sqlite()
+    else:
+        _upgrade_postgresql()
+
+
+def _reject_sms_downgrade(bind: sa.Connection) -> None:
+    sms_rows = int(
+        bind.execute(
+            sa.text("SELECT COUNT(*) FROM communication_sessions WHERE channel = 'sms'")
+        ).scalar_one()
+    )
+    if sms_rows:
+        raise RuntimeError(
+            "Cannot downgrade phone verification schema while SMS sessions exist; "
+            "remove or migrate SMS sessions before retrying the downgrade."
+        )
+
+
+def _downgrade_sqlite() -> None:
     op.drop_index(
         "ix_communication_sessions_related_session_id", table_name="communication_sessions"
     )
     op.drop_index(
         "ix_communication_sessions_verification_status", table_name="communication_sessions"
     )
-
     with op.batch_alter_table("call_facts", recreate="always") as batch_op:
         batch_op.drop_constraint("uq_call_facts_session_field", type_="unique")
         batch_op.drop_column("confirmed_at")
         batch_op.drop_column("confirmation_source")
-
-    # ``processing`` is a transient state and is not part of the parent
-    # revision's enum. Normalize it before restoring that constraint.
     op.execute(
         sa.text(
             "UPDATE communication_sessions SET summary_state = 'pending' "
             "WHERE summary_state = 'processing'"
         )
     )
-    # SMS sessions have no PhoneGate event cursor. The parent schema requires
-    # this legacy column, so use its neutral sentinel while downgrading.
-    op.execute(
-        sa.text(
-            "UPDATE communication_sessions SET phonegate_event_id_start = 0 "
-            "WHERE phonegate_event_id_start IS NULL"
-        )
-    )
-    copy_from = _communication_sessions_without_summary_check(op.get_bind())
+    copy_from = _communication_sessions_with_legacy_summary_check(op.get_bind())
     with op.batch_alter_table(
         "communication_sessions", recreate="always", copy_from=copy_from
     ) as batch_op:
@@ -226,3 +327,59 @@ def downgrade() -> None:
             existing_nullable=True,
             nullable=False,
         )
+
+
+def _downgrade_postgresql() -> None:
+    op.drop_constraint("uq_call_facts_session_field", "call_facts", type_="unique")
+    op.drop_constraint(
+        "uq_communication_sessions_transport_channel_external_id",
+        "communication_sessions",
+        type_="unique",
+    )
+    op.drop_index(
+        "ix_communication_sessions_related_session_id", table_name="communication_sessions"
+    )
+    op.drop_index(
+        "ix_communication_sessions_verification_status", table_name="communication_sessions"
+    )
+    op.drop_column("call_facts", "confirmed_at")
+    op.drop_column("call_facts", "confirmation_source")
+    op.execute(
+        sa.text(
+            "UPDATE communication_sessions SET summary_state = 'pending' "
+            "WHERE summary_state = 'processing'"
+        )
+    )
+    op.execute(
+        sa.text(
+            "ALTER TABLE communication_sessions ADD CONSTRAINT "
+            "ck_communication_sessions_phonesummarystate CHECK ("
+            f"{_LEGACY_SUMMARY_STATE_CHECK_SQL})"
+        )
+    )
+    op.drop_constraint(
+        "fk_communication_sessions_related_session_id_communication_sessions",
+        "communication_sessions",
+        type_="foreignkey",
+    )
+    op.drop_column("communication_sessions", "related_session_id")
+    op.drop_column("communication_sessions", "transport_external_id")
+    op.drop_column("communication_sessions", "processing_started_at")
+    op.drop_column("communication_sessions", "verification_revision")
+    op.drop_column("communication_sessions", "verification_status")
+    op.alter_column(
+        "communication_sessions",
+        "phonegate_event_id_start",
+        existing_type=sa.Integer(),
+        existing_nullable=True,
+        nullable=False,
+    )
+
+
+def downgrade() -> None:
+    bind = op.get_bind()
+    _reject_sms_downgrade(bind)
+    if bind.dialect.name == "sqlite":
+        _downgrade_sqlite()
+    else:
+        _downgrade_postgresql()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib
+
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import app.models  # noqa: F401  (registers every ORM entity on ``Base.metadata``)
@@ -82,3 +84,111 @@ async def test_phase_2b_verification_schema_present_after_metadata_create(
         unique["name"] for unique in session_uniques
     }
     assert "uq_call_facts_session_field" in {unique["name"] for unique in fact_uniques}
+
+
+def test_postgresql_upgrade_operations_do_not_drop_communication_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module(
+        "migrations.versions.f2a3b4c5d6e7_phone_phase_2b_verification_sms"
+    )
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def __getattr__(self, name: str):
+            def record(*args: object, **kwargs: object) -> None:
+                self.calls.append((name, args))
+
+            return record
+
+    recorder = Recorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.setattr(migration, "_assert_no_duplicate_transport_ids", lambda _bind: None)
+    migration._upgrade_postgresql()
+
+    assert not any(
+        name == "drop_table" and args == ("communication_sessions",)
+        for name, args in recorder.calls
+    )
+    assert ("add_column", ("communication_sessions",)) in {
+        (name, args[:1]) for name, args in recorder.calls
+    }
+
+
+def test_duplicate_transport_diagnostic_redacts_external_id() -> None:
+    migration = importlib.import_module(
+        "migrations.versions.f2a3b4c5d6e7_phone_phase_2b_verification_sms"
+    )
+
+    class Result:
+        def scalar_one(self) -> int:
+            return 1
+
+    class Bind:
+        def execute(self, _statement: object) -> Result:
+            return Result()
+
+    with pytest.raises(RuntimeError) as error:
+        migration._assert_no_duplicate_transport_ids(Bind())
+    message = str(error.value)
+    assert "duplicate session transport ID groups" in message
+    assert "+37360000000" not in message
+
+
+def test_phone_summary_legacy_values_exclude_processing_after_direct_downgrade(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine
+
+    database_path = tmp_path / "summary-downgrade.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
+    command.upgrade(Config("alembic.ini"), "head")
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.begin() as connection:
+            profile_id = "11111111111111111111111111111111"
+            session_id = "22222222222222222222222222222222"
+            connection.execute(
+                text(
+                    "INSERT INTO user_profiles "
+                    "(id, name, is_default, languages, work_experience, education, skills, "
+                    "driving_licences, confirmed_facts, availability, created_at, updated_at) "
+                    "VALUES (:id, 'p', 1, '[]', '[]', '[]', '[]', '[]', '[]', '{}', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"id": profile_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO communication_sessions "
+                    "(id, profile_id, channel, transport, direction, remote_address, remote_raw, "
+                    "phonegate_event_id_start, started_at, needs_review, rx_frame_stats, "
+                    "diagnostics, "
+                    "created_at, updated_at, phonegate_generation, auto_answered, summary, "
+                    "summary_state, verification_status, verification_revision) VALUES "
+                    "(:id, :profile_id, 'call', 'phonegate', 'inbound', '', '', 1, "
+                    "CURRENT_TIMESTAMP, "
+                    "0, '{}', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0, 0, '{}', "
+                    "'processing', 'pending', 0)"
+                ),
+                {"id": session_id, "profile_id": profile_id},
+            )
+        command.downgrade(Config("alembic.ini"), "e171bb9f241e")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT summary_state FROM communication_sessions")
+                ).scalar_one()
+                == "pending"
+            )
+            check = inspect(engine).get_check_constraints("communication_sessions")
+            assert check and "processing" not in check[0]["sqltext"]
+            assert {"summary", "summary_state"} <= {
+                column["name"] for column in inspect(engine).get_columns("communication_sessions")
+            }
+    finally:
+        engine.dispose()

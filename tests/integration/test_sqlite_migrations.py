@@ -142,6 +142,19 @@ def test_fresh_sqlite_database_migrations_round_trip(
     finally:
         engine.dispose()
 
+    # Legacy schema cannot represent an SMS session's nullable PhoneGate cursor;
+    # downgrade must reject it before changing any schema or data.
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with pytest.raises(RuntimeError, match="SMS sessions"):
+            command.downgrade(Config("alembic.ini"), "e171bb9f241e")
+        with Session(engine) as session:
+            assert session.query(CommunicationSession).count() == 2
+            session.query(CommunicationSession).delete()
+            session.commit()
+    finally:
+        engine.dispose()
+
     get_settings.cache_clear()
     try:
         command.downgrade(Config("alembic.ini"), "base")

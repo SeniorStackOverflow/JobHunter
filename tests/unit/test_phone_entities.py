@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -201,3 +202,39 @@ async def test_sms_session_accepts_string_transport_id(db: AsyncSession) -> None
     db.add(sms)
     await db.flush()
     assert sms.phonegate_event_id_start is None
+
+
+async def test_related_session_delete_sets_foreign_key_to_null(db: AsyncSession) -> None:
+    await db.execute(text("PRAGMA foreign_keys=ON"))
+    profile = UserProfile(name="Test Profile", is_default=True)
+    db.add(profile)
+    await db.flush()
+
+    call = CommunicationSession(
+        profile_id=profile.id,
+        channel=CommunicationChannel.CALL,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        phonegate_event_id_start=1,
+        started_at=datetime.now(UTC),
+    )
+    db.add(call)
+    await db.flush()
+    sms = CommunicationSession(
+        profile_id=profile.id,
+        channel=CommunicationChannel.SMS,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        phonegate_event_id_start=None,
+        transport_external_id="incoming:related-test",
+        related_session_id=call.id,
+        started_at=datetime.now(UTC),
+        ended_at=datetime.now(UTC),
+    )
+    db.add(sms)
+    await db.flush()
+
+    await db.delete(call)
+    await db.flush()
+    await db.refresh(sms)
+    assert sms.related_session_id is None
