@@ -2,7 +2,7 @@
 
 Date: 2026-09-06
 
-Status: approved design, awaiting implementation plan
+Status: approved design, implementation planned
 
 Branch: `phone-2b-impl`
 
