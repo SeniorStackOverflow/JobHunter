@@ -350,6 +350,11 @@ def _downgrade_postgresql() -> None:
             "WHERE summary_state = 'processing'"
         )
     )
+    op.drop_constraint(
+        "ck_communication_sessions_phonesummarystate",
+        "communication_sessions",
+        type_="check",
+    )
     op.execute(
         sa.text(
             "ALTER TABLE communication_sessions ADD CONSTRAINT "

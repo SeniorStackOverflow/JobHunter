@@ -117,6 +117,41 @@ def test_postgresql_upgrade_operations_do_not_drop_communication_sessions(
     }
 
 
+def test_postgresql_downgrade_replaces_summary_check_before_adding_legacy_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module(
+        "migrations.versions.f2a3b4c5d6e7_phone_phase_2b_verification_sms"
+    )
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def __getattr__(self, name: str):
+            def record(*args: object, **kwargs: object) -> None:
+                self.calls.append((name, args))
+
+            return record
+
+    recorder = Recorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    migration._downgrade_postgresql()
+
+    drop_current = next(
+        index
+        for index, (name, args) in enumerate(recorder.calls)
+        if name == "drop_constraint"
+        and args[:2] == ("ck_communication_sessions_phonesummarystate", "communication_sessions")
+    )
+    add_legacy = next(
+        index
+        for index, (name, args) in enumerate(recorder.calls)
+        if name == "execute" and "ADD CONSTRAINT" in str(args[0])
+    )
+    assert drop_current < add_legacy
+
+
 def test_duplicate_transport_diagnostic_redacts_external_id() -> None:
     migration = importlib.import_module(
         "migrations.versions.f2a3b4c5d6e7_phone_phase_2b_verification_sms"
