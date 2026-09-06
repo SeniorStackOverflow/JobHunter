@@ -286,12 +286,15 @@ async def prune_env(
 @pytest.mark.asyncio
 async def test_prune_removes_by_age_and_nulls_pointer(prune_env):
     env = prune_env(retention_days=7)
-    env.make_clip(session_dir="s1", tid=3, age_days=30)  # stale
-    env.make_clip(session_dir="s1", tid=4, age_days=1)  # fresh
+    size_3 = 150_000
+    size_4 = 200_000
+    env.make_clip(session_dir="s1", tid=3, age_days=30, size_bytes=size_3)  # stale
+    env.make_clip(session_dir="s1", tid=4, age_days=1, size_bytes=size_4)  # fresh
     await env.link(session_id="s1", tid=3)
     await env.link(session_id="s1", tid=4)
     result = await prune_phone_evidence()
     assert result["removed"] == 1
+    assert result["freed_bytes"] == size_3
     assert not env.clip_exists("s1", 3) and env.clip_exists("s1", 4)
     assert (await env.turn("s1", 3)).audio_evidence_path is None
     assert (await env.turn("s1", 4)).audio_evidence_path is not None

@@ -95,8 +95,8 @@ async def prune_phone_evidence() -> dict[str, int]:
                 st = clip.stat()
                 clips.append((clip, st.st_mtime, st.st_size))
 
-    # First pass: age cutoff
-    to_remove = {c[0] for c in clips if c[1] < cutoff}
+    # First pass: age cutoff — map path -> size for accurate freed_bytes
+    to_remove: dict[Path, int] = {c[0]: c[2] for c in clips if c[1] < cutoff}
     survivors = sorted((c for c in clips if c[0] not in to_remove), key=lambda c: c[1])
 
     # Second pass: total size cap (oldest first)
@@ -104,12 +104,11 @@ async def prune_phone_evidence() -> dict[str, int]:
     cap = settings.phone_evidence_max_total_mb * 1024 * 1024
     idx = 0
     while total > cap and idx < len(survivors):
-        to_remove.add(survivors[idx][0])
+        to_remove[survivors[idx][0]] = survivors[idx][2]
         total -= survivors[idx][2]
         idx += 1
 
     # Remove files and null database entries
-    freed = 0
     async with async_session_factory() as db:
         store = SessionStore()
         for path in to_remove:
@@ -118,15 +117,17 @@ async def prune_phone_evidence() -> dict[str, int]:
                 await store.clear_turn_evidence_path(
                     db, session_id_text=sid, transcript_id_text=tid
                 )
-            with contextlib.suppress(OSError):
-                freed += path.stat().st_size
             path.unlink(missing_ok=True)
         await db.commit()
+
+    # Calculate freed_bytes from the known sizes (not re-stat'ing)
+    freed = sum(to_remove.values())
 
     # Remove empty session dirs
     for session_dir in list(root.iterdir()):  # noqa: ASYNC240
         if session_dir.is_dir() and not any(session_dir.iterdir()):
-            session_dir.rmdir()
+            with contextlib.suppress(OSError):
+                session_dir.rmdir()
 
     return {"removed": len(to_remove), "freed_bytes": freed}
 
