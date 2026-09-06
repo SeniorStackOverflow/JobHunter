@@ -1,0 +1,16 @@
+<section class="admin-section">
+  <div class="section-heading"><div><h1>Звонки</h1><p>Живой статус телефонного агента и история звонков.</p></div>{% if tab == 'history' %}<span class="badge muted">{{ pagination.total }} записей</span>{% endif %}</div>
+  {% set phone_health = calls_health %}
+  {% include "_phone_health.html" %}
+  <div class="filter-panel">
+    <div class="tabs">
+      <a class="tab {% if tab == 'live' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=live">Live</a>
+      <a class="tab {% if tab == 'history' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history">История</a>
+      <a class="tab {% if tab == 'evidence' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=evidence">Evidence</a>
+      <span class="tab" style="opacity:.4;pointer-events:none" aria-disabled="true">Собеседования · после Phase 4</span>
+    </div>
+  </div>
+  {% if tab == 'history' %}{% include "_calls_history.html" %}
+  {% elif tab == 'evidence' %}<div class="panel"><div class="empty-state">Просмотр доказательной базы появится в следующей задаче.</div></div>
+  {% else %}{% include "_calls_live.html" %}{% endif %}
+</section>

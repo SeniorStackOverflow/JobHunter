@@ -1,0 +1,9 @@
+<div class="panel">
+  {% if calls_health.active_call %}
+  <div class="section-heading"><h2>Активный звонок</h2><span class="badge warning">в эфире</span></div>
+  <p class="muted">Сессия <code>{{ calls_health.active_call.session_id }}</code> · сценарий: {{ calls_health.active_call.script_stage or '—' }}</p>
+  <p class="muted">Управление вызовом (завершить / замолчать) — в блоке состояния канала выше. Страница обновляется автоматически каждые 5 секунд.</p>
+  {% else %}
+  <div class="empty-state">Сейчас активных звонков нет. Управление авто-ответом — в блоке состояния канала выше.</div>
+  {% endif %}
+</div>

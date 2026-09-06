@@ -8,9 +8,15 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.selectable import Select
 
+# ``routes`` is imported as a module (not ``from ... import _phone_redis``) on
+# purpose: ``phone_health_context`` and the POST handlers read
+# ``_admin_routes._phone_redis`` / ``_admin_routes._audit_admin`` through the
+# module object so tests can ``monkeypatch.setattr(admin_routes, "_phone_redis", ...)``
+# and have the override take effect here.
 from app.admin import routes as _admin_routes
 from app.admin.routes import require_admin, require_csrf
 from app.database import get_session
@@ -102,6 +108,130 @@ async def phone_health_context(session: AsyncSession) -> dict[str, Any]:
         },
         "active_call": active_call,
     }
+
+
+_CALLS_PER_PAGE = 25
+_CALLS_TABS = {"live", "history", "evidence"}
+
+
+def _apply_call_filter(stmt: Select[Any], filter_: str) -> Select[Any]:
+    """Narrow a ``communication_sessions`` query by the history filter.
+
+    RULING R2: this lives here for now; Task 15 lifts it into a shared helper.
+    ``interview_proposed`` is intentionally not handled in SQL — see
+    ``build_calls_context`` for why it is filtered in Python instead.
+    """
+    from app.models.entities import CommunicationSession
+    from app.models.enums import CommunicationOutcome
+
+    if filter_ == "needs_review":
+        return stmt.where(CommunicationSession.needs_review.is_(True))
+    if filter_ == "missed_dropped":
+        return stmt.where(
+            CommunicationSession.outcome.in_(
+                [CommunicationOutcome.MISSED, CommunicationOutcome.ABANDONED]
+            )
+        )
+    if filter_ == "unknown_caller":
+        return stmt.where(CommunicationSession.application_id.is_(None))
+    return stmt
+
+
+async def _call_row(session: AsyncSession, row: Any) -> dict[str, Any]:
+    from app.models.entities import CanonicalJob
+    from app.phone.numbers import mask_phone
+
+    company: str | None = None
+    vacancy: str | None = None
+    if row.canonical_job_id is not None:
+        job = await session.get(CanonicalJob, row.canonical_job_id)
+        if job is not None:
+            company = job.normalized_company
+            vacancy = job.normalized_title
+    duration_s: int | None = None
+    if row.ended_at is not None and row.started_at is not None:
+        duration_s = int((row.ended_at - row.started_at).total_seconds())
+    summary: dict[str, Any] = row.summary or {}
+    return {
+        "id": str(row.id),
+        "started_at": row.started_at,
+        "company": company,
+        "vacancy": vacancy,
+        "caller": mask_phone(row.remote_address),
+        "direction": row.direction.value,
+        "duration_s": duration_s,
+        "outcome": row.outcome.value if row.outcome is not None else None,
+        "auto_answered": row.auto_answered,
+        "needs_review": row.needs_review,
+        "summary_state": row.summary_state.value,
+        "telegram_state": (summary.get("telegram") or {}).get("state"),
+    }
+
+
+async def build_calls_context(
+    session: AsyncSession,
+    *,
+    tab: str,
+    page: int,
+    filter_: str,
+    query: str,
+) -> dict[str, Any]:
+    """Assemble the ``?view=calls`` template context (Live + История tabs)."""
+    from app.models.entities import CanonicalJob, CommunicationSession
+    from app.models.enums import CommunicationChannel
+
+    valid_tab = tab if tab in _CALLS_TABS else "live"
+    health = await phone_health_context(session)
+    ctx: dict[str, Any] = {
+        "tab": valid_tab,
+        "filter": filter_,
+        "query": query,
+        "detail": None,
+        "calls_health": health,
+        "active_call": health.get("active_call"),
+        "call_rows": [],
+        "pagination": _admin_routes._pagination(0, 1, _CALLS_PER_PAGE),
+    }
+    if valid_tab != "history":
+        return ctx
+
+    stmt = select(CommunicationSession).where(
+        CommunicationSession.channel == CommunicationChannel.CALL
+    )
+    if query:
+        like = f"%{query}%"
+        stmt = stmt.outerjoin(
+            CanonicalJob, CommunicationSession.canonical_job_id == CanonicalJob.id
+        ).where(
+            or_(
+                CanonicalJob.normalized_company.ilike(like),
+                CanonicalJob.normalized_title.ilike(like),
+                CommunicationSession.remote_address.ilike(like),
+            )
+        )
+    stmt = _apply_call_filter(stmt, filter_).order_by(CommunicationSession.started_at.desc())
+
+    if filter_ == "interview_proposed":
+        # JSON-path access (summary -> hints -> outcome_guess) is not portable
+        # between SQLite (unit tests) and Postgres (prod), so fetch the filtered
+        # set and narrow it in Python before paginating the resulting list.
+        matched = [
+            row
+            for row in (await session.scalars(stmt)).all()
+            if ((row.summary or {}).get("hints") or {}).get("outcome_guess") == "interview_proposed"
+        ]
+        pagination = _admin_routes._pagination(len(matched), page, _CALLS_PER_PAGE)
+        start = (int(pagination["page"]) - 1) * _CALLS_PER_PAGE
+        page_rows = matched[start : start + _CALLS_PER_PAGE]
+    else:
+        total = int(await session.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+        pagination = _admin_routes._pagination(total, page, _CALLS_PER_PAGE)
+        offset = (int(pagination["page"]) - 1) * _CALLS_PER_PAGE
+        page_rows = list((await session.scalars(stmt.limit(_CALLS_PER_PAGE).offset(offset))).all())
+
+    ctx["pagination"] = pagination
+    ctx["call_rows"] = [await _call_row(session, row) for row in page_rows]
+    return ctx
 
 
 @router.post("/admin/phone/auto-answer/{action}")

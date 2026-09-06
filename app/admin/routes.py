@@ -56,6 +56,7 @@ from app.models.entities import (
     Alert,
     Application,
     AuditEvent,
+    CommunicationSession,
     JobSource,
     MatchEvaluation,
     Resume,
@@ -64,8 +65,10 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
+    CommunicationChannel,
     JobStatus,
     MatchDecision,
+    PhoneSummaryState,
     ReviewOutcome,
     ReviewReason,
     RunStatus,
@@ -161,6 +164,7 @@ _VIEW_TITLES = {
     "history": "История",
     "settings": "Настройки",
     "diagnostics": "Диагностика",
+    "calls": "Звонки",
 }
 
 _AUDIT_ACTION_LABELS = {
@@ -779,6 +783,18 @@ async def dashboard(
         )
         or 0
     )
+    counts["phone_review"] = int(
+        await session.scalar(
+            select(func.count(CommunicationSession.id)).where(
+                CommunicationSession.channel == CommunicationChannel.CALL,
+                or_(
+                    CommunicationSession.needs_review.is_(True),
+                    CommunicationSession.summary_state == PhoneSummaryState.FAILED,
+                ),
+            )
+        )
+        or 0
+    )
     matching_backlog = int(
         await session.scalar(
             select(func.count(SourceJob.id)).where(
@@ -926,6 +942,7 @@ async def dashboard(
     learning_summary = None
     learning_scores: dict[UUID, LearnedReviewScore] = {}
     phone_health: dict[str, Any] = {}
+    calls_context: dict[str, Any] = {}
     pagination = _pagination(0, 1, 10)
 
     if view == "overview":
@@ -1220,6 +1237,16 @@ async def dashboard(
                 )
             ).all()
         )
+    elif view == "calls":
+        from app.admin.phone_routes import build_calls_context
+
+        calls_context = await build_calls_context(
+            session,
+            tab=(request.query_params.get("tab") or "live"),
+            page=int(request.query_params.get("page", "1") or "1"),
+            filter_=(request.query_params.get("filter") or "all"),
+            query=(request.query_params.get("q") or "").strip(),
+        )
     else:
         active_alerts = list(
             (
@@ -1370,6 +1397,10 @@ async def dashboard(
             "settings": get_settings(),
             "feedback_notice": _FEEDBACK_NOTICES.get(feedback_key),
             "feedback_notice_tone": _FEEDBACK_NOTICE_TONES.get(feedback_key, "success"),
+            # ``calls_context`` is empty for every non-calls view, so this merge
+            # (tab/filter/query/calls_health/active_call/call_rows/pagination) is
+            # inert elsewhere and never disturbs the existing five views.
+            **calls_context,
         },
     )
     response.headers["Cache-Control"] = "no-store"

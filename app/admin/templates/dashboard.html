@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ view_title }} · JobHunter{% endblock %}
 {% block body_class %}dashboard-page{% endblock %}
+{% block head %}{% if view == 'calls' and calls_health and calls_health.active_call %}<meta http-equiv="refresh" content="5">{% endif %}{% endblock %}
 {% block body %}
 <div class="app-shell">
   <aside class="sidebar">
@@ -11,6 +12,7 @@
       <a class="nav-link {% if view == 'history' %}is-active{% endif %}" href="/?view=history&profile_id={{ selected_profile_id }}"><span class="nav-icon">◷</span><span>История</span></a>
       <a class="nav-link {% if view == 'settings' %}is-active{% endif %}" href="/?view=settings&profile_id={{ selected_profile_id }}"><span class="nav-icon">⚙</span><span>Настройки</span></a>
       <a class="nav-link {% if view == 'diagnostics' %}is-active{% endif %}" href="/?view=diagnostics&profile_id={{ selected_profile_id }}"><span class="nav-icon">◌</span><span>Диагностика</span>{% if counts.active_alerts %}<span class="nav-count">{{ counts.active_alerts }}</span>{% endif %}</a>
+      <a class="nav-link {% if view == 'calls' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}"><span class="nav-icon">☎</span><span>Звонки</span>{% if counts.phone_review %}<span class="nav-count">{{ counts.phone_review }}</span>{% endif %}</a>
     </nav>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-status">
@@ -31,6 +33,7 @@
       {% elif view == 'decisions' %}{% include "dashboard_decisions.html" %}
       {% elif view == 'history' %}{% include "dashboard_history.html" %}
       {% elif view == 'settings' %}{% include "dashboard_settings.html" %}
+      {% elif view == 'calls' %}{% include "calls.html" %}
       {% else %}{% include "dashboard_diagnostics.html" %}{% endif %}
     </main>
   </div>
