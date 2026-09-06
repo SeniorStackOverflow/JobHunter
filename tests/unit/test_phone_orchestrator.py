@@ -23,7 +23,7 @@ from app.phone.client import PhoneGateClient
 from app.phone.correlation import CorrelationResult
 from app.phone.evidence import EvidenceCapturer
 from app.phone.orchestrator import CallOrchestrator
-from app.phone.script import SCRIPT_GREETING
+from app.phone.script import SCRIPT_CLOSING_SMS, SCRIPT_GREETING
 from app.phone.sessions import SessionStore
 from app.settings.config import Settings
 from tests.fixtures.fake_phonegate import FakePhoneGate
@@ -135,6 +135,39 @@ async def test_happy_path_greeting_listen_closing(
     assert len(assistant) == len(SCRIPT_GREETING) + 1  # greeting blocks + one closing
     assert all(t.delivery_status is TurnDeliveryStatus.DELIVERED for t in assistant)
     assert fake._call_state == "IDLE"  # hung up
+
+
+@pytest.mark.asyncio
+async def test_critical_rx_marker_uses_sms_closing(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(
+            client=client, session_factory=file_factory, settings=_fast_settings()
+        )
+        task = asyncio.create_task(orch.run(session_id))
+        try:
+            for _ in range(300):
+                async with file_factory() as db:
+                    call = await db.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "listening":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("never reached LISTENING")
+            fake.transcript(speaker="rx", text="Собеседование завтра в 10")
+            stage = await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert stage == "greeting_completed"
+    assistant = await _assistant_turns(file_factory, session_id)
+    assert assistant[-1].spoken_text == SCRIPT_CLOSING_SMS
 
 
 @pytest.mark.asyncio

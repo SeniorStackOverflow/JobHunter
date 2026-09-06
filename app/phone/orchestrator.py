@@ -15,11 +15,12 @@ from app.audit import record_audit_event
 from app.models.entities import CommunicationSession
 from app.models.enums import TurnDeliveryStatus
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
+from app.phone.critical import closing_for_transcript
 from app.phone.evidence import EvidenceCapturer
 from app.phone.numbers import mask_phone, normalize_e164
 from app.phone.policy import should_answer
 from app.phone.schemas import DeviceStatus
-from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_INTERRUPTED, SCRIPT_GREETING
+from app.phone.script import SCRIPT_CLOSING_INTERRUPTED, SCRIPT_GREETING
 from app.phone.sessions import SessionStore
 from app.phone.speak import observe_tx_delivery, speak_block, wait_until_speakable
 from app.settings.config import Settings
@@ -195,6 +196,7 @@ class CallOrchestrator:
         await self._set_stage("listening")
         last_activity = time.monotonic()
         seen_transcript_id = 0
+        observed_rx_entries: list[str] = []
         while True:
             cmd = await self._cmd()
             terminal = await self._dispatch_command(session_id, cmd)
@@ -223,6 +225,7 @@ class CallOrchestrator:
                 seen_transcript_id = max(seen_transcript_id, max(e.id for e in page.entries))
                 rx_entries = [e for e in page.entries if e.speaker == "rx"]
                 if rx_entries:
+                    observed_rx_entries.extend(e.text for e in rx_entries)
                     last_activity = now
                     try:
                         await self._evidence.maybe_capture(rx_entries)
@@ -241,7 +244,8 @@ class CallOrchestrator:
 
         # CLOSING ---------------------------------------------------
         await self._set_stage("closing")
-        await self._say(session_id, SCRIPT_CLOSING)
+        closing = closing_for_transcript(observed_rx_entries)
+        await self._say(session_id, closing)
         await self._hangup()
         await self._finish("greeting_completed")
         return "greeting_completed"

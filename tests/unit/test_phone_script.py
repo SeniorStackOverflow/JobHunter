@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_INTERRUPTED, SCRIPT_GREETING
+# ruff: noqa: RUF001 — Russian script text is intentional.
+from app.phone.script import (
+    SCRIPT_CLOSING,
+    SCRIPT_CLOSING_INTERRUPTED,
+    SCRIPT_CLOSING_SMS,
+    SCRIPT_GREETING,
+)
 
 
 def test_greeting_blocks_are_short_nonempty_strings() -> None:
@@ -13,3 +19,10 @@ def test_greeting_blocks_are_short_nonempty_strings() -> None:
 def test_closing_blocks_present() -> None:
     assert SCRIPT_CLOSING and SCRIPT_CLOSING_INTERRUPTED
     assert SCRIPT_CLOSING != SCRIPT_CLOSING_INTERRUPTED
+
+
+def test_sms_closing_asks_for_interview_details() -> None:
+    assert SCRIPT_CLOSING_SMS == (
+        "Спасибо. Чтобы избежать ошибки в дате и времени, пожалуйста, отправьте данные "
+        "собеседования SMS на этот номер. Андрей свяжется с вами. Всего доброго."
+    )
