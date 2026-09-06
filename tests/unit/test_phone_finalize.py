@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,9 +27,16 @@ from app.phone import summary as summary_module
 from app.phone.summary import (
     CallSummary,
     PhoneSummaryUnavailable,
+    claim_pending_calls,
     finalize_pending_calls,
 )
 from app.phone.telegram import TelegramDeliveryError
+from app.phone.verification import (
+    ArbitrationResult,
+    ExtractionResult,
+    ModelCallMeta,
+    VerificationResult,
+)
 from app.settings.config import Settings
 
 
@@ -293,3 +301,137 @@ async def test_finalize_skips_non_int_clip_stem(
     # must not raise
     await finalize_pending_calls()
     assert (await env.get_session()).summary_state is PhoneSummaryState.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_claim_pending_call_uses_processing_lease(
+    finalize_env: Callable[..., Awaitable[_Env]],
+) -> None:
+    env = await finalize_env(llm_enabled=False)
+    async with env.factory() as db:
+        claimed = await claim_pending_calls(db, batch=10, lease_seconds=300)
+        assert claimed == [env.session_id]
+        row = await db.get(CommunicationSession, env.session_id)
+        assert row is not None
+        assert row.summary_state is PhoneSummaryState.PROCESSING
+        assert row.processing_started_at is not None
+
+    async with env.factory() as db:
+        assert await claim_pending_calls(db, batch=10, lease_seconds=300) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claimers_return_a_call_once(
+    finalize_env: Callable[..., Awaitable[_Env]],
+) -> None:
+    env = await finalize_env(llm_enabled=False)
+
+    async def claim_once() -> list[UUID]:
+        async with env.factory() as db:
+            return await claim_pending_calls(db, batch=1, lease_seconds=300)
+
+    results = await asyncio.gather(claim_once(), claim_once())
+    assert sum(len(result) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_runs_independent_passes_in_order(
+    finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await finalize_env(llm_enabled=True)
+    order: list[str] = []
+    meta = ModelCallMeta("llmrouter", "m", 1, 1)
+
+    class FakeProvider:
+        async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+            order.append("extractor")
+            return ExtractionResult(
+                summary_text="итог", outcome_guess="info_request", facts=[], review_reasons=[]
+            ), meta
+
+        async def verify(self, context: Any) -> tuple[VerificationResult, ModelCallMeta]:
+            order.append("verifier")
+            return VerificationResult(facts=[], review_reasons=[]), meta
+
+        async def arbitrate(
+            self, context: Any, extracted: Any, verified: Any
+        ) -> tuple[ArbitrationResult, ModelCallMeta]:
+            order.append("arbiter")
+            return ArbitrationResult(decisions=[]), meta
+
+    monkeypatch.setattr(
+        summary_module, "_build_verification_provider", lambda settings: FakeProvider()
+    )
+    assert await summary_module.finalize_call(env.session_id) == "done"
+    assert order == ["extractor", "verifier", "arbiter"]
+    session = await env.get_session()
+    assert session.summary_state is PhoneSummaryState.DONE
+    assert session.verification_status.value == "needs_review"
+    assert session.summary["verification"]["pipeline_version"] == "phone-2b-v1"
+
+
+@pytest.mark.asyncio
+async def test_finalize_requeues_when_transcript_changes_during_pipeline(
+    finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await finalize_env(llm_enabled=True)
+    meta = ModelCallMeta("llmrouter", "m", 1, 1)
+
+    class FakeProvider:
+        async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+            return ExtractionResult(
+                summary_text="итог", outcome_guess="info_request", facts=[], review_reasons=[]
+            ), meta
+
+        async def verify(self, context: Any) -> tuple[VerificationResult, ModelCallMeta]:
+            async with env.factory() as db:
+                turn = await db.scalar(
+                    select(CommunicationTurn).where(
+                        CommunicationTurn.session_id == env.session_id,
+                        CommunicationTurn.phonegate_transcript_id == 7,
+                    )
+                )
+                assert turn is not None
+                turn.text = "Новая реплика после снимка"
+                await db.commit()
+            return VerificationResult(facts=[], review_reasons=[]), meta
+
+        async def arbitrate(
+            self, context: Any, extracted: Any, verified: Any
+        ) -> tuple[ArbitrationResult, ModelCallMeta]:
+            return ArbitrationResult(decisions=[]), meta
+
+    monkeypatch.setattr(
+        summary_module, "_build_verification_provider", lambda settings: FakeProvider()
+    )
+    assert await summary_module.finalize_call(env.session_id) == "skipped"
+    session = await env.get_session()
+    assert session.summary_state is PhoneSummaryState.PENDING
+    assert session.processing_started_at is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_failure_retries_then_marks_needs_review(
+    finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await finalize_env(llm_enabled=True)
+    env.settings.phone_verification_max_attempts = 2
+
+    class FailingProvider:
+        async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+            raise summary_module.VerificationUnavailable("timeout")
+
+    monkeypatch.setattr(
+        summary_module, "_build_verification_provider", lambda settings: FailingProvider()
+    )
+    assert await summary_module.finalize_call(env.session_id) == "skipped"
+    first = await env.get_session()
+    assert first.summary_state is PhoneSummaryState.PENDING
+    assert first.summary["model_meta"]["attempts"] == 1
+    assert first.summary["model_meta"]["last_error"] == "timeout"
+
+    assert await summary_module.finalize_call(env.session_id) == "failed"
+    second = await env.get_session()
+    assert second.summary_state.value == "failed"
+    assert second.verification_status.value == "needs_review"
+    assert second.summary["model_meta"]["attempts"] == 2

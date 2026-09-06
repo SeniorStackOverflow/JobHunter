@@ -14,3 +14,7 @@ def test_phone_beat_entries_present() -> None:
     bs = celery_app.conf.beat_schedule
     assert bs["finalize-pending-calls"]["options"]["queue"] == "phone"
     assert bs["prune-phone-evidence"]["options"]["queue"] == "phone"
+
+
+def test_finalize_task_keeps_atomic_entrypoint() -> None:
+    assert finalize_pending_calls_task.name == "job_agent.scheduler.finalize_pending_calls"

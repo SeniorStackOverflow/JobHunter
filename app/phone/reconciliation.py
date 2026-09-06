@@ -113,7 +113,7 @@ def _inspect_candidate(
         reasons.append("source turn unresolved")
     else:
         asr_confidence = turn.asr_confidence
-        source_id = _turn_id(turn.evidence_reference)
+        source_id = turn.turn_id or _turn_id(turn.evidence_reference)
         if _normalized_text(candidate.quote) not in _normalized_text(turn.text):
             reasons.append("quote not found")
         if source_id is None or source_id not in evidence_turn_ids:

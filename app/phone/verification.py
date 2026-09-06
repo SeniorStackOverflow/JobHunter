@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, TypeVar
+from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -31,6 +32,10 @@ class VerificationTurn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     seq: int = Field(ge=1)
+    # The persisted CommunicationTurn identity is separate from the display
+    # path used to retrieve an audio clip.  Keeping both prevents a file path
+    # from ever being mistaken for an evidence identity.
+    turn_id: UUID | None = None
     speaker: str
     text: str
     asr_confidence: float | None = Field(default=None, ge=0, le=1)

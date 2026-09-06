@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.entities import UserProfile
-from app.models.enums import CommunicationOutcome, PhoneSummaryState
+from app.models.entities import CommunicationSession, UserProfile
+from app.models.enums import (
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
+    PhoneSummaryState,
+    PhoneVerificationStatus,
+)
 from app.phone.correlation import CorrelationResult
 from app.phone.sessions import SessionStore
 
@@ -49,6 +55,60 @@ async def test_open_find_close(db: AsyncSession) -> None:
     refreshed = await db.get(type(call), call.id)
     assert refreshed is not None and refreshed.outcome == CommunicationOutcome.COMPLETED
     assert refreshed.answered_at is not None
+
+
+async def test_claim_leases_stale_calls_and_excludes_ineligible_sessions(
+    db: AsyncSession,
+) -> None:
+    from app.phone.summary import claim_pending_calls
+
+    now = datetime.now(UTC)
+    profile_id = db.info["profile_id"]
+
+    def call(
+        *,
+        state: PhoneSummaryState,
+        auto_answered: bool = True,
+        channel: CommunicationChannel = CommunicationChannel.CALL,
+        processing_started_at: datetime | None = None,
+    ) -> CommunicationSession:
+        return CommunicationSession(
+            profile_id=profile_id,
+            channel=channel,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            phonegate_event_id_start=1 if channel is CommunicationChannel.CALL else None,
+            started_at=now,
+            ended_at=now,
+            outcome=CommunicationOutcome.COMPLETED,
+            auto_answered=auto_answered,
+            summary_state=state,
+            verification_status=PhoneVerificationStatus.NOT_APPLICABLE,
+            processing_started_at=processing_started_at,
+        )
+
+    pending = call(state=PhoneSummaryState.PENDING)
+    stale = call(
+        state=PhoneSummaryState.PROCESSING,
+        processing_started_at=now - timedelta(seconds=301),
+    )
+    fresh = call(
+        state=PhoneSummaryState.PROCESSING,
+        processing_started_at=now,
+    )
+    unanswered = call(state=PhoneSummaryState.PENDING, auto_answered=False)
+    sms = call(state=PhoneSummaryState.PENDING, channel=CommunicationChannel.SMS)
+    db.add_all([pending, stale, fresh, unanswered, sms])
+    await db.commit()
+
+    claimed = await claim_pending_calls(db, batch=10, lease_seconds=300)
+    assert set(claimed) == {pending.id, stale.id}
+    await db.refresh(fresh)
+    await db.refresh(unanswered)
+    await db.refresh(sms)
+    assert fresh.summary_state is PhoneSummaryState.PROCESSING
+    assert unanswered.summary_state is PhoneSummaryState.PENDING
+    assert sms.summary_state is PhoneSummaryState.PENDING
 
 
 async def test_append_turn_is_idempotent(db: AsyncSession) -> None:
