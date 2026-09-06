@@ -69,7 +69,10 @@ async def replace_current_facts(
     if not isinstance(old_verification, dict):
         old_verification = {}
     old_fingerprint = old_verification.get("input_fingerprint")
-    changed_input = old_fingerprint != input_fingerprint
+    old_pipeline_version = old_verification.get("pipeline_version")
+    if old_fingerprint == input_fingerprint and old_pipeline_version == pipeline_version:
+        return
+    changed_input = old_fingerprint != input_fingerprint or old_pipeline_version != pipeline_version
     if changed_input:
         call.verification_revision += 1
     history = list(old_verification.get("history", []))

@@ -143,6 +143,37 @@ def test_arbiter_rejection_is_conflict() -> None:
     assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
 
 
+def test_missing_arbiter_decision_is_unknown_for_review() -> None:
+    decision = _decide(arbitration=[])
+    assert decision.facts[0].state is CallFactState.UNKNOWN
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert "arbiter" in decision.facts[0].reason
+
+
+def test_candidate_ambiguity_is_unknown_for_review() -> None:
+    ambiguous = _candidate()
+    ambiguous.ambiguity = "возможны два времени"
+    decision = _decide(extracted=[ambiguous], verified=[ambiguous])
+    assert decision.facts[0].state is CallFactState.UNKNOWN
+    assert "ambiguity" in decision.facts[0].reason
+
+
+def test_pass_review_reason_requires_review_but_preserves_safe_fact() -> None:
+    context, extracted, verified, arbitration, evidence = _inputs()
+    extracted.review_reasons.append("модель требует ручной проверки")
+    decision = reconcile_verification(
+        context=context,
+        extracted=extracted,
+        verified=verified,
+        arbitration=arbitration,
+        asr_floor=0.8,
+        evidence_turn_ids=evidence,
+    )
+    assert decision.facts[0].state is CallFactState.CANDIDATE
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert any("ручной проверки" in reason for reason in decision.reasons)
+
+
 def test_explicit_low_asr_confidence_is_unknown() -> None:
     transcript = [
         VerificationTurn(
@@ -223,6 +254,52 @@ def test_last_unambiguous_correction_wins_and_prior_expression_is_diagnostic() -
     assert any("2026-09-07" in reason for reason in decision.reasons)
 
 
+def test_supported_correction_wins_over_unsupported_earlier_expression() -> None:
+    first_id = uuid4()
+    second_id = uuid4()
+    transcript = [
+        VerificationTurn(
+            seq=1,
+            speaker="employer",
+            text="Собеседование завтра, но фраза неразборчива",
+            asr_confidence=0.2,
+            evidence_reference=str(first_id),
+        ),
+        VerificationTurn(
+            seq=2,
+            speaker="employer",
+            text="Нет, точнее послезавтра в 14:30",
+            asr_confidence=0.95,
+            evidence_reference=str(second_id),
+        ),
+    ]
+    earlier = _candidate(quote="Собеседование завтра")
+    corrected = _candidate(
+        raw="послезавтра",
+        normalized="2026-09-08",
+        quote="Нет, точнее послезавтра в 14:30",
+        seq=2,
+    )
+    decision = _decide(
+        extracted=[earlier, corrected],
+        verified=[earlier, corrected],
+        transcript=transcript,
+        evidence=[first_id, second_id],
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-08",
+                supporting_quote="Нет, точнее послезавтра в 14:30",
+                accepted=True,
+                reason="исправление",
+            )
+        ],
+    )
+    assert decision.status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert decision.facts[0].normalized_value == "2026-09-08"
+    assert any("завтра" in reason for reason in decision.reasons)
+
+
 def test_address_difference_in_case_and_whitespace_is_equal() -> None:
     first = FactCandidate(
         field="address",
@@ -263,7 +340,7 @@ def test_address_difference_in_case_and_whitespace_is_equal() -> None:
                 ArbitrationItem(
                     field="address",
                     accepted_value="УЛ.  ПУШКИНА,  5",
-                    supporting_quote="УЛ.  ПУШКИНА,  5",
+                    supporting_quote="ул. Пушкина, 5",
                     accepted=True,
                     reason="совпадает",
                 )

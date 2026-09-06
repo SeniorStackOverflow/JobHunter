@@ -103,6 +103,8 @@ def _inspect_candidate(
         candidate.field, deterministic
     ):
         reasons.append("normalized value mismatch")
+    if candidate.ambiguity.strip():
+        reasons.append(f"ambiguity: {candidate.ambiguity.strip()}")
     turn = next((item for item in context.transcript if item.seq == candidate.turn_seq), None)
     source_id: UUID | None = None
     turn_seq = candidate.turn_seq or 0
@@ -166,6 +168,7 @@ def reconcile_verification(
     arbitration_by_field = {item.field: item for item in arbitration.decisions}
     facts: list[ReconciledFact] = []
     reasons: list[str] = [*extracted.review_reasons, *verified.review_reasons]
+    pass_review_required = bool(extracted.review_reasons or verified.review_reasons)
 
     for field, candidates in by_field.items():
         supported = [item for item in candidates if item.supported]
@@ -180,9 +183,12 @@ def reconcile_verification(
             groups[_comparison_value(field, item.deterministic_value)].append(item)
         arbiter = arbitration_by_field.get(field)
         field_reasons: list[str] = []
-        if arbiter is not None and not arbiter.accepted:
+        if arbiter is None:
+            field_reasons.append("arbiter decision missing")
+        elif not arbiter.accepted:
             field_reasons.append(f"arbiter rejected: {arbiter.reason}")
         accepted_group: list[_CandidateEvidence] = []
+        correction_applied = False
         if len(groups) == 1 and groups:
             accepted_group = next(iter(groups.values()))
         elif len(groups) > 1:
@@ -194,6 +200,7 @@ def reconcile_verification(
             source_turn = next((t for t in context.transcript if t.seq == latest.turn_seq), None)
             if source_turn is not None and _correction_text(source_turn.text):
                 accepted_group = latest_group
+                correction_applied = True
                 for value, group in groups.items():
                     if group is not latest_group:
                         reasons.extend(
@@ -209,7 +216,22 @@ def reconcile_verification(
             actual = _comparison_value(field, arbiter.accepted_value)
             if not arbiter.accepted or actual != expected:
                 field_reasons.append("arbiter value mismatch")
-        if not supported or any(item.reasons for item in candidates if item not in supported):
+            arbiter_quote = _normalized_text(arbiter.supporting_quote)
+            if not any(
+                arbiter_quote in _normalized_text(turn.text)
+                for turn in context.transcript
+                if turn.speaker.casefold() == "employer"
+            ):
+                field_reasons.append("arbiter quote not found")
+        if correction_applied:
+            field_reasons.extend(reason for item in accepted_group for reason in item.reasons)
+            reasons.extend(
+                f"superseded expression {item.candidate.raw_expression}: {reason}"
+                for item in candidates
+                if item not in accepted_group
+                for reason in item.reasons
+            )
+        elif not supported or any(item.reasons for item in candidates if item not in supported):
             field_reasons.extend(reason for item in candidates for reason in item.reasons)
         if not accepted_group or field_reasons:
             state = (
@@ -252,7 +274,9 @@ def reconcile_verification(
 
     status = (
         PhoneVerificationStatus.HIGH_CONFIDENCE
-        if facts and all(fact.state is CallFactState.CANDIDATE for fact in facts)
+        if facts
+        and not pass_review_required
+        and all(fact.state is CallFactState.CANDIDATE for fact in facts)
         else PhoneVerificationStatus.NEEDS_REVIEW
     )
     return VerificationDecision(

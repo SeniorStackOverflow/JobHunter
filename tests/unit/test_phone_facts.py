@@ -128,6 +128,129 @@ async def test_replace_current_facts_is_idempotent_and_keeps_history(
 
 
 @pytest.mark.asyncio
+async def test_same_fingerprint_and_pipeline_is_a_true_noop(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="",
+            remote_raw="",
+            phonegate_event_id_start=1,
+            started_at=datetime.now(UTC),
+        )
+        db.add(call)
+        await db.flush()
+        turn = CommunicationTurn(
+            id=TURN_ID,
+            session_id=call.id,
+            seq=1,
+            speaker=TurnSpeaker.EMPLOYER,
+            text="Собеседование завтра",
+            occurred_at=datetime.now(UTC),
+        )
+        db.add(turn)
+        await db.flush()
+        first = _decision("2026-09-07")
+        second = _decision("2026-09-08")
+        meta = {"extractor": ModelCallMeta("llmrouter", "m", 1, 1)}
+        result = {"extractor": VerificationResult(facts=[], review_reasons=[])}
+        await replace_current_facts(
+            db,
+            call=call,
+            decision=first,
+            pass_metadata=meta,
+            input_fingerprint="same",
+            pipeline_version="v1",
+            pass_results=result,
+        )
+        await db.flush()
+        before_summary = call.summary
+        before_revision = call.verification_revision
+        before_status = call.verification_status
+        before_fact = (
+            await db.execute(select(CallFact).where(CallFact.session_id == call.id))
+        ).scalar_one()
+        before_fact_values = (
+            before_fact.raw_expression,
+            before_fact.normalized_value,
+            before_fact.state,
+        )
+        await replace_current_facts(
+            db,
+            call=call,
+            decision=second,
+            pass_metadata={"extractor": ModelCallMeta("llmrouter", "different", 99, 3)},
+            input_fingerprint="same",
+            pipeline_version="v1",
+            pass_results={"extractor": VerificationResult(facts=[], review_reasons=["retry"])},
+        )
+        await db.flush()
+        after_fact = (
+            await db.execute(select(CallFact).where(CallFact.session_id == call.id))
+        ).scalar_one()
+        assert call.summary == before_summary
+        assert call.verification_revision == before_revision
+        assert call.verification_status is before_status
+        assert (
+            after_fact.raw_expression,
+            after_fact.normalized_value,
+            after_fact.state,
+        ) == before_fact_values
+
+
+@pytest.mark.asyncio
+async def test_pipeline_change_creates_revision_for_same_input(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="",
+            remote_raw="",
+            phonegate_event_id_start=1,
+            started_at=datetime.now(UTC),
+        )
+        db.add(call)
+        await db.flush()
+        db.add(
+            CommunicationTurn(
+                id=TURN_ID,
+                session_id=call.id,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="Собеседование завтра",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        await db.flush()
+        kwargs = {
+            "decision": _decision(),
+            "pass_metadata": {},
+            "input_fingerprint": "same",
+            "pass_results": {},
+        }
+        await replace_current_facts(db, call=call, pipeline_version="v1", **kwargs)
+        await db.flush()
+        await replace_current_facts(db, call=call, pipeline_version="v2", **kwargs)
+        await db.flush()
+        assert call.verification_revision == 2
+        assert len(call.summary["verification"]["history"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_model_retry_preserves_sms_confirmation(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
