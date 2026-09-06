@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 # ruff: noqa: RUF001 — Cyrillic and Romanian characters in regex patterns are intentional
+import contextlib
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from uuid import UUID
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import async_session_factory
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.schemas import TranscriptEntry
 from app.phone.sessions import SessionStore
-from app.settings.config import Settings
+from app.settings.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
 
@@ -62,6 +65,70 @@ async def link_session_evidence(db: AsyncSession, session_id: UUID, evidence_dir
         )
         linked += 1
     return linked
+
+
+async def prune_phone_evidence() -> dict[str, int]:
+    """Delete *.wav clips older than phone_evidence_retention_days or beyond total size cap.
+
+    - Applies age cutoff first
+    - Then enforces total-size cap (oldest-first)
+    - Nulls matching communication_turns.audio_evidence_path
+    - Removes empty <session_id>/ dirs
+    - Tolerates missing root, already-deleted files
+    - Returns {"removed": count, "freed_bytes": total_bytes}
+    """
+    settings = get_settings()
+    root = Path(settings.phone_evidence_dir)
+    if not root.is_dir():  # noqa: ASYNC240
+        return {"removed": 0, "freed_bytes": 0}
+
+    now = time.time()
+    cutoff = now - settings.phone_evidence_retention_days * 86_400
+    clips: list[tuple[Path, float, int]] = []
+
+    # Scan for all .wav clips with their mtime and size
+    for session_dir in root.iterdir():  # noqa: ASYNC240
+        if not session_dir.is_dir():
+            continue
+        for clip in session_dir.glob("*.wav"):
+            with contextlib.suppress(OSError):
+                st = clip.stat()
+                clips.append((clip, st.st_mtime, st.st_size))
+
+    # First pass: age cutoff
+    to_remove = {c[0] for c in clips if c[1] < cutoff}
+    survivors = sorted((c for c in clips if c[0] not in to_remove), key=lambda c: c[1])
+
+    # Second pass: total size cap (oldest first)
+    total = sum(c[2] for c in survivors)
+    cap = settings.phone_evidence_max_total_mb * 1024 * 1024
+    idx = 0
+    while total > cap and idx < len(survivors):
+        to_remove.add(survivors[idx][0])
+        total -= survivors[idx][2]
+        idx += 1
+
+    # Remove files and null database entries
+    freed = 0
+    async with async_session_factory() as db:
+        store = SessionStore()
+        for path in to_remove:
+            sid, tid = path.parent.name, path.stem
+            with contextlib.suppress(ValueError, LookupError):
+                await store.clear_turn_evidence_path(
+                    db, session_id_text=sid, transcript_id_text=tid
+                )
+            with contextlib.suppress(OSError):
+                freed += path.stat().st_size
+            path.unlink(missing_ok=True)
+        await db.commit()
+
+    # Remove empty session dirs
+    for session_dir in list(root.iterdir()):  # noqa: ASYNC240
+        if session_dir.is_dir() and not any(session_dir.iterdir()):
+            session_dir.rmdir()
+
+    return {"removed": len(to_remove), "freed_bytes": freed}
 
 
 class EvidenceCapturer:

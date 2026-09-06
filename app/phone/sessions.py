@@ -220,6 +220,38 @@ class SessionStore:
         if turn is not None and turn.audio_evidence_path is None:
             turn.audio_evidence_path = path
 
+    async def clear_turn_evidence_path(
+        self,
+        db: AsyncSession,
+        *,
+        session_id_text: str,
+        transcript_id_text: str,
+    ) -> None:
+        """Null the audio_evidence_path for a turn.
+
+        Defensively parses session_id_text as UUID and transcript_id_text as int.
+        Raises ValueError or LookupError if parsing fails; no-ops on success if turn not found.
+        """
+        try:
+            session_id = UUID(session_id_text)
+        except (ValueError, AttributeError) as e:
+            raise ValueError(f"Invalid session_id_text: {session_id_text}") from e
+
+        try:
+            transcript_id = int(transcript_id_text)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid transcript_id_text: {transcript_id_text}") from e
+
+        turn = await db.scalar(
+            select(CommunicationTurn).where(
+                CommunicationTurn.session_id == session_id,
+                CommunicationTurn.phonegate_transcript_id == transcript_id,
+            )
+        )
+        if turn is not None:
+            turn.audio_evidence_path = None
+            await db.flush()
+
     async def set_script_stage(self, call: CommunicationSession, stage: str) -> None:
         call.script_stage = stage
 
