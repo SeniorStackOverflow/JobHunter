@@ -1,3 +1,4 @@
+{% if detail %}{% include "_calls_history_detail.html" %}{% else %}
 <div class="filter-panel">
   <form class="server-search" method="get" action="/">
     <input type="hidden" name="view" value="calls">
@@ -37,4 +38,5 @@
   <span>Страница {{ pagination.page }} из {{ pagination.pages }}</span>
   <form method="get"><input type="hidden" name="view" value="calls"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="tab" value="history"><input type="hidden" name="filter" value="{{ filter }}"><input type="hidden" name="q" value="{{ query }}"><input type="hidden" name="page" value="{{ pagination.page + 1 }}"><button class="btn" {% if not pagination.has_next %}disabled{% endif %}>Дальше →</button></form>
 </div>
+{% endif %}
 {% endif %}

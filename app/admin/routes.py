@@ -1243,9 +1243,10 @@ async def dashboard(
         calls_context = await build_calls_context(
             session,
             tab=(request.query_params.get("tab") or "live"),
-            page=int(request.query_params.get("page", "1") or "1"),
+            page=page,
             filter_=(request.query_params.get("filter") or "all"),
-            query=(request.query_params.get("q") or "").strip(),
+            query=q,
+            session_id=request.query_params.get("session"),
         )
     else:
         active_alerts = list(

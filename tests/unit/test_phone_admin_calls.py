@@ -16,12 +16,20 @@ from selectolax.parser import HTMLParser
 from app.admin import routes as admin_routes
 from app.admin.phone_routes import build_calls_context
 from app.database.session import get_session
-from app.models.entities import CanonicalJob, CommunicationSession, UserProfile
+from app.models.entities import (
+    AuditEvent,
+    CanonicalJob,
+    CommunicationSession,
+    CommunicationTurn,
+    UserProfile,
+)
 from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
     PhoneSummaryState,
+    TurnDeliveryStatus,
+    TurnSpeaker,
 )
 from app.security.auth import hash_password
 from app.settings import Settings
@@ -51,6 +59,7 @@ class SeededCalls:
     db: Any
     newest_first_ids: list[str]
     profile_id: UUID
+    summarized_id: str
 
 
 async def _seed(session: Any) -> SeededCalls:
@@ -103,10 +112,63 @@ async def _seed(session: Any) -> SeededCalls:
     )
     for row in rows:
         session.add(row)
+
+    summarized = rows[0]
+    summarized.script_stage = "wrap_up"
+    summarized.diagnostics = {"asr_backend": "whisper"}
+    summarized.rx_frame_stats = {"frames": 1234}
+    summarized.summary = {
+        "summary_text": "Работодатель предложил собеседование в четверг.",
+        "hints": {"outcome_guess": "unknown"},
+        "model_meta": {"model": "mock", "tokens": 42},
+        "telegram": {"state": "sent"},
+    }
+    session.add(
+        CommunicationTurn(
+            id=uuid4(),
+            session_id=summarized.id,
+            phonegate_transcript_id=1,
+            seq=0,
+            speaker=TurnSpeaker.EMPLOYER,
+            text="Здравствуйте, вы откликались на вакансию?",
+            delivery_status=TurnDeliveryStatus.NOT_APPLICABLE,
+            occurred_at=base,
+        )
+    )
+    session.add(
+        CommunicationTurn(
+            id=uuid4(),
+            session_id=summarized.id,
+            phonegate_transcript_id=2,
+            seq=1,
+            speaker=TurnSpeaker.ASSISTANT,
+            text="assistant raw",
+            spoken_text="Да, добрый день.",
+            delivery_status=TurnDeliveryStatus.DELIVERED,
+            asr_confidence=0.91,
+            audio_evidence_path="/evidence/2.wav",
+            occurred_at=base + timedelta(seconds=5),
+        )
+    )
+    session.add(
+        AuditEvent(
+            id=uuid4(),
+            actor="operator",
+            action="phone.call.summary.generated",
+            entity_type="communication_session",
+            entity_id=str(summarized.id),
+            correlation_id="test-corr",
+        )
+    )
     await session.commit()
 
     newest_first_ids = [str(rows[2].id), str(rows[1].id), str(rows[0].id)]
-    return SeededCalls(db=session, newest_first_ids=newest_first_ids, profile_id=profile_id)
+    return SeededCalls(
+        db=session,
+        newest_first_ids=newest_first_ids,
+        profile_id=profile_id,
+        summarized_id=str(summarized.id),
+    )
 
 
 @pytest_asyncio.fixture
@@ -218,6 +280,75 @@ async def test_calls_nav_link_present_on_other_views(admin_client: httpx.AsyncCl
     resp = await admin_client.get("/?view=overview")
     assert resp.status_code == 200
     assert "/?view=calls" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_calls_detail_exposes_summary_and_evidence_url(
+    seeded_calls: SeededCalls,
+) -> None:
+    ctx = await build_calls_context(
+        seeded_calls.db,
+        tab="history",
+        page=1,
+        filter_="all",
+        query="",
+        session_id=seeded_calls.summarized_id,
+    )
+    d = ctx["detail"]
+    assert d["summary"]["summary_text"]
+    assert d["summary_state"] == "done"
+    assert d["session"]["script_stage"] == "wrap_up"
+    assert d["session"]["rx_frame_stats"] == {"frames": 1234}
+    assert [t["text"] for t in d["turns"]] == [
+        "Здравствуйте, вы откликались на вакансию?",
+        "Да, добрый день.",
+    ]
+    assert any(t["audio_evidence_url"] for t in d["turns"])
+    assert d["turns"][1]["audio_evidence_url"] == (
+        f"/admin/phone/evidence/{seeded_calls.summarized_id}/2.wav"
+    )
+    assert d["audit_events"][0]["action"] == "phone.call.summary.generated"
+
+
+@pytest.mark.asyncio
+async def test_calls_detail_absent_for_unknown_session(seeded_calls: SeededCalls) -> None:
+    ctx = await build_calls_context(
+        seeded_calls.db,
+        tab="history",
+        page=1,
+        filter_="all",
+        query="",
+        session_id="not-a-uuid",
+    )
+    assert not ctx["detail"]
+    ctx2 = await build_calls_context(
+        seeded_calls.db,
+        tab="history",
+        page=1,
+        filter_="all",
+        query="",
+        session_id=str(uuid4()),
+    )
+    assert not ctx2["detail"]
+
+
+@pytest.mark.asyncio
+async def test_calls_detail_page_renders(
+    admin_client: httpx.AsyncClient, seeded_calls: SeededCalls
+) -> None:
+    resp = await admin_client.get(f"/?view=calls&tab=history&session={seeded_calls.summarized_id}")
+    assert resp.status_code == 200
+    assert "Итог звонка" in resp.text
+    assert "Работодатель предложил собеседование в четверг." in resp.text
+    assert "123456" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_calls_detail_page_non_numeric_page_no_500(
+    admin_client: httpx.AsyncClient,
+) -> None:
+    resp = await admin_client.get("/?view=calls&tab=history&page=abc")
+    assert resp.status_code != 500
 
 
 def test_calls_in_view_titles() -> None:

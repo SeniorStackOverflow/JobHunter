@@ -168,6 +168,75 @@ async def _call_row(session: AsyncSession, row: Any) -> dict[str, Any]:
     }
 
 
+async def _call_detail_context(session: AsyncSession, session_id: str) -> dict[str, Any] | None:
+    """Build the session-detail block for ``?view=calls&session=<uuid>``.
+
+    An invalid or unknown ``session_id`` returns ``None`` so the caller falls
+    through to the history list (never a 404/500).
+    """
+    from app.models.entities import AuditEvent, CommunicationSession, CommunicationTurn
+    from app.models.enums import TurnSpeaker
+
+    try:
+        sid = UUID(session_id)
+    except ValueError:
+        return None
+
+    call = await session.get(CommunicationSession, sid)
+    if call is None:
+        return None
+
+    turns = list(
+        (
+            await session.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.session_id == call.id)
+                .order_by(CommunicationTurn.seq)
+            )
+        ).all()
+    )
+    audits = list(
+        (
+            await session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.entity_id == str(call.id))
+                .order_by(AuditEvent.timestamp)
+            )
+        ).all()
+    )
+
+    session_row = await _call_row(session, call)
+    session_row.update(
+        {
+            "script_stage": call.script_stage,
+            "diagnostics": call.diagnostics,
+            "rx_frame_stats": call.rx_frame_stats,
+        }
+    )
+
+    return {
+        "session": session_row,
+        "summary": call.summary or {},
+        "summary_state": call.summary_state.value,
+        "turns": [
+            {
+                "seq": t.seq,
+                "speaker": t.speaker.value,
+                "text": (t.spoken_text if t.speaker is TurnSpeaker.ASSISTANT else t.text),
+                "delivery_status": t.delivery_status.value,
+                "asr_confidence": t.asr_confidence,
+                "audio_evidence_url": (
+                    f"/admin/phone/evidence/{call.id}/{t.phonegate_transcript_id}.wav"
+                    if t.audio_evidence_path
+                    else None
+                ),
+            }
+            for t in turns
+        ],
+        "audit_events": [{"action": a.action, "at": a.timestamp.isoformat()} for a in audits],
+    }
+
+
 async def build_calls_context(
     session: AsyncSession,
     *,
@@ -175,6 +244,7 @@ async def build_calls_context(
     page: int,
     filter_: str,
     query: str,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the ``?view=calls`` template context (Live + История tabs)."""
     from app.models.entities import CanonicalJob, CommunicationSession
@@ -192,6 +262,9 @@ async def build_calls_context(
         "call_rows": [],
         "pagination": _admin_routes._pagination(0, 1, _CALLS_PER_PAGE),
     }
+    if session_id is not None:
+        ctx["detail"] = await _call_detail_context(session, session_id)
+
     if valid_tab != "history":
         return ctx
 
