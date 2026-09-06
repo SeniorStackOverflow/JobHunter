@@ -86,15 +86,15 @@ class ExtractionResult(BaseModel):
 
     summary_text: str
     outcome_guess: Literal["interview_proposed", "info_request", "not_relevant", "unclear", "other"]
-    facts: list[FactCandidate] = Field(default_factory=list)
-    review_reasons: list[str] = Field(default_factory=list)
+    facts: list[FactCandidate]
+    review_reasons: list[str]
 
 
 class VerificationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    facts: list[FactCandidate] = Field(default_factory=list)
-    review_reasons: list[str] = Field(default_factory=list)
+    facts: list[FactCandidate]
+    review_reasons: list[str]
 
 
 class ArbitrationItem(BaseModel):
@@ -110,7 +110,7 @@ class ArbitrationItem(BaseModel):
 class ArbitrationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    decisions: list[ArbitrationItem] = Field(default_factory=list)
+    decisions: list[ArbitrationItem]
 
 
 class SmsFieldComparison(BaseModel):
@@ -126,7 +126,7 @@ class SmsFieldComparison(BaseModel):
 class SmsComparisonResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    comparisons: list[SmsFieldComparison] = Field(default_factory=list)
+    comparisons: list[SmsFieldComparison]
 
 
 @dataclass(frozen=True)
@@ -288,61 +288,82 @@ class PostCallVerificationProvider:
         client = self._client or httpx.AsyncClient(timeout=self._timeout, follow_redirects=False)
         started = time.perf_counter()
         attempts = 0
+        terminal_reason: str | None = None
         try:
             while attempts < self._max_attempts:
                 attempts += 1
+                response: httpx.Response | None = None
+                request_reason: str | None = None
                 try:
                     response = await client.post(
                         f"{self._base_url}/v1/chat/completions",
                         headers=headers,
                         json=body,
+                        follow_redirects=False,
                     )
-                except httpx.TimeoutException as exc:
-                    if attempts < self._max_attempts:
-                        continue
-                    raise VerificationUnavailable("timeout") from exc
-                except httpx.RequestError as exc:
-                    if attempts < self._max_attempts:
-                        continue
-                    raise VerificationUnavailable("transport") from exc
+                except httpx.TimeoutException:
+                    request_reason = "timeout"
+                except httpx.RequestError:
+                    request_reason = "transport"
 
+                if request_reason is not None:
+                    terminal_reason = request_reason
+                    if attempts < self._max_attempts:
+                        continue
+                    break
+
+                if response is None:
+                    terminal_reason = "transport"
+                    break
                 if response.status_code >= 300:
+                    terminal_reason = f"http_{response.status_code}"
                     if attempts < self._max_attempts and (
                         response.status_code == 429 or response.status_code >= 500
                     ):
                         continue
-                    raise VerificationUnavailable(f"http_{response.status_code}")
+                    break
 
+                parse_reason: str | None = None
+                content: object = None
                 try:
                     payload = response.json()
                     content = payload["choices"][0]["message"]["content"]
-                except (ValueError, KeyError, IndexError, TypeError) as exc:
+                except (ValueError, KeyError, IndexError, TypeError):
+                    parse_reason = "malformed_envelope"
+                if parse_reason is not None:
+                    terminal_reason = parse_reason
                     if attempts < self._max_attempts:
                         continue
-                    raise VerificationUnavailable("malformed_envelope") from exc
+                    break
                 if not isinstance(content, str) or not content.strip():
+                    terminal_reason = "empty_content"
                     if attempts < self._max_attempts:
                         continue
-                    raise VerificationUnavailable("empty_content")
+                    break
+
                 try:
                     result = schema_model.model_validate_json(_strip_fence(content))
-                except (ValidationError, ValueError) as exc:
+                except (ValidationError, ValueError):
+                    terminal_reason = "schema_mismatch"
                     if attempts < self._max_attempts:
                         continue
-                    raise VerificationUnavailable("schema_mismatch") from exc
+                    break
 
                 latency = max(1, round((time.perf_counter() - started) * 1000))
                 return result, ModelCallMeta(
                     "llmrouter", self._models[pass_name], latency, attempts
                 )
-            raise VerificationUnavailable("exhausted")
-        except VerificationUnavailable as exc:
+
             latency = max(1, round((time.perf_counter() - started) * 1000))
-            exc.metadata = ModelCallMeta("llmrouter", self._models[pass_name], latency, attempts)
-            raise
+            metadata = ModelCallMeta("llmrouter", self._models[pass_name], latency, attempts)
         finally:
             if owns_client:
                 await client.aclose()
+
+        # This raise is intentionally outside all exception handlers.  It keeps
+        # transport and validation details out of __cause__, __context__, and
+        # traceback rendering for callers that persist the failure.
+        raise VerificationUnavailable(terminal_reason or "exhausted", metadata=metadata)
 
     async def extract(self, ctx: VerificationContext) -> tuple[ExtractionResult, ModelCallMeta]:
         return await self._complete_json(

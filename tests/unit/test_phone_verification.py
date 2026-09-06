@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from datetime import UTC, datetime
 
 import httpx
@@ -79,6 +80,13 @@ def test_verification_models_are_recursive_strict() -> None:
             if isinstance(nested, dict) and "properties" in nested
         )
 
+    assert "facts" in ExtractionResult.model_json_schema()["required"]
+    assert "review_reasons" in ExtractionResult.model_json_schema()["required"]
+    assert "facts" in VerificationResult.model_json_schema()["required"]
+    assert "review_reasons" in VerificationResult.model_json_schema()["required"]
+    assert "decisions" in ArbitrationResult.model_json_schema()["required"]
+    assert "comparisons" in SmsComparisonResult.model_json_schema()["required"]
+
 
 @pytest.mark.asyncio
 async def test_verifier_request_contains_original_context_only() -> None:
@@ -86,7 +94,7 @@ async def test_verifier_request_contains_original_context_only() -> None:
     extraction = {
         "summary_text": "итог",
         "outcome_guess": "unclear",
-        "facts": [],
+        "facts": [_candidate() | {"normalized_value": "14:30"}],
         "review_reasons": [],
     }
 
@@ -101,13 +109,14 @@ async def test_verifier_request_contains_original_context_only() -> None:
         model="model",
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
-    await provider.extract(_context())
+    extracted, _ = await provider.extract(_context())
     await provider.verify(_context())
 
     assert bodies[0] != bodies[1]
     verifier_json = json.dumps(bodies[1], ensure_ascii=False)
     assert "extractor_result" not in verifier_json
-    assert '"normalized_value": "14:30"' not in verifier_json
+    assert extracted.facts[0].normalized_value is not None
+    assert extracted.facts[0].normalized_value not in verifier_json
 
 
 @pytest.mark.asyncio
@@ -148,6 +157,66 @@ async def test_provider_sanitizes_transport_failures() -> None:
     assert str(caught.value) == "timeout"
     assert "+37360111222" not in str(caught.value)
     assert "secret-token" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    formatted = "".join(traceback.format_exception(caught.value))
+    exposed = formatted + repr(caught.value.args) + repr(vars(caught.value))
+    assert "+37360111222" not in exposed
+    assert "secret-token" not in exposed
+    assert "SMS" not in exposed
+
+
+@pytest.mark.asyncio
+async def test_provider_schema_failure_has_no_original_exception_context() -> None:
+    provider = PostCallVerificationProvider(
+        base_url="http://router",
+        api_key="secret-token",
+        model="model",
+        max_attempts=1,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: _response(
+                    {
+                        "facts": [],
+                        "review_reasons": [],
+                        "invalid_output": "employer prompt with phone +37360111222",
+                    }
+                )
+            )
+        ),
+    )
+    with pytest.raises(VerificationUnavailable) as caught:
+        await provider.verify(_context())
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    formatted = "".join(traceback.format_exception(caught.value))
+    assert "invalid_output" not in formatted
+    assert "+37360111222" not in formatted
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_redirects_even_when_client_allows_them() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            return httpx.Response(307, headers={"location": "https://evil.example/"})
+        return _response({"facts": [], "review_reasons": []})
+
+    provider = PostCallVerificationProvider(
+        base_url="http://router",
+        api_key="secret-token",
+        model="model",
+        max_attempts=1,
+        client=httpx.AsyncClient(
+            follow_redirects=True,
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    with pytest.raises(VerificationUnavailable, match="http_307"):
+        await provider.verify(_context())
+    assert calls == ["http://router/v1/chat/completions"]
 
 
 @pytest.mark.asyncio
