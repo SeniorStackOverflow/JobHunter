@@ -116,7 +116,7 @@ services:
       - worker
       - --loglevel=${LOG_LEVEL:-INFO}
       - --hostname=worker@%h
-      - --queues=crawling,matching,applications,email,reports,maintenance,celery
+      - --queues=crawling,matching,applications,email,reports,maintenance,celery,phone
       - --pool=solo
     depends_on:
       migrate:

@@ -593,14 +593,30 @@ def record_learning_shadow_task() -> int | dict[str, str]:
     return _run_locked_periodic("record-learning-shadow", record_learning_shadow(), ttl_seconds=600)
 
 
+@celery_app.task(name="job_agent.scheduler.finalize_pending_calls")
+def finalize_pending_calls_task() -> dict[str, Any]:
+    from app.phone.summary import finalize_pending_calls
+
+    return _run_locked_periodic("phone-finalize", finalize_pending_calls(), ttl_seconds=600)
+
+
+@celery_app.task(name="job_agent.scheduler.prune_phone_evidence")
+def prune_phone_evidence_task() -> dict[str, Any]:
+    from app.phone.evidence import prune_phone_evidence
+
+    return _run_locked_periodic("phone-evidence-prune", prune_phone_evidence(), ttl_seconds=900)
+
+
 __all__ = [
     "DEFAULT_SOURCE_SCHEDULES",
     "close_task_event_loop",
     "cron_expression_is_due",
     "dispatch_due_sources_task",
+    "finalize_pending_calls_task",
     "generate_daily_report_task",
     "prepare_pending_applications_task",
     "process_unprocessed_jobs_task",
+    "prune_phone_evidence_task",
     "recheck_source_task",
     "record_learning_shadow_task",
     "retry_temporary_failures_task",

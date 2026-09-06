@@ -142,7 +142,7 @@ services:
       - worker
       - --loglevel=${LOG_LEVEL:-INFO}
       - --hostname=control@%h
-      - --queues=email,reports,maintenance
+      - --queues=email,reports,maintenance,phone
       - --pool=solo
     depends_on:
       migrate:

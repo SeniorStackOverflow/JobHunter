@@ -96,6 +96,16 @@ celery_app.conf.update(
             "schedule": 300.0,
             "options": {"queue": "matching", "expires": 270},
         },
+        "finalize-pending-calls": {
+            "task": "job_agent.scheduler.finalize_pending_calls",
+            "schedule": 120.0,
+            "options": {"queue": "phone", "expires": 110},
+        },
+        "prune-phone-evidence": {
+            "task": "job_agent.scheduler.prune_phone_evidence",
+            "schedule": crontab(minute=40, hour=3),
+            "options": {"queue": "phone"},
+        },
     },
     task_routes={
         "job_agent.scheduler.run_scan": {"queue": "crawling"},
@@ -108,6 +118,8 @@ celery_app.conf.update(
         "job_agent.scheduler.generate_daily_report": {"queue": "reports"},
         "job_agent.scheduler.train_learning_models": {"queue": "matching"},
         "job_agent.scheduler.record_learning_shadow": {"queue": "matching"},
+        "job_agent.scheduler.finalize_pending_calls": {"queue": "phone"},
+        "job_agent.scheduler.prune_phone_evidence": {"queue": "phone"},
     },
 )
 
