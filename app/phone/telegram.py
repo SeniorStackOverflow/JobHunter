@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from html import escape
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from uuid import UUID
 
 import httpx
 from sqlalchemy import Select, or_, select, update
@@ -184,7 +185,15 @@ def _controlled_alternatives(call: object, field: str) -> list[tuple[str, str]]:
             value = _clean(
                 candidate.get("normalized_value") or candidate.get("raw_expression"), limit=160
             )
-            quote = _short_quote(candidate.get("supporting_quote"))
+            try:
+                source_turn_id = UUID(str(candidate.get("source_turn_id", "")))
+            except (TypeError, ValueError, AttributeError):
+                source_turn_id = None
+            quote = (
+                _short_quote(candidate.get("supporting_quote"))
+                if source_turn_id is not None
+                else ""
+            )
             pair = (value, quote)
             if value and pair not in out:
                 out.append(pair)

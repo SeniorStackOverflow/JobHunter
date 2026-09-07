@@ -262,7 +262,7 @@ def reconcile_verification(
             llm_confidence=chosen.candidate.confidence,
             state=state,
             reason=reason,
-            supporting_quote=_normalized_text(chosen.candidate.quote),
+            supporting_quote=(_normalized_text(chosen.candidate.quote) if chosen.supported else ""),
         )
         facts.append(fact)
         if state is not CallFactState.CANDIDATE:
