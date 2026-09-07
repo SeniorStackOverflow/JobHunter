@@ -8,6 +8,9 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 10.0
+TELEGRAM_LEASE_SAFETY_MARGIN_SECONDS = 5.0
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -127,6 +130,17 @@ class Settings(BaseSettings):
     def validate_resume_size(cls, value: int) -> int:
         if value < 1024 or value > 25 * 1024 * 1024:
             raise ValueError("MAX_RESUME_BYTES must be between 1 KiB and 25 MiB")
+        return value
+
+    @field_validator("phone_telegram_lease_seconds")
+    @classmethod
+    def validate_telegram_lease_seconds(cls, value: int) -> int:
+        minimum = int(TELEGRAM_REQUEST_TIMEOUT_SECONDS + TELEGRAM_LEASE_SAFETY_MARGIN_SECONDS) + 1
+        if value < minimum:
+            raise ValueError(
+                "PHONE_TELEGRAM_LEASE_SECONDS must exceed the Telegram request timeout "
+                "plus its safety margin"
+            )
         return value
 
     @field_validator("public_base_url")

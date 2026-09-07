@@ -32,6 +32,7 @@ class ReconciledFact:
     llm_confidence: float | None
     state: CallFactState
     reason: str
+    supporting_quote: str = ""
 
 
 @dataclass(frozen=True)
@@ -261,6 +262,7 @@ def reconcile_verification(
             llm_confidence=chosen.candidate.confidence,
             state=state,
             reason=reason,
+            supporting_quote=_normalized_text(chosen.candidate.quote),
         )
         facts.append(fact)
         if state is not CallFactState.CANDIDATE:

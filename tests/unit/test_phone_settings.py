@@ -127,6 +127,12 @@ def test_summary_and_telegram_defaults() -> None:
     assert s.effective_summary_model == ""
 
 
+def test_telegram_lease_exceeds_request_timeout_with_margin() -> None:
+    with pytest.raises(ValueError, match="Telegram request timeout"):
+        Settings(_env_file=None, phone_telegram_lease_seconds=15)
+    Settings(_env_file=None, phone_telegram_lease_seconds=16)
+
+
 def test_sms_polling_defaults() -> None:
     s = Settings(_env_file=None)
     assert s.phone_sms_batch == 150

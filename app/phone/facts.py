@@ -62,6 +62,7 @@ def _decision_json(decision: VerificationDecision) -> dict[str, object]:
                 "llm_confidence": fact.llm_confidence,
                 "state": fact.state.value,
                 "reason": fact.reason,
+                "supporting_quote": fact.supporting_quote,
             }
             for fact in decision.facts
         ],
@@ -248,9 +249,6 @@ async def apply_sms_confirmation(
         ),
         None,
     )
-    if existing_entry is not None and existing_entry.get("status") != "unlinked":
-        return call.verification_status
-
     facts = list((await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all())
     by_field = {cast(CriticalField, fact.field): fact for fact in facts}
     reasons: list[str] = []
@@ -357,9 +355,10 @@ async def apply_sms_confirmation(
     comparisons_history.append(entry)
     verification["sms_comparisons"] = comparisons_history
     input_ids = _sms_turn_id_set(verification)
-    if turn_key not in input_ids:
-        call.verification_revision += 1
-        input_ids.add(turn_key)
+    # Applying a comparison persists trust/fact state even when a retry refers
+    # to an already linked SMS. Bind every such mutation to a fresh revision.
+    call.verification_revision += 1
+    input_ids.add(turn_key)
     verification["sms_input_ids"] = sorted(input_ids)
     if reasons:
         prior_reasons = verification.get("review_reason_codes", [])

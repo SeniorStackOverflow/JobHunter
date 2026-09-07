@@ -326,7 +326,7 @@ async def test_sms_relative_date_uses_sms_occurrence_in_chisinau_timezone(
 
 
 @pytest.mark.asyncio
-async def test_same_sms_is_idempotent_and_unlink_restores_prior_fact(
+async def test_repeated_sms_apply_revisions_and_unlink_restores_prior_fact(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with sqlite_session_factory() as db:
@@ -349,14 +349,12 @@ async def test_same_sms_is_idempotent_and_unlink_restores_prior_fact(
         first = await apply_sms_confirmation(
             db, call=call, sms_session=sms, comparison=comparison, metadata=meta
         )
-        first_summary = call.summary
         first_revision = call.verification_revision
         second = await apply_sms_confirmation(
             db, call=call, sms_session=sms, comparison=comparison, metadata=meta
         )
         assert second is first
-        assert call.summary == first_summary
-        assert call.verification_revision == first_revision
+        assert call.verification_revision == first_revision + 1
         await unlink_sms_confirmation(db, call=call, sms_session=sms)
         await db.commit()
 

@@ -4,16 +4,19 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy import select
 
-from app.models.entities import CallFact, CommunicationSession
+from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import (
     CallFactConfirmationSource,
     CallFactState,
     CommunicationChannel,
     CommunicationDirection,
     PhoneVerificationStatus,
+    TurnSpeaker,
 )
 from app.phone import telegram as telegram_module
+from app.phone.facts import apply_sms_confirmation
 from app.phone.summary import CallSummary
 from app.phone.telegram import (
     TelegramDeliveryError,
@@ -21,7 +24,21 @@ from app.phone.telegram import (
     render_call_notification,
     send_telegram_message,
 )
+from app.phone.verification import ModelCallMeta, SmsComparisonResult, SmsFieldComparison
 from app.settings import Settings
+
+
+def test_due_query_compiles_postgres_locking_and_predicates() -> None:
+    from sqlalchemy.dialects import postgresql
+
+    query = telegram_module._due_query(
+        now=datetime(2026, 9, 7, tzinfo=UTC),
+        lease_before=datetime(2026, 9, 7, tzinfo=UTC),
+        limit=1,
+    ).with_for_update(skip_locked=True)
+    sql = str(query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "summary" in sql and "next_attempt_at" in sql and "claimed_at" in sql
 
 
 @pytest.mark.asyncio
@@ -197,6 +214,8 @@ def test_render_trust_aware_facts_and_conflict_alternatives():
                             "raw_expression": "в 10:00",
                             "normalized_value": "10:00",
                             "state": "conflict",
+                            "source_turn_id": str(uuid4()),
+                            "supporting_quote": "<b>в 10:00</b>",
                         },
                     ]
                 },
@@ -209,6 +228,8 @@ def test_render_trust_aware_facts_and_conflict_alternatives():
                                     "raw_expression": "в 11:00",
                                     "normalized_value": "11:00",
                                     "state": "conflict",
+                                    "source_turn_id": str(uuid4()),
+                                    "supporting_quote": "в 11:00",
                                 }
                             ]
                         }
@@ -234,11 +255,22 @@ def test_render_trust_aware_facts_and_conflict_alternatives():
     assert "Требуется проверка" in text
     assert "Варианты" in text
     assert "10:00" in text and "11:00" in text
+    assert "&lt;b&gt;в 10:00&lt;/b&gt;" in text
     assert "<script>" not in text
     assert "подтверждено" not in text.casefold()
     assert "A&lt;b&gt;" in text
     assert "🔗" not in text
     assert len(text) <= 4096
+
+
+def test_render_reads_summary_text_from_persisted_mapping() -> None:
+    call = _call(
+        PhoneVerificationStatus.NOT_APPLICABLE,
+        summary={"summary_text": "Сохранённый итог", "proposed_address_text": "ул. 1"},
+    )
+    text = render_call_notification(call, base_url=None)
+    assert "Сохранённый итог" in text
+    assert "ул. 1" in text
 
 
 def test_render_confirmed_and_high_confidence_labels_only():
@@ -554,6 +586,132 @@ async def test_revision_change_after_send_keeps_new_revision_pending(
         assert stored is not None
         assert stored.summary["telegram"]["state"] == "pending"
         assert stored.summary["telegram"]["input_revision"] == 2
+        assert stored.summary["telegram"]["message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_inflight_delivery_loses_to_committed_sms_apply(
+    sqlite_session_factory, monkeypatch: pytest.MonkeyPatch
+):
+    from app.models.enums import CommunicationOutcome, PhoneSummaryState
+
+    settings = Settings(
+        _env_file=None,
+        telegram_enabled=True,
+        telegram_bot_token="bot-token",
+        telegram_chat_id="chat-id",
+    )
+    monkeypatch.setattr(telegram_module, "get_settings", lambda: settings)
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    sent = 0
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            started_at=datetime(2026, 9, 6, 21, 0, tzinfo=UTC),
+            ended_at=datetime(2026, 9, 6, 21, 0, tzinfo=UTC),
+            outcome=CommunicationOutcome.COMPLETED,
+            summary_state=PhoneSummaryState.DONE,
+            verification_status=PhoneVerificationStatus.HIGH_CONFIDENCE,
+            verification_revision=0,
+            summary={
+                "summary_text": "Готово",
+                "verification": {
+                    "transcript_status": "high_confidence",
+                    "decision": {"status": "high_confidence", "facts": []},
+                    "sms_input_ids": [],
+                },
+                "telegram": {"state": "pending", "input_revision": 0},
+            },
+        )
+        sms = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.SMS,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            transport_external_id="sms-interleave",
+            related_session_id=call.id,
+            started_at=datetime(2026, 9, 6, 21, 30, tzinfo=UTC),
+            ended_at=datetime(2026, 9, 6, 21, 30, tzinfo=UTC),
+        )
+        db.add_all([call, sms])
+        await db.flush()
+        sms.related_session_id = call.id
+        db.add(
+            CommunicationTurn(
+                session_id=sms.id,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="Подтверждаем сегодня",
+                occurred_at=sms.started_at,
+            )
+        )
+        db.add(
+            CallFact(
+                session_id=call.id,
+                field="interview_date",
+                raw_expression="завтра",
+                normalized_value="2026-09-07",
+                state=CallFactState.CANDIDATE,
+            )
+        )
+        await db.commit()
+        call_id = call.id
+
+    async def paused_send(**kwargs):
+        nonlocal sent
+        sent += 1
+        started.set()
+        await release.wait()
+        return TelegramDeliveryResult(message_id=909)
+
+    monkeypatch.setattr(telegram_module, "send_telegram_message", paused_send)
+    worker = asyncio.create_task(telegram_module.deliver_pending_phone_notifications())
+    await started.wait()
+    async with sqlite_session_factory() as db:
+        latest = await db.get(CommunicationSession, call_id)
+        sms_session = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport_external_id == "sms-interleave"
+            )
+        )
+        assert latest is not None and sms_session is not None
+        status = await apply_sms_confirmation(
+            db,
+            call=latest,
+            sms_session=sms_session,
+            comparison=SmsComparisonResult(
+                comparisons=[
+                    SmsFieldComparison(
+                        field="interview_date",
+                        relation="matches",
+                        sms_expression="сегодня",
+                        call_expression="завтра",
+                        reason="confirmed",
+                    )
+                ]
+            ),
+            metadata=ModelCallMeta("test", "test", 1, 1),
+        )
+        assert status is PhoneVerificationStatus.CONFIRMED
+        await db.commit()
+    release.set()
+    result = await worker
+    assert result["skipped"] == 1
+    assert sent == 1
+    async with sqlite_session_factory() as db:
+        stored = await db.get(CommunicationSession, call_id)
+        assert stored is not None
+        assert stored.verification_revision == 1
+        assert stored.summary["telegram"]["state"] == "pending"
+        assert stored.summary["telegram"]["input_revision"] == 1
         assert stored.summary["telegram"]["message_id"] is None
 
 

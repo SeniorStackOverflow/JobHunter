@@ -10,13 +10,13 @@ import re
 import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from html import escape
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 import httpx
-from sqlalchemy import or_, select, update
+from sqlalchemy import Select, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import utcnow
@@ -24,6 +24,7 @@ from app.models.entities import CallFact, CanonicalJob, CommunicationSession
 from app.models.enums import CallFactState, CommunicationChannel
 from app.phone.notification_state import refresh_telegram_notification
 from app.settings import Settings, get_settings
+from app.settings.config import TELEGRAM_REQUEST_TIMEOUT_SECONDS
 
 _API = "https://api.telegram.org"
 _MAX_MESSAGE_LENGTH = 4096
@@ -65,7 +66,7 @@ async def send_telegram_message(
     chat_id: str,
     text: str,
     client: httpx.AsyncClient | None = None,
-    timeout: float = 10.0,  # noqa: ASYNC109 - passed to httpx.AsyncClient, not a cancel scope
+    timeout: float = TELEGRAM_REQUEST_TIMEOUT_SECONDS,  # noqa: ASYNC109 - passed to httpx.AsyncClient, not a cancel scope
 ) -> TelegramDeliveryResult:
     payload = {
         "chat_id": chat_id,
@@ -183,7 +184,8 @@ def _controlled_alternatives(call: object, field: str) -> list[tuple[str, str]]:
             value = _clean(
                 candidate.get("normalized_value") or candidate.get("raw_expression"), limit=160
             )
-            pair = (value, "")
+            quote = _short_quote(candidate.get("supporting_quote"))
+            pair = (value, quote)
             if value and pair not in out:
                 out.append(pair)
     return out[:4]
@@ -269,7 +271,14 @@ def render_call_notification(
             if fact.state is CallFactState.CONFLICT:
                 pairs = _controlled_alternatives(call, fact.field)
                 if pairs:
-                    alternatives.extend(f"{label}: {candidate}" for candidate, _quote in pairs)
+                    alternatives.extend(
+                        (
+                            f"{label}: {candidate} (фраза: «{quote}»)"
+                            if quote
+                            else f"{label}: {candidate}"
+                        )
+                        for candidate, quote in pairs
+                    )
                 else:
                     alternatives.append(f"{label}: значение расходится")
                 continue
@@ -282,11 +291,22 @@ def render_call_notification(
             lines.append("Варианты для проверки:")
             lines.extend(f"• {escape(item)}" for item in alternatives)
     else:
-        summary_text = _clean(getattr(call, "summary_text", "") or "", limit=900)
+        persisted_summary = getattr(call, "summary", None)
+
+        def summary_text_value(key: str) -> str:
+            if isinstance(persisted_summary, dict):
+                value = persisted_summary.get(key)
+                return value if isinstance(value, str) else ""
+            # Retain the legacy value-object form used by the pre-persistence
+            # renderer callers; CommunicationSession always takes the mapping path.
+            value = getattr(call, key, "")
+            return value if isinstance(value, str) else ""
+
+        summary_text = _clean(summary_text_value("summary_text"), limit=900)
         if summary_text:
             lines.append(escape(summary_text))
-        proposed_datetime = _clean(getattr(call, "proposed_datetime_text", "") or "", limit=220)
-        proposed_address = _clean(getattr(call, "proposed_address_text", "") or "", limit=220)
+        proposed_datetime = _clean(summary_text_value("proposed_datetime_text"), limit=220)
+        proposed_address = _clean(summary_text_value("proposed_address_text"), limit=220)
         if proposed_datetime:
             lines.append(f"🕒 {escape(proposed_datetime)}")
         if proposed_address:
@@ -301,19 +321,6 @@ def _telegram_record(summary: object) -> dict[str, Any]:
         return {}
     value = summary.get("telegram")
     return dict(value) if isinstance(value, dict) else {}
-
-
-def _due(record: dict[str, Any], now: datetime) -> bool:
-    value = record.get("next_attempt_at")
-    if not value:
-        return True
-    try:
-        due_at = datetime.fromisoformat(str(value))
-    except ValueError:
-        return True
-    if due_at.tzinfo is None:
-        due_at = due_at.replace(tzinfo=UTC)
-    return due_at <= now
 
 
 async def _job_company_vacancy(
@@ -364,13 +371,12 @@ async def _store_claimed_summary(
     return int(getattr(result, "rowcount", 0)) == 1
 
 
-async def _claim_due(
-    db: AsyncSession, *, settings: Settings, now: datetime, batch: int = 1
-) -> list[tuple[Any, str]]:
-    claimed: list[tuple[Any, str]] = []
-    lease_before = now - timedelta(seconds=settings.phone_telegram_lease_seconds)
-    async with db.begin():
-        query = select(CommunicationSession).where(
+def _due_query(
+    *, now: datetime, lease_before: datetime, limit: int
+) -> Select[tuple[CommunicationSession]]:
+    return (
+        select(CommunicationSession)
+        .where(
             CommunicationSession.channel == CommunicationChannel.CALL,
             CommunicationSession.summary_state == "done",
             CommunicationSession.summary["telegram"]["state"]
@@ -387,31 +393,27 @@ async def _claim_due(
                 <= lease_before.isoformat(),
             ),
         )
+        .order_by(CommunicationSession.ended_at, CommunicationSession.id)
+        .limit(limit)
+    )
+
+
+async def _claim_due(
+    db: AsyncSession, *, settings: Settings, now: datetime, batch: int = 1
+) -> list[tuple[Any, str]]:
+    claimed: list[tuple[Any, str]] = []
+    lease_before = now - timedelta(seconds=settings.phone_telegram_lease_seconds)
+    async with db.begin():
+        query = _due_query(
+            now=now,
+            lease_before=lease_before,
+            limit=max(1, min(batch, settings.phone_telegram_batch)),
+        )
         if db.bind is not None and db.bind.dialect.name == "postgresql":
             query = query.with_for_update(skip_locked=True)
-        rows = list(
-            (
-                await db.scalars(
-                    query.order_by(CommunicationSession.ended_at, CommunicationSession.id).limit(
-                        max(1, min(batch, settings.phone_telegram_batch))
-                    )
-                )
-            ).all()
-        )
+        rows = list((await db.scalars(query)).all())
         for call in rows:
             record = _telegram_record(call.summary)
-            if record.get("state") not in {"pending", "retrying"} or not _due(record, now):
-                continue
-            claimed_at = record.get("claimed_at")
-            if claimed_at:
-                try:
-                    value = datetime.fromisoformat(str(claimed_at))
-                    if value.tzinfo is None:
-                        value = value.replace(tzinfo=UTC)
-                    if value > lease_before:
-                        continue
-                except ValueError:
-                    pass
             token = secrets.token_urlsafe(32)
             updated_record = {
                 "input_revision": int(record.get("input_revision", call.verification_revision)),

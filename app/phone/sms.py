@@ -665,7 +665,6 @@ async def _record_sms_failure(
             call.summary_state = PhoneSummaryState.DONE
             call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
             call.needs_review = True
-            call.verification_revision += 1
         verification["sms_reconciliation"] = {
             "state": "retry" if retryable else "failed",
             "sms_turn_id": str(sms_turn_id),
@@ -677,9 +676,9 @@ async def _record_sms_failure(
         summary = dict(call.summary or {})
         summary["verification"] = verification
         call.summary = summary
-        if not retryable:
-            refresh_telegram_notification(call)
-            flag_modified(call, "summary")
+        call.verification_revision += 1
+        refresh_telegram_notification(call)
+        flag_modified(call, "summary")
         await db.commit()
         return call.verification_status
 
