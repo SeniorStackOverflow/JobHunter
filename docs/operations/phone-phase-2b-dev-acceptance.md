@@ -84,6 +84,22 @@ The browser workflow covered narrow layout, fact review states, evidence
 empty state, SMS linkage controls, audit state, Telegram state, processing,
 failure, conflict, and empty states.
 
+## Final repository checks
+
+The final checks ran after the DEV and browser checks:
+
+| Command | Result |
+| --- | --- |
+| `uv run ruff check .` | passed |
+| `uv run mypy app fixture_site` | passed; 120 source files |
+| `uv run pytest` | 910 passed, 16 skipped, 132.92s |
+| `git diff --check` | passed |
+| `uv run ruff format --check .` | blocked by six pre-existing unformatted Phase 1/2 design and plan Markdown files; changed Python and acceptance files pass targeted format checks |
+
+The skipped tests are the existing service-backed/live suites plus the
+opt-in real-call module described above. No unrelated documentation was
+reformatted to force the repository-wide format check green.
+
 ## Known limits
 
 The live acceptance remains incomplete until the operator supplies the
