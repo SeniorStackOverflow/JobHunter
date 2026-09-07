@@ -13,7 +13,8 @@
       {% if s.outcome %}<span class="badge {{ status_tone(s.outcome) }}">{{ status_label(s.outcome) }}</span>{% endif %}
       {% if s.auto_answered %}<span class="badge muted">авто-ответ</span>{% endif %}
       {% if s.needs_review %}<span class="badge warning">проверка</span>{% endif %}
-      {% if s.verification_status == 'confirmed' %}<span class="badge success">Подтверждено</span>{% elif s.verification_status == 'high_confidence' %}<span class="badge success">Высокая уверенность</span>{% elif s.verification_status == 'needs_review' %}<span class="badge warning">Нужна проверка</span>{% endif %}
+      {% if s.verification_provenance %}<span class="badge success">{{ s.verification_provenance }}</span>{% elif s.verification_status == 'confirmed' %}<span class="badge success">Подтверждено</span>{% elif s.verification_status == 'high_confidence' %}<span class="badge success">Высокая уверенность</span>{% elif s.verification_status == 'needs_review' %}<span class="badge warning">Нужна проверка</span>{% endif %}
+      {% if detail.summary_state == 'pending' %}<span class="badge muted">Ожидает обработки</span>{% elif detail.summary_state == 'processing' %}<span class="badge muted">Обработка выполняется</span>{% endif %}
     </div>
   </div>
   <p><a class="btn" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history">← К списку</a></p>
@@ -36,7 +37,7 @@
       </div>
       <div class="queue-card-badges">
         <span class="badge {% if fact.state == 'confirmed' %}success{% elif fact.state in ['conflict','unknown'] %}warning{% else %}muted{% endif %}">{{ fact.state_label }}</span>
-        {% if fact.confirmation_source %}<span class="badge muted">Источник: {{ fact.confirmation_source }}</span>{% endif %}
+        {% if fact.confirmation_source_label %}<span class="badge muted">{{ fact.confirmation_source_label }}</span>{% endif %}
         <form method="post" action="/admin/phone/calls/{{ s.id }}/facts/{{ fact.field }}/review">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="action" value="confirm">
@@ -90,13 +91,13 @@
 
 <div class="panel">
   <h3>Итог звонка</h3>
-  {% if detail.summary_state == 'failed' %}<p><span class="badge danger">резюме: ошибка</span></p>{% endif %}
+  {% if detail.summary_state == 'pending' %}<p><span class="badge muted">Ожидает обработки</span></p><div class="empty-state">Обработка резюме ещё не началась.</div>{% elif detail.summary_state == 'processing' %}<p><span class="badge muted">Обработка выполняется</span></p><div class="empty-state">Резюме формируется. Обновите страницу через минуту.</div>{% elif detail.summary_state == 'failed' %}<p><span class="badge danger">резюме: ошибка</span></p>{% endif %}
   {% if detail.summary.telegram and detail.summary.telegram.state %}
   <p><span class="badge muted">TG: {{ detail.summary.telegram.state }}</span></p>
   {% endif %}
   {% if detail.summary.summary_text %}
   <p class="call-summary-text">{{ detail.summary.summary_text }}</p>
-  {% else %}
+  {% elif detail.summary_state not in ['pending', 'processing'] %}
   <div class="empty-state">Резюме звонка ещё не готово.</div>
   {% endif %}
   {% if detail.summary.hints %}

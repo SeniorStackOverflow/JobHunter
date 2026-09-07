@@ -24,7 +24,8 @@
       {% if row.outcome %}<span class="badge {{ status_tone(row.outcome) }}">{{ status_label(row.outcome) }}</span>{% endif %}
       {% if row.auto_answered %}<span class="badge muted">авто-ответ</span>{% endif %}
       {% if row.needs_review %}<span class="badge warning">проверка</span>{% endif %}
-      {% if row.verification_status == 'confirmed' %}<span class="badge success">Подтверждено</span>{% elif row.verification_status == 'high_confidence' %}<span class="badge success">Высокая уверенность</span>{% elif row.verification_status == 'needs_review' %}<span class="badge warning">Нужна проверка</span>{% endif %}
+      {% if row.verification_provenance %}<span class="badge success">{{ row.verification_provenance }}</span>{% elif row.verification_status == 'confirmed' %}<span class="badge success">Подтверждено</span>{% elif row.verification_status == 'high_confidence' %}<span class="badge success">Высокая уверенность</span>{% elif row.verification_status == 'needs_review' %}<span class="badge warning">Нужна проверка</span>{% endif %}
+      {% if row.summary_state == 'pending' %}<span class="badge muted">Ожидает обработки</span>{% elif row.summary_state == 'processing' %}<span class="badge muted">Обработка выполняется</span>{% endif %}
       {% if row.model_latency_ms is not none %}<span class="badge muted">модель: {{ row.model_latency_ms }} мс</span>{% endif %}
       {% if row.summary_state == 'failed' %}<span class="badge danger">резюме: ошибка</span>{% endif %}
       {% if row.telegram_state %}<span class="badge muted">TG: {{ row.telegram_state }}</span>{% endif %}

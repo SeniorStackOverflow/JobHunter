@@ -40,6 +40,57 @@ class SmsConfirmationRejected(ValueError):
     """The supplied SMS is not an eligible employer message for this call."""
 
 
+class CallMutationRejected(RuntimeError):
+    """A manual trust mutation lost its revision/lease compare-and-swap."""
+
+
+async def reserve_call_mutation(
+    db: AsyncSession,
+    *,
+    call: CommunicationSession,
+) -> CommunicationSession:
+    """Reserve a call trust mutation with a row lock or SQLite CAS.
+
+    PostgreSQL serializes this boundary with ``FOR UPDATE``.  SQLite has no
+    row locks, so it conditionally advances the observed revision while the
+    claim is still null.  Callers must keep all related writes in this same
+    transaction; rollback then removes both the reservation and any facts.
+    """
+    await db.flush()
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    if dialect != "postgresql":
+        if call.claim_token is not None:
+            raise CallMutationRejected("call is unavailable for mutation")
+        observed_revision = call.verification_revision
+        result = await db.execute(
+            update(CommunicationSession)
+            .where(
+                CommunicationSession.id == call.id,
+                CommunicationSession.verification_revision == observed_revision,
+                CommunicationSession.claim_token.is_(None),
+            )
+            .values(verification_revision=observed_revision + 1)
+        )
+        if int(getattr(result, "rowcount", 0)) != 1:
+            raise CallMutationRejected("call changed during mutation")
+        await db.refresh(call)
+        return call
+
+    query = (
+        select(CommunicationSession)
+        .where(CommunicationSession.id == call.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    latest = await db.scalar(query)
+    if latest is None or latest.claim_token is not None:
+        raise CallMutationRejected("call is unavailable for mutation")
+    else:
+        observed_revision = latest.verification_revision
+        latest.verification_revision = observed_revision + 1
+    return latest
+
+
 def _meta_json(metadata: ModelCallMeta) -> dict[str, object]:
     return {
         "provider": metadata.provider,
@@ -685,9 +736,11 @@ async def replace_current_facts(
 
 
 __all__ = [
+    "CallMutationRejected",
     "SmsConfirmationRejected",
     "apply_sms_confirmation",
     "derive_verification_status",
     "replace_current_facts",
+    "reserve_call_mutation",
     "unlink_sms_confirmation",
 ]

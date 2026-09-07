@@ -147,6 +147,41 @@ def _verification_tone(status: str | None) -> str:
     }.get(status or "", "muted")
 
 
+def _confirmation_source_label(source: str | None) -> str | None:
+    if source is None:
+        return None
+    return {
+        "sms": "Подтверждено по SMS",
+        "manual": "Подтверждено вручную",
+    }.get(source)
+
+
+async def _confirmation_provenance(session: AsyncSession, call_id: UUID) -> str | None:
+    from app.models.entities import CallFact
+    from app.models.enums import CallFactState
+
+    sources = {
+        source.value
+        for source in (
+            await session.scalars(
+                select(CallFact.confirmation_source).where(
+                    CallFact.session_id == call_id,
+                    CallFact.state == CallFactState.CONFIRMED,
+                    CallFact.confirmation_source.is_not(None),
+                )
+            )
+        ).all()
+        if source is not None
+    }
+    # A manual action is the most explicit operator provenance when a call
+    # contains both manually and SMS confirmed fields.
+    if "manual" in sources:
+        return "Подтверждено вручную"
+    if "sms" in sources:
+        return "Подтверждено по SMS"
+    return None
+
+
 def _apply_call_filter(stmt: Select[Any], filter_: str) -> Select[Any]:
     """Narrow a ``communication_sessions`` query by the history filter.
 
@@ -196,6 +231,11 @@ async def _call_row(session: AsyncSession, row: Any) -> dict[str, Any]:
     if row.ended_at is not None and row.started_at is not None:
         duration_s = int((row.ended_at - row.started_at).total_seconds())
     summary: dict[str, Any] = row.summary or {}
+    provenance = (
+        await _confirmation_provenance(session, row.id)
+        if row.verification_status.value == "confirmed"
+        else None
+    )
     return {
         "id": str(row.id),
         "started_at": row.started_at,
@@ -211,6 +251,7 @@ async def _call_row(session: AsyncSession, row: Any) -> dict[str, Any]:
         "telegram_state": (summary.get("telegram") or {}).get("state"),
         "verification_status": row.verification_status.value,
         "verification_label": _verification_label(row.verification_status.value),
+        "verification_provenance": provenance,
         "verification_tone": _verification_tone(row.verification_status.value),
         "model_latency_ms": (
             (summary.get("verification") or {})
@@ -267,6 +308,11 @@ async def _call_detail_context(session: AsyncSession, session_id: str) -> dict[s
             "script_stage": call.script_stage,
             "diagnostics": call.diagnostics,
             "rx_frame_stats": call.rx_frame_stats,
+            "verification_provenance": (
+                await _confirmation_provenance(session, call.id)
+                if call.verification_status.value == "confirmed"
+                else None
+            ),
         }
     )
 
@@ -309,6 +355,9 @@ async def _call_detail_context(session: AsyncSession, session_id: str) -> dict[s
                     "unknown": "Нужна проверка: значение неизвестно",
                 }.get(fact.state.value, "Нужна проверка"),
                 "confirmation_source": (
+                    fact.confirmation_source.value if fact.confirmation_source else None
+                ),
+                "confirmation_source_label": _confirmation_source_label(
                     fact.confirmation_source.value if fact.confirmation_source else None
                 ),
                 "confirmed_at": fact.confirmed_at,
@@ -550,6 +599,16 @@ async def _locked_call(session: AsyncSession, call_id: UUID) -> Any:
     return call
 
 
+async def _reserve_call_mutation(session: AsyncSession, call: Any) -> Any:
+    """Reserve a manual trust write, including SQLite's revision CAS."""
+    from app.phone.facts import CallMutationRejected, reserve_call_mutation
+
+    try:
+        return await reserve_call_mutation(session, call=call)
+    except CallMutationRejected as exc:
+        raise HTTPException(status_code=409, detail="звонок изменился, повторите действие") from exc
+
+
 async def _get_sms_for_call(session: AsyncSession, call: Any, sms_id: UUID) -> Any:
     from app.models.entities import CommunicationSession
     from app.models.enums import CommunicationChannel, CommunicationDirection
@@ -622,16 +681,11 @@ async def review_call_fact(
     fact = await session.scalar(
         select(CallFact).where(CallFact.session_id == call.id, CallFact.field == field)
     )
-    if fact is None:
-        if action == "unknown":
-            fact = CallFact(session_id=call.id, field=field, raw_expression="не указано")
-            session.add(fact)
-            await session.flush()
-        else:
-            raise HTTPException(status_code=404, detail="факт не найден")
-    old_value = fact.normalized_value
+    if fact is None and action != "unknown":
+        raise HTTPException(status_code=404, detail="факт не найден")
+    old_value = fact.normalized_value if fact is not None else None
     reference_at = call.started_at
-    supplied = (value or fact.normalized_value or "").strip()[:500]
+    supplied = (value or (fact.normalized_value if fact is not None else None) or "").strip()[:500]
     normalized: str | None = None
     if action in {"confirm", "correct"}:
         if not supplied:
@@ -644,6 +698,27 @@ async def review_call_fact(
         )
         if normalized is None:
             raise HTTPException(status_code=422, detail="значение не прошло проверку")
+
+    call = await _reserve_call_mutation(session, call)
+    # Re-read after reserving the revision so the fact and summary are derived
+    # from the same state that won the CAS boundary.
+    fact = await session.scalar(
+        select(CallFact).where(CallFact.session_id == call.id, CallFact.field == field)
+    )
+    if fact is None:
+        if action != "unknown":
+            raise HTTPException(status_code=409, detail="факт изменился, повторите действие")
+        fact = CallFact(
+            session_id=call.id,
+            field=field,
+            raw_expression="не указано",
+            state=CallFactState.UNKNOWN,
+        )
+        session.add(fact)
+    if action in {"confirm", "correct"}:
+        # The CAS prevents a concurrent writer from changing this row in
+        # SQLite while PostgreSQL holds the call lock.  Reapply the validated
+        # operator value to the freshly selected instance for clarity.
         fact.raw_expression = supplied
         fact.normalized_value = normalized
         fact.state = CallFactState.CONFIRMED
@@ -660,7 +735,6 @@ async def review_call_fact(
     status = await _manual_status(session, call)
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
-    call.verification_revision += 1
     summary = dict(call.summary or {})
     verification = summary.get("verification")
     if not isinstance(verification, dict):
@@ -715,6 +789,12 @@ async def link_call_sms(
     if sms.related_session_id is not None and sms.related_session_id != call.id:
         raise HTTPException(status_code=404, detail="SMS уже связано с другим звонком")
     turn = await _sms_turn(session, sms)
+    call = await _reserve_call_mutation(session, call)
+    await session.refresh(sms)
+    if sms.related_session_id is not None and sms.related_session_id != call.id:
+        raise HTTPException(status_code=409, detail="SMS уже связано с другим звонком")
+    if sms.related_session_id == call.id:
+        raise HTTPException(status_code=409, detail="SMS уже связано с этим звонком")
     summary = dict(call.summary or {})
     verification = summary.get("verification")
     if not isinstance(verification, dict):
@@ -739,7 +819,6 @@ async def link_call_sms(
     sms.related_session_id = call.id
     sms.needs_review = False
     call.summary = summary
-    call.verification_revision += 1
     flag_modified(call, "summary")
     from app.phone.notification_state import refresh_telegram_notification
 
