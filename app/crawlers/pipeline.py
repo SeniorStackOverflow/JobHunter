@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -91,6 +92,23 @@ def _degradation_reason(exc: Exception) -> str | None:
     return None
 
 
+def _safe_scan_error_reason(exc: Exception) -> str | None:
+    message = str(exc).casefold()
+    if "aws waf challenge did not resolve" in message:
+        return "aws_waf_challenge_timeout"
+    if "browser navigation failed before response headers" in message:
+        return "browser_navigation_before_headers"
+    if "browser navigation did not reach domcontentloaded" in message:
+        return "browser_domcontentloaded_timeout"
+    if "browser fragment fetch returned no result" in message:
+        return "browser_fragment_empty"
+    if "browser fragment response did not contain data.content" in message:
+        return "browser_fragment_invalid_payload"
+    if "browser fragment response was not successful" in message:
+        return "browser_fragment_unsuccessful"
+    return None
+
+
 def scan_has_pending_reference_failures(run: ScanRun) -> bool:
     checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
     state = checkpoint.get("adapter_state")
@@ -100,6 +118,11 @@ def scan_has_pending_reference_failures(run: ScanRun) -> bool:
     return isinstance(failures, dict) and any(
         isinstance(n, int) and n > 0 for n in failures.values()
     )
+
+
+def scan_is_resume(run: ScanRun) -> bool:
+    diagnostics = run.diagnostics if isinstance(run.diagnostics, dict) else {}
+    return isinstance(diagnostics.get("resume_parent_scan_id"), str)
 
 
 def _completed_scan_status(run: ScanRun) -> RunStatus:
@@ -151,7 +174,8 @@ class ScanService:
         source_id: UUID,
         scan_type: ScanType,
         *,
-        resume_from_checkpoint: bool = True,
+        resume_from_checkpoint: bool = False,
+        resume_scan_id: UUID | None = None,
         actor: str = "scheduler",
     ) -> ScanRun:
         async with self.session_factory() as session:
@@ -172,8 +196,20 @@ class ScanService:
             )
             if active is not None:
                 return active
-            checkpoint: dict[str, Any] = {}
-            if resume_from_checkpoint:
+
+            previous: ScanRun | None = None
+            if resume_scan_id is not None:
+                previous = await session.get(ScanRun, resume_scan_id)
+                if (
+                    previous is None
+                    or previous.source_id != source_id
+                    or previous.scan_type != scan_type
+                    or previous.status not in {RunStatus.FAILED, RunStatus.PARTIAL}
+                ):
+                    raise ValueError(
+                        "resume scan must be a failed or partial scan for the same source/type"
+                    )
+            elif resume_from_checkpoint:
                 previous = await session.scalar(
                     select(ScanRun)
                     .where(
@@ -186,13 +222,30 @@ class ScanService:
                     )
                     .limit(1)
                 )
-                if previous is not None:
-                    checkpoint = previous.checkpoint
+
+            checkpoint: dict[str, Any] = {}
+            diagnostics: dict[str, Any] = {}
+            if previous is not None:
+                checkpoint = (
+                    deepcopy(previous.checkpoint) if isinstance(previous.checkpoint, dict) else {}
+                )
+                previous_diagnostics = (
+                    previous.diagnostics if isinstance(previous.diagnostics, dict) else {}
+                )
+                root_scan_id = previous_diagnostics.get("resume_root_scan_id")
+                diagnostics = {
+                    "resume_parent_scan_id": str(previous.id),
+                    "resume_root_scan_id": (
+                        root_scan_id if isinstance(root_scan_id, str) else str(previous.id)
+                    ),
+                }
+
             run = ScanRun(
                 source_id=source_id,
                 scan_type=scan_type,
                 status=RunStatus.QUEUED,
                 checkpoint=checkpoint,
+                diagnostics=diagnostics,
             )
             session.add(run)
             await session.flush()
@@ -203,7 +256,11 @@ class ScanService:
                 entity_type="scan_run",
                 entity_id=str(run.id),
                 correlation_id=str(run.id),
-                details={"source_id": str(source_id), "scan_type": scan_type.value},
+                details={
+                    "source_id": str(source_id),
+                    "scan_type": scan_type.value,
+                    "resume_parent_scan_id": diagnostics.get("resume_parent_scan_id"),
+                },
             )
             await session.commit()
             return run
@@ -351,12 +408,14 @@ class ScanService:
                         run.parsing_errors += 1
                         diagnostics = dict(run.diagnostics)
                         errors = list(diagnostics.get("errors", []))
-                        errors.append(
-                            {
-                                "external_id": reference.external_id,
-                                "type": type(exc).__name__,
-                            }
-                        )
+                        error = {
+                            "external_id": reference.external_id,
+                            "type": type(exc).__name__,
+                        }
+                        reason = _safe_scan_error_reason(exc)
+                        if reason is not None:
+                            error["reason"] = reason
+                        errors.append(error)
                         diagnostics["errors"] = errors[-20:]
                         run.diagnostics = diagnostics
                         failure_count = await self._save_checkpoint(
@@ -432,10 +491,13 @@ class ScanService:
                 )
                 run.status = RunStatus.PARTIAL
             else:
-                source.health_status = SourceHealth.HEALTHY
-                if recovering_automatic_pause:
-                    source.automatic_actions_paused = False
                 run.status = _completed_scan_status(run)
+                # A partial segment is not evidence that a degraded source has recovered.
+                # Keep the existing source health/pause state until a scan actually completes.
+                if run.status == RunStatus.SUCCEEDED:
+                    source.health_status = SourceHealth.HEALTHY
+                    if recovering_automatic_pause:
+                        source.automatic_actions_paused = False
             source.last_scan_status = run.status
             run.finished_at = datetime.now(UTC)
             await record_audit_event(
@@ -791,24 +853,37 @@ class ScanService:
         return "updated"
 
     async def _detect_degradation(self, session: AsyncSession, run: ScanRun) -> str | None:
-        previous = await session.scalar(
-            select(ScanRun)
-            .where(
-                ScanRun.source_id == run.source_id,
-                ScanRun.id != run.id,
-                ScanRun.scan_type == run.scan_type,
-                ScanRun.status == RunStatus.SUCCEEDED,
-                ScanRun.found_jobs > 0,
-            )
-            .order_by(desc(ScanRun.finished_at))
-            .limit(1)
+        is_resume = scan_is_resume(run)
+        previous_candidates = list(
+            (
+                await session.scalars(
+                    select(ScanRun)
+                    .where(
+                        ScanRun.source_id == run.source_id,
+                        ScanRun.id != run.id,
+                        ScanRun.scan_type == run.scan_type,
+                        ScanRun.status == RunStatus.SUCCEEDED,
+                        ScanRun.found_jobs > 0,
+                    )
+                    .order_by(desc(ScanRun.finished_at))
+                    .limit(20)
+                )
+            ).all()
         )
-        if run.found_jobs == 0:
+        # A resume continues a previous logical traversal. Its found_jobs counter only
+        # describes this segment, so zero/small counts are not source-wide health signals.
+        # Resumed successes are likewise not valid count baselines for fresh scans.
+        previous = next(
+            (candidate for candidate in previous_candidates if not scan_is_resume(candidate)),
+            None,
+        )
+        if not is_resume and run.found_jobs == 0:
             return "source returned zero jobs; automatic actions were paused for review"
         # A detail failure stops iteration intentionally. found_jobs is then only a prefix,
-        # not a complete source result, so comparing it with the previous full scan is invalid.
+        # not a complete source result, so comparing it with the previous fresh scan is invalid.
         if (
-            not scan_has_pending_reference_failures(run)
+            not is_resume
+            and not scan_has_pending_reference_failures(run)
             and previous is not None
             and previous.found_jobs >= 20
             and run.found_jobs < previous.found_jobs * 0.2

@@ -159,7 +159,27 @@ async def _load_enabled_sources() -> list[SourceSchedule]:
     ]
 
 
-async def _get_or_create_queued_scan(source_id: UUID, scan_type: ScanType) -> ScanRun:
+def _resume_from_checkpoint_enabled(source: SourceSchedule, operation: str) -> bool:
+    section_name = _CONFIG_SECTION[operation]
+    roots: list[dict[str, Any]] = [source.configuration]
+    nested = source.configuration.get("source")
+    if isinstance(nested, dict):
+        roots.append(nested)
+    for root in roots:
+        section = root.get(section_name)
+        if isinstance(section, dict):
+            value = section.get("resume_from_checkpoint")
+            if isinstance(value, bool):
+                return value
+    return False
+
+
+async def _get_or_create_queued_scan(
+    source_id: UUID,
+    scan_type: ScanType,
+    *,
+    resume_from_checkpoint: bool = False,
+) -> ScanRun:
     async with async_session_factory() as session:
         queued = await session.scalar(
             select(ScanRun).where(
@@ -170,7 +190,12 @@ async def _get_or_create_queued_scan(source_id: UUID, scan_type: ScanType) -> Sc
         )
     if queued is not None:
         return queued
-    return await _scan_service().create_scan(source_id, scan_type, actor="celery_beat")
+    return await _scan_service().create_scan(
+        source_id,
+        scan_type,
+        actor="celery_beat",
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
 
 
 async def _scan_identity(scan_id: UUID) -> tuple[UUID, ScanType]:
@@ -302,7 +327,12 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
             and scan_has_pending_reference_failures(run)
         ):
             resumed = _run_async(
-                _scan_service().create_scan(source_id, scan_type, actor="partial_resume")
+                _scan_service().create_scan(
+                    source_id,
+                    scan_type,
+                    resume_scan_id=run.id,
+                    actor="partial_resume",
+                )
             )
             reservation = reserve_once(
                 client,
@@ -443,7 +473,13 @@ def _dispatch_one(
             recheck_source_task.apply_async(args=[str(source.source_id)], queue="crawling")
             return f"recheck:{source.source_id}"
         scan_type = ScanType(operation)
-        run = _run_async(_get_or_create_queued_scan(source.source_id, scan_type))
+        run = _run_async(
+            _get_or_create_queued_scan(
+                source.source_id,
+                scan_type,
+                resume_from_checkpoint=_resume_from_checkpoint_enabled(source, operation),
+            )
+        )
         run_scan_task.apply_async(args=[str(run.id)], queue="crawling")
         return f"{operation}:{run.id}"
     except Exception:
