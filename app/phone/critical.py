@@ -124,6 +124,11 @@ _HOUR_PHRASE_RE = re.compile(
     r"час(?:а|ов)?(?:\s+(?P<period>утра|дня|вечера|ночи))?(?!\w)",
     re.IGNORECASE,
 )
+_SMS_CORRECTION_RE = re.compile(
+    r"\b(?:не|вместо|точнее|исправлен(?:ие|о)|исправляем|замен(?:а|яем)|"
+    r"перенос(?:им)?|или|либо)\b",
+    re.IGNORECASE,
+)
 
 
 def _clean(raw: str) -> str:
@@ -362,6 +367,73 @@ def canonical_critical_value(field: CriticalField, value: str | None) -> str | N
     if field in {"timezone", "format"}:
         return text.casefold()
     return text
+
+
+def sms_field_evidence_matches(
+    field: CriticalField,
+    full_text: str,
+    expression: str,
+    *,
+    reference_at: datetime,
+    timezone: str = "Europe/Chisinau",
+) -> bool:
+    """Require a quoted SMS expression to agree with the complete SMS turn.
+
+    A substring proves only that the model copied text.  This second gate
+    rejects corrections, negation and competing values before a fact can be
+    confirmed.  Textual fields have no safe general extractor, so they require
+    one occurrence and the same conservative correction scan.
+    """
+    full = _clean(unicodedata.normalize("NFKC", full_text))
+    bound = _clean(unicodedata.normalize("NFKC", expression))
+    if not full or not bound:
+        return False
+    folded_full = full.casefold()
+    folded_bound = bound.casefold()
+    if folded_bound not in folded_full or _SMS_CORRECTION_RE.search(full):
+        return False
+    bound_value = normalize_critical_value(
+        field, bound, reference_at=reference_at, timezone=timezone
+    )
+    bound_canonical = canonical_critical_value(field, bound_value)
+    if bound_canonical is None:
+        return False
+
+    if field in {"company", "vacancy"}:
+        if re.search(r"\bи\b", full, re.IGNORECASE):
+            return False
+        return folded_full.count(folded_bound) == 1
+    if field == "address":
+        candidates = [
+            candidate
+            for candidate in _ADDRESS_RE.findall(full)
+            if canonical_critical_value(
+                field,
+                normalize_critical_value(
+                    field, candidate, reference_at=reference_at, timezone=timezone
+                ),
+            )
+            is not None
+        ]
+    elif field == "timezone":
+        candidates = re.findall(
+            r"(?:по\s+(?:кишин[её]вскому|молдавскому|московскому)\s+времени|"
+            r"(?:utc|gmt)\s*[+-]\s*\d{1,2}(?::?\d{2})?|"
+            r"\b(?:utc|gmt|eet|eest)\b|\b[A-Za-z_]+/[A-Za-z_]+\b)",
+            full,
+            re.IGNORECASE,
+        )
+    else:
+        candidates = [full]
+    normalized = []
+    for candidate in candidates:
+        value = normalize_critical_value(
+            field, candidate, reference_at=reference_at, timezone=timezone
+        )
+        canonical = canonical_critical_value(field, value)
+        if canonical is not None:
+            normalized.append(canonical)
+    return len(set(normalized)) == 1 and normalized[0] == bound_canonical
 
 
 def has_confirmation_critical_markers(texts: Sequence[str]) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ruff: noqa: RUF001 — Russian correction phrases are intentional test data.
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from app.models.enums import (
     CallFactState,
     CommunicationChannel,
     CommunicationDirection,
+    PhoneSummaryState,
     PhoneVerificationStatus,
     TurnSpeaker,
 )
@@ -205,6 +207,84 @@ async def test_deterministic_sms_mismatch_cannot_be_overridden_by_matches(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "sms_text", "sms_expression", "raw_expression", "normalized_value"),
+    [
+        (
+            "interview_date",
+            "Собеседование не завтра, а послезавтра",
+            "завтра",
+            "завтра",
+            "2026-09-07",
+        ),
+        (
+            "interview_time",
+            "В 10:00, точнее в 11:00",
+            "10:00",
+            "в 10:00",
+            "10:00",
+        ),
+        (
+            "address",
+            "Вместо ул. Индустриальная 12 будет проспект Дачия 4",
+            "ул. Индустриальная 12",
+            "ул. Индустриальная 12",
+            "ул. Индустриальная 12",
+        ),
+        (
+            "company",
+            "Компания не Acme",
+            "Acme",
+            "Acme",
+            "Acme",
+        ),
+    ],
+)
+async def test_sms_correction_or_negation_never_confirms(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    field: str,
+    sms_text: str,
+    sms_expression: str,
+    raw_expression: str,
+    normalized_value: str,
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call, sms, fact = await _call_with_sms(db, profile)
+        fact.field = field
+        fact.raw_expression = raw_expression
+        fact.normalized_value = normalized_value
+        turn = await db.scalar(
+            select(CommunicationTurn).where(CommunicationTurn.session_id == sms.id)
+        )
+        assert turn is not None
+        turn.text = sms_text
+        status = await apply_sms_confirmation(
+            db,
+            call=call,
+            sms_session=sms,
+            comparison=SmsComparisonResult(
+                comparisons=[
+                    SmsFieldComparison(
+                        field=field,
+                        relation="matches",
+                        sms_expression=sms_expression,
+                        call_expression=raw_expression,
+                        reason="model says matches",
+                    )
+                ]
+            ),
+            metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
+        )
+
+    assert status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert fact.state is CallFactState.CANDIDATE
+    assert fact.confirmation_source is None
+
+
+@pytest.mark.asyncio
 async def test_sms_relative_date_uses_sms_occurrence_in_chisinau_timezone(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -284,6 +364,51 @@ async def test_same_sms_is_idempotent_and_unlink_restores_prior_fact(
     assert fact.confirmation_source is None
     assert fact.confirmed_by_turn_id is None
     assert call.verification_status is PhoneVerificationStatus.HIGH_CONFIDENCE
+
+
+@pytest.mark.asyncio
+async def test_unlink_removes_sms_work_and_requeues_ended_call(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call, sms, _fact = await _call_with_sms(db, profile)
+        call.auto_answered = True
+        call.ended_at = call.started_at
+        call.summary_state = PhoneSummaryState.DONE
+        await apply_sms_confirmation(
+            db,
+            call=call,
+            sms_session=sms,
+            comparison=SmsComparisonResult(
+                comparisons=[
+                    SmsFieldComparison(
+                        field="interview_date",
+                        relation="matches",
+                        sms_expression="сегодня",
+                        call_expression="завтра",
+                        reason="same date",
+                    )
+                ]
+            ),
+            metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
+        )
+        summary = dict(call.summary)
+        verification = dict(summary["verification"])
+        verification["sms_pending"] = [str(SMS_TURN_ID)]
+        summary["verification"] = verification
+        call.summary = summary
+        revision = call.verification_revision
+        await unlink_sms_confirmation(db, call=call, sms_session=sms)
+        verification = call.summary["verification"]
+
+    assert call.verification_revision == revision + 1
+    assert str(SMS_TURN_ID) not in verification["sms_pending"]
+    assert str(SMS_TURN_ID) not in verification["sms_input_ids"]
+    assert call.summary_state is PhoneSummaryState.PENDING
+    assert sms.related_session_id is None
 
 
 @pytest.mark.asyncio

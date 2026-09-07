@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import String, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -346,6 +347,29 @@ async def _mark_sms_comparison_pending(
     sms_session: CommunicationSession,
 ) -> bool:
     """Record one linked SMS input without touching the transcript pipeline."""
+    call_query = (
+        select(CommunicationSession)
+        .where(CommunicationSession.id == call.id)
+        .execution_options(populate_existing=True)
+    )
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        call_query = call_query.with_for_update()
+    locked_call = await db.scalar(call_query)
+    if locked_call is None or locked_call.claim_token is not None:
+        return False
+    if db.bind is not None and db.bind.dialect.name != "postgresql":
+        result = await db.execute(
+            update(CommunicationSession)
+            .where(
+                CommunicationSession.id == locked_call.id,
+                CommunicationSession.verification_revision == locked_call.verification_revision,
+                CommunicationSession.claim_token.is_(None),
+            )
+            .values(verification_revision=locked_call.verification_revision)
+        )
+        if cast(int, getattr(result, "rowcount", 0)) != 1:
+            return False
+    call = locked_call
     turn = await db.scalar(
         select(CommunicationTurn).where(
             CommunicationTurn.session_id == sms_session.id,
@@ -418,6 +442,13 @@ def _facts_signature(
     )
 
 
+def _context_signature(context: VerificationContext) -> str:
+    payload = json.dumps(
+        context.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _sms_snapshot_is_eligible(
     *,
     call: CommunicationSession,
@@ -438,10 +469,84 @@ def _sms_snapshot_is_eligible(
     )
 
 
+async def _claim_sms_item(
+    *,
+    call_id: UUID,
+    sms_turn_id: UUID,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> str | None:
+    """Claim one pending SMS using the shared call lease/token boundary."""
+    token = secrets.token_urlsafe(48)
+    now = datetime.now(UTC)
+    stale_before = now - timedelta(seconds=settings.phone_verification_processing_lease_seconds)
+    async with session_factory() as db:
+        query = (
+            select(CommunicationSession)
+            .where(CommunicationSession.id == call_id)
+            .execution_options(populate_existing=True)
+        )
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        call = await db.scalar(query)
+        if call is None or str(sms_turn_id) not in _pending_ids(call):
+            return None
+        live_claim = call.claim_token is not None and (
+            call.processing_started_at is None or _utc(call.processing_started_at) >= stale_before
+        )
+        if live_claim:
+            return None
+        claim_filter = [CommunicationSession.id == call_id]
+        if call.claim_token is None:
+            claim_filter.append(CommunicationSession.claim_token.is_(None))
+        else:
+            claim_filter.extend(
+                [
+                    CommunicationSession.claim_token == call.claim_token,
+                    CommunicationSession.processing_started_at == call.processing_started_at,
+                ]
+            )
+        result = await db.execute(
+            update(CommunicationSession)
+            .where(*claim_filter)
+            .values(claim_token=token, processing_started_at=now)
+        )
+        if cast(int, getattr(result, "rowcount", 0)) != 1:
+            return None
+        await db.commit()
+    return token
+
+
+async def _clear_sms_claim(
+    *,
+    call_id: UUID,
+    claim_token: str,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> bool:
+    async with session_factory() as db:
+        result = await db.execute(
+            update(CommunicationSession)
+            .where(
+                CommunicationSession.id == call_id,
+                CommunicationSession.claim_token == claim_token,
+            )
+            .values(claim_token=None, processing_started_at=None)
+        )
+        changed = cast(int, getattr(result, "rowcount", 0)) == 1
+        await db.commit()
+        return changed
+
+
 async def _record_sms_failure(
     *,
     call_id: UUID,
     sms_turn_id: UUID,
+    sms_id: str,
+    claim_token: str,
+    claimed_revision: int,
+    claimed_fact_signature: tuple[tuple[str, str, str | None, str, str | None, str | None], ...],
+    claimed_sms_text: str,
+    claimed_sms_occurred_at: datetime,
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
     reason: str,
@@ -451,11 +556,47 @@ async def _record_sms_failure(
         if db.bind is not None and db.bind.dialect.name == "postgresql":
             query = query.with_for_update()
         call = await db.scalar(query)
+        sms_session = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport == "phonegate",
+                CommunicationSession.channel == CommunicationChannel.SMS,
+                CommunicationSession.transport_external_id == sms_id,
+            )
+        )
+        turns = []
+        if sms_session is not None:
+            turns = list(
+                (
+                    await db.scalars(
+                        select(CommunicationTurn)
+                        .where(CommunicationTurn.session_id == sms_session.id)
+                        .order_by(CommunicationTurn.seq, CommunicationTurn.id)
+                    )
+                ).all()
+            )
+        if call is None or call.claim_token != claim_token:
+            return None
         if (
-            call is None
-            or call.claim_token is not None
+            sms_session is None
+            or not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns)
+            or turns[0].text != claimed_sms_text
+            or turns[0].occurred_at != claimed_sms_occurred_at
             or str(sms_turn_id) not in _pending_ids(call)
         ):
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
+            return None
+        current_facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
+        if (
+            call.verification_revision != claimed_revision
+            or _facts_signature(current_facts) != claimed_fact_signature
+        ):
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
             return None
         raw_verification = (call.summary or {}).get("verification", {})
         verification = dict(raw_verification) if isinstance(raw_verification, dict) else {}
@@ -479,6 +620,8 @@ async def _record_sms_failure(
             "attempt": count,
             "reason": reason,
         }
+        call.claim_token = None
+        call.processing_started_at = None
         summary = dict(call.summary or {})
         summary["verification"] = verification
         call.summary = summary
@@ -505,7 +648,7 @@ async def process_sms_confirmation(
                 CommunicationSession.transport_external_id == sms_id,
             )
         )
-        if call is None or sms_session is None or call.claim_token is not None:
+        if call is None or sms_session is None:
             return None
         turns = list(
             (
@@ -518,8 +661,51 @@ async def process_sms_confirmation(
         )
         if not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns):
             return None
-        if str(turns[0].id) not in _pending_ids(call):
+        turn = turns[0]
+        if str(turn.id) not in _pending_ids(call):
             return None
+    claim_token = await _claim_sms_item(
+        call_id=call_id,
+        sms_turn_id=turn.id,
+        session_factory=session_factory,
+        settings=current_settings,
+    )
+    if claim_token is None:
+        return None
+
+    async with session_factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+        sms_session = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport == "phonegate",
+                CommunicationSession.channel == CommunicationChannel.SMS,
+                CommunicationSession.transport_external_id == sms_id,
+            )
+        )
+        turns = []
+        if sms_session is not None:
+            turns = list(
+                (
+                    await db.scalars(
+                        select(CommunicationTurn)
+                        .where(CommunicationTurn.session_id == sms_session.id)
+                        .order_by(CommunicationTurn.seq, CommunicationTurn.id)
+                    )
+                ).all()
+            )
+        if (
+            call is None
+            or sms_session is None
+            or call.claim_token != claim_token
+            or not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns)
+            or str(turns[0].id) not in _pending_ids(call)
+        ):
+            await db.rollback()
+            await _clear_sms_claim(
+                call_id=call_id, claim_token=claim_token, session_factory=session_factory
+            )
+            return None
+        turn = turns[0]
         facts = list(
             (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
         )
@@ -543,16 +729,13 @@ async def process_sms_confirmation(
                 "vacancy",
             }
         ]
-        context = VerificationContext(
-            call_id=str(call.id),
-            call_started_at=call.started_at,
-            timezone="Europe/Chisinau",
-            transcript=[],
-        )
+        from app.phone.summary import build_verification_context
+
+        context = await build_verification_context(db, call)
         revision = call.verification_revision
         fact_signature = _facts_signature(facts)
-        turn = turns[0]
         sms_text = turn.text
+        context_signature = _context_signature(context)
         await db.commit()
 
     try:
@@ -566,6 +749,12 @@ async def process_sms_confirmation(
         return await _record_sms_failure(
             call_id=call_id,
             sms_turn_id=turn.id,
+            sms_id=sms_id,
+            claim_token=claim_token,
+            claimed_revision=revision,
+            claimed_fact_signature=fact_signature,
+            claimed_sms_text=sms_text,
+            claimed_sms_occurred_at=turn.occurred_at,
             session_factory=session_factory,
             settings=current_settings,
             reason=_safe_sms_failure(exc),
@@ -583,7 +772,7 @@ async def process_sms_confirmation(
                 CommunicationSession.transport_external_id == sms_id,
             )
         )
-        if call is None or sms_session is None:
+        if call is None or sms_session is None or call.claim_token != claim_token:
             return None
         turns = list(
             (
@@ -595,15 +784,29 @@ async def process_sms_confirmation(
             ).all()
         )
         if not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns):
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
             return None
         current_facts = list(
             (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
         )
         if (
-            call.claim_token is not None
+            call.claim_token != claim_token
             or call.verification_revision != revision
             or _facts_signature(current_facts) != fact_signature
         ):
+            if call.claim_token == claim_token:
+                call.claim_token = None
+                call.processing_started_at = None
+                await db.commit()
+            return None
+        from app.phone.summary import build_verification_context
+
+        if _context_signature(await build_verification_context(db, call)) != context_signature:
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
             return None
         if (
             not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns)
@@ -612,14 +815,23 @@ async def process_sms_confirmation(
             or turns[0].occurred_at != turn.occurred_at
             or str(turn.id) not in _pending_ids(call)
         ):
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
             return None
-        status = await apply_sms_confirmation(
-            db,
-            call=call,
-            sms_session=sms_session,
-            comparison=comparison,
-            metadata=metadata,
-        )
+        try:
+            status = await apply_sms_confirmation(
+                db,
+                call=call,
+                sms_session=sms_session,
+                comparison=comparison,
+                metadata=metadata,
+            )
+        except SmsConfirmationRejected:
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
+            return None
         verification = dict((call.summary or {}).get("verification", {}))
         verification["sms_pending"] = [
             value for value in _pending_ids(call) if value != str(turn.id)
@@ -628,6 +840,8 @@ async def process_sms_confirmation(
             "state": "done",
             "sms_turn_id": str(turn.id),
         }
+        call.claim_token = None
+        call.processing_started_at = None
         summary = dict(call.summary or {})
         summary["verification"] = verification
         call.summary = summary
@@ -642,17 +856,24 @@ async def reconcile_pending_sms(
     settings: Settings | None = None,
 ) -> dict[str, int]:
     """Scan ordered pending SMS inputs so a crash after linking is recoverable."""
+    current_settings = settings or get_settings()
     async with session_factory() as db:
         calls = list(
             (
                 await db.scalars(
-                    select(CommunicationSession).where(
-                        CommunicationSession.channel == CommunicationChannel.CALL
+                    select(CommunicationSession)
+                    .where(
+                        CommunicationSession.channel == CommunicationChannel.CALL,
+                        CommunicationSession.summary.cast(String).like("%sms_pending%"),
                     )
+                    .order_by(CommunicationSession.ended_at, CommunicationSession.id)
+                    .limit(current_settings.phone_verification_batch)
                 )
             ).all()
         )
-        work = [(call.id, item) for call in calls for item in _pending_ids(call)]
+        # One ordered item per call per poll bounds work and leaves later SMS
+        # inputs in the durable queue for the next poll.
+        work = [(call.id, pending[0]) for call in calls if (pending := _pending_ids(call))]
     result = {"picked": 0, "done": 0, "failed": 0, "skipped": 0}
     for call_id, turn_text in work:
         try:
@@ -682,7 +903,7 @@ async def reconcile_pending_sms(
             sms_id=sms_id,
             session_factory=session_factory,
             provider=provider,
-            settings=settings,
+            settings=current_settings,
         )
         if status is None:
             result["skipped"] += 1

@@ -8,8 +8,9 @@ from typing import Any, cast
 from uuid import UUID
 
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.entities import CallFact, CommunicationSession, CommunicationTurn
 from app.models.enums import (
@@ -17,6 +18,7 @@ from app.models.enums import (
     CallFactState,
     CommunicationChannel,
     CommunicationDirection,
+    PhoneSummaryState,
     PhoneVerificationStatus,
     TurnSpeaker,
 )
@@ -24,6 +26,7 @@ from app.phone.critical import (
     CriticalField,
     canonical_critical_value,
     normalize_critical_value,
+    sms_field_evidence_matches,
 )
 from app.phone.reconciliation import VerificationDecision
 from app.phone.verification import ModelCallMeta, SmsComparisonResult
@@ -276,6 +279,15 @@ async def apply_sms_confirmation(
             if not expression or expression not in sms_text:
                 reasons.append(f"sms:{field}:expression_unbound")
                 continue
+            if not sms_field_evidence_matches(
+                field,
+                turn.text,
+                item.sms_expression,
+                reference_at=turn.occurred_at,
+                timezone="Europe/Chisinau",
+            ):
+                reasons.append(f"sms:{field}:full_turn_ambiguous")
+                continue
             if item.call_expression and _folded(item.call_expression) not in _folded(
                 fact.raw_expression
             ):
@@ -355,6 +367,10 @@ async def apply_sms_confirmation(
         verification["review_reason_codes"] = list(dict.fromkeys([*prior_reasons, *reasons]))
     verification["sms_supporters"] = supporters
     verification["sms_originals"] = originals
+    summary = dict(call.summary or {})
+    summary["verification"] = verification
+    call.summary = summary
+    flag_modified(call, "summary")
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
     return status
@@ -367,6 +383,39 @@ async def unlink_sms_confirmation(
     sms_session: CommunicationSession,
 ) -> PhoneVerificationStatus:
     """Detach one SMS and reverse only facts solely confirmed by its turn."""
+    await db.flush()
+    call_query = (
+        select(CommunicationSession)
+        .where(CommunicationSession.id == call.id)
+        .execution_options(populate_existing=True)
+    )
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        call_query = call_query.with_for_update()
+    latest_call = await db.scalar(call_query)
+    sms_query = (
+        select(CommunicationSession)
+        .where(CommunicationSession.id == sms_session.id)
+        .execution_options(populate_existing=True)
+    )
+    latest_sms = await db.scalar(sms_query)
+    if latest_call is None or latest_sms is None:
+        raise SmsConfirmationRejected("call or SMS no longer exists")
+    if latest_call.claim_token is not None:
+        raise SmsConfirmationRejected("call has an active processing claim")
+    if db.bind is not None and db.bind.dialect.name != "postgresql":
+        result = await db.execute(
+            update(CommunicationSession)
+            .where(
+                CommunicationSession.id == latest_call.id,
+                CommunicationSession.verification_revision == latest_call.verification_revision,
+                CommunicationSession.claim_token.is_(None),
+            )
+            .values(verification_revision=latest_call.verification_revision)
+        )
+        if int(getattr(result, "rowcount", 0)) != 1:
+            raise SmsConfirmationRejected("call changed during unlink")
+    call = latest_call
+    sms_session = latest_sms
     turn = await _validate_sms_confirmation(db, call=call, sms_session=sms_session)
     verification = _verification_summary(call)
     entries = verification.get("sms_comparisons", [])
@@ -412,15 +461,30 @@ async def unlink_sms_confirmation(
         entry["status"] = "unlinked"
         entry["unlinked_at"] = datetime.now(UTC).isoformat()
     sms_session.related_session_id = None
+    for key in ("sms_pending", "sms_input_ids"):
+        values = verification.get(key, [])
+        if isinstance(values, list):
+            verification[key] = [value for value in values if value != str(turn.id)]
+    attempts = verification.get("sms_attempts", {})
+    if isinstance(attempts, dict):
+        attempts.pop(str(turn.id), None)
+        verification["sms_attempts"] = attempts
     call.verification_revision += 1
     verification["sms_reconciliation"] = {
-        "state": "pending",
+        "state": "unlinked",
         "sms_turn_id": str(turn.id),
         "reason": "manual_unlink",
     }
+    if call.auto_answered and call.ended_at is not None:
+        call.summary_state = PhoneSummaryState.PENDING
+        call.processing_started_at = None
     status = _sms_status(call, facts, review=False, verification=verification)
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
+    summary = dict(call.summary or {})
+    summary["verification"] = verification
+    call.summary = summary
+    flag_modified(call, "summary")
     return status
 
 
