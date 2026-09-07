@@ -16,6 +16,7 @@ from redis.asyncio import Redis
 from sqlalchemy import String, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import async_session_factory
 from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
@@ -23,6 +24,7 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    PhoneSummaryState,
     PhoneVerificationStatus,
     TurnDeliveryStatus,
     TurnSpeaker,
@@ -84,6 +86,16 @@ SMS_SYNC_MARKER_TTL_SECONDS = 7 * 24 * 60 * 60
 _MIN_SMS_TIMESTAMP = datetime(2000, 1, 1, tzinfo=UTC)
 _MAX_SMS_TIMESTAMP = datetime(2100, 1, 1, tzinfo=UTC)
 SMS_SYNC_BOOT_ID = uuid4().hex
+_SMS_FACT_FIELDS = {
+    "interview_date",
+    "interview_time",
+    "timezone",
+    "format",
+    "address",
+    "meeting_url",
+    "company",
+    "vacancy",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,7 +367,17 @@ async def _mark_sms_comparison_pending(
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         call_query = call_query.with_for_update()
     locked_call = await db.scalar(call_query)
-    if locked_call is None or locked_call.claim_token is not None:
+    if locked_call is None:
+        return False
+    already_linked = sms_session.related_session_id == locked_call.id
+    if locked_call.claim_token is not None:
+        if not already_linked:
+            sms_session.related_session_id = None
+        sms_session.needs_review = True
+        sms_session.diagnostics = {
+            **sms_session.diagnostics,
+            "sms_correlation": {"status": "retry", "reason": "call_processing_busy"},
+        }
         return False
     if db.bind is not None and db.bind.dialect.name != "postgresql":
         result = await db.execute(
@@ -368,6 +390,13 @@ async def _mark_sms_comparison_pending(
             .values(verification_revision=locked_call.verification_revision)
         )
         if cast(int, getattr(result, "rowcount", 0)) != 1:
+            if not already_linked:
+                sms_session.related_session_id = None
+            sms_session.needs_review = True
+            sms_session.diagnostics = {
+                **sms_session.diagnostics,
+                "sms_correlation": {"status": "retry", "reason": "call_processing_busy"},
+            }
             return False
     call = locked_call
     turn = await db.scalar(
@@ -387,7 +416,8 @@ async def _mark_sms_comparison_pending(
         input_ids = []
     turn_id = str(turn.id)
     if turn_id in input_ids:
-        return False
+        return sms_session.related_session_id == locked_call.id
+    sms_session.related_session_id = locked_call.id
     call.verification_revision += 1
     verification["sms_input_ids"] = sorted(
         {*(item for item in input_ids if isinstance(item, str)), turn_id}
@@ -405,6 +435,7 @@ async def _mark_sms_comparison_pending(
     }
     summary["verification"] = verification
     call.summary = summary
+    flag_modified(call, "summary")
     return True
 
 
@@ -416,6 +447,16 @@ def _pending_ids(call: CommunicationSession) -> list[str]:
     if not isinstance(values, list):
         return []
     return [value for value in values if isinstance(value, str)]
+
+
+def _sms_call_is_ready(call: CommunicationSession, facts: Sequence[CallFact]) -> bool:
+    verification = (call.summary or {}).get("verification", {})
+    return (
+        call.summary_state == PhoneSummaryState.DONE
+        and any(fact.field in _SMS_FACT_FIELDS for fact in facts)
+        and isinstance(verification, dict)
+        and isinstance(verification.get("decision"), dict)
+    )
 
 
 def _safe_sms_failure(exc: BaseException) -> str:
@@ -490,6 +531,11 @@ async def _claim_sms_item(
             query = query.with_for_update()
         call = await db.scalar(query)
         if call is None or str(sms_turn_id) not in _pending_ids(call):
+            return None
+        facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
+        if not _sms_call_is_ready(call, facts):
             return None
         live_claim = call.claim_token is not None and (
             call.processing_started_at is None or _utc(call.processing_started_at) >= stale_before
@@ -576,20 +622,21 @@ async def _record_sms_failure(
             )
         if call is None or call.claim_token != claim_token:
             return None
+        current_facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
         if (
             sms_session is None
             or not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns)
             or turns[0].text != claimed_sms_text
             or turns[0].occurred_at != claimed_sms_occurred_at
             or str(sms_turn_id) not in _pending_ids(call)
+            or not _sms_call_is_ready(call, current_facts)
         ):
             call.claim_token = None
             call.processing_started_at = None
             await db.commit()
             return None
-        current_facts = list(
-            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
-        )
         if (
             call.verification_revision != claimed_revision
             or _facts_signature(current_facts) != claimed_fact_signature
@@ -612,6 +659,7 @@ async def _record_sms_failure(
             verification["sms_pending"] = [
                 value for value in _pending_ids(call) if value != str(sms_turn_id)
             ]
+            call.summary_state = PhoneSummaryState.DONE
             call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
             call.needs_review = True
         verification["sms_reconciliation"] = {
@@ -664,6 +712,11 @@ async def process_sms_confirmation(
         turn = turns[0]
         if str(turn.id) not in _pending_ids(call):
             return None
+        facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
+        if not _sms_call_is_ready(call, facts):
+            return None
     claim_token = await _claim_sms_item(
         call_id=call_id,
         sms_turn_id=turn.id,
@@ -709,6 +762,11 @@ async def process_sms_confirmation(
         facts = list(
             (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
         )
+        if not _sms_call_is_ready(call, facts):
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
+            return None
         persisted = [
             PersistedFact(
                 field=fact.field,
@@ -717,21 +775,17 @@ async def process_sms_confirmation(
                 state=fact.state,
             )
             for fact in facts
-            if fact.field
-            in {
-                "interview_date",
-                "interview_time",
-                "timezone",
-                "format",
-                "address",
-                "meeting_url",
-                "company",
-                "vacancy",
-            }
+            if fact.field in _SMS_FACT_FIELDS
         ]
         from app.phone.summary import build_verification_context
 
-        context = await build_verification_context(db, call)
+        try:
+            context = await build_verification_context(db, call)
+        except Exception:
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
+            return None
         revision = call.verification_revision
         fact_signature = _facts_signature(facts)
         sms_text = turn.text
@@ -772,7 +826,12 @@ async def process_sms_confirmation(
                 CommunicationSession.transport_external_id == sms_id,
             )
         )
-        if call is None or sms_session is None or call.claim_token != claim_token:
+        if call is None or call.claim_token != claim_token:
+            return None
+        if sms_session is None:
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
             return None
         turns = list(
             (
@@ -795,6 +854,7 @@ async def process_sms_confirmation(
             call.claim_token != claim_token
             or call.verification_revision != revision
             or _facts_signature(current_facts) != fact_signature
+            or not _sms_call_is_ready(call, current_facts)
         ):
             if call.claim_token == claim_token:
                 call.claim_token = None
@@ -803,7 +863,16 @@ async def process_sms_confirmation(
             return None
         from app.phone.summary import build_verification_context
 
-        if _context_signature(await build_verification_context(db, call)) != context_signature:
+        try:
+            current_context_signature = _context_signature(
+                await build_verification_context(db, call)
+            )
+        except Exception:
+            call.claim_token = None
+            call.processing_started_at = None
+            await db.commit()
+            return None
+        if current_context_signature != context_signature:
             call.claim_token = None
             call.processing_started_at = None
             await db.commit()
@@ -864,6 +933,7 @@ async def reconcile_pending_sms(
                     select(CommunicationSession)
                     .where(
                         CommunicationSession.channel == CommunicationChannel.CALL,
+                        CommunicationSession.summary_state == PhoneSummaryState.DONE,
                         CommunicationSession.summary.cast(String).like("%sms_pending%"),
                     )
                     .order_by(CommunicationSession.ended_at, CommunicationSession.id)
@@ -1081,8 +1151,10 @@ async def _ingest_with_client(
                 settings=settings,
             )
             if len(matches) == 1:
-                was_linked = sms_session.related_session_id == matches[0].id
-                if sms_session.related_session_id is not None and not was_linked:
+                if (
+                    sms_session.related_session_id is not None
+                    and sms_session.related_session_id != matches[0].id
+                ):
                     sms_session.needs_review = True
                     sms_session.diagnostics = {
                         **sms_session.diagnostics,
@@ -1093,20 +1165,31 @@ async def _ingest_with_client(
                     }
                     result["ambiguous"] += 1
                 else:
-                    sms_session.related_session_id = matches[0].id
-                    sms_session.needs_review = False
-                    sms_session.diagnostics = {
-                        **sms_session.diagnostics,
-                        "sms_correlation": {
-                            "status": "linked",
-                            "reason": "single_completed_call",
-                        },
-                    }
-                    result["correlated"] += 1
-                    if not was_linked:
-                        await _mark_sms_comparison_pending(
-                            db, call=matches[0], sms_session=sms_session
-                        )
+                    marked = await _mark_sms_comparison_pending(
+                        db, call=matches[0], sms_session=sms_session
+                    )
+                    if sms_session.related_session_id == matches[0].id:
+                        sms_session.needs_review = False
+                        sms_session.diagnostics = {
+                            **sms_session.diagnostics,
+                            "sms_correlation": {
+                                "status": "linked" if marked else "retry",
+                                "reason": (
+                                    "single_completed_call" if marked else "call_processing_busy"
+                                ),
+                            },
+                        }
+                        result["correlated"] += 1
+                    else:
+                        sms_session.needs_review = True
+                        sms_session.diagnostics = {
+                            **sms_session.diagnostics,
+                            "sms_correlation": {
+                                "status": "retry",
+                                "reason": "call_processing_busy",
+                            },
+                        }
+                        result["unlinked"] += 1
             else:
                 reason = (
                     "ambiguous_completed_calls"

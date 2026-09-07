@@ -384,7 +384,10 @@ async def _claim_pending_calls_with_tokens(
     stale_before = now - timedelta(seconds=lease_seconds)
     eligible = (
         (CommunicationSession.summary_state == PhoneSummaryState.PENDING)
-        & CommunicationSession.claim_token.is_(None)
+        & (
+            CommunicationSession.claim_token.is_(None)
+            | (CommunicationSession.processing_started_at < stale_before)
+        )
     ) | (
         (CommunicationSession.summary_state == PhoneSummaryState.PROCESSING)
         & (CommunicationSession.processing_started_at < stale_before)
@@ -499,7 +502,10 @@ async def _claim_call(call_id: UUID, *, lease_seconds: int) -> str | None:
     token = secrets.token_urlsafe(48)
     eligible = (
         (CommunicationSession.summary_state == PhoneSummaryState.PENDING)
-        & CommunicationSession.claim_token.is_(None)
+        & (
+            CommunicationSession.claim_token.is_(None)
+            | (CommunicationSession.processing_started_at < stale_before)
+        )
     ) | (
         (CommunicationSession.summary_state == PhoneSummaryState.PROCESSING)
         & (CommunicationSession.processing_started_at < stale_before)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -308,6 +308,26 @@ async def test_claim_pending_call_uses_processing_lease(
 
     async with env.factory() as db:
         assert await claim_pending_calls(db, batch=10, lease_seconds=300) == []
+
+
+@pytest.mark.asyncio
+async def test_task6_reclaims_stale_shared_sms_lease(
+    finalize_env: Callable[..., Awaitable[_Env]],
+) -> None:
+    env = await finalize_env(llm_enabled=False)
+    async with env.factory() as db:
+        call = await db.get(CommunicationSession, env.session_id)
+        assert call is not None
+        call.claim_token = "stale-sms-token"
+        call.processing_started_at = datetime.now(UTC) - timedelta(seconds=301)
+        await db.commit()
+
+    async with env.factory() as db:
+        claimed = await claim_pending_calls(db, batch=1, lease_seconds=300)
+        assert claimed == [env.session_id]
+        call = await db.get(CommunicationSession, env.session_id)
+        assert call is not None
+        assert call.claim_token not in {None, "stale-sms-token"}
 
 
 @pytest.mark.asyncio

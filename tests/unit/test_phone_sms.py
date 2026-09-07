@@ -13,6 +13,7 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    PhoneSummaryState,
     PhoneVerificationStatus,
     TurnSpeaker,
 )
@@ -79,6 +80,24 @@ class ComparisonProvider:
 class FailingComparisonProvider:
     async def compare_sms(self, _ctx: object, _sms_text: str, _facts: object):
         raise VerificationUnavailable("transport")
+
+
+class DeletingComparisonProvider:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], sms_id: str) -> None:
+        self.session_factory = session_factory
+        self.sms_id = sms_id
+
+    async def compare_sms(self, _ctx: object, _sms_text: str, _facts: object):
+        async with self.session_factory() as db:
+            sms_session = await db.scalar(
+                select(CommunicationSession).where(
+                    CommunicationSession.transport_external_id == self.sms_id
+                )
+            )
+            assert sms_session is not None
+            await db.delete(sms_session)
+            await db.commit()
+        raise VerificationUnavailable("source_deleted")
 
 
 class MemorySyncMarker:
@@ -225,6 +244,8 @@ async def test_sms_worker_calls_only_compare_sms_and_applies_pending_input(
                 state=CallFactState.CANDIDATE,
             )
         )
+        call.summary_state = PhoneSummaryState.DONE
+        call.summary = {"verification": {"decision": {"status": "high_confidence"}}}
         await db.commit()
     gateway = StubPhoneGate([sms(ident="worker-1", timestamp=int(ended.timestamp() * 1000))])
     await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
@@ -303,6 +324,17 @@ async def test_sms_provider_failure_retries_then_marks_review(
         db.add(profile)
         await db.flush()
         call = await add_call(db, profile, ended_at=ended)
+        db.add(
+            CallFact(
+                session_id=call.id,
+                field="interview_date",
+                raw_expression="завтра",
+                normalized_value="2024-07-04",
+                state=CallFactState.CANDIDATE,
+            )
+        )
+        call.summary_state = PhoneSummaryState.DONE
+        call.summary = {"verification": {"decision": {"status": "high_confidence"}}}
         await db.commit()
     gateway = StubPhoneGate([sms(ident="retry-1", timestamp=int(ended.timestamp() * 1000))])
     await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
@@ -329,8 +361,108 @@ async def test_sms_provider_failure_retries_then_marks_review(
     async with sqlite_session_factory() as db:
         refreshed = await db.get(CommunicationSession, call.id)
     assert refreshed is not None
+    assert refreshed.summary_state is PhoneSummaryState.DONE
     assert refreshed.summary["verification"]["sms_pending"] == []
     assert list(refreshed.summary["verification"]["sms_attempts"].values()) == [2]
+
+
+@pytest.mark.asyncio
+async def test_live_task6_claim_defers_link_then_duplicate_ingest_retries(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        call = await add_call(db, profile, ended_at=ended)
+        call.summary_state = PhoneSummaryState.DONE
+        call.summary = {"verification": {"decision": {"status": "high_confidence"}}}
+        call.claim_token = "task6-live"
+        call.processing_started_at = datetime.now(UTC)
+        db.add(
+            CallFact(
+                session_id=call.id,
+                field="interview_date",
+                raw_expression="завтра",
+                normalized_value="2024-07-04",
+                state=CallFactState.CANDIDATE,
+            )
+        )
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="deferred-1", timestamp=int(ended.timestamp() * 1000))])
+
+    first = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    assert first["correlated"] == 0
+    async with sqlite_session_factory() as db:
+        call = await db.get(CommunicationSession, call.id)
+        imported = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport_external_id == "deferred-1"
+            )
+        )
+        assert call is not None and imported is not None
+        assert imported.related_session_id is None
+        assert "sms_pending" not in call.summary.get("verification", {})
+        call.claim_token = None
+        call.processing_started_at = None
+        await db.commit()
+
+    second = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    assert second["correlated"] == 1
+    async with sqlite_session_factory() as db:
+        call = await db.get(CommunicationSession, call.id)
+        imported = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport_external_id == "deferred-1"
+            )
+        )
+        assert call is not None and imported is not None
+        assert imported.related_session_id == call.id
+        assert len(call.summary["verification"]["sms_pending"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_sms_source_after_claim_clears_owned_lease(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        call = await add_call(db, profile, ended_at=ended)
+        call.summary_state = PhoneSummaryState.DONE
+        call.summary = {"verification": {"decision": {"status": "high_confidence"}}}
+        db.add(
+            CallFact(
+                session_id=call.id,
+                field="interview_date",
+                raw_expression="завтра",
+                normalized_value="2024-07-04",
+                state=CallFactState.CANDIDATE,
+            )
+        )
+        await db.commit()
+    gateway = StubPhoneGate(
+        [sms(ident="delete-after-claim", timestamp=int(ended.timestamp() * 1000))]
+    )
+    await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    provider = DeletingComparisonProvider(sqlite_session_factory, "delete-after-claim")
+
+    result = await process_sms_confirmation(
+        call_id=call.id,
+        sms_id="delete-after-claim",
+        session_factory=sqlite_session_factory,
+        provider=provider,
+    )
+
+    assert result is None
+    async with sqlite_session_factory() as db:
+        refreshed = await db.get(CommunicationSession, call.id)
+    assert refreshed is not None
+    assert refreshed.claim_token is None
+    assert refreshed.processing_started_at is None
 
 
 @pytest.mark.asyncio
