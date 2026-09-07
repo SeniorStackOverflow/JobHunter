@@ -32,6 +32,7 @@ from app.phone.verification import (
 
 TURN_ID = UUID("22222222-2222-2222-2222-222222222222")
 SMS_TURN_ID = UUID("33333333-3333-3333-3333-333333333333")
+SMS2_TURN_ID = UUID("44444444-4444-4444-4444-444444444444")
 
 
 def _decision(value: str = "2026-09-07") -> VerificationDecision:
@@ -99,7 +100,7 @@ async def _call_with_sms(
             session_id=sms.id,
             seq=1,
             speaker=TurnSpeaker.EMPLOYER,
-            text="Подтверждаем завтра в 10:00",
+            text="Подтверждаем сегодня в 10:00",
             occurred_at=sms.started_at,
         )
     )
@@ -112,6 +113,7 @@ async def _call_with_sms(
     )
     db.add(fact)
     await db.flush()
+    call.verification_status = PhoneVerificationStatus.HIGH_CONFIDENCE
     return call, sms, fact
 
 
@@ -176,6 +178,7 @@ async def test_deterministic_sms_mismatch_cannot_be_overridden_by_matches(
         db.add(profile)
         await db.flush()
         call, sms, fact = await _call_with_sms(db, profile)
+        fact.normalized_value = "2026-09-08"
 
         status = await apply_sms_confirmation(
             db,
@@ -186,7 +189,7 @@ async def test_deterministic_sms_mismatch_cannot_be_overridden_by_matches(
                     SmsFieldComparison(
                         field="interview_date",
                         relation="matches",
-                        sms_expression="послезавтра",
+                        sms_expression="сегодня",
                         call_expression="завтра",
                         reason="model says matches",
                     )
@@ -214,6 +217,11 @@ async def test_sms_relative_date_uses_sms_occurrence_in_chisinau_timezone(
         # 21:00 UTC and is already on Sep 7 locally.
         sms.started_at = datetime(2026, 9, 6, 20, 30, tzinfo=UTC)
         sms.ended_at = sms.started_at
+        sms_turn = await db.scalar(
+            select(CommunicationTurn).where(CommunicationTurn.session_id == sms.id)
+        )
+        assert sms_turn is not None
+        sms_turn.occurred_at = sms.started_at
         fact.normalized_value = "2026-09-06"
         status = await apply_sms_confirmation(
             db,
@@ -300,6 +308,128 @@ async def test_sms_confirmation_rejects_unlinked_or_outgoing_message(
                 comparison=SmsComparisonResult(comparisons=[]),
                 metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
             )
+
+
+@pytest.mark.asyncio
+async def test_sms_confirmation_rejects_multiple_turns(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call, sms, _ = await _call_with_sms(db, profile)
+        db.add(
+            CommunicationTurn(
+                session_id=sms.id,
+                seq=2,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="вторая поддельная часть",
+                occurred_at=sms.started_at,
+            )
+        )
+        await db.flush()
+        with pytest.raises(SmsConfirmationRejected):
+            await apply_sms_confirmation(
+                db,
+                call=call,
+                sms_session=sms,
+                comparison=SmsComparisonResult(comparisons=[]),
+                metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
+            )
+
+
+@pytest.mark.asyncio
+async def test_multiple_sms_supporters_survive_single_unlink(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    comparison = SmsComparisonResult(
+        comparisons=[
+            SmsFieldComparison(
+                field="interview_date",
+                relation="matches",
+                sms_expression="сегодня",
+                call_expression="завтра",
+                reason="same",
+            )
+        ]
+    )
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call, first, fact = await _call_with_sms(db, profile)
+        second = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.SMS,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360000000",
+            remote_raw="+37360000000",
+            transport_external_id="sms-2",
+            related_session_id=call.id,
+            started_at=first.started_at,
+            ended_at=first.ended_at,
+        )
+        db.add(second)
+        await db.flush()
+        db.add(
+            CommunicationTurn(
+                id=SMS2_TURN_ID,
+                session_id=second.id,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="Подтверждаем сегодня",
+                occurred_at=second.started_at,
+            )
+        )
+        await db.flush()
+        meta = ModelCallMeta("llmrouter", "sms-model", 4, 1)
+        await apply_sms_confirmation(
+            db, call=call, sms_session=first, comparison=comparison, metadata=meta
+        )
+        await apply_sms_confirmation(
+            db, call=call, sms_session=second, comparison=comparison, metadata=meta
+        )
+        await unlink_sms_confirmation(db, call=call, sms_session=first)
+        assert fact.state is CallFactState.CONFIRMED
+        assert fact.confirmed_by_turn_id == SMS2_TURN_ID
+        await unlink_sms_confirmation(db, call=call, sms_session=second)
+
+    assert fact.state is CallFactState.CANDIDATE
+    assert fact.confirmation_source is None
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_sms_expression_is_review_only(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call, sms, fact = await _call_with_sms(db, profile)
+        call.verification_status = PhoneVerificationStatus.HIGH_CONFIDENCE
+        status = await apply_sms_confirmation(
+            db,
+            call=call,
+            sms_session=sms,
+            comparison=SmsComparisonResult(
+                comparisons=[
+                    SmsFieldComparison(
+                        field="interview_date",
+                        relation="matches",
+                        sms_expression="послезавтра",
+                        call_expression="завтра",
+                        reason="hallucinated",
+                    )
+                ]
+            ),
+            metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
+        )
+
+    assert status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert fact.state is CallFactState.CANDIDATE
 
 
 @pytest.mark.asyncio

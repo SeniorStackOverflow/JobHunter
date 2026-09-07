@@ -7,11 +7,13 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.entities import CommunicationSession, CommunicationTurn, UserProfile
+from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import (
+    CallFactState,
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    PhoneVerificationStatus,
     TurnSpeaker,
 )
 from app.phone.client import PhoneGateClient
@@ -24,6 +26,13 @@ from app.phone.sms import (
     RedisSmsSyncMarker,
     SmsSyncState,
     ingest_phonegate_sms,
+    process_sms_confirmation,
+)
+from app.phone.verification import (
+    ModelCallMeta,
+    SmsComparisonResult,
+    SmsFieldComparison,
+    VerificationUnavailable,
 )
 from app.settings import Settings
 from tests.fixtures.fake_phonegate import FakePhoneGate
@@ -55,6 +64,21 @@ class SequencedPhoneGate(StubPhoneGate):
         page = self.pages[min(self.history_calls, len(self.pages) - 1)]
         self.history_calls += 1
         return page
+
+
+class ComparisonProvider:
+    def __init__(self, result: SmsComparisonResult) -> None:
+        self.result = result
+        self.calls: list[tuple[object, str, object]] = []
+
+    async def compare_sms(self, ctx: object, sms_text: str, facts: object):
+        self.calls.append((ctx, sms_text, facts))
+        return self.result, ModelCallMeta("fixture", "sms", 1, 1)
+
+
+class FailingComparisonProvider:
+    async def compare_sms(self, _ctx: object, _sms_text: str, _facts: object):
+        raise VerificationUnavailable("transport")
 
 
 class MemorySyncMarker:
@@ -180,6 +204,133 @@ async def test_ingest_correlates_only_single_completed_call_in_window(
         linked_call = await db.get(CommunicationSession, call.id)
     assert linked_call is not None
     assert linked_call.verification_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_sms_worker_calls_only_compare_sms_and_applies_pending_input(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        call = await add_call(db, profile, ended_at=ended)
+        db.add(
+            CallFact(
+                session_id=call.id,
+                field="interview_date",
+                raw_expression="завтра",
+                normalized_value="2024-07-04",
+                state=CallFactState.CANDIDATE,
+            )
+        )
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="worker-1", timestamp=int(ended.timestamp() * 1000))])
+    await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    provider = ComparisonProvider(
+        SmsComparisonResult(
+            comparisons=[
+                SmsFieldComparison(
+                    field="interview_date",
+                    relation="matches",
+                    sms_expression="завтра",
+                    call_expression="завтра",
+                    reason="same",
+                )
+            ]
+        )
+    )
+
+    result = await process_sms_confirmation(
+        call_id=call.id,
+        sms_id="worker-1",
+        session_factory=sqlite_session_factory,
+        provider=provider,
+    )
+
+    assert result is not None
+    assert len(provider.calls) == 1
+    context, sms_text, _facts = provider.calls[0]
+    assert sms_text == "Собеседование завтра в 10"
+    assert context.transcript == []
+    async with sqlite_session_factory() as db:
+        fact = await db.scalar(select(CallFact).where(CallFact.session_id == call.id))
+        refreshed = await db.get(CommunicationSession, call.id)
+    assert fact is not None and fact.state is CallFactState.CONFIRMED
+    assert refreshed is not None
+    assert refreshed.summary["verification"]["sms_pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_ingest_preserves_existing_sms_link_when_new_call_matches(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        first = await add_call(db, profile, ended_at=ended)
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="relink-1", timestamp=int(ended.timestamp() * 1000))])
+    await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    async with sqlite_session_factory() as db:
+        second = await add_call(db, profile, ended_at=ended + timedelta(minutes=1))
+        await db.commit()
+    result = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    async with sqlite_session_factory() as db:
+        imported = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport_external_id == "relink-1"
+            )
+        )
+    assert result["ambiguous"] == 1
+    assert imported is not None
+    assert imported.related_session_id == first.id
+    assert imported.related_session_id != second.id
+    assert imported.diagnostics["sms_correlation"]["reason"] == "existing_link_preserved"
+
+
+@pytest.mark.asyncio
+async def test_sms_provider_failure_retries_then_marks_review(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        call = await add_call(db, profile, ended_at=ended)
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="retry-1", timestamp=int(ended.timestamp() * 1000))])
+    await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    settings = Settings(_env_file=None, phone_verification_max_attempts=2)
+    provider = FailingComparisonProvider()
+
+    first = await process_sms_confirmation(
+        call_id=call.id,
+        sms_id="retry-1",
+        session_factory=sqlite_session_factory,
+        provider=provider,
+        settings=settings,
+    )
+    second = await process_sms_confirmation(
+        call_id=call.id,
+        sms_id="retry-1",
+        session_factory=sqlite_session_factory,
+        provider=provider,
+        settings=settings,
+    )
+
+    assert first is PhoneVerificationStatus.NOT_APPLICABLE
+    assert second is PhoneVerificationStatus.NEEDS_REVIEW
+    async with sqlite_session_factory() as db:
+        refreshed = await db.get(CommunicationSession, call.id)
+    assert refreshed is not None
+    assert refreshed.summary["verification"]["sms_pending"] == []
+    assert list(refreshed.summary["verification"]["sms_attempts"].values()) == [2]
 
 
 @pytest.mark.asyncio

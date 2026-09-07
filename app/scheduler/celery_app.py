@@ -113,6 +113,11 @@ celery_app.conf.update(
             "schedule": _sms_poll_interval,
             "options": {"queue": "phone", "expires": _sms_poll_expires},
         },
+        "reconcile-phone-sms": {
+            "task": "job_agent.scheduler.reconcile_phone_sms",
+            "schedule": _sms_poll_interval,
+            "options": {"queue": "phone", "expires": _sms_poll_expires},
+        },
     },
     task_routes={
         "job_agent.scheduler.run_scan": {"queue": "crawling"},
@@ -128,6 +133,7 @@ celery_app.conf.update(
         "job_agent.scheduler.finalize_pending_calls": {"queue": "phone"},
         "job_agent.scheduler.prune_phone_evidence": {"queue": "phone"},
         "job_agent.scheduler.ingest_phonegate_sms": {"queue": "phone"},
+        "job_agent.scheduler.reconcile_phone_sms": {"queue": "phone"},
     },
 )
 

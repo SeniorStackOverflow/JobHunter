@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
@@ -17,11 +17,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import async_session_factory
-from app.models.entities import CommunicationSession, CommunicationTurn, UserProfile
+from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    PhoneVerificationStatus,
     TurnDeliveryStatus,
     TurnSpeaker,
 )
@@ -33,6 +34,13 @@ from app.phone.facts import (
 )
 from app.phone.numbers import normalize_e164
 from app.phone.schemas import PhoneSmsMessage, PhoneSmsPage
+from app.phone.verification import (
+    ModelCallMeta,
+    PersistedFact,
+    SmsComparisonResult,
+    VerificationContext,
+    VerificationUnavailable,
+)
 from app.settings import Settings, get_settings
 
 
@@ -40,6 +48,12 @@ class SmsHistoryClient(Protocol):
     async def sms_history(self, *, limit: int = 200, number: str | None = None) -> PhoneSmsPage: ...
 
     async def sync_sms(self) -> None: ...
+
+
+class SmsComparisonProvider(Protocol):
+    async def compare_sms(
+        self, ctx: VerificationContext, sms_text: str, facts: Sequence[PersistedFact]
+    ) -> tuple[SmsComparisonResult, ModelCallMeta]: ...
 
 
 class SmsSyncMarker(Protocol):
@@ -354,6 +368,12 @@ async def _mark_sms_comparison_pending(
     verification["sms_input_ids"] = sorted(
         {*(item for item in input_ids if isinstance(item, str)), turn_id}
     )
+    pending = verification.get("sms_pending", [])
+    if not isinstance(pending, list):
+        pending = []
+    if turn_id not in pending:
+        pending = [*pending, turn_id]
+    verification["sms_pending"] = pending
     verification["sms_reconciliation"] = {
         "state": "pending",
         "sms_turn_id": turn_id,
@@ -362,6 +382,315 @@ async def _mark_sms_comparison_pending(
     summary["verification"] = verification
     call.summary = summary
     return True
+
+
+def _pending_ids(call: CommunicationSession) -> list[str]:
+    verification = (call.summary or {}).get("verification", {})
+    if not isinstance(verification, dict):
+        return []
+    values = verification.get("sms_pending", [])
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str)]
+
+
+def _safe_sms_failure(exc: BaseException) -> str:
+    if isinstance(exc, VerificationUnavailable):
+        return exc.reason
+    return "internal_error"
+
+
+def _facts_signature(
+    facts: Sequence[CallFact],
+) -> tuple[tuple[str, str, str | None, str, str | None, str | None], ...]:
+    return tuple(
+        sorted(
+            (
+                fact.field,
+                fact.raw_expression,
+                fact.normalized_value,
+                fact.state.value,
+                fact.confirmation_source.value if fact.confirmation_source is not None else None,
+                str(fact.confirmed_by_turn_id) if fact.confirmed_by_turn_id else None,
+            )
+            for fact in facts
+        )
+    )
+
+
+def _sms_snapshot_is_eligible(
+    *,
+    call: CommunicationSession,
+    sms_session: CommunicationSession,
+    turns: Sequence[CommunicationTurn],
+) -> bool:
+    """Validate the immutable SMS identity before spending a model call."""
+    return (
+        sms_session.channel == CommunicationChannel.SMS
+        and sms_session.transport == "phonegate"
+        and sms_session.transport_external_id is not None
+        and sms_session.direction == CommunicationDirection.INBOUND
+        and sms_session.profile_id == call.profile_id
+        and sms_session.related_session_id == call.id
+        and len(turns) == 1
+        and turns[0].seq == 1
+        and turns[0].speaker == TurnSpeaker.EMPLOYER
+    )
+
+
+async def _record_sms_failure(
+    *,
+    call_id: UUID,
+    sms_turn_id: UUID,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    reason: str,
+) -> PhoneVerificationStatus | None:
+    async with session_factory() as db:
+        query = select(CommunicationSession).where(CommunicationSession.id == call_id)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        call = await db.scalar(query)
+        if (
+            call is None
+            or call.claim_token is not None
+            or str(sms_turn_id) not in _pending_ids(call)
+        ):
+            return None
+        raw_verification = (call.summary or {}).get("verification", {})
+        verification = dict(raw_verification) if isinstance(raw_verification, dict) else {}
+        attempts = verification.get("sms_attempts", {})
+        if not isinstance(attempts, dict):
+            attempts = {}
+        previous = attempts.get(str(sms_turn_id), 0)
+        count = previous + 1 if isinstance(previous, int) else 1
+        attempts[str(sms_turn_id)] = count
+        verification["sms_attempts"] = attempts
+        retryable = count < settings.phone_verification_max_attempts
+        if not retryable:
+            verification["sms_pending"] = [
+                value for value in _pending_ids(call) if value != str(sms_turn_id)
+            ]
+            call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
+            call.needs_review = True
+        verification["sms_reconciliation"] = {
+            "state": "retry" if retryable else "failed",
+            "sms_turn_id": str(sms_turn_id),
+            "attempt": count,
+            "reason": reason,
+        }
+        summary = dict(call.summary or {})
+        summary["verification"] = verification
+        call.summary = summary
+        await db.commit()
+        return call.verification_status
+
+
+async def process_sms_confirmation(
+    *,
+    call_id: UUID,
+    sms_id: str,
+    session_factory: async_sessionmaker[AsyncSession],
+    provider: SmsComparisonProvider | None = None,
+    settings: Settings | None = None,
+) -> PhoneVerificationStatus | None:
+    """Run only ``compare_sms`` for one pending SMS and apply under a final lock."""
+    current_settings = settings or get_settings()
+    async with session_factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+        sms_session = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport == "phonegate",
+                CommunicationSession.channel == CommunicationChannel.SMS,
+                CommunicationSession.transport_external_id == sms_id,
+            )
+        )
+        if call is None or sms_session is None or call.claim_token is not None:
+            return None
+        turns = list(
+            (
+                await db.scalars(
+                    select(CommunicationTurn)
+                    .where(CommunicationTurn.session_id == sms_session.id)
+                    .order_by(CommunicationTurn.seq, CommunicationTurn.id)
+                )
+            ).all()
+        )
+        if not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns):
+            return None
+        if str(turns[0].id) not in _pending_ids(call):
+            return None
+        facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
+        persisted = [
+            PersistedFact(
+                field=fact.field,
+                raw_expression=fact.raw_expression,
+                normalized_value=fact.normalized_value,
+                state=fact.state,
+            )
+            for fact in facts
+            if fact.field
+            in {
+                "interview_date",
+                "interview_time",
+                "timezone",
+                "format",
+                "address",
+                "meeting_url",
+                "company",
+                "vacancy",
+            }
+        ]
+        context = VerificationContext(
+            call_id=str(call.id),
+            call_started_at=call.started_at,
+            timezone="Europe/Chisinau",
+            transcript=[],
+        )
+        revision = call.verification_revision
+        fact_signature = _facts_signature(facts)
+        turn = turns[0]
+        sms_text = turn.text
+        await db.commit()
+
+    try:
+        comparison_provider = provider
+        if comparison_provider is None:
+            from app.phone.summary import _build_verification_provider
+
+            comparison_provider = _build_verification_provider(current_settings)
+        comparison, metadata = await comparison_provider.compare_sms(context, sms_text, persisted)
+    except Exception as exc:
+        return await _record_sms_failure(
+            call_id=call_id,
+            sms_turn_id=turn.id,
+            session_factory=session_factory,
+            settings=current_settings,
+            reason=_safe_sms_failure(exc),
+        )
+
+    async with session_factory() as db:
+        query = select(CommunicationSession).where(CommunicationSession.id == call_id)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        call = await db.scalar(query)
+        sms_session = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport == "phonegate",
+                CommunicationSession.channel == CommunicationChannel.SMS,
+                CommunicationSession.transport_external_id == sms_id,
+            )
+        )
+        if call is None or sms_session is None:
+            return None
+        turns = list(
+            (
+                await db.scalars(
+                    select(CommunicationTurn)
+                    .where(CommunicationTurn.session_id == sms_session.id)
+                    .order_by(CommunicationTurn.seq, CommunicationTurn.id)
+                )
+            ).all()
+        )
+        if not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns):
+            return None
+        current_facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
+        if (
+            call.claim_token is not None
+            or call.verification_revision != revision
+            or _facts_signature(current_facts) != fact_signature
+        ):
+            return None
+        if (
+            not _sms_snapshot_is_eligible(call=call, sms_session=sms_session, turns=turns)
+            or str(turn.id) != str(turns[0].id)
+            or turns[0].text != sms_text
+            or turns[0].occurred_at != turn.occurred_at
+            or str(turn.id) not in _pending_ids(call)
+        ):
+            return None
+        status = await apply_sms_confirmation(
+            db,
+            call=call,
+            sms_session=sms_session,
+            comparison=comparison,
+            metadata=metadata,
+        )
+        verification = dict((call.summary or {}).get("verification", {}))
+        verification["sms_pending"] = [
+            value for value in _pending_ids(call) if value != str(turn.id)
+        ]
+        verification["sms_reconciliation"] = {
+            "state": "done",
+            "sms_turn_id": str(turn.id),
+        }
+        summary = dict(call.summary or {})
+        summary["verification"] = verification
+        call.summary = summary
+        await db.commit()
+        return status
+
+
+async def reconcile_pending_sms(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    provider: SmsComparisonProvider | None = None,
+    settings: Settings | None = None,
+) -> dict[str, int]:
+    """Scan ordered pending SMS inputs so a crash after linking is recoverable."""
+    async with session_factory() as db:
+        calls = list(
+            (
+                await db.scalars(
+                    select(CommunicationSession).where(
+                        CommunicationSession.channel == CommunicationChannel.CALL
+                    )
+                )
+            ).all()
+        )
+        work = [(call.id, item) for call in calls for item in _pending_ids(call)]
+    result = {"picked": 0, "done": 0, "failed": 0, "skipped": 0}
+    for call_id, turn_text in work:
+        try:
+            turn_id = UUID(turn_text)
+        except ValueError:
+            result["skipped"] += 1
+            continue
+        async with session_factory() as db:
+            sms_id = await db.scalar(
+                select(CommunicationSession.transport_external_id)
+                .join(
+                    CommunicationTurn,
+                    CommunicationTurn.session_id == CommunicationSession.id,
+                )
+                .where(
+                    CommunicationSession.related_session_id == call_id,
+                    CommunicationSession.channel == CommunicationChannel.SMS,
+                    CommunicationTurn.id == turn_id,
+                )
+            )
+        if not sms_id:
+            result["skipped"] += 1
+            continue
+        result["picked"] += 1
+        status = await process_sms_confirmation(
+            call_id=call_id,
+            sms_id=sms_id,
+            session_factory=session_factory,
+            provider=provider,
+            settings=settings,
+        )
+        if status is None:
+            result["skipped"] += 1
+        elif status is PhoneVerificationStatus.NEEDS_REVIEW:
+            result["failed"] += 1
+        else:
+            result["done"] += 1
+    return result
 
 
 async def _persist_message(
@@ -532,23 +861,43 @@ async def _ingest_with_client(
             )
             if len(matches) == 1:
                 was_linked = sms_session.related_session_id == matches[0].id
-                sms_session.related_session_id = matches[0].id
-                sms_session.needs_review = False
-                sms_session.diagnostics = {
-                    **sms_session.diagnostics,
-                    "sms_correlation": {"status": "linked", "reason": "single_completed_call"},
-                }
-                result["correlated"] += 1
-                if not was_linked:
-                    await _mark_sms_comparison_pending(db, call=matches[0], sms_session=sms_session)
+                if sms_session.related_session_id is not None and not was_linked:
+                    sms_session.needs_review = True
+                    sms_session.diagnostics = {
+                        **sms_session.diagnostics,
+                        "sms_correlation": {
+                            "status": "review",
+                            "reason": "existing_link_preserved",
+                        },
+                    }
+                    result["ambiguous"] += 1
+                else:
+                    sms_session.related_session_id = matches[0].id
+                    sms_session.needs_review = False
+                    sms_session.diagnostics = {
+                        **sms_session.diagnostics,
+                        "sms_correlation": {
+                            "status": "linked",
+                            "reason": "single_completed_call",
+                        },
+                    }
+                    result["correlated"] += 1
+                    if not was_linked:
+                        await _mark_sms_comparison_pending(
+                            db, call=matches[0], sms_session=sms_session
+                        )
             else:
                 reason = (
                     "ambiguous_completed_calls"
                     if len(matches) > 1
                     else "no_matching_completed_call"
                 )
-                sms_session.related_session_id = None
-                sms_session.needs_review = len(matches) > 1
+                if sms_session.related_session_id is not None:
+                    reason = "existing_link_preserved"
+                    sms_session.needs_review = True
+                else:
+                    sms_session.related_session_id = None
+                    sms_session.needs_review = len(matches) > 1
                 sms_session.diagnostics = {
                     **sms_session.diagnostics,
                     "sms_correlation": {"status": "unlinked", "reason": reason},
@@ -631,5 +980,7 @@ __all__ = [
     "SmsConfirmationRejected",
     "apply_sms_confirmation",
     "ingest_phonegate_sms",
+    "process_sms_confirmation",
+    "reconcile_pending_sms",
     "unlink_sms_confirmation",
 ]

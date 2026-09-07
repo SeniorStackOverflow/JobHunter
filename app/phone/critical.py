@@ -2,9 +2,11 @@ from __future__ import annotations
 
 # ruff: noqa: RUF001 — Russian characters in parser patterns are intentional.
 import re
+import unicodedata
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_SMS
@@ -320,6 +322,46 @@ def normalize_critical_value(
             return None
         return text
     return None
+
+
+def canonical_critical_value(field: CriticalField, value: str | None) -> str | None:
+    """Canonicalize already-normalized values for safe cross-source equality."""
+    if value is None:
+        return None
+    text = " ".join(unicodedata.normalize("NFKC", value).split())
+    if not text:
+        return None
+    if field in {"address", "company", "vacancy"}:
+        return text.casefold()
+    if field == "meeting_url":
+        try:
+            parsed = urlsplit(text)
+        except ValueError:
+            return None
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+            return None
+        host = parsed.hostname.casefold().rstrip(".")
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        netloc = host
+        if port is not None and not (
+            (parsed.scheme.casefold() == "http" and port == 80)
+            or (parsed.scheme.casefold() == "https" and port == 443)
+        ):
+            netloc = f"{host}:{port}"
+        normalized = SplitResult(
+            parsed.scheme.casefold(),
+            netloc,
+            parsed.path or "/",
+            parsed.query,
+            parsed.fragment,
+        )
+        return urlunsplit(normalized)
+    if field in {"timezone", "format"}:
+        return text.casefold()
+    return text
 
 
 def has_confirmation_critical_markers(texts: Sequence[str]) -> bool:

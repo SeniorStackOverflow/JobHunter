@@ -8,11 +8,28 @@ import pytest
 
 from app.phone.critical import (
     CriticalField,
+    canonical_critical_value,
     closing_for_transcript,
     has_confirmation_critical_markers,
     normalize_critical_value,
 )
 from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_SMS
+
+
+@pytest.mark.parametrize(
+    ("field", "left", "right"),
+    [
+        ("address", " Ул. Пушкина, 5 ", "ул. пушкина, 5"),
+        ("company", "Acme  Group", "acme group"),
+        ("vacancy", "Инженер", " инженер "),
+        ("format", "REMOTE", "remote"),
+        ("timezone", "Europe/Chisinau", "europe/chisinau"),
+        ("meeting_url", "HTTPS://Meet.Example:443/Room", "https://meet.example/Room"),
+    ],
+)
+def test_canonical_critical_values_compare_safe_variants(field: str, left: str, right: str) -> None:
+    typed = cast(CriticalField, field)
+    assert canonical_critical_value(typed, left) == canonical_critical_value(typed, right)
 
 
 @pytest.mark.parametrize(

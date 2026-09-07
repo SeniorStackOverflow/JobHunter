@@ -616,6 +616,19 @@ def ingest_phonegate_sms_task() -> dict[str, int] | dict[str, str]:
     return _run_locked_periodic("phone-sms", ingest_phonegate_sms(), ttl_seconds=ttl_seconds)
 
 
+@celery_app.task(name="job_agent.scheduler.reconcile_phone_sms")
+def reconcile_phone_sms_task() -> dict[str, int] | dict[str, str]:
+    from app.phone.sms import reconcile_pending_sms
+
+    interval = get_settings().phone_sms_poll_interval_seconds
+    ttl_seconds = max(5, int(interval * 2))
+    return _run_locked_periodic(
+        "phone-sms-reconcile",
+        reconcile_pending_sms(session_factory=async_session_factory),
+        ttl_seconds=ttl_seconds,
+    )
+
+
 __all__ = [
     "DEFAULT_SOURCE_SCHEDULES",
     "close_task_event_loop",
@@ -628,6 +641,7 @@ __all__ = [
     "process_unprocessed_jobs_task",
     "prune_phone_evidence_task",
     "recheck_source_task",
+    "reconcile_phone_sms_task",
     "record_learning_shadow_task",
     "retry_temporary_failures_task",
     "run_scan_task",

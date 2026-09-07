@@ -20,7 +20,11 @@ from app.models.enums import (
     PhoneVerificationStatus,
     TurnSpeaker,
 )
-from app.phone.critical import CriticalField, normalize_critical_value
+from app.phone.critical import (
+    CriticalField,
+    canonical_critical_value,
+    normalize_critical_value,
+)
 from app.phone.reconciliation import VerificationDecision
 from app.phone.verification import ModelCallMeta, SmsComparisonResult
 
@@ -95,14 +99,18 @@ def _sms_turn_id_set(verification: Mapping[str, Any]) -> set[str]:
     return {value for value in values if isinstance(value, str)}
 
 
-def _safe_comparison_json(comparison: SmsComparisonResult) -> list[dict[str, str]]:
+def _safe_comparison_json(
+    comparison: SmsComparisonResult, *, valid_fields: set[CriticalField]
+) -> list[dict[str, str]]:
     return [
         {
             "field": item.field,
             "relation": item.relation,
-            "sms_expression": _safe_sms_text(item.sms_expression),
-            "call_expression": _safe_sms_text(item.call_expression),
-            "reason": _safe_sms_text(item.reason),
+            "reason_code": (
+                "accepted"
+                if item.field in valid_fields and item.relation in {"matches", "conflicts"}
+                else "review_required"
+            ),
         }
         for item in comparison.comparisons
     ]
@@ -126,14 +134,20 @@ async def _validate_sms_confirmation(
         raise SmsConfirmationRejected("SMS is not linked to this call")
     if sms_session.transport != "phonegate" or not sms_session.transport_external_id:
         raise SmsConfirmationRejected("SMS external identity is invalid")
-    turn = await db.scalar(
-        select(CommunicationTurn).where(
-            CommunicationTurn.session_id == sms_session.id,
-            CommunicationTurn.seq == 1,
-        )
+    turns = list(
+        (
+            await db.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.session_id == sms_session.id)
+                .order_by(CommunicationTurn.seq, CommunicationTurn.id)
+            )
+        ).all()
     )
-    if turn is None or turn.speaker is not TurnSpeaker.EMPLOYER:
-        raise SmsConfirmationRejected("SMS employer turn is missing")
+    if len(turns) != 1:
+        raise SmsConfirmationRejected("SMS must have one employer turn")
+    turn = turns[0]
+    if turn.seq != 1 or turn.speaker is not TurnSpeaker.EMPLOYER:
+        raise SmsConfirmationRejected("SMS employer turn is invalid")
     return turn
 
 
@@ -173,18 +187,31 @@ def _restore_fact_snapshot(fact: CallFact, snapshot: Mapping[str, object]) -> No
 
 
 def _sms_status(
-    call: CommunicationSession, facts: list[CallFact], *, review: bool
+    call: CommunicationSession,
+    facts: list[CallFact],
+    *,
+    review: bool,
+    verification: Mapping[str, Any] | None = None,
 ) -> PhoneVerificationStatus:
     if review or any(fact.state is CallFactState.CONFLICT for fact in facts):
         return PhoneVerificationStatus.NEEDS_REVIEW
     if facts and all(fact.state is CallFactState.CONFIRMED for fact in facts):
         return PhoneVerificationStatus.CONFIRMED
-    current = call.verification_status
-    if current is PhoneVerificationStatus.CONFIRMED:
-        return PhoneVerificationStatus.HIGH_CONFIDENCE
-    if current in {PhoneVerificationStatus.NOT_APPLICABLE, PhoneVerificationStatus.PENDING}:
-        return PhoneVerificationStatus.HIGH_CONFIDENCE if facts else current
-    return current
+    stored = (verification or {}).get("decision", {})
+    if isinstance(stored, dict):
+        status = stored.get("status")
+        if status in {item.value for item in PhoneVerificationStatus}:
+            return PhoneVerificationStatus(status)
+    prior = (verification or {}).get("transcript_status")
+    if prior in {item.value for item in PhoneVerificationStatus}:
+        return PhoneVerificationStatus(prior)
+    return call.verification_status
+
+
+def _folded(value: str) -> str:
+    import unicodedata
+
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
 
 
 async def apply_sms_confirmation(
@@ -203,6 +230,8 @@ async def apply_sms_confirmation(
     """
     turn = await _validate_sms_confirmation(db, call=call, sms_session=sms_session)
     verification = _verification_summary(call)
+    if "transcript_status" not in verification:
+        verification["transcript_status"] = call.verification_status.value
     comparisons_history = verification.get("sms_comparisons", [])
     if not isinstance(comparisons_history, list):
         comparisons_history = []
@@ -223,6 +252,14 @@ async def apply_sms_confirmation(
     reasons: list[str] = []
     matched_fields: set[CriticalField] = set()
     previous: dict[str, dict[str, object]] = {}
+    valid_fields: set[CriticalField] = set()
+    sms_text = _folded(turn.text)
+    supporters = verification.get("sms_supporters", {})
+    if not isinstance(supporters, dict):
+        supporters = {}
+    originals = verification.get("sms_originals", {})
+    if not isinstance(originals, dict):
+        originals = {}
     for item in comparison.comparisons:
         field = item.field
         fact = by_field.get(field)
@@ -234,37 +271,61 @@ async def apply_sms_confirmation(
         if fact is None:
             reasons.append(f"sms:{field}:fact_missing")
             continue
+        if item.relation in {"matches", "conflicts"}:
+            expression = _folded(item.sms_expression)
+            if not expression or expression not in sms_text:
+                reasons.append(f"sms:{field}:expression_unbound")
+                continue
+            if item.call_expression and _folded(item.call_expression) not in _folded(
+                fact.raw_expression
+            ):
+                reasons.append(f"sms:{field}:call_expression_unbound")
+                continue
         if field not in matched_fields:
             previous[field] = _fact_snapshot(fact)
             matched_fields.add(field)
+        if field not in originals:
+            originals[field] = _fact_snapshot(fact)
         if item.relation == "conflicts":
             fact.state = CallFactState.CONFLICT
             reasons.append(f"sms:{field}:conflict")
+            valid_fields.add(field)
             continue
         sms_value = normalize_critical_value(
             field,
             item.sms_expression,
-            reference_at=sms_session.started_at,
+            reference_at=turn.occurred_at,
             timezone="Europe/Chisinau",
         )
-        call_value = fact.normalized_value
-        if sms_value is None or call_value is None or sms_value != call_value:
+        call_value = canonical_critical_value(field, fact.normalized_value)
+        sms_canonical = canonical_critical_value(field, sms_value)
+        if sms_canonical is None or call_value is None or sms_canonical != call_value:
             fact.state = CallFactState.CONFLICT
             reasons.append(f"sms:{field}:deterministic_mismatch")
+            valid_fields.add(field)
             continue
         if fact.state is CallFactState.CONFLICT:
             reasons.append(f"sms:{field}:conflict_sticky")
+            valid_fields.add(field)
             continue
+        field_supporters = supporters.get(field, [])
+        if not isinstance(field_supporters, list):
+            field_supporters = []
+        if turn_key not in field_supporters:
+            field_supporters = [*field_supporters, turn_key]
+        supporters[field] = field_supporters
         if fact.confirmation_source is not None:
             # Preserve the first trusted confirmer and its audit identity.
+            valid_fields.add(field)
             continue
         fact.state = CallFactState.CONFIRMED
         fact.confirmed_by_turn_id = turn.id
         fact.confirmation_source = CallFactConfirmationSource.SMS
         fact.confirmed_at = datetime.now(UTC)
+        valid_fields.add(field)
 
     review = bool(reasons) or any(fact.state is CallFactState.CONFLICT for fact in facts)
-    status = _sms_status(call, facts, review=review)
+    status = _sms_status(call, facts, review=review, verification=verification)
     now = datetime.now(UTC).isoformat()
     entry: dict[str, Any] = {
         "sms_turn_id": turn_key,
@@ -273,9 +334,10 @@ async def apply_sms_confirmation(
         "status": status.value,
         "pipeline_version": verification.get("pipeline_version", _SMS_PIPELINE_VERSION),
         "metadata": _safe_sms_metadata(metadata),
-        "comparisons": _safe_comparison_json(comparison),
-        "reasons": reasons,
+        "comparisons": _safe_comparison_json(comparison, valid_fields=valid_fields),
+        "reason_codes": reasons,
         "previous": previous,
+        "supporters": {field: list(value) for field, value in supporters.items()},
     }
     if existing_entry is not None:
         comparisons_history = [item for item in comparisons_history if item is not existing_entry]
@@ -287,10 +349,12 @@ async def apply_sms_confirmation(
         input_ids.add(turn_key)
     verification["sms_input_ids"] = sorted(input_ids)
     if reasons:
-        prior_reasons = verification.get("review_reasons", [])
+        prior_reasons = verification.get("review_reason_codes", [])
         if not isinstance(prior_reasons, list):
             prior_reasons = []
-        verification["review_reasons"] = list(dict.fromkeys([*prior_reasons, *reasons]))
+        verification["review_reason_codes"] = list(dict.fromkeys([*prior_reasons, *reasons]))
+    verification["sms_supporters"] = supporters
+    verification["sms_originals"] = originals
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
     return status
@@ -318,17 +382,33 @@ async def unlink_sms_confirmation(
     )
     facts = list((await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all())
     if isinstance(entry, dict):
-        previous = entry.get("previous", {})
-        if isinstance(previous, dict):
-            for fact in facts:
-                if (
-                    fact.confirmation_source is CallFactConfirmationSource.SMS
-                    and fact.confirmed_by_turn_id == turn.id
-                    and fact.state is not CallFactState.CONFLICT
-                ):
-                    snapshot = previous.get(fact.field)
-                    if isinstance(snapshot, dict):
-                        _restore_fact_snapshot(fact, snapshot)
+        supporters = verification.get("sms_supporters", {})
+        if not isinstance(supporters, dict):
+            supporters = {}
+        originals = verification.get("sms_originals", {})
+        if not isinstance(originals, dict):
+            originals = {}
+        for fact in facts:
+            field_supporters = supporters.get(fact.field, [])
+            if not isinstance(field_supporters, list):
+                field_supporters = []
+            if str(turn.id) in field_supporters:
+                field_supporters = [value for value in field_supporters if value != str(turn.id)]
+                supporters[fact.field] = field_supporters
+            if fact.state is CallFactState.CONFLICT:
+                continue
+            if field_supporters:
+                if fact.confirmation_source is CallFactConfirmationSource.SMS:
+                    fact.confirmed_by_turn_id = UUID(field_supporters[0])
+                continue
+            if (
+                fact.confirmation_source is CallFactConfirmationSource.SMS
+                and fact.confirmed_by_turn_id == turn.id
+            ):
+                snapshot = originals.get(fact.field)
+                if isinstance(snapshot, dict):
+                    _restore_fact_snapshot(fact, snapshot)
+        verification["sms_supporters"] = supporters
         entry["status"] = "unlinked"
         entry["unlinked_at"] = datetime.now(UTC).isoformat()
     sms_session.related_session_id = None
@@ -338,7 +418,7 @@ async def unlink_sms_confirmation(
         "sms_turn_id": str(turn.id),
         "reason": "manual_unlink",
     }
-    status = _sms_status(call, facts, review=False)
+    status = _sms_status(call, facts, review=False, verification=verification)
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
     return status
@@ -393,7 +473,17 @@ async def replace_current_facts(
         "attempt_history": list(old_verification.get("attempt_history", [])),
         "stored_at": datetime.now(UTC).isoformat(),
     }
-    for key in ("sms_comparisons", "sms_input_ids", "sms_reconciliation", "review_reasons"):
+    for key in (
+        "sms_comparisons",
+        "sms_input_ids",
+        "sms_pending",
+        "sms_attempts",
+        "sms_supporters",
+        "sms_originals",
+        "sms_reconciliation",
+        "transcript_status",
+        "review_reason_codes",
+    ):
         if key in old_verification:
             verification[key] = old_verification[key]
     current["verification"] = verification
