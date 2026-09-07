@@ -1256,7 +1256,7 @@ async def test_llmrouter_falls_back_when_backend_rejects_json_schema() -> None:
         body = json.loads(request.content)
         bodies.append(body)
         if "response_format" in body:
-            return httpx.Response(400, request=request, json={"error": {"message": "unsupported"}})
+            return httpx.Response(400, request=request, json={"error": {"message": "unsupported", "retryable_without_structured_output": True}})
         return httpx.Response(
             200,
             request=request,
@@ -1320,6 +1320,6 @@ async def test_llmrouter_exhausted_structured_pool_stays_structured_and_retries_
             await provider.evaluate(make_request())
 
     assert exc.value.provider == "llmrouter"
-    assert exc.value.retry_after_seconds == 60
+    assert exc.value.retry_after_seconds == 5
     assert len(bodies) == 1
     assert "response_format" in bodies[0]
