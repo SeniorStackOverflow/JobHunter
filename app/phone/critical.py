@@ -211,13 +211,13 @@ def _parse_time(raw: str) -> str | None:
     # ASR commonly renders a spoken time separator as a period (``14.30``).
     # Accept that form only when it is an unambiguous HH.MM expression; the
     # surrounding ambiguity checks above still reject alternatives and ranges.
-    # A minute value through 12 can also be a DD.MM calendar token, so keep
-    # those dotted forms in review even when a loose time word is nearby.
+    # A valid 1..31 day and 1..12 month pair can also be a DD.MM calendar
+    # token, so keep only those dotted forms in review.
     for match in _NUMERIC_DOT_TIME_RE.finditer(text):
         hour, minute = int(match.group("hour")), int(match.group("minute"))
         if hour > 23 or minute > 59:
             return None
-        if minute <= 12:
+        if 1 <= hour <= 31 and 1 <= minute <= 12:
             continue
         candidates.append((hour, minute))
 
