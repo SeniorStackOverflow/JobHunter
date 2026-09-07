@@ -24,7 +24,7 @@ runtime image creates the directory for UID 10001 before the volume is first
 used. Blank phone summary transport settings fall back to llmRouter base URL,
 key, and model; explicit phone overrides still win.
 
-At 14:07 the DEV services were healthy:
+After the final rebuild and credential rotation the DEV services were healthy:
 
 | Service | Result |
 | --- | --- |
@@ -49,11 +49,12 @@ cursor after a failed call; no production project or data was touched.
 ## Automated and live checks
 
 The root acceptance run completed the five real llmRouter verification cases
-with `LLMROUTER_PREFER=fast` and a 120-second timeout. The real PhoneGate
-health, device, read-only SMS history, and audio endpoints also passed. No
-Telegram credentials were present, so the DEV override recorded Telegram as
-`disabled`; no message was sent or claimed. Outbound SMS matching/conflict
-checks remain unavailable on the approved employer-side rig.
+with `LLMROUTER_PREFER=fast` and a 120-second timeout (`1 passed` in 22.81s).
+The real PhoneGate health, device, read-only SMS history, and audio endpoints
+also passed (`1 passed` in 0.28s). No Telegram credentials were present, so the
+DEV override recorded Telegram as `disabled`; no message was sent or claimed.
+Outbound SMS matching/conflict checks remain unavailable on the approved
+employer-side rig.
 
 The local A06 harness checks passed:
 
@@ -71,7 +72,7 @@ no provider response body or credential is stored here.
 
 ```text
 uv run pytest -q tests/unit/test_phone_verification.py
-16 passed
+20 passed
 ```
 
 No provider response body, credential, transcript, or raw identifier is stored
@@ -101,6 +102,23 @@ acceptance and are not represented as one. The harness now waits for
 transcript events by bounded event time, and requires evidence links before
 high-confidence facts can pass.
 
+The final automated A06→A14 call completed the physical call, persisted an
+employer RX turn and audio evidence, and ran Extractor, Verifier, and Arbiter.
+It safely ended `done/needs_review`. Extractor and Arbiter agreed on the date,
+time, address, timezone, and vacancy, but the independent Verifier labelled the
+date and time as `meeting_url`; the reconciliation gate therefore refused to
+promote those critical fields. The provider boundary now rejects structurally
+impossible canonical values (for example, a time stored as a meeting URL) and
+retries the independent pass. A direct request to the real llmRouter using the
+same Russian phrase passed after this change with five correctly typed fields
+on the first attempt. The reconciliation rule still requires two independent
+passes plus transcript/audio evidence and matching Arbiter confirmation.
+
+The DEV PhoneGate token that appeared in private failed-test output was rotated
+after the external checks. PhoneGate accepted the new token with HTTP 200 and
+rejected the old token with HTTP 401. The rebuilt API, worker, and call-agent
+were verified to hold the current token without printing it.
+
 ## Admin browser acceptance
 
 With Playwright Chromium installed locally, the complete admin review suite
@@ -122,10 +140,11 @@ The final checks ran after the DEV and browser checks:
 | Command | Result |
 | --- | --- |
 | `uv run ruff check .` | passed |
-| `uv run mypy app fixture_site` | passed; 120 source files |
-| `uv run pytest -q` | 922 passed, 16 skipped, 134.94s |
+| `uv run mypy app fixture_site` | passed; 121 source files |
+| `uv run pytest -q` | 961 passed, 16 skipped, 135.27s |
 | `git diff --check` | passed |
-| `uv run ruff format --check .` | blocked by six pre-existing unformatted Phase 1/2 design and plan Markdown files; changed Python and acceptance files pass targeted format checks |
+| `uv run ruff format --check app fixture_site tests migrations` | passed; 212 Python files |
+| `uv run ruff format --check .` | blocked only by six pre-existing unformatted Phase 1/2 design and plan Markdown files |
 
 The skipped tests are the existing service-backed/live suites plus the
 opt-in real-call module described above. No unrelated documentation was
@@ -134,6 +153,8 @@ reformatted to force the repository-wide format check green.
 ## Known limits
 
 Telegram delivery and outbound SMS comparison remain unverified because the
-authorized credentials/rig were unavailable. A fresh GSM run with a working
-Edge-TTS/ASR path is still required to record a truthful high-confidence live
-call; the current evidence is deliberately reported as incomplete.
+authorized credentials/rig were unavailable. The automated GSM run proves the
+real call, ASR, evidence, persistence, and conservative review path. A fresh
+manual GSM call is still required to record a truthful post-fix
+`high_confidence` result; it must be performed only after the whole-branch Sol
+review is clean.

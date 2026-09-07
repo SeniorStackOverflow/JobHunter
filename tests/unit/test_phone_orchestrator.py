@@ -696,7 +696,10 @@ async def test_supervisor_spawns_on_ringing_and_answers(
             await sup.tick(await client.device_status(), session_id)
             assert await redis.get(CALL_OWNED_KEY) == str(session_id)
             # let it run to completion
-            for _ in range(500):
+            # The orchestrator may legitimately consume the five-second hard
+            # cap before it reaches its bounded closing/hangup cleanup.  Leave
+            # headroom for that cleanup on slower CI hosts.
+            for _ in range(800):
                 await asyncio.sleep(0.01)
                 await sup.tick(await client.device_status(), session_id)
                 if await redis.get(CALL_OWNED_KEY) is None:

@@ -11,16 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal, TypeVar
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.models.enums import CallFactState
 from app.phone.critical import CriticalField
@@ -103,6 +105,29 @@ class FactCandidate(BaseModel):
     turn_seq: int | None
     confidence: float = Field(ge=0, le=1)
     ambiguity: str | None = None
+
+    @model_validator(mode="after")
+    def validate_canonical_shape(self) -> FactCandidate:
+        """Reject values that cannot belong to the field before reconciliation."""
+        value = self.normalized_value
+        if value is None:
+            return self
+        valid = True
+        if self.field == "interview_date":
+            try:
+                valid = date.fromisoformat(value).isoformat() == value
+            except ValueError:
+                valid = False
+        elif self.field == "interview_time":
+            valid = bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value))
+        elif self.field == "meeting_url":
+            parsed = urlsplit(value)
+            valid = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        elif self.field == "format":
+            valid = value in {"onsite", "remote", "phone"}
+        if not valid:
+            raise ValueError("normalized_value has an invalid canonical shape for field")
+        return self
 
 
 class ExtractionResult(BaseModel):

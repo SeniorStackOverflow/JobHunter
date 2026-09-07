@@ -547,9 +547,7 @@ class MatchingService:
         profile_id: UUID | None = None,
     ) -> MatchEvaluation:
         # Evaluate without holding a row lock; re-lock and verify the revision before persist.
-        job = await session.scalar(
-            select(SourceJob).where(SourceJob.id == source_job_id)
-        )
+        job = await session.scalar(select(SourceJob).where(SourceJob.id == source_job_id))
         if job is None:
             raise LookupError(f"source job {source_job_id} does not exist")
         if job.canonical_job_id is None:

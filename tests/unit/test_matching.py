@@ -1256,7 +1256,16 @@ async def test_llmrouter_falls_back_when_backend_rejects_json_schema() -> None:
         body = json.loads(request.content)
         bodies.append(body)
         if "response_format" in body:
-            return httpx.Response(400, request=request, json={"error": {"message": "unsupported", "retryable_without_structured_output": True}})
+            return httpx.Response(
+                400,
+                request=request,
+                json={
+                    "error": {
+                        "message": "unsupported",
+                        "retryable_without_structured_output": True,
+                    }
+                },
+            )
         return httpx.Response(
             200,
             request=request,

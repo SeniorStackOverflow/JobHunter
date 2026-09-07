@@ -459,8 +459,15 @@ class LLMRouterProvider:
                                 error_payload = response.json()
                             except json.JSONDecodeError:
                                 error_payload = {}
-                            error = error_payload.get("error") if isinstance(error_payload, dict) else None
-                            if isinstance(error, dict) and error.get("retryable_without_structured_output") is True:
+                            error = (
+                                error_payload.get("error")
+                                if isinstance(error_payload, dict)
+                                else None
+                            )
+                            if (
+                                isinstance(error, dict)
+                                and error.get("retryable_without_structured_output") is True
+                            ):
                                 switch_to_unstructured = True
                                 break
                         retryable = response.status_code == 429 or response.status_code >= 500

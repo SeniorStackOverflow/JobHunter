@@ -251,6 +251,42 @@ async def test_provider_parses_fenced_json_and_records_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_retries_semantically_invalid_field_value() -> None:
+    responses = iter(
+        [
+            {
+                "facts": [
+                    _candidate()
+                    | {
+                        "field": "meeting_url",
+                        "raw_expression": "14.30",
+                        "normalized_value": "14:30",
+                    }
+                ],
+                "review_reasons": [],
+            },
+            {"facts": [_candidate()], "review_reasons": []},
+        ]
+    )
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return _response(next(responses))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = PostCallVerificationProvider(
+            base_url="http://router",
+            api_key="secret-token",
+            model="model",
+            max_attempts=2,
+            client=client,
+        )
+        result, meta = await provider.verify(_context())
+
+    assert result.facts[0].field == "interview_time"
+    assert meta.attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_provider_sanitizes_transport_failures() -> None:
     provider = PostCallVerificationProvider(
         base_url="http://router",
