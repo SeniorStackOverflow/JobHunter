@@ -84,6 +84,29 @@ def test_dotted_calendar_continuations_are_not_times(raw: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("12.09", None),
+        ("01.10", None),
+        ("14.05", None),
+        ("14.30", "14:30"),
+        ("время 12.09", None),
+        ("в 12.09", None),
+        ("время 14.30", "14:30"),
+    ],
+)
+def test_dotted_time_date_overlap_is_conservative(raw: str, expected: str | None) -> None:
+    assert (
+        normalize_critical_value(
+            "interview_time",
+            raw,
+            reference_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
     ("field", "raw"),
     [
         ("interview_date", "завтра, а точнее послезавтра"),

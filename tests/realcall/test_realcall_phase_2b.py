@@ -139,18 +139,27 @@ async def test_real_llmrouter_verification_cases() -> None:
                 item for item in arbitration.decisions if item.field == "interview_date"
             ]
             accepted_dates = {
-                item.accepted_value for item in date_decisions if item.accepted
+                item.accepted_value
+                for item in date_decisions
+                if item.accepted and item.accepted_value is not None
             }
+            allowed_dates = {"2026-09-08"}
+            unexpected_accepted_dates = accepted_dates - allowed_dates
             explicitly_unsafe = bool(
                 extracted.review_reasons
                 or verified.review_reasons
                 or any(fact.ambiguity for fact in all_facts)
             )
-            assert "2026-09-07" not in accepted_dates, (
-                "superseded Monday was accepted for the correction fixture"
+            if unexpected_accepted_dates:
+                assert explicitly_unsafe, (
+                    "a wrong correction date requires an explicit review signal"
+                )
+            assert not unexpected_accepted_dates, (
+                "correction accepted a date outside the normalized Tuesday value"
             )
             assert (
-                "2026-09-08" in accepted_dates or explicitly_unsafe
+                accepted_dates <= allowed_dates
+                and ("2026-09-08" in accepted_dates or explicitly_unsafe)
             ), "correction must select Tuesday or remain explicitly unsafe"
         elif expected_date is not None:
             date_values = {
