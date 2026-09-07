@@ -246,26 +246,46 @@ def _restore_fact_snapshot(fact: CallFact, snapshot: Mapping[str, object]) -> No
     fact.confirmed_at = None
 
 
-def _sms_status(
+def derive_verification_status(
     call: CommunicationSession,
-    facts: list[CallFact],
+    facts: Sequence[CallFact],
     *,
     review: bool,
     verification: Mapping[str, Any] | None = None,
 ) -> PhoneVerificationStatus:
-    if review or any(fact.state is CallFactState.CONFLICT for fact in facts):
+    facts_list = list(facts)
+    if review or any(
+        fact.state in {CallFactState.CONFLICT, CallFactState.UNKNOWN} for fact in facts_list
+    ):
         return PhoneVerificationStatus.NEEDS_REVIEW
-    if facts and all(fact.state is CallFactState.CONFIRMED for fact in facts):
+    verification_data = verification or {}
+    hints = call.summary.get("hints", {}) if isinstance(call.summary, dict) else {}
+    scheduled = bool(
+        any(fact.field in {"interview_date", "interview_time"} for fact in facts_list)
+        or (isinstance(hints, dict) and hints.get("outcome_guess") == "interview_proposed")
+    )
+    if scheduled:
+        required = {"interview_date", "interview_time"}
+        by_field = {fact.field: fact for fact in facts_list}
+        if any(
+            by_field.get(field) is None or by_field[field].state is not CallFactState.CONFIRMED
+            for field in required
+        ):
+            return PhoneVerificationStatus.NEEDS_REVIEW
+    if facts_list and all(fact.state is CallFactState.CONFIRMED for fact in facts_list):
         return PhoneVerificationStatus.CONFIRMED
-    stored = (verification or {}).get("decision", {})
+    stored = verification_data.get("decision", {})
     if isinstance(stored, dict):
         status = stored.get("status")
         if status in {item.value for item in PhoneVerificationStatus}:
             return PhoneVerificationStatus(status)
-    prior = (verification or {}).get("transcript_status")
+    prior = verification_data.get("transcript_status")
     if prior in {item.value for item in PhoneVerificationStatus}:
         return PhoneVerificationStatus(prior)
     return call.verification_status
+
+
+_sms_status = derive_verification_status
 
 
 def _folded(value: str) -> str:
@@ -400,7 +420,7 @@ async def apply_sms_confirmation(
         valid_fields.add(field)
 
     review = bool(reasons) or any(fact.state is CallFactState.CONFLICT for fact in facts)
-    status = _sms_status(call, facts, review=review, verification=verification)
+    status = derive_verification_status(call, facts, review=review, verification=verification)
     now = datetime.now(UTC).isoformat()
     entry: dict[str, Any] = {
         "sms_turn_id": turn_key,
@@ -546,7 +566,7 @@ async def unlink_sms_confirmation(
     if call.auto_answered and call.ended_at is not None:
         call.summary_state = PhoneSummaryState.PENDING
         call.processing_started_at = None
-    status = _sms_status(call, facts, review=False, verification=verification)
+    status = derive_verification_status(call, facts, review=False, verification=verification)
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
     summary = dict(call.summary or {})
@@ -622,8 +642,16 @@ async def replace_current_facts(
             verification[key] = old_verification[key]
     current["verification"] = verification
     call.summary = current
-    call.verification_status = decision.status
-    call.needs_review = decision.status is not PhoneVerificationStatus.HIGH_CONFIDENCE
+    current_facts = list(
+        (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+    )
+    call.verification_status = derive_verification_status(
+        call,
+        current_facts,
+        review=decision.status is PhoneVerificationStatus.NEEDS_REVIEW,
+        verification=verification,
+    )
+    call.needs_review = call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
 
     existing = {
         fact.field: fact
@@ -659,6 +687,7 @@ async def replace_current_facts(
 __all__ = [
     "SmsConfirmationRejected",
     "apply_sms_confirmation",
+    "derive_verification_status",
     "replace_current_facts",
     "unlink_sms_confirmation",
 ]

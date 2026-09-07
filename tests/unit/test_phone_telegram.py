@@ -774,7 +774,7 @@ async def test_inflight_delivery_loses_to_committed_sms_apply(
             ),
             metadata=ModelCallMeta("test", "test", 1, 1),
         )
-        assert status is PhoneVerificationStatus.CONFIRMED
+        assert status is PhoneVerificationStatus.NEEDS_REVIEW
         await db.commit()
     release.set()
     result = await worker

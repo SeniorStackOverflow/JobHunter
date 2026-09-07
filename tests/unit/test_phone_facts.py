@@ -164,7 +164,7 @@ async def test_matching_sms_confirms_only_explicitly_mentioned_fact(
         )
         await db.commit()
 
-    assert status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert status is PhoneVerificationStatus.NEEDS_REVIEW
     assert fact.state is CallFactState.CONFIRMED
     assert fact.confirmation_source is CallFactConfirmationSource.SMS
     assert fact.confirmed_by_turn_id == SMS_TURN_ID
@@ -321,7 +321,7 @@ async def test_sms_relative_date_uses_sms_occurrence_in_chisinau_timezone(
             metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
         )
 
-    assert status is PhoneVerificationStatus.CONFIRMED
+    assert status is PhoneVerificationStatus.NEEDS_REVIEW
     assert fact.state is CallFactState.CONFIRMED
 
 
@@ -381,7 +381,7 @@ async def test_equivalent_sms_replay_is_idempotent_and_unlink_restores_prior_fac
     assert fact.state is CallFactState.CANDIDATE
     assert fact.confirmation_source is None
     assert fact.confirmed_by_turn_id is None
-    assert call.verification_status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
 
 
 @pytest.mark.asyncio

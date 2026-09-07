@@ -508,18 +508,13 @@ async def _evidence_rows(session: AsyncSession) -> list[dict[str, Any]]:
 async def _manual_status(session: AsyncSession, call: Any) -> Any:
     """Derive a conservative trust status after an operator fact mutation."""
     from app.models.entities import CallFact
-    from app.models.enums import CallFactState, PhoneVerificationStatus
+    from app.phone.facts import derive_verification_status
 
     facts = list(
         (await session.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
     )
-    if any(fact.state in {CallFactState.CONFLICT, CallFactState.UNKNOWN} for fact in facts):
-        return PhoneVerificationStatus.NEEDS_REVIEW
-    if facts and all(fact.state is CallFactState.CONFIRMED for fact in facts):
-        return PhoneVerificationStatus.CONFIRMED
-    if facts and all(fact.state is CallFactState.CANDIDATE for fact in facts):
-        return PhoneVerificationStatus.HIGH_CONFIDENCE
-    return PhoneVerificationStatus.PENDING
+    verification = (call.summary or {}).get("verification", {})
+    return derive_verification_status(call, facts, review=False, verification=verification)
 
 
 async def _get_call(session: AsyncSession, call_id: UUID) -> Any:
@@ -529,6 +524,29 @@ async def _get_call(session: AsyncSession, call_id: UUID) -> Any:
     call = await session.get(CommunicationSession, call_id)
     if call is None or call.channel is not CommunicationChannel.CALL:
         raise HTTPException(status_code=404, detail="звонок не найден")
+    return call
+
+
+async def _locked_call(session: AsyncSession, call_id: UUID) -> Any:
+    """Reload a call under the database lock before a trust mutation."""
+    from app.models.entities import CommunicationSession
+    from app.models.enums import CommunicationChannel
+
+    query = (
+        select(CommunicationSession)
+        .where(
+            CommunicationSession.id == call_id,
+            CommunicationSession.channel == CommunicationChannel.CALL,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        query = query.with_for_update()
+    call = await session.scalar(query)
+    if call is None:
+        raise HTTPException(status_code=404, detail="звонок не найден")
+    if call.claim_token is not None:
+        raise HTTPException(status_code=409, detail="звонок сейчас обрабатывается")
     return call
 
 
@@ -552,7 +570,15 @@ async def _get_sms_for_call(session: AsyncSession, call: Any, sms_id: UUID) -> A
 
 async def _sms_turn(session: AsyncSession, sms: Any) -> Any:
     from app.models.entities import CommunicationTurn
-    from app.models.enums import TurnSpeaker
+    from app.models.enums import CommunicationChannel, CommunicationDirection, TurnSpeaker
+
+    if (
+        sms.channel is not CommunicationChannel.SMS
+        or sms.transport != "phonegate"
+        or not sms.transport_external_id
+        or sms.direction is not CommunicationDirection.INBOUND
+    ):
+        raise HTTPException(status_code=404, detail="SMS не прошло проверку источника")
 
     turns = list(
         (
@@ -563,10 +589,9 @@ async def _sms_turn(session: AsyncSession, sms: Any) -> Any:
             )
         ).all()
     )
-    turn = next((item for item in turns if item.speaker is TurnSpeaker.EMPLOYER), None)
-    if turn is None:
-        raise HTTPException(status_code=404, detail="SMS не содержит сообщения работодателя")
-    return turn
+    if len(turns) != 1 or turns[0].seq != 1 or turns[0].speaker is not TurnSpeaker.EMPLOYER:
+        raise HTTPException(status_code=404, detail="SMS не прошло проверку сообщения")
+    return turns[0]
 
 
 @router.post("/admin/phone/calls/{call_id}/facts/{field}/review")
@@ -583,7 +608,8 @@ async def review_call_fact(
     require_csrf(request, csrf_token)
     if action not in {"confirm", "correct", "unknown"} or field not in _REVIEW_FIELDS:
         raise HTTPException(status_code=404, detail="операция недоступна")
-    call = await _get_call(session, call_id)
+    await _get_call(session, call_id)
+    call = await _locked_call(session, call_id)
     from app.models.entities import CallFact
     from app.models.enums import (
         CallFactConfirmationSource,
@@ -683,7 +709,8 @@ async def link_call_sms(
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    call = await _get_call(session, call_id)
+    await _get_call(session, call_id)
+    call = await _locked_call(session, call_id)
     sms = await _get_sms_for_call(session, call, sms_id)
     if sms.related_session_id is not None and sms.related_session_id != call.id:
         raise HTTPException(status_code=404, detail="SMS уже связано с другим звонком")
@@ -740,7 +767,8 @@ async def unlink_call_sms(
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    call = await _get_call(session, call_id)
+    await _get_call(session, call_id)
+    call = await _locked_call(session, call_id)
     sms = await _get_sms_for_call(session, call, sms_id)
     if sms.related_session_id != call.id:
         raise HTTPException(status_code=404, detail="SMS не связано с этим звонком")

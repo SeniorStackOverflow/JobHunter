@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
 from app.database import get_session
 from app.main import app
@@ -319,6 +321,53 @@ async def test_sessions_filters_reject_invalid_enum_and_limit(client) -> None:
         await client.get("/api/v1/phone/sessions", params={"outcome": "bogus"})
     ).status_code == 422
     assert (await client.get("/api/v1/phone/sessions", params={"limit": 0})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_telegram_filter_is_applied_before_pagination(client, sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="telegram filter", is_default=True)
+        session.add(profile)
+        await session.flush()
+        rows = []
+        for index, state in enumerate(("failed", "sent", "failed")):
+            rows.append(
+                CommunicationSession(
+                    profile_id=profile.id,
+                    channel=CommunicationChannel.CALL,
+                    transport="phonegate",
+                    direction=CommunicationDirection.INBOUND,
+                    remote_address=f"+37360111{index:03d}",
+                    started_at=datetime.now(UTC) + timedelta(seconds=index),
+                    summary={"telegram": {"state": state}},
+                )
+            )
+        session.add_all(rows)
+        await session.commit()
+        expected_id = str(rows[0].id)
+
+    response = await client.get(
+        "/api/v1/phone/sessions",
+        params={"telegram_state": "failed", "limit": 1, "offset": 1},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["next_offset"] is None
+    assert body["sessions"][0]["id"] == expected_id
+
+
+def test_telegram_filter_uses_postgresql_json_expression() -> None:
+    expression = CommunicationSession.summary["telegram"]["state"].as_string()
+    compiled = str(
+        select(CommunicationSession.id)
+        .where(expression == "failed")
+        .compile(dialect=postgresql.dialect())
+    )
+    assert "summary" in compiled
+    assert "summary" in compiled
+    assert "->" in compiled
+    assert "->>" in compiled
 
 
 @pytest.mark.asyncio

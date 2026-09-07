@@ -229,13 +229,17 @@ async def list_sessions(
         stmt = stmt.where(CommunicationSession.needs_review.is_(needs_review))
     if outcome is not None:
         stmt = stmt.where(CommunicationSession.outcome == outcome)
-    candidates = list(
-        (await session.scalars(stmt.order_by(desc(CommunicationSession.started_at)))).all()
-    )
     if telegram_state is not None:
-        candidates = [call for call in candidates if _telegram_state(call) == telegram_state]
-    total = len(candidates)
-    calls = candidates[offset : offset + limit]
+        telegram_state_expr = CommunicationSession.summary["telegram"]["state"].as_string()
+        stmt = stmt.where(telegram_state_expr == telegram_state)
+    total = int(await session.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    calls = list(
+        (
+            await session.scalars(
+                stmt.order_by(desc(CommunicationSession.started_at)).offset(offset).limit(limit)
+            )
+        ).all()
+    )
     counts: dict[UUID, int] = {
         session_id: int(count)
         for session_id, count in (
