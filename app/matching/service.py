@@ -793,6 +793,10 @@ async def process_unprocessed_jobs() -> int:
                         error_type=type(exc).__name__,
                     )
                     continue
+                # Release the short SourceJob row lock before the next LLM call.
+                # Without this commit, locks acquired after the SAVEPOINT can survive
+                # until the end of the whole batch and recreate the crawler deadlock window.
+                await session.commit()
                 processed += 1
                 if (
                     needs_ai
