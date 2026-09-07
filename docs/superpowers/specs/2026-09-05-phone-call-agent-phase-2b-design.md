@@ -2,6 +2,11 @@
 
 Date: 2026-09-05
 Status: approved design, ready for implementation planning
+
+> Superseded for Phase 2b delivery by
+> `docs/superpowers/specs/2026-09-06-phone-call-agent-phase-2b-production-readiness-design.md`.
+> The production-readiness specification governs verification states, critical-field
+> normalization, inbound SMS, Telegram retries, review controls, and DEV acceptance.
 Parent architecture: `docs/phonegate-call-agent-architecture.md` (§16, §24, §25, §26, §33, §34.2, §39, §40.2, §40.3)
 Parent spec: `docs/superpowers/specs/2026-09-03-phone-call-agent-phase-2-design.md`
 (§1.3 and §14 fix Phase 2b's boundaries; this spec fills them in)

@@ -20,6 +20,7 @@ from app.models.entities import CommunicationSession, CommunicationTurn, UserPro
 from app.models.enums import (
     CommunicationOutcome,
     PhoneSummaryState,
+    PhoneVerificationStatus,
     TurnSpeaker,
 )
 from app.phone import summary as summary_module
@@ -200,5 +201,6 @@ async def test_evidence_capture_then_finalize_links_and_summarizes(
             )
         )
     assert call is not None and call.summary_state is PhoneSummaryState.DONE
+    assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
     assert call.summary["summary_text"] == "Работодатель предложил собеседование."
     assert turn is not None and turn.audio_evidence_path == f"{session_id}/{transcript_id}.wav"

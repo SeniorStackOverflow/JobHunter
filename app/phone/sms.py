@@ -213,7 +213,7 @@ def _sync_timestamp_is_stale(
     synced = _provider_timestamp_to_datetime(synced_at, allow_zero=True)
     if synced is None:
         return True
-    return now - synced > timedelta(seconds=stale_after_seconds)
+    return _utc(now) - synced > timedelta(seconds=stale_after_seconds)
 
 
 def _validate_message_timestamp(message: PhoneSmsMessage) -> datetime:

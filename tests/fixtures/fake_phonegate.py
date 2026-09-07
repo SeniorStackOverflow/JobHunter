@@ -43,6 +43,7 @@ class FakePhoneGate:
         self._sms_messages: list[dict[str, Any]] = []
         self._sms_synced_at: int | None = None
         self._sms_syncing = False
+        self._fail_next_sms_sync = False
         self.sms_sync_requests = 0
         self.app = Starlette(
             routes=[
@@ -180,6 +181,9 @@ class FakePhoneGate:
 
     def set_sms_syncing(self, value: bool) -> None:
         self._sms_syncing = value
+
+    def fail_next_sms_sync(self) -> None:
+        self._fail_next_sms_sync = True
 
     def set_ring_polls_after_answer(self, n: int) -> None:
         """After the next accepted /api/call/answer, report RINGING for ``n``
@@ -366,6 +370,9 @@ class FakePhoneGate:
         if not self._auth_ok(request):
             return JSONResponse({"detail": "auth"}, status_code=401)
         self.sms_sync_requests += 1
+        if self._fail_next_sms_sync:
+            self._fail_next_sms_sync = False
+            return JSONResponse({"success": False}, status_code=503)
         self._sms_synced_at = int(time.time() * 1000)
         self._sms_syncing = False
         return JSONResponse({"success": True})

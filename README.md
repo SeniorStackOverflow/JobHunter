@@ -55,6 +55,30 @@ PhoneGate REST API (`/api/events`, `/api/device/status`), сопоставляе
 и `PHONEGATE_AUTH_TOKEN`. Здоровье канала — в разделе `Диагностика` и
 `GET /api/v1/phone/status`. Деградация телефона не влияет на `/ready`.
 
+## Телефонная проверка после звонка (Phase 2b)
+
+Автоотвеченный звонок закрывается детерминированным сценарием, после чего Celery
+сохраняет короткие WAV-доказательства и запускает три строгих русскоязычных прохода
+llmRouter. Факты проходят состояния `candidate`, `confirmed`, `conflict` и
+`unknown`; производное состояние сессии — `high_confidence`, `confirmed` или
+`needs_review`. `candidate` становится `confirmed` только после связанного SMS или
+аудируемого действия оператора. Все SMS читаются идемпотентно из PhoneGate, а
+Telegram уведомления имеют bounded retry и revision.
+
+DEV-настройки выключены безопасно по умолчанию: включайте их через
+`PHONE_SUMMARY_LLM_ENABLED`, `TELEGRAM_ENABLED` и соответствующие параметры
+`PHONE_VERIFICATION_*`, `PHONE_SMS_*`, `PHONE_EVIDENCE_*`, `PHONE_TELEGRAM_*`.
+Проверка реального GSM и внешних сервисов выполняется только явно:
+
+```bash
+ENABLE_REALCALL_TESTS=true uv run pytest tests/realcall/test_realcall_phase_2b.py -vv
+```
+
+Проверка очереди выполняется в панели `Звонки`: оператор сверяет транскрипт и
+доказательство, затем подтверждает или исправляет факт. Контур не ведёт realtime
+LLM-диалог, не записывает `InterviewAppointment`, не синхронизирует календарь и не
+делает исходящие звонки или SMS.
+
 ## Быстрый локальный запуск
 
 Требуются Docker Compose v2 и, для host-проверок, Python 3.12+ с `uv`.
