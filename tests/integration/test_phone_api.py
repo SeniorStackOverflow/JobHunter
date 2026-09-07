@@ -21,6 +21,7 @@ from app.models.enums import (
     CommunicationOutcome,
     PhoneComponentStatus,
     PhoneSummaryState,
+    PhoneVerificationStatus,
     TurnSpeaker,
 )
 from tests.fixtures.fake_redis import FakeAsyncRedis
@@ -245,6 +246,68 @@ async def test_sessions_filters_and_returns_summary_and_evidence_metadata(
     assert detail["summary"]["summary_text"] == "Итог звонка"
     assert detail["turns"][0]["audio_evidence_url"] == (f"/admin/phone/evidence/{call_id}/7.wav")
     assert "audio_evidence_path" not in detail["turns"][0]
+
+
+@pytest.mark.asyncio
+async def test_sessions_verification_filter_and_list_redacts_sms_text(
+    client, sqlite_session_factory
+) -> None:
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="verification", is_default=True)
+        session.add(profile)
+        await session.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+            outcome=CommunicationOutcome.COMPLETED,
+            verification_status=PhoneVerificationStatus.NEEDS_REVIEW,
+            summary={
+                "summary_text": "Итог",
+                "verification": {
+                    "sms_originals": {"interview_date": {"normalized_value": "2026-09-12"}},
+                    "sms_comparisons": [{"sms_text": "секретный SMS текст"}],
+                },
+                "telegram": {"state": "pending"},
+            },
+            summary_state=PhoneSummaryState.DONE,
+        )
+        sms = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.SMS,
+            transport="phonegate",
+            transport_external_id="sms-1",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            started_at=datetime.now(UTC),
+        )
+        session.add_all([call, sms])
+        await session.flush()
+        sms.related_session_id = call.id
+        session.add(
+            CommunicationTurn(
+                session_id=sms.id,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="секретный SMS текст",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+
+    response = await client.get(
+        "/api/v1/phone/sessions",
+        params={"verification_status": "needs_review", "telegram_state": "pending"},
+    )
+    assert response.status_code == 200
+    rows = response.json()["sessions"]
+    assert len(rows) == 1
+    assert rows[0]["verification_status"] == "needs_review"
+    assert "секретный SMS текст" not in response.text
 
 
 @pytest.mark.asyncio

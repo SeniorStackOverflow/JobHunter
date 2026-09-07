@@ -15,6 +15,7 @@ from app.api.dependencies import require_api_actor
 from app.database import get_session
 from app.models.entities import (
     AuditEvent,
+    CallFact,
     CommunicationSession,
     CommunicationTurn,
     PhoneChannelHealth,
@@ -25,6 +26,8 @@ from app.models.enums import (
     CommunicationOutcome,
     PhoneComponentStatus,
     PhoneSummaryState,
+    PhoneVerificationStatus,
+    TurnSpeaker,
 )
 from app.phone.health import HealthComponent, agent_component_is_stale, channel_status
 from app.phone.numbers import mask_phone
@@ -145,6 +148,42 @@ async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str
     }
 
 
+def _safe_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
+    """Return list-safe summary data without transcript/SMS evidence payloads."""
+
+    def _clean(value: Any, *, key: str = "") -> Any:
+        key_lower = key.casefold()
+        if "sms" in key_lower or key_lower in {"transcript", "raw_text"}:
+            return None
+        if isinstance(value, dict):
+            return {
+                name: cleaned
+                for name, item in value.items()
+                if (cleaned := _clean(item, key=str(name))) is not None
+            }
+        if isinstance(value, list):
+            return [_clean(item) for item in value]
+        return value
+
+    if not isinstance(summary, dict):
+        return {}
+    result = {
+        key: cleaned
+        for key, value in summary.items()
+        if key != "verification" and (cleaned := _clean(value, key=str(key))) is not None
+    }
+    telegram = result.get("telegram")
+    if isinstance(telegram, dict):
+        result["telegram"] = {"state": telegram.get("state")}
+    return result
+
+
+def _telegram_state(call: CommunicationSession) -> str | None:
+    summary = call.summary if isinstance(call.summary, dict) else {}
+    telegram = summary.get("telegram")
+    return telegram.get("state") if isinstance(telegram, dict) else None
+
+
 def _session_row(call: CommunicationSession, turn_count: int) -> dict[str, Any]:
     return {
         "id": str(call.id),
@@ -158,8 +197,11 @@ def _session_row(call: CommunicationSession, turn_count: int) -> dict[str, Any]:
         "outcome": call.outcome.value if call.outcome else None,
         "needs_review": call.needs_review,
         "turn_count": turn_count,
-        "summary": call.summary,
+        "summary": _safe_summary(call.summary),
         "summary_state": call.summary_state.value,
+        "verification_status": call.verification_status.value,
+        "verification_revision": call.verification_revision,
+        "telegram_state": _telegram_state(call),
         "script_stage": call.script_stage,
         "auto_answered": call.auto_answered,
     }
@@ -168,7 +210,10 @@ def _session_row(call: CommunicationSession, turn_count: int) -> dict[str, Any]:
 @router.get("/sessions", dependencies=[Depends(require_api_actor)])
 async def list_sessions(
     limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     summary_state: PhoneSummaryState | None = None,
+    verification_status: PhoneVerificationStatus | None = None,
+    telegram_state: str | None = Query(None, max_length=32),
     needs_review: bool | None = None,
     outcome: CommunicationOutcome | None = None,
     session: AsyncSession = Depends(get_session),
@@ -178,15 +223,19 @@ async def list_sessions(
     )
     if summary_state is not None:
         stmt = stmt.where(CommunicationSession.summary_state == summary_state)
+    if verification_status is not None:
+        stmt = stmt.where(CommunicationSession.verification_status == verification_status)
     if needs_review is not None:
         stmt = stmt.where(CommunicationSession.needs_review.is_(needs_review))
     if outcome is not None:
         stmt = stmt.where(CommunicationSession.outcome == outcome)
-    calls = list(
-        (
-            await session.scalars(stmt.order_by(desc(CommunicationSession.started_at)).limit(limit))
-        ).all()
+    candidates = list(
+        (await session.scalars(stmt.order_by(desc(CommunicationSession.started_at)))).all()
     )
+    if telegram_state is not None:
+        candidates = [call for call in candidates if _telegram_state(call) == telegram_state]
+    total = len(candidates)
+    calls = candidates[offset : offset + limit]
     counts: dict[UUID, int] = {
         session_id: int(count)
         for session_id, count in (
@@ -197,7 +246,13 @@ async def list_sessions(
             )
         ).all()
     }
-    return {"sessions": [_session_row(c, int(counts.get(c.id, 0))) for c in calls]}
+    return {
+        "sessions": [_session_row(c, int(counts.get(c.id, 0))) for c in calls],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + limit if offset + limit < total else None,
+    }
 
 
 @router.get("/sessions/{session_id}", dependencies=[Depends(require_api_actor)])
@@ -216,10 +271,158 @@ async def session_detail(
             )
         ).all()
     )
+    facts = list(
+        (
+            await session.scalars(
+                select(CallFact).where(CallFact.session_id == session_id).order_by(CallFact.field)
+            )
+        ).all()
+    )
+    turn_by_id = {turn.id: turn for turn in turns}
+    verification = (call.summary or {}).get("verification", {})
+    if not isinstance(verification, dict):
+        verification = {}
+    sms_sessions = list(
+        (
+            await session.scalars(
+                select(CommunicationSession)
+                .where(
+                    CommunicationSession.channel == CommunicationChannel.SMS,
+                    CommunicationSession.profile_id == call.profile_id,
+                )
+                .order_by(desc(CommunicationSession.started_at))
+            )
+        ).all()
+    )
+    from app.phone.numbers import normalize_e164
+
+    call_number = normalize_e164(call.remote_address) or call.remote_address
+    sms_sessions = [
+        sms
+        for sms in sms_sessions
+        if (normalize_e164(sms.remote_address) or sms.remote_address) == call_number
+    ]
+    audit_events = list(
+        (
+            await session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.entity_id == str(call.id))
+                .order_by(desc(AuditEvent.timestamp))
+            )
+        ).all()
+    )
+
+    async def _sms_row(item: CommunicationSession, *, include_text: bool) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "id": str(item.id),
+            "external_id": item.transport_external_id,
+            "remote_address": mask_phone(item.remote_address),
+            "started_at": item.started_at.isoformat(),
+            "needs_review": item.needs_review,
+            "related_session_id": str(item.related_session_id) if item.related_session_id else None,
+        }
+        if include_text:
+            sms_turn = next(
+                (
+                    turn
+                    for turn in (
+                        await session.scalars(
+                            select(CommunicationTurn).where(CommunicationTurn.session_id == item.id)
+                        )
+                    ).all()
+                    if turn.speaker is TurnSpeaker.EMPLOYER
+                ),
+                None,
+            )
+            row["text"] = sms_turn.text if sms_turn is not None else None
+        return row
+
+    related_sms = [
+        await _sms_row(item, include_text=True)
+        for item in sms_sessions
+        if item.related_session_id == call.id
+    ]
+    unlinked_sms = [
+        await _sms_row(item, include_text=False)
+        for item in sms_sessions
+        if item.related_session_id is None
+    ]
+    pass_metadata = verification.get("pass_metadata", {})
+    pass_results = verification.get("pass_results", {})
+    pass_decisions: list[dict[str, Any]] = []
+    for name in ("extractor", "verifier", "arbiter"):
+        value = pass_results.get(name, {}) if isinstance(pass_results, dict) else {}
+        metadata = pass_metadata.get(name, {}) if isinstance(pass_metadata, dict) else {}
+        pass_decisions.append(
+            {
+                "pass": name,
+                "status": value.get("status") if isinstance(value, dict) else None,
+                "review_reasons": (
+                    value.get("review_reasons", value.get("reasons", []))
+                    if isinstance(value, dict)
+                    else []
+                ),
+                "latency_ms": metadata.get("latency_ms") if isinstance(metadata, dict) else None,
+            }
+        )
+    facts_payload = []
+    for fact in facts:
+        source_turn = turn_by_id.get(fact.source_turn_id) if fact.source_turn_id else None
+        facts_payload.append(
+            {
+                "id": str(fact.id),
+                "field": fact.field,
+                "raw_expression": fact.raw_expression,
+                "normalized_value": fact.normalized_value,
+                "state": fact.state.value,
+                "state_label": {
+                    "candidate": "Высокая уверенность",
+                    "confirmed": "Подтверждено",
+                    "conflict": "Нужна проверка: конфликт",
+                    "unknown": "Нужна проверка: значение неизвестно",
+                }.get(fact.state.value, "Нужна проверка"),
+                "confirmation_source": (
+                    fact.confirmation_source.value if fact.confirmation_source else None
+                ),
+                "confirmed_at": fact.confirmed_at.isoformat() if fact.confirmed_at else None,
+                "source_quote": source_turn.text if source_turn else None,
+                "evidence_url": (
+                    f"/admin/phone/evidence/{call.id}/{source_turn.phonegate_transcript_id}.wav"
+                    if (
+                        source_turn
+                        and source_turn.audio_evidence_path
+                        and source_turn.phonegate_transcript_id is not None
+                    )
+                    else None
+                ),
+            }
+        )
+    review_reasons = verification.get("review_reason_codes", [])
+    if not isinstance(review_reasons, list):
+        review_reasons = []
+    decision = verification.get("decision")
+    if isinstance(decision, dict) and isinstance(decision.get("reasons"), list):
+        review_reasons = list(dict.fromkeys([*review_reasons, *decision["reasons"]]))
     return {
         **_session_row(call, len(turns)),
         "diagnostics": call.diagnostics,
         "rx_frame_stats": call.rx_frame_stats,
+        "facts": facts_payload,
+        "pass_decisions": pass_decisions,
+        "review_reasons": review_reasons,
+        "related_sms": related_sms,
+        "unlinked_sms": unlinked_sms,
+        "audit_events": [
+            {
+                "action": event.action,
+                "actor": event.actor,
+                "decision": event.decision,
+                "at": event.timestamp.isoformat(),
+                "details": event.sanitized_details,
+            }
+            for event in audit_events
+        ],
+        "verification": verification,
         "turns": [
             {
                 "seq": t.seq,

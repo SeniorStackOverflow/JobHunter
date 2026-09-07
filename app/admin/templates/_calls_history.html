@@ -5,7 +5,7 @@
     <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
     <input type="hidden" name="tab" value="history">
     <select name="filter">
-      {% for value, label in [('all','Все'),('needs_review','Требуют проверки'),('interview_proposed','Предложено собеседование'),('missed_dropped','Пропущенные / сорванные'),('unknown_caller','Неизвестный абонент')] %}
+      {% for value, label in [('all','Все'),('confirmed','Подтверждено'),('high_confidence','Высокая уверенность'),('needs_review','Нужна проверка'),('summary_failed','Ошибка обработки'),('telegram_failed','Ошибка Telegram'),('interview_proposed','Предложено собеседование'),('missed_dropped','Пропущенные / сорванные'),('unknown_caller','Неизвестный абонент')] %}
       <option value="{{ value }}" {% if filter == value %}selected{% endif %}>{{ label }}</option>
       {% endfor %}
     </select>
@@ -24,6 +24,8 @@
       {% if row.outcome %}<span class="badge {{ status_tone(row.outcome) }}">{{ status_label(row.outcome) }}</span>{% endif %}
       {% if row.auto_answered %}<span class="badge muted">авто-ответ</span>{% endif %}
       {% if row.needs_review %}<span class="badge warning">проверка</span>{% endif %}
+      {% if row.verification_status == 'confirmed' %}<span class="badge success">Подтверждено</span>{% elif row.verification_status == 'high_confidence' %}<span class="badge success">Высокая уверенность</span>{% elif row.verification_status == 'needs_review' %}<span class="badge warning">Нужна проверка</span>{% endif %}
+      {% if row.model_latency_ms is not none %}<span class="badge muted">модель: {{ row.model_latency_ms }} мс</span>{% endif %}
       {% if row.summary_state == 'failed' %}<span class="badge danger">резюме: ошибка</span>{% endif %}
       {% if row.telegram_state %}<span class="badge muted">TG: {{ row.telegram_state }}</span>{% endif %}
     </div>

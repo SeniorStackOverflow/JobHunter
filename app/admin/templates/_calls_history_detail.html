@@ -13,9 +13,79 @@
       {% if s.outcome %}<span class="badge {{ status_tone(s.outcome) }}">{{ status_label(s.outcome) }}</span>{% endif %}
       {% if s.auto_answered %}<span class="badge muted">авто-ответ</span>{% endif %}
       {% if s.needs_review %}<span class="badge warning">проверка</span>{% endif %}
+      {% if s.verification_status == 'confirmed' %}<span class="badge success">Подтверждено</span>{% elif s.verification_status == 'high_confidence' %}<span class="badge success">Высокая уверенность</span>{% elif s.verification_status == 'needs_review' %}<span class="badge warning">Нужна проверка</span>{% endif %}
     </div>
   </div>
   <p><a class="btn" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history">← К списку</a></p>
+</div>
+
+<div class="panel">
+  <h3>Проверка фактов</h3>
+  {% if detail.review_reasons %}
+  <p class="badge warning">Причина: {{ detail.review_reasons|join(', ') }}</p>
+  {% endif %}
+  <div class="queue-list">
+  {% for fact in detail.facts %}
+    <article class="queue-card">
+      <div>
+        <strong>{{ fact.label }}</strong>
+        <p>{{ fact.value or 'Значение не подтверждено' }}</p>
+        {% if fact.raw_expression %}<small class="muted">Фраза: {{ fact.raw_expression }}</small>{% endif %}
+        {% if fact.source_quote %}<p class="muted">Источник: «{{ fact.source_quote }}»</p>{% endif %}
+        {% if fact.evidence_url %}<audio controls preload="none" src="{{ fact.evidence_url }}"></audio>{% else %}<small class="muted">Аудиодоказательство отсутствует</small>{% endif %}
+      </div>
+      <div class="queue-card-badges">
+        <span class="badge {% if fact.state == 'confirmed' %}success{% elif fact.state in ['conflict','unknown'] %}warning{% else %}muted{% endif %}">{{ fact.state_label }}</span>
+        {% if fact.confirmation_source %}<span class="badge muted">Источник: {{ fact.confirmation_source }}</span>{% endif %}
+        <form method="post" action="/admin/phone/calls/{{ s.id }}/facts/{{ fact.field }}/review">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="confirm">
+          <input type="hidden" name="value" value="{{ fact.value or '' }}">
+          <button class="btn btn-sm" type="submit">Подтвердить</button>
+        </form>
+        <form method="post" action="/admin/phone/calls/{{ s.id }}/facts/{{ fact.field }}/review">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="unknown">
+          <button class="btn btn-sm" type="submit">Неизвестно</button>
+        </form>
+        <form method="post" action="/admin/phone/calls/{{ s.id }}/facts/{{ fact.field }}/review">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="correct">
+          <label class="muted">Исправить <input name="value" value="{{ fact.value or '' }}" required></label>
+          <button class="btn btn-sm" type="submit">Сохранить</button>
+        </form>
+      </div>
+    </article>
+  {% else %}
+    <div class="empty-state">Факты ещё не извлечены. Требуется проверка.</div>
+  {% endfor %}
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Сравнение с SMS</h3>
+  {% for comparison in detail.sms_comparisons %}
+  <div class="transcript-meta"><strong>{{ comparison.status or 'Нужна проверка' }}</strong><span class="muted">SMS {{ comparison.sms_turn_id }}</span></div>
+  {% for item in comparison.comparisons %}<p class="muted">{{ item.field }} · {{ item.relation }}{% if item.reason_code %} · {{ item.reason_code }}{% endif %}</p>{% endfor %}
+  {% if comparison.reason_codes %}<p class="badge warning">{{ comparison.reason_codes|join(', ') }}</p>{% endif %}
+  {% else %}<p class="muted">Сравнение с SMS ещё не выполнялось.</p>{% endfor %}
+</div>
+
+<div class="panel">
+  <h3>Решения моделей</h3>
+  {% for decision in detail.model_decisions %}
+  <div class="transcript-meta"><strong>{{ decision.name }}</strong><span class="badge muted">{{ decision.status or 'нет решения' }}</span>{% if decision.latency_ms is not none %}<span class="muted">{{ decision.latency_ms }} мс</span>{% endif %}</div>
+  {% if decision.reasons %}<p class="muted">{{ decision.reasons|join(', ') }}</p>{% endif %}
+  {% else %}<p class="muted">Решения моделей пока не сохранены.</p>{% endfor %}
+</div>
+
+<div class="panel">
+  <h3>SMS работодателя</h3>
+  {% for sms in detail.related_sms %}
+  <div class="transcript-turn"><div class="transcript-meta"><strong>Связанное SMS</strong><span class="muted">{{ format_dt(sms.started_at) }}</span></div><p>{{ sms.text }}</p><form method="post" action="/admin/phone/calls/{{ s.id }}/sms/{{ sms.id }}/unlink"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm" type="submit">Отвязать SMS</button></form></div>
+  {% else %}<p class="muted">Связанных SMS нет.</p>{% endfor %}
+  {% if detail.unlinked_sms %}<p class="muted">Найдено неподтверждённых SMS: {{ detail.unlinked_sms|length }}</p>{% endif %}
+  {% for sms in detail.unlinked_sms %}<form method="post" action="/admin/phone/calls/{{ s.id }}/sms/{{ sms.id }}/link" class="detail-form-action"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><span class="muted">{{ format_dt(sms.started_at) }} · {{ sms.external_id or 'без ID' }}</span><button class="btn btn-sm" type="submit">Связать с этим звонком</button></form>{% endfor %}
 </div>
 
 <div class="panel">
