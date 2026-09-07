@@ -26,6 +26,11 @@ from app.models.enums import (
     TurnSpeaker,
 )
 from app.phone.client import PhoneGateClient
+from app.phone.facts import (
+    SmsConfirmationRejected,
+    apply_sms_confirmation,
+    unlink_sms_confirmation,
+)
 from app.phone.numbers import normalize_e164
 from app.phone.schemas import PhoneSmsMessage, PhoneSmsPage
 from app.settings import Settings, get_settings
@@ -320,6 +325,45 @@ async def _ensure_turn(
     await db.flush()
 
 
+async def _mark_sms_comparison_pending(
+    db: AsyncSession,
+    *,
+    call: CommunicationSession,
+    sms_session: CommunicationSession,
+) -> bool:
+    """Record one linked SMS input without touching the transcript pipeline."""
+    turn = await db.scalar(
+        select(CommunicationTurn).where(
+            CommunicationTurn.session_id == sms_session.id,
+            CommunicationTurn.seq == 1,
+        )
+    )
+    if turn is None:
+        return False
+    summary = dict(call.summary or {})
+    verification = summary.get("verification")
+    if not isinstance(verification, dict):
+        verification = {}
+    input_ids = verification.get("sms_input_ids", [])
+    if not isinstance(input_ids, list):
+        input_ids = []
+    turn_id = str(turn.id)
+    if turn_id in input_ids:
+        return False
+    call.verification_revision += 1
+    verification["sms_input_ids"] = sorted(
+        {*(item for item in input_ids if isinstance(item, str)), turn_id}
+    )
+    verification["sms_reconciliation"] = {
+        "state": "pending",
+        "sms_turn_id": turn_id,
+        "reason": "new_linked_sms",
+    }
+    summary["verification"] = verification
+    call.summary = summary
+    return True
+
+
 async def _persist_message(
     db: AsyncSession,
     *,
@@ -487,6 +531,7 @@ async def _ingest_with_client(
                 settings=settings,
             )
             if len(matches) == 1:
+                was_linked = sms_session.related_session_id == matches[0].id
                 sms_session.related_session_id = matches[0].id
                 sms_session.needs_review = False
                 sms_session.diagnostics = {
@@ -494,6 +539,8 @@ async def _ingest_with_client(
                     "sms_correlation": {"status": "linked", "reason": "single_completed_call"},
                 }
                 result["correlated"] += 1
+                if not was_linked:
+                    await _mark_sms_comparison_pending(db, call=matches[0], sms_session=sms_session)
             else:
                 reason = (
                     "ambiguous_completed_calls"
@@ -580,4 +627,9 @@ async def ingest_phonegate_sms(
             await marker.aclose()
 
 
-__all__ = ["ingest_phonegate_sms"]
+__all__ = [
+    "SmsConfirmationRejected",
+    "apply_sms_confirmation",
+    "ingest_phonegate_sms",
+    "unlink_sms_confirmation",
+]

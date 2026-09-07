@@ -167,9 +167,19 @@ async def test_ingest_correlates_only_single_completed_call_in_window(
                 CommunicationSession.channel == CommunicationChannel.SMS
             )
         )
+        linked_call = await db.get(CommunicationSession, call.id)
     assert result["correlated"] == 1
     assert imported is not None
     assert imported.related_session_id == call.id
+    assert linked_call is not None
+    assert linked_call.verification_revision == 1
+    assert linked_call.summary["verification"]["sms_reconciliation"]["state"] == "pending"
+
+    await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    async with sqlite_session_factory() as db:
+        linked_call = await db.get(CommunicationSession, call.id)
+    assert linked_call is not None
+    assert linked_call.verification_revision == 1
 
 
 @pytest.mark.asyncio
