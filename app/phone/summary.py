@@ -842,6 +842,24 @@ async def _finalize_claimed_call(
                 },
             },
         )
+        existing_telegram = call.summary.get("telegram", {})
+        if not isinstance(existing_telegram, dict):
+            existing_telegram = {}
+        telegram_state = existing_telegram.get("state")
+        if (
+            telegram_state == "sent"
+            and int(existing_telegram.get("input_revision", -1)) == call.verification_revision
+        ):
+            telegram = existing_telegram
+        else:
+            telegram = {
+                "input_revision": call.verification_revision,
+                "state": "pending",
+                "attempts": 0,
+                "next_attempt_at": utcnow().isoformat(),
+                "message_id": None,
+                "ambiguous_delivery": False,
+            }
         call.summary = {
             **call.summary,
             "summary_text": extracted.summary_text,
@@ -857,7 +875,7 @@ async def _finalize_claimed_call(
                     arbiter_meta.latency_ms,
                 ),
             },
-            "telegram": {"state": "pending"},
+            "telegram": telegram,
         }
         call.summary_state = PhoneSummaryState.DONE
         call.processing_started_at = None
@@ -893,58 +911,3 @@ async def finalize_pending_calls() -> dict[str, int]:
         result = await _finalize_claimed_call(call_id, token)
         counters[result] += 1
     return counters
-
-
-async def _notify(
-    db: AsyncSession,
-    session: CommunicationSession,
-    result: CallSummary,
-    settings: Settings,
-) -> None:
-    """Send the post-call Telegram notification. Never raises."""
-    try:
-        if (
-            not settings.telegram_enabled
-            or settings.telegram_bot_token is None
-            or not settings.telegram_chat_id
-        ):
-            session.summary = {**session.summary, "telegram": {"state": "disabled"}}
-            return
-
-        from app.phone.telegram import (
-            TelegramDeliveryError,
-            render_call_notification,
-            send_telegram_message,
-        )
-
-        company, vacancy = await _job_company_vacancy(db, session)
-        text = render_call_notification(
-            result,
-            company=company,
-            vacancy=vacancy,
-            session_id=str(session.id),
-            base_url=settings.public_base_url,
-        )
-        try:
-            await send_telegram_message(
-                token=settings.telegram_bot_token.get_secret_value(),
-                chat_id=settings.telegram_chat_id,
-                text=text,
-            )
-        except TelegramDeliveryError as exc:
-            logger.warning(
-                "phone_telegram_delivery_failed",
-                session_id=str(session.id),
-                error=str(exc),
-            )
-            session.summary = {
-                **session.summary,
-                "telegram": {"state": "failed", "error": str(exc)},
-            }
-            return
-        session.summary = {
-            **session.summary,
-            "telegram": {"state": "sent", "sent_at": utcnow().isoformat()},
-        }
-    except Exception as exc:  # _notify must never propagate
-        logger.warning("phone_notify_failed", session_id=str(session.id), error=type(exc).__name__)

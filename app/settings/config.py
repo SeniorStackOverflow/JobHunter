@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     telegram_enabled: bool = False
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
+    phone_telegram_batch: int = Field(default=10, ge=1, le=100)
+    phone_telegram_lease_seconds: int = Field(default=300, ge=1, le=86_400)
+    phone_telegram_max_attempts: int = Field(default=3, ge=1, le=10)
+    phone_telegram_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
+    phone_telegram_retry_max_seconds: int = Field(default=3600, ge=1, le=86_400)
 
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024

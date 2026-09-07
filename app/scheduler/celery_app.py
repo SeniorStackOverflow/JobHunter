@@ -103,6 +103,11 @@ celery_app.conf.update(
             "schedule": 120.0,
             "options": {"queue": "phone", "expires": 110},
         },
+        "deliver-phone-notifications": {
+            "task": "job_agent.scheduler.deliver_phone_notifications",
+            "schedule": 30.0,
+            "options": {"queue": "phone", "expires": 25},
+        },
         "prune-phone-evidence": {
             "task": "job_agent.scheduler.prune_phone_evidence",
             "schedule": crontab(minute=40, hour=3),
@@ -131,6 +136,7 @@ celery_app.conf.update(
         "job_agent.scheduler.train_learning_models": {"queue": "matching"},
         "job_agent.scheduler.record_learning_shadow": {"queue": "matching"},
         "job_agent.scheduler.finalize_pending_calls": {"queue": "phone"},
+        "job_agent.scheduler.deliver_phone_notifications": {"queue": "phone"},
         "job_agent.scheduler.prune_phone_evidence": {"queue": "phone"},
         "job_agent.scheduler.ingest_phonegate_sms": {"queue": "phone"},
         "job_agent.scheduler.reconcile_phone_sms": {"queue": "phone"},

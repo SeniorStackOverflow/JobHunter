@@ -10,6 +10,9 @@ def test_phone_defaults() -> None:
     assert settings.phone_agent_enabled is False
     assert settings.phonegate_url == "http://127.0.0.1:8888"
     assert settings.phonegate_auth_token is None
+    assert settings.phone_telegram_batch == 10
+    assert settings.phone_telegram_lease_seconds == 300
+    assert settings.phone_telegram_max_attempts == 3
     assert settings.phone_poll_idle_seconds == 1.0
     assert settings.phone_caller_region == "MD"
 

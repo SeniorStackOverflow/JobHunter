@@ -109,7 +109,7 @@ Admin / MCP ─authn/authz/audit─► services ─► Celery/Redis
 | T18 | Неверный LLM JSON/галлюцинация | ложная оценка/факт | strict Pydantic, bounded retry, confirmed-fact validation, manual fallback | качественная, но неверная оценка остаётся возможной |
 | T19 | Access policy/terms change | юридический/технический риск | source pause, ручная периодическая проверка terms, documented limitations | автоматического terms hash/change detector нет; ручная проверка не заменяет юриста |
 | T20 | Backup/restore compromise | утечка или потеря данных | Compose dump/checksum/restore guard; внешние encryption, off-host copy, retention и restore drills | поставляемый named volume остаётся на одном host и не шифруется автоматически |
-| T21 | Telegram post-call notification intercept | утечка summary/link | HTTPS only, fixed host, best-effort без retry, отключено по умолчанию, sidecar fail не влияет на call handling, токен хранится как SecretStr | compromised Telegram account или bot; утечка внутренних application ID через link |
+| T21 | Telegram post-call notification intercept или duplicate после crash | утечка summary/link, повторная карточка | HTTPS only, fixed host, no redirects, bounded retry, ambiguous transport terminal, revision/lease claim, privacy-aware rendering, отключено по умолчанию, sidecar fail не влияет на call handling, токен хранится как SecretStr | compromised Telegram account или bot; unavoidable crash-after-response window из-за отсутствия Telegram idempotency key; утечка внутренних application ID через link |
 
 ## Детальные abuse cases
 

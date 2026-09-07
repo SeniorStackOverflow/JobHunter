@@ -600,6 +600,16 @@ def finalize_pending_calls_task() -> dict[str, Any]:
     return _run_locked_periodic("phone-finalize", finalize_pending_calls(), ttl_seconds=600)
 
 
+@celery_app.task(name="job_agent.scheduler.deliver_phone_notifications")
+def deliver_phone_notifications_task() -> dict[str, Any]:
+    from app.phone.telegram import deliver_pending_phone_notifications
+
+    lease = get_settings().phone_telegram_lease_seconds
+    return _run_locked_periodic(
+        "phone-telegram", deliver_pending_phone_notifications(), ttl_seconds=max(5, lease)
+    )
+
+
 @celery_app.task(name="job_agent.scheduler.prune_phone_evidence")
 def prune_phone_evidence_task() -> dict[str, Any]:
     from app.phone.evidence import prune_phone_evidence
@@ -633,6 +643,7 @@ __all__ = [
     "DEFAULT_SOURCE_SCHEDULES",
     "close_task_event_loop",
     "cron_expression_is_due",
+    "deliver_phone_notifications_task",
     "dispatch_due_sources_task",
     "finalize_pending_calls_task",
     "generate_daily_report_task",

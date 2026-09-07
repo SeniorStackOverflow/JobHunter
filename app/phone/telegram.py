@@ -1,16 +1,61 @@
+"""Privacy-conscious Telegram delivery for completed phone calls.
+
+Telegram has no idempotency key. A short claim lease and an explicit
+ambiguous terminal state make that limitation visible to operators.
+"""
+
 from __future__ import annotations
 
+import re
+import secrets
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from html import escape
+from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.phone.summary import CallSummary
+from app.database.base import utcnow
+from app.models.entities import CallFact, CanonicalJob, CommunicationSession
+from app.models.enums import CallFactState, CommunicationChannel
+from app.settings import Settings, get_settings
 
 _API = "https://api.telegram.org"
+_MAX_MESSAGE_LENGTH = 4096
+_MAX_QUOTE_LENGTH = 160
+_MAX_RETRY_AFTER = 3600
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d ()-]{6,}\d)(?!\w)")
+
+
+@dataclass(frozen=True)
+class TelegramDeliveryResult:
+    message_id: int
 
 
 class TelegramDeliveryError(RuntimeError):
-    """Telegram did not accept the message."""
+    """Telegram rejected the request or its result could not be trusted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        permanent: bool = True,
+        ambiguous_delivery: bool = False,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.permanent = permanent
+        self.ambiguous_delivery = ambiguous_delivery
+        self.retry_after = retry_after
 
 
 async def send_telegram_message(
@@ -20,7 +65,7 @@ async def send_telegram_message(
     text: str,
     client: httpx.AsyncClient | None = None,
     timeout: float = 10.0,  # noqa: ASYNC109 - passed to httpx.AsyncClient, not a cancel scope
-) -> None:
+) -> TelegramDeliveryResult:
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -29,37 +74,472 @@ async def send_telegram_message(
     }
     url = f"{_API}/bot{token}/sendMessage"
     owns = client is None
-    client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    request_client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     try:
-        response = await client.post(url, json=payload)
+        response = await request_client.post(url, json=payload)
+    except httpx.TimeoutException as exc:
+        raise TelegramDeliveryError(
+            "transport_timeout", ambiguous_delivery=True, permanent=True
+        ) from exc
     except httpx.RequestError as exc:
-        raise TelegramDeliveryError(f"transport:{type(exc).__name__}") from exc
+        raise TelegramDeliveryError(
+            "transport_error", ambiguous_delivery=True, permanent=True
+        ) from exc
     finally:
         if owns:
-            await client.aclose()
+            await request_client.aclose()
+
+    if response.status_code == 429:
+        retry_after: int | None = None
+        try:
+            data = response.json()
+            parameters = data.get("parameters") if isinstance(data, dict) else None
+            value = parameters.get("retry_after") if isinstance(parameters, dict) else None
+            if isinstance(value, int) and not isinstance(value, bool):
+                retry_after = min(max(value, 1), _MAX_RETRY_AFTER)
+        except (ValueError, TypeError):
+            pass
+        raise TelegramDeliveryError(
+            "http_429",
+            status_code=429,
+            retryable=True,
+            permanent=False,
+            retry_after=retry_after,
+        )
+    if 500 <= response.status_code <= 599:
+        raise TelegramDeliveryError(
+            f"http_{response.status_code}",
+            status_code=response.status_code,
+            retryable=True,
+            permanent=False,
+        )
     if response.status_code >= 300:
-        raise TelegramDeliveryError(f"http_{response.status_code}")
+        raise TelegramDeliveryError(
+            f"http_{response.status_code}", status_code=response.status_code, permanent=True
+        )
+    try:
+        data = response.json()
+    except (ValueError, TypeError) as exc:
+        raise TelegramDeliveryError("invalid_response", permanent=True) from exc
+    if not isinstance(data, dict):
+        raise TelegramDeliveryError("invalid_response", permanent=True)
+    result = data.get("result")
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if (
+        data.get("ok") is not True
+        or not isinstance(message_id, int)
+        or isinstance(message_id, bool)
+    ):
+        raise TelegramDeliveryError("invalid_response", permanent=True)
+    return TelegramDeliveryResult(message_id=message_id)
+
+
+def _clean(value: object, *, limit: int = 500) -> str:
+    text = " ".join(str(value or "").split())
+    return _PHONE_RE.sub("[номер скрыт]", text)[:limit]
+
+
+def _short_quote(value: object) -> str:
+    text = _clean(value, limit=_MAX_QUOTE_LENGTH)
+    return text if len(text) < _MAX_QUOTE_LENGTH else text[: _MAX_QUOTE_LENGTH - 1] + "…"
+
+
+def _status(call: object) -> str:
+    raw = getattr(call, "verification_status", None)
+    if raw is not None:
+        return getattr(raw, "value", str(raw))
+    if getattr(call, "needs_review", False):
+        return "needs_review"
+    return "high_confidence"
+
+
+def _controlled_alternatives(call: object, field: str) -> list[tuple[str, str]]:
+    summary = getattr(call, "summary", None)
+    if not isinstance(summary, dict):
+        return []
+    verification = summary.get("verification", {})
+    passes = verification.get("pass_results", {}) if isinstance(verification, dict) else {}
+    out: list[tuple[str, str]] = []
+    if not isinstance(passes, dict):
+        return out
+    for pass_result in passes.values():
+        if not isinstance(pass_result, dict):
+            continue
+        candidates = pass_result.get("facts", [])
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or candidate.get("field") != field:
+                continue
+            value = _clean(
+                candidate.get("normalized_value") or candidate.get("raw_expression"), limit=160
+            )
+            quote = _short_quote(candidate.get("quote") or candidate.get("raw_expression"))
+            pair = (value, quote)
+            if value and pair not in out:
+                out.append(pair)
+    return out[:4]
+
+
+def _admin_link(base_url: str | None, session_id: object) -> str:
+    if not base_url or not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return ""
+    parts = urlsplit(base_url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return ""
+    url = f"{base_url.rstrip('/')}/?view=calls&session={session_id}"
+    return f"\n🔗 {escape(url, quote=True)}"
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_MESSAGE_LENGTH:
+        return text
+    text = text[: _MAX_MESSAGE_LENGTH - 1]
+    partial = re.search(r"&(?:[A-Za-z][A-Za-z0-9]{0,15}|#[0-9]{1,7})?$", text)
+    return (text[: partial.start()] if partial else text) + "…"
 
 
 def render_call_notification(
-    summary: CallSummary,
+    call: object | None = None,
+    facts: Sequence[CallFact] = (),
     *,
-    company: str | None,
-    vacancy: str | None,
-    session_id: str,
-    base_url: str | None,
+    company: str | None = None,
+    vacancy: str | None = None,
+    base_url: str | None = None,
+    session_id: str | None = None,
 ) -> str:
-    link = f"\n🔗 {base_url}/?view=calls&session={session_id}" if base_url else ""
-    body = escape(summary.summary_text)
-    if summary.needs_review or summary.outcome_guess != "interview_proposed":
-        head = escape(company) if company else "Неизвестная компания"
-        return f"📞 {head}\n{body}\n⚠️ Требуется проверка — открой запись звонка.{link}"
-    title = escape(company or "")
+    """Render Russian status-aware content without exposing caller numbers."""
+    # The first positional CallSummary/session_id form remains accepted for the
+    # original Phase 2b caller; new code passes the persisted call and facts.
+    status = _status(call)
+    actual_session_id = session_id or str(getattr(call, "id", ""))
+    title = _clean(company or "Неизвестная компания", limit=180)
     if vacancy:
-        title = f"{title} — {escape(vacancy)}" if title else escape(vacancy)
-    parts = [f"📞 {title}".rstrip(), body]
-    if summary.proposed_datetime_text:
-        parts.append(f"🕒 {escape(summary.proposed_datetime_text)}")
-    if summary.proposed_address_text:
-        parts.append(f"📍 {escape(summary.proposed_address_text)}")
-    return "\n".join(parts) + link
+        title = f"{title} — {_clean(vacancy, limit=180)}"
+    lines = [f"📞 {escape(title)}"]
+    labels = {
+        "confirmed": "Подтверждено",
+        "high_confidence": "Высокая уверенность",
+        "needs_review": "Требуется проверка",
+        "pending": "Ожидает проверки",
+        "not_applicable": "Статус не определён",
+    }
+    lines.append(f"Статус: {escape(labels.get(status, 'Требуется проверка'))}")
+
+    if facts:
+        field_labels = {
+            "interview_date": "Дата",
+            "interview_time": "Время",
+            "timezone": "Часовой пояс",
+            "interview_format": "Формат",
+            "address": "Место",
+            "meeting_link": "Ссылка",
+        }
+        alternatives: list[str] = []
+        for fact in facts:
+            label = field_labels.get(fact.field, _clean(fact.field, limit=64))
+            value = _clean(fact.normalized_value or fact.raw_expression, limit=220)
+            if not value:
+                continue
+            if fact.state is CallFactState.CONFLICT:
+                pairs = _controlled_alternatives(call, fact.field)
+                if pairs:
+                    alternatives.extend(
+                        f"{label}: {candidate} (фраза: «{quote}»)" for candidate, quote in pairs
+                    )
+                else:
+                    alternatives.append(f"{label}: значение расходится")
+                continue
+            if fact.state is CallFactState.UNKNOWN:
+                alternatives.append(f"{label}: значение не установлено")
+                continue
+            marker = "Подтверждено" if fact.state is CallFactState.CONFIRMED else "Предварительно"
+            quote = _short_quote(fact.raw_expression)
+            lines.append(f"{marker} — {escape(label)}: {escape(value)} (фраза: «{escape(quote)}» )")
+        if alternatives:
+            lines.append("Варианты для проверки:")
+            lines.extend(f"• {escape(item)}" for item in alternatives)
+    else:
+        summary_text = _clean(getattr(call, "summary_text", "") or "", limit=900)
+        if summary_text:
+            lines.append(escape(summary_text))
+        proposed_datetime = _clean(getattr(call, "proposed_datetime_text", "") or "", limit=220)
+        proposed_address = _clean(getattr(call, "proposed_address_text", "") or "", limit=220)
+        if proposed_datetime:
+            lines.append(f"🕒 {escape(proposed_datetime)}")
+        if proposed_address:
+            lines.append(f"📍 {escape(proposed_address)}")
+        if getattr(call, "needs_review", False):
+            lines.append("⚠️ Требуется проверка — откройте запись звонка.")
+    return _truncate("\n".join(lines) + _admin_link(base_url, actual_session_id))
+
+
+def _telegram_record(summary: object) -> dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {}
+    value = summary.get("telegram")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _due(record: dict[str, Any], now: datetime) -> bool:
+    value = record.get("next_attempt_at")
+    if not value:
+        return True
+    try:
+        due_at = datetime.fromisoformat(str(value))
+    except ValueError:
+        return True
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=UTC)
+    return due_at <= now
+
+
+async def _job_company_vacancy(
+    db: AsyncSession, call: CommunicationSession
+) -> tuple[str | None, str | None]:
+    if call.canonical_job_id is None:
+        return None, None
+    job = await db.get(CanonicalJob, call.canonical_job_id)
+    if job is None:
+        return None, None
+    return job.normalized_company, job.normalized_title
+
+
+async def _claim_due(
+    db: AsyncSession, *, settings: Settings, now: datetime
+) -> list[tuple[Any, str]]:
+    claimed: list[tuple[Any, str]] = []
+    lease_before = now - timedelta(seconds=settings.phone_telegram_lease_seconds)
+    async with db.begin():
+        query = select(CommunicationSession).where(
+            CommunicationSession.channel == CommunicationChannel.CALL,
+            CommunicationSession.summary_state == "done",
+        )
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        rows = list((await db.scalars(query.limit(settings.phone_telegram_batch * 4))).all())
+        for call in rows:
+            record = _telegram_record(call.summary)
+            if record.get("state") not in {"pending", "retrying"} or not _due(record, now):
+                continue
+            claimed_at = record.get("claimed_at")
+            if claimed_at:
+                try:
+                    value = datetime.fromisoformat(str(claimed_at))
+                    if value.tzinfo is None:
+                        value = value.replace(tzinfo=UTC)
+                    if value > lease_before:
+                        continue
+                except ValueError:
+                    pass
+            token = secrets.token_urlsafe(32)
+            updated_record = {
+                "input_revision": int(record.get("input_revision", call.verification_revision)),
+                "state": "pending",
+                "attempts": int(record.get("attempts", 0)),
+                "next_attempt_at": record.get("next_attempt_at"),
+                "message_id": record.get("message_id"),
+                "ambiguous_delivery": bool(record.get("ambiguous_delivery", False)),
+                "claim_token": token,
+                "claimed_at": now.isoformat(),
+            }
+            if db.bind is not None and db.bind.dialect.name == "postgresql":
+                call.summary = {**call.summary, "telegram": updated_record}
+                claimed.append((call.id, token))
+            else:
+                old_summary = call.summary
+                result = await db.execute(
+                    update(CommunicationSession)
+                    .where(
+                        CommunicationSession.id == call.id,
+                        CommunicationSession.summary == old_summary,
+                    )
+                    .values(summary={**old_summary, "telegram": updated_record})
+                )
+                if int(getattr(result, "rowcount", 0)) == 1:
+                    claimed.append((call.id, token))
+            if len(claimed) >= settings.phone_telegram_batch:
+                break
+    return claimed
+
+
+async def _mark_disabled(now: datetime) -> int:
+    from app.database.session import async_session_factory
+
+    count = 0
+    async with async_session_factory() as db, db.begin():
+        rows = list(
+            (
+                await db.scalars(
+                    select(CommunicationSession).where(
+                        CommunicationSession.channel == CommunicationChannel.CALL,
+                        CommunicationSession.summary_state == "done",
+                    )
+                )
+            ).all()
+        )
+        for call in rows:
+            record = _telegram_record(call.summary)
+            if record.get("state") not in {"pending", "retrying"}:
+                continue
+            call.summary = {
+                **call.summary,
+                "telegram": {
+                    "input_revision": call.verification_revision,
+                    "state": "disabled",
+                    "attempts": int(record.get("attempts", 0)),
+                    "next_attempt_at": None,
+                    "message_id": record.get("message_id"),
+                    "ambiguous_delivery": bool(record.get("ambiguous_delivery", False)),
+                },
+            }
+            count += 1
+    return count
+
+
+async def _deliver_claim(call_id: Any, token: str, *, settings: Settings) -> str:
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+        if call is None:
+            return "skipped"
+        record = _telegram_record(call.summary)
+        if record.get("claim_token") != token:
+            return "skipped"
+        if int(record.get("input_revision", -1)) != call.verification_revision:
+            call.summary = {
+                **call.summary,
+                "telegram": {
+                    "input_revision": call.verification_revision,
+                    "state": "pending",
+                    "attempts": 0,
+                    "next_attempt_at": utcnow().isoformat(),
+                    "message_id": None,
+                    "ambiguous_delivery": False,
+                },
+            }
+            await db.commit()
+            return "skipped"
+        facts = list(
+            (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
+        )
+        company, vacancy = await _job_company_vacancy(db, call)
+        text = render_call_notification(
+            call=call,
+            facts=facts,
+            company=company,
+            vacancy=vacancy,
+            base_url=settings.public_base_url,
+        )
+        revision = call.verification_revision
+        attempts = int(record.get("attempts", 0)) + 1
+        await db.commit()
+
+    try:
+        result = await send_telegram_message(
+            token=settings.telegram_bot_token.get_secret_value()
+            if settings.telegram_bot_token
+            else "",
+            chat_id=settings.telegram_chat_id or "",
+            text=text,
+        )
+    except TelegramDeliveryError as exc:
+        async with async_session_factory() as db:
+            call = await db.get(CommunicationSession, call_id)
+            if call is None:
+                return "skipped"
+            record = _telegram_record(call.summary)
+            if record.get("claim_token") != token:
+                return "skipped"
+            if (
+                exc.ambiguous_delivery
+                or exc.permanent
+                or attempts >= settings.phone_telegram_max_attempts
+            ):
+                state = "failed"
+                next_attempt = None
+            else:
+                state = "retrying"
+                delay = exc.retry_after or min(
+                    settings.phone_telegram_retry_max_seconds,
+                    settings.phone_telegram_retry_base_seconds * (2 ** max(attempts - 1, 0)),
+                )
+                next_attempt = (utcnow() + timedelta(seconds=delay)).isoformat()
+            call.summary = {
+                **call.summary,
+                "telegram": {
+                    "input_revision": revision,
+                    "state": state,
+                    "attempts": attempts,
+                    "next_attempt_at": next_attempt,
+                    "message_id": None,
+                    "ambiguous_delivery": bool(exc.ambiguous_delivery),
+                },
+            }
+            await db.commit()
+        return state
+
+    async with async_session_factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+        if call is None:
+            return "skipped"
+        record = _telegram_record(call.summary)
+        if record.get("claim_token") != token:
+            return "skipped"
+        if call.verification_revision != revision:
+            call.summary = {
+                **call.summary,
+                "telegram": {
+                    "input_revision": call.verification_revision,
+                    "state": "pending",
+                    "attempts": 0,
+                    "next_attempt_at": utcnow().isoformat(),
+                    "message_id": None,
+                    "ambiguous_delivery": False,
+                },
+            }
+        else:
+            call.summary = {
+                **call.summary,
+                "telegram": {
+                    "input_revision": revision,
+                    "state": "sent",
+                    "attempts": attempts,
+                    "next_attempt_at": None,
+                    "message_id": result.message_id,
+                    "ambiguous_delivery": False,
+                },
+            }
+        await db.commit()
+    return "sent"
+
+
+async def deliver_pending_phone_notifications() -> dict[str, int]:
+    from app.database.session import async_session_factory
+
+    settings = get_settings()
+    counters = {"picked": 0, "sent": 0, "retrying": 0, "failed": 0, "disabled": 0, "skipped": 0}
+    if (
+        not settings.telegram_enabled
+        or settings.telegram_bot_token is None
+        or not settings.telegram_chat_id
+    ):
+        counters["disabled"] = await _mark_disabled(utcnow())
+        return counters
+    async with async_session_factory() as db:
+        claimed = await _claim_due(db, settings=settings, now=utcnow())
+    counters["picked"] = len(claimed)
+    for call_id, token in claimed:
+        result = await _deliver_claim(call_id, token, settings=settings)
+        counters[result] = counters.get(result, 0) + 1
+    return counters
+
+
+__all__ = [
+    "TelegramDeliveryError",
+    "TelegramDeliveryResult",
+    "deliver_pending_phone_notifications",
+    "render_call_notification",
+    "send_telegram_message",
+]

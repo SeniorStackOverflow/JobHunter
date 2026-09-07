@@ -1,6 +1,7 @@
 import app.scheduler.tasks as scheduler_tasks
 from app.scheduler.celery_app import celery_app
 from app.scheduler.tasks import (
+    deliver_phone_notifications_task,
     finalize_pending_calls_task,
     ingest_phonegate_sms_task,
     prune_phone_evidence_task,
@@ -10,6 +11,12 @@ from app.scheduler.tasks import (
 
 def test_finalize_pending_calls_task_registered() -> None:
     assert finalize_pending_calls_task.name == "job_agent.scheduler.finalize_pending_calls"
+
+
+def test_deliver_phone_notifications_task_registered() -> None:
+    assert (
+        deliver_phone_notifications_task.name == "job_agent.scheduler.deliver_phone_notifications"
+    )
 
 
 def test_prune_phone_evidence_task_registered() -> None:
@@ -32,6 +39,7 @@ def test_phone_beat_entries_present() -> None:
     assert bs["ingest-phonegate-sms"]["schedule"] == 60.0
     assert bs["ingest-phonegate-sms"]["options"]["expires"] == 55.0
     assert bs["reconcile-phone-sms"]["options"]["queue"] == "phone"
+    assert bs["deliver-phone-notifications"]["options"]["queue"] == "phone"
 
 
 def test_finalize_task_keeps_atomic_entrypoint() -> None:
