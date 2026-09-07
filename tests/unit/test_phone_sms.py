@@ -59,14 +59,16 @@ class SequencedPhoneGate(StubPhoneGate):
 
 class MemorySyncMarker:
     def __init__(self, value: int | None = None) -> None:
-        self.value = SmsSyncState("test", value) if value is not None else None
+        self.values: dict[str, SmsSyncState] = (
+            {"test": SmsSyncState("test", value)} if value is not None else {}
+        )
         self.marked: list[int] = []
 
-    async def get(self) -> SmsSyncState | None:
-        return self.value
+    async def get(self, generation: str) -> SmsSyncState | None:
+        return self.values.get(generation)
 
     async def mark_success(self, generation: str, timestamp: int) -> None:
-        self.value = SmsSyncState(generation, timestamp)
+        self.values[generation] = SmsSyncState(generation, timestamp)
         self.marked.append(timestamp)
 
 
@@ -434,12 +436,14 @@ async def test_no_profile_is_degradation_and_does_not_advance_marker(
 class _FakeRedis:
     def __init__(self, value: str | None = None) -> None:
         self.value = value
+        self.expires: int | None = None
 
     async def get(self, _key: str) -> str | None:
         return self.value
 
-    async def set(self, _key: str, value: str) -> None:
+    async def set(self, _key: str, value: str, *, ex: int | None = None) -> None:
         self.value = value
+        self.expires = ex
 
 
 @pytest.mark.asyncio
@@ -447,15 +451,93 @@ async def test_redis_marker_is_strict_json_and_preserves_generation() -> None:
     redis = _FakeRedis()
     marker = RedisSmsSyncMarker(redis)  # type: ignore[arg-type]
     await marker.mark_success("worker-a", 1_720_000_000_000)
-    state = await marker.get()
+    state = await marker.get("worker-a")
     assert state is not None
     assert state.generation == "worker-a"
     assert state.last_success_at == 1_720_000_000_000
+    assert redis.expires is not None and redis.expires >= 300
     redis.value = "not-json"
-    assert await marker.get() is None
+    assert await marker.get("worker-a") is None
     redis.value = '{"generation":"worker-a","last_success_at":999999999999999999}'
-    with pytest.raises(PhoneSmsMalformedData):
-        await marker.get()
+    assert await marker.get("worker-a") is None
+
+
+@pytest.mark.asyncio
+async def test_marker_generations_do_not_thrash_each_other(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="m-1", timestamp=1_720_000_000_000)])
+    marker = MemorySyncMarker()
+
+    for generation in ("worker-a", "worker-b", "worker-a", "worker-b"):
+        await ingest_phonegate_sms(
+            client=gateway,
+            session_factory=sqlite_session_factory,
+            sync_marker=marker,
+            boot_id=generation,
+        )
+    assert gateway.sync_calls == 2
+    assert len(marker.marked) == 4
+
+
+@pytest.mark.asyncio
+async def test_reordered_complete_pages_remain_idempotent(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    gateway = StubPhoneGate(
+        [
+            sms(ident="m-a", timestamp=1_720_000_000_000),
+            sms(ident="m-b", timestamp=1_720_000_000_001),
+        ]
+    )
+    marker = MemorySyncMarker()
+    first = await ingest_phonegate_sms(
+        client=gateway,
+        session_factory=sqlite_session_factory,
+        sync_marker=marker,
+        boot_id="worker-a",
+    )
+    gateway.messages.reverse()
+    second = await ingest_phonegate_sms(
+        client=gateway,
+        session_factory=sqlite_session_factory,
+        sync_marker=marker,
+        boot_id="worker-a",
+    )
+    assert first["imported"] == 2
+    assert second["duplicates"] == 2
+    assert gateway.sync_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_corrupt_marker_self_heals_after_complete_import(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    redis = _FakeRedis('{"generation":"worker-a","last_success_at":999999999999999999}')
+    marker = RedisSmsSyncMarker(redis)  # type: ignore[arg-type]
+    gateway = StubPhoneGate([sms(ident="m-1", timestamp=1_720_000_000_000)])
+
+    await ingest_phonegate_sms(
+        client=gateway,
+        session_factory=sqlite_session_factory,
+        sync_marker=marker,
+        boot_id="worker-a",
+    )
+
+    assert gateway.sync_calls == 1
+    assert await marker.get("worker-a") is not None
 
 
 @pytest.mark.asyncio

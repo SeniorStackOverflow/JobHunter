@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -28,6 +29,19 @@ def speaker_from_phonegate(value: str) -> TurnSpeaker:
 
 
 class SessionStore:
+    def __init__(
+        self,
+        *,
+        retry_sleeper: Callable[[float], Awaitable[object]] | None = None,
+        retry_attempts: int = 5,
+        retry_base_seconds: float = 0.01,
+        retry_max_seconds: float = 0.25,
+    ) -> None:
+        self._retry_sleeper = retry_sleeper or asyncio.sleep
+        self._retry_attempts = max(1, retry_attempts)
+        self._retry_base_seconds = max(0.0, retry_base_seconds)
+        self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
+
     async def _lock_session_for_turn(self, session: AsyncSession, session_id: UUID) -> None:
         bind = session.get_bind()
         if bind.dialect.name == "postgresql":
@@ -40,7 +54,7 @@ class SessionStore:
     async def _flush_turn_with_retry(
         self, session: AsyncSession, turn: CommunicationTurn, *, transcript_id: int | None
     ) -> CommunicationTurn | None:
-        for attempt in range(5):
+        for attempt in range(self._retry_attempts):
             try:
                 async with session.begin_nested():
                     session.add(turn)
@@ -63,16 +77,23 @@ class SessionStore:
                 ):
                     raise
             except OperationalError as exc:
-                if "locked" not in str(exc.orig or exc).lower() or attempt == 4:
+                if (
+                    "locked" not in str(exc.orig or exc).lower()
+                    or attempt == self._retry_attempts - 1
+                ):
                     raise
-            if attempt < 4:
+            if attempt < self._retry_attempts - 1:
                 max_seq = await session.scalar(
                     select(func.max(CommunicationTurn.seq)).where(
                         CommunicationTurn.session_id == turn.session_id
                     )
                 )
                 turn.seq = int(max_seq or 0) + 1
-                await asyncio.sleep(0)
+                delay = min(
+                    self._retry_max_seconds,
+                    self._retry_base_seconds * (2**attempt),
+                )
+                await self._retry_sleeper(delay)
         raise RuntimeError("turn sequence allocation exhausted")
 
     async def find_open(self, session: AsyncSession) -> CommunicationSession | None:

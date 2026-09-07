@@ -3,9 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.models.entities import CallFact, CommunicationSession, UserProfile
+from app.database.base import Base
+from app.database.session import make_session_factory
+from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import (
     CallFactConfirmationSource,
     CallFactState,
@@ -14,8 +17,10 @@ from app.models.enums import (
     CommunicationOutcome,
     PhoneSummaryState,
     PhoneVerificationStatus,
+    TurnDeliveryStatus,
 )
 from app.phone.correlation import CorrelationResult
+from app.phone.schemas import TranscriptEntry
 from app.phone.sessions import SessionStore
 
 
@@ -156,6 +161,147 @@ async def test_append_turn_is_idempotent(db: AsyncSession) -> None:
     third = await store.append_turn(db, session_id=call.id, entry=entry2)
     assert third is not None and third.seq == 2 and third.speaker == TurnSpeaker.ASSISTANT
     assert speaker_from_phonegate("weird") is TurnSpeaker.SYSTEM
+
+
+async def test_file_sqlite_concurrent_append_retries_with_exponential_backoff(tmp_path) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'turn-race.db'}",
+        connect_args={"timeout": 0.05},
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = make_session_factory(engine)
+    async with factory() as setup:
+        profile = UserProfile(name="p", is_default=True)
+        setup.add(profile)
+        await setup.flush()
+        call = await SessionStore().open(
+            setup,
+            remote_raw="+37360000000",
+            remote_address="+37360000000",
+            event_id=1,
+            correlation=_corr(profile.id),
+            opened_at=datetime.now(UTC),
+        )
+        await setup.commit()
+        call_id = call.id
+
+    first = factory()
+    second = factory()
+    first_turn = await SessionStore().append_turn(
+        first,
+        session_id=call_id,
+        entry=TranscriptEntry(id=1, speaker="rx", text="first", timestamp_ms=1),
+    )
+    await first.commit()
+    lock_session = factory()
+    await lock_session.execute(text("BEGIN IMMEDIATE"))
+    delays: list[float] = []
+    released = False
+
+    async def release_after_backoff(delay: float) -> None:
+        nonlocal released
+        delays.append(delay)
+        if not released:
+            released = True
+            await lock_session.rollback()
+            await lock_session.close()
+
+    second_store = SessionStore(retry_sleeper=release_after_backoff, retry_base_seconds=0.001)
+    second_turn = await second_store.append_turn(
+        second,
+        session_id=call_id,
+        entry=TranscriptEntry(id=2, speaker="rx", text="second", timestamp_ms=2),
+    )
+    await second.commit()
+    await first.close()
+    await second.close()
+    async with factory() as check:
+        turns = list(
+            (
+                await check.scalars(
+                    select(CommunicationTurn).where(CommunicationTurn.session_id == call_id)
+                )
+            ).all()
+        )
+    await engine.dispose()
+    assert first_turn is not None and first_turn.seq == 1
+    assert second_turn is not None and second_turn.seq == 2
+    assert [turn.seq for turn in turns] == [1, 2]
+    assert delays == [0.001]
+
+
+async def test_file_sqlite_concurrent_assistant_allocation_retries(tmp_path) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'assistant-race.db'}",
+        connect_args={"timeout": 0.05},
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = make_session_factory(engine)
+    async with factory() as setup:
+        profile = UserProfile(name="p", is_default=True)
+        setup.add(profile)
+        await setup.flush()
+        call = await SessionStore().open(
+            setup,
+            remote_raw="+37360000000",
+            remote_address="+37360000000",
+            event_id=1,
+            correlation=_corr(profile.id),
+            opened_at=datetime.now(UTC),
+        )
+        await setup.commit()
+        call_id = call.id
+
+    first = factory()
+    first_turn = await SessionStore().record_assistant_turn(
+        first,
+        session_id=call_id,
+        phonegate_transcript_id=10,
+        spoken_text="first",
+        delivery_status=TurnDeliveryStatus.ATTEMPTED,
+        occurred_at=datetime.now(UTC),
+    )
+    await first.commit()
+    lock_session = factory()
+    await lock_session.execute(text("BEGIN IMMEDIATE"))
+    delays: list[float] = []
+
+    async def release_lock(delay: float) -> None:
+        delays.append(delay)
+        await lock_session.rollback()
+        await lock_session.close()
+
+    second = factory()
+    second_turn = await SessionStore(
+        retry_sleeper=release_lock, retry_base_seconds=0.001
+    ).record_assistant_turn(
+        second,
+        session_id=call_id,
+        phonegate_transcript_id=11,
+        spoken_text="second",
+        delivery_status=TurnDeliveryStatus.ATTEMPTED,
+        occurred_at=datetime.now(UTC),
+    )
+    await second.commit()
+    await first.close()
+    await second.close()
+    async with factory() as check:
+        turns = list(
+            (
+                await check.scalars(
+                    select(CommunicationTurn)
+                    .where(CommunicationTurn.session_id == call_id)
+                    .order_by(CommunicationTurn.seq)
+                )
+            ).all()
+        )
+    await engine.dispose()
+    assert first_turn.seq == 1
+    assert second_turn.seq == 2
+    assert [turn.seq for turn in turns] == [1, 2]
+    assert delays == [0.001]
 
 
 async def test_open_with_diagnostics(db: AsyncSession) -> None:

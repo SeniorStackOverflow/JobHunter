@@ -33,12 +33,14 @@ def test_finalize_task_keeps_atomic_entrypoint() -> None:
 
 
 def test_sms_periodic_lock_ttl_tracks_configured_interval(monkeypatch) -> None:
-    seen: dict[str, int] = {}
+    seen: dict[str, object] = {}
 
     async def fake_ingest() -> dict[str, int]:
         return {}
 
-    def fake_run(_operation, awaitable, *, ttl_seconds):
+    def fake_run(operation, awaitable, *, ttl_seconds):
+        seen["operation"] = operation
+        assert hasattr(awaitable, "close")
         seen["ttl"] = ttl_seconds
         awaitable.close()
         return {"status": "ok"}
@@ -52,4 +54,5 @@ def test_sms_periodic_lock_ttl_tracks_configured_interval(monkeypatch) -> None:
     monkeypatch.setattr("app.phone.sms.ingest_phonegate_sms", fake_ingest)
 
     assert ingest_phonegate_sms_task.run() == {"status": "ok"}
+    assert seen["operation"] == "phone-sms"
     assert seen["ttl"] == 20

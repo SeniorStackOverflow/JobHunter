@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ class SmsHistoryClient(Protocol):
 
 
 class SmsSyncMarker(Protocol):
-    async def get(self) -> SmsSyncState | None: ...
+    async def get(self, generation: str) -> SmsSyncState | None: ...
 
     async def mark_success(self, generation: str, timestamp: int) -> None: ...
 
@@ -59,6 +60,7 @@ class PhoneSmsProfileUnavailable(RuntimeError):
 
 
 SMS_SYNC_STATE_KEY = "job-agent:phone:sms:sync-state"
+SMS_SYNC_MARKER_TTL_SECONDS = 7 * 24 * 60 * 60
 _MIN_SMS_TIMESTAMP = datetime(2000, 1, 1, tzinfo=UTC)
 _MAX_SMS_TIMESTAMP = datetime(2100, 1, 1, tzinfo=UTC)
 SMS_SYNC_BOOT_ID = uuid4().hex
@@ -74,43 +76,50 @@ class RedisSmsSyncMarker:
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
 
-    async def get(self) -> SmsSyncState | None:
-        raw = await self._redis.get(SMS_SYNC_STATE_KEY)
+    @staticmethod
+    def _key(generation: str) -> str:
+        _validate_generation(generation)
+        digest = hashlib.sha256(generation.encode("utf-8")).hexdigest()
+        return f"{SMS_SYNC_STATE_KEY}:{digest}"
+
+    async def get(self, generation: str) -> SmsSyncState | None:
+        raw = await self._redis.get(self._key(generation))
         if raw is None:
             return None
         try:
             payload = json.loads(raw)
             if not isinstance(payload, dict) or set(payload) != {"generation", "last_success_at"}:
                 return None
-            generation = payload["generation"]
+            stored_generation = payload["generation"]
             timestamp = payload["last_success_at"]
             if (
-                not isinstance(generation, str)
-                or not generation
-                or len(generation) > 96
+                not isinstance(stored_generation, str)
+                or not stored_generation
+                or len(stored_generation) > 96
                 or not isinstance(timestamp, int)
                 or isinstance(timestamp, bool)
             ):
+                return None
+            if stored_generation != generation:
                 return None
             _provider_timestamp_to_datetime(timestamp, allow_zero=False)
             return SmsSyncState(generation=generation, last_success_at=timestamp)
         except (TypeError, json.JSONDecodeError):
             return None
-        except (ValueError, OverflowError, OSError) as exc:
-            raise PhoneSmsMalformedData(
-                "PhoneGate returned an invalid SMS marker timestamp"
-            ) from exc
+        except (ValueError, OverflowError, OSError):
+            return None
 
     async def mark_success(self, generation: str, timestamp: int) -> None:
         _validate_generation(generation)
         _provider_timestamp_to_datetime(timestamp, allow_zero=False)
         await self._redis.set(
-            SMS_SYNC_STATE_KEY,
+            self._key(generation),
             json.dumps(
                 {"generation": generation, "last_success_at": timestamp},
                 separators=(",", ":"),
                 sort_keys=True,
             ),
+            ex=SMS_SYNC_MARKER_TTL_SECONDS,
         )
 
     async def aclose(self) -> None:
@@ -121,13 +130,13 @@ class MemorySmsSyncMarker:
     """Small injected seam for tests; production uses ``RedisSmsSyncMarker``."""
 
     def __init__(self) -> None:
-        self._value: SmsSyncState | None = None
+        self._values: dict[str, SmsSyncState] = {}
 
-    async def get(self) -> SmsSyncState | None:
-        return self._value
+    async def get(self, generation: str) -> SmsSyncState | None:
+        return self._values.get(generation)
 
     async def mark_success(self, generation: str, timestamp: int) -> None:
-        self._value = SmsSyncState(generation=generation, last_success_at=timestamp)
+        self._values[generation] = SmsSyncState(generation=generation, last_success_at=timestamp)
 
 
 def _validate_generation(generation: str) -> None:
@@ -399,7 +408,7 @@ async def _ingest_with_client(
     _validate_page(page, requested_limit=settings.phone_sms_batch)
     sync_performed = 0
     now = now_factory()
-    marker = await sync_marker.get()
+    marker = await sync_marker.get(generation)
     try:
         marker_stale = (
             marker is None
