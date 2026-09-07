@@ -35,6 +35,10 @@ not waive this testing gate; bypassing it requires the operator to explicitly de
 override.
 
 
+## Cross-service PhoneGate isolation
+
+JobHunter DEV agents must never modify `/srv/phonegate/.env`, rotate PhoneGate production secrets, or restart `phonegate.service`. Treat PhoneGate as an external production dependency. Live tests may use an operator-injected `PHONEGATE_AUTH_TOKEN` only after explicit authorization; never create a "DEV token" by changing PhoneGate production credentials. If a PhoneGate secret may have leaked, stop and report it; rotation belongs to the PhoneGate deployment workflow.
+
 ## Docker image and disk hygiene
 
 Do not leave Docker archaeology after builds or deployments. After a JobHunter rollout, `api`, `worker`, and `beat` must converge on the same intended application image digest; do not leave long-running services split across old generations.
