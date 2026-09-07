@@ -17,6 +17,20 @@ def test_phone_defaults() -> None:
     assert settings.phone_caller_region == "MD"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://user:pass@example.com",
+        "https://example.com/path?token=x",
+        "https://example.com/path#fragment",
+        "javascript://example.com",
+    ],
+)
+def test_public_base_url_rejects_credentials_queries_fragments_and_non_http(value: str) -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, public_base_url=value)
+
+
 def test_empty_token_is_unset() -> None:
     settings = Settings(_env_file=None, phonegate_auth_token="   ")
     assert settings.phonegate_auth_token is None

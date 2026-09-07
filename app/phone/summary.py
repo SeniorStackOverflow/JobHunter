@@ -30,6 +30,7 @@ from app.models.enums import (
     TurnSpeaker,
 )
 from app.phone.evidence import link_session_evidence
+from app.phone.notification_state import refresh_telegram_notification
 from app.phone.verification import (
     ModelCallMeta,
     PersistedFact,
@@ -842,24 +843,6 @@ async def _finalize_claimed_call(
                 },
             },
         )
-        existing_telegram = call.summary.get("telegram", {})
-        if not isinstance(existing_telegram, dict):
-            existing_telegram = {}
-        telegram_state = existing_telegram.get("state")
-        if (
-            telegram_state == "sent"
-            and int(existing_telegram.get("input_revision", -1)) == call.verification_revision
-        ):
-            telegram = existing_telegram
-        else:
-            telegram = {
-                "input_revision": call.verification_revision,
-                "state": "pending",
-                "attempts": 0,
-                "next_attempt_at": utcnow().isoformat(),
-                "message_id": None,
-                "ambiguous_delivery": False,
-            }
         call.summary = {
             **call.summary,
             "summary_text": extracted.summary_text,
@@ -875,8 +858,8 @@ async def _finalize_claimed_call(
                     arbiter_meta.latency_ms,
                 ),
             },
-            "telegram": telegram,
         }
+        refresh_telegram_notification(call)
         call.summary_state = PhoneSummaryState.DONE
         call.processing_started_at = None
         call.claim_token = None

@@ -129,6 +129,29 @@ class Settings(BaseSettings):
             raise ValueError("MAX_RESUME_BYTES must be between 1 KiB and 25 MiB")
         return value
 
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_base_url(cls, value: str) -> str:
+        try:
+            parts = urlsplit(value)
+            _ = parts.port
+        except ValueError as exc:
+            raise ValueError("PUBLIC_BASE_URL must be a valid URL") from exc
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or any(char in value for char in "<>\"'\\")
+            or any(ord(char) < 32 or char.isspace() for char in parts.hostname or "")
+        ):
+            raise ValueError(
+                "PUBLIC_BASE_URL must be an http(s) URL without credentials, query, or fragment"
+            )
+        return value.rstrip("/")
+
     @field_validator(
         "admin_password_hash",
         "token_encryption_key",

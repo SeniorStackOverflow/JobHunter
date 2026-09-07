@@ -604,9 +604,13 @@ def finalize_pending_calls_task() -> dict[str, Any]:
 def deliver_phone_notifications_task() -> dict[str, Any]:
     from app.phone.telegram import deliver_pending_phone_notifications
 
-    lease = get_settings().phone_telegram_lease_seconds
+    settings = get_settings()
+    lease = settings.phone_telegram_lease_seconds
+    batch = settings.phone_telegram_batch
     return _run_locked_periodic(
-        "phone-telegram", deliver_pending_phone_notifications(), ttl_seconds=max(5, lease)
+        "phone-telegram",
+        deliver_pending_phone_notifications(),
+        ttl_seconds=max(5, lease, batch * 15),
     )
 
 

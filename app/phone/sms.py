@@ -35,6 +35,7 @@ from app.phone.facts import (
     apply_sms_confirmation,
     unlink_sms_confirmation,
 )
+from app.phone.notification_state import refresh_telegram_notification
 from app.phone.numbers import normalize_e164
 from app.phone.schemas import PhoneSmsMessage, PhoneSmsPage
 from app.phone.verification import (
@@ -436,6 +437,8 @@ async def _mark_sms_comparison_pending(
     summary["verification"] = verification
     call.summary = summary
     flag_modified(call, "summary")
+    refresh_telegram_notification(call)
+    flag_modified(call, "summary")
     return True
 
 
@@ -662,6 +665,7 @@ async def _record_sms_failure(
             call.summary_state = PhoneSummaryState.DONE
             call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
             call.needs_review = True
+            call.verification_revision += 1
         verification["sms_reconciliation"] = {
             "state": "retry" if retryable else "failed",
             "sms_turn_id": str(sms_turn_id),
@@ -673,6 +677,9 @@ async def _record_sms_failure(
         summary = dict(call.summary or {})
         summary["verification"] = verification
         call.summary = summary
+        if not retryable:
+            refresh_telegram_notification(call)
+            flag_modified(call, "summary")
         await db.commit()
         return call.verification_status
 

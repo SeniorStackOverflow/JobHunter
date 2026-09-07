@@ -28,6 +28,7 @@ from app.phone.critical import (
     normalize_critical_value,
     sms_field_evidence_matches,
 )
+from app.phone.notification_state import refresh_telegram_notification
 from app.phone.reconciliation import VerificationDecision
 from app.phone.verification import ModelCallMeta, SmsComparisonResult
 
@@ -371,6 +372,8 @@ async def apply_sms_confirmation(
     summary["verification"] = verification
     call.summary = summary
     flag_modified(call, "summary")
+    refresh_telegram_notification(call)
+    flag_modified(call, "summary")
     call.verification_status = status
     call.needs_review = status is PhoneVerificationStatus.NEEDS_REVIEW
     return status
@@ -485,6 +488,8 @@ async def unlink_sms_confirmation(
     summary["verification"] = verification
     call.summary = summary
     flag_modified(call, "summary")
+    refresh_telegram_notification(call)
+    flag_modified(call, "summary")
     return status
 
 
@@ -581,6 +586,9 @@ async def replace_current_facts(
     if persisted_conflict:
         call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
         call.needs_review = True
+    if changed_input:
+        refresh_telegram_notification(call)
+        flag_modified(call, "summary")
 
 
 __all__ = [

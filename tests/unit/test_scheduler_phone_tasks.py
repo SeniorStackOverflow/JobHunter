@@ -19,6 +19,33 @@ def test_deliver_phone_notifications_task_registered() -> None:
     )
 
 
+def test_notification_task_lock_covers_bounded_batch(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    async def fake_deliver() -> dict[str, int]:
+        return {}
+
+    def fake_run(operation, awaitable, *, ttl_seconds):
+        seen["operation"] = operation
+        seen["ttl"] = ttl_seconds
+        awaitable.close()
+        return {"status": "ok"}
+
+    monkeypatch.setattr(scheduler_tasks, "_run_locked_periodic", fake_run)
+    monkeypatch.setattr(
+        scheduler_tasks,
+        "get_settings",
+        lambda: type(
+            "SettingsStub",
+            (),
+            {"phone_telegram_lease_seconds": 300, "phone_telegram_batch": 100},
+        )(),
+    )
+    monkeypatch.setattr("app.phone.telegram.deliver_pending_phone_notifications", fake_deliver)
+    assert deliver_phone_notifications_task.run() == {"status": "ok"}
+    assert seen == {"operation": "phone-telegram", "ttl": 1500}
+
+
 def test_prune_phone_evidence_task_registered() -> None:
     assert prune_phone_evidence_task.name == "job_agent.scheduler.prune_phone_evidence"
 
