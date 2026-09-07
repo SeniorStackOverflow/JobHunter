@@ -1,3 +1,4 @@
+import app.scheduler.tasks as scheduler_tasks
 from app.scheduler.celery_app import celery_app
 from app.scheduler.tasks import (
     finalize_pending_calls_task,
@@ -29,3 +30,26 @@ def test_phone_beat_entries_present() -> None:
 
 def test_finalize_task_keeps_atomic_entrypoint() -> None:
     assert finalize_pending_calls_task.name == "job_agent.scheduler.finalize_pending_calls"
+
+
+def test_sms_periodic_lock_ttl_tracks_configured_interval(monkeypatch) -> None:
+    seen: dict[str, int] = {}
+
+    async def fake_ingest() -> dict[str, int]:
+        return {}
+
+    def fake_run(_operation, awaitable, *, ttl_seconds):
+        seen["ttl"] = ttl_seconds
+        awaitable.close()
+        return {"status": "ok"}
+
+    monkeypatch.setattr(scheduler_tasks, "_run_locked_periodic", fake_run)
+    monkeypatch.setattr(
+        scheduler_tasks,
+        "get_settings",
+        lambda: type("SettingsStub", (), {"phone_sms_poll_interval_seconds": 10})(),
+    )
+    monkeypatch.setattr("app.phone.sms.ingest_phonegate_sms", fake_ingest)
+
+    assert ingest_phonegate_sms_task.run() == {"status": "ok"}
+    assert seen["ttl"] == 20

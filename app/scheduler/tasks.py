@@ -611,7 +611,9 @@ def prune_phone_evidence_task() -> dict[str, Any]:
 def ingest_phonegate_sms_task() -> dict[str, int] | dict[str, str]:
     from app.phone.sms import ingest_phonegate_sms
 
-    return _run_locked_periodic("phone-sms", ingest_phonegate_sms(), ttl_seconds=120)
+    interval = get_settings().phone_sms_poll_interval_seconds
+    ttl_seconds = max(5, int(interval * 2))
+    return _run_locked_periodic("phone-sms", ingest_phonegate_sms(), ttl_seconds=ttl_seconds)
 
 
 __all__ = [

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -35,9 +37,9 @@ class SmsHistoryClient(Protocol):
 
 
 class SmsSyncMarker(Protocol):
-    async def get(self) -> int | None: ...
+    async def get(self) -> SmsSyncState | None: ...
 
-    async def mark_success(self, timestamp: int) -> None: ...
+    async def mark_success(self, generation: str, timestamp: int) -> None: ...
 
 
 class PhoneSmsBacklogOverflow(RuntimeError):
@@ -52,26 +54,64 @@ class PhoneSmsMalformedData(RuntimeError):
     """PhoneGate returned an unrepresentable SMS timestamp."""
 
 
+class PhoneSmsProfileUnavailable(RuntimeError):
+    """No local profile exists to own an inbound SMS snapshot."""
+
+
 SMS_SYNC_STATE_KEY = "job-agent:phone:sms:sync-state"
 _MIN_SMS_TIMESTAMP = datetime(2000, 1, 1, tzinfo=UTC)
 _MAX_SMS_TIMESTAMP = datetime(2100, 1, 1, tzinfo=UTC)
+SMS_SYNC_BOOT_ID = uuid4().hex
+
+
+@dataclass(frozen=True, slots=True)
+class SmsSyncState:
+    generation: str
+    last_success_at: int
 
 
 class RedisSmsSyncMarker:
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
 
-    async def get(self) -> int | None:
+    async def get(self) -> SmsSyncState | None:
         raw = await self._redis.get(SMS_SYNC_STATE_KEY)
         if raw is None:
             return None
         try:
-            return int(raw)
-        except (TypeError, ValueError):
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {"generation", "last_success_at"}:
+                return None
+            generation = payload["generation"]
+            timestamp = payload["last_success_at"]
+            if (
+                not isinstance(generation, str)
+                or not generation
+                or len(generation) > 96
+                or not isinstance(timestamp, int)
+                or isinstance(timestamp, bool)
+            ):
+                return None
+            _provider_timestamp_to_datetime(timestamp, allow_zero=False)
+            return SmsSyncState(generation=generation, last_success_at=timestamp)
+        except (TypeError, json.JSONDecodeError):
             return None
+        except (ValueError, OverflowError, OSError) as exc:
+            raise PhoneSmsMalformedData(
+                "PhoneGate returned an invalid SMS marker timestamp"
+            ) from exc
 
-    async def mark_success(self, timestamp: int) -> None:
-        await self._redis.set(SMS_SYNC_STATE_KEY, str(timestamp))
+    async def mark_success(self, generation: str, timestamp: int) -> None:
+        _validate_generation(generation)
+        _provider_timestamp_to_datetime(timestamp, allow_zero=False)
+        await self._redis.set(
+            SMS_SYNC_STATE_KEY,
+            json.dumps(
+                {"generation": generation, "last_success_at": timestamp},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
 
     async def aclose(self) -> None:
         await self._redis.aclose()
@@ -81,23 +121,41 @@ class MemorySmsSyncMarker:
     """Small injected seam for tests; production uses ``RedisSmsSyncMarker``."""
 
     def __init__(self) -> None:
-        self._value: int | None = None
+        self._value: SmsSyncState | None = None
 
-    async def get(self) -> int | None:
+    async def get(self) -> SmsSyncState | None:
         return self._value
 
-    async def mark_success(self, timestamp: int) -> None:
-        self._value = timestamp
+    async def mark_success(self, generation: str, timestamp: int) -> None:
+        self._value = SmsSyncState(generation=generation, last_success_at=timestamp)
 
 
-def _timestamp_to_datetime(timestamp: int) -> datetime:
+def _validate_generation(generation: str) -> None:
+    if not isinstance(generation, str) or not generation or len(generation) > 96:
+        raise ValueError("invalid SMS sync generation")
+
+
+def _provider_timestamp_to_datetime(timestamp: int, *, allow_zero: bool) -> datetime | None:
     """Convert PhoneGate Unix timestamps to an aware UTC datetime.
 
     Current PhoneGate emits milliseconds; accepting the older seconds form keeps
     recovery imports safe across gateway upgrades.
     """
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        raise ValueError("invalid provider timestamp")
+    if timestamp == 0 and allow_zero:
+        return None
     divisor = 1000 if timestamp >= 100_000_000_000 else 1
-    return datetime.fromtimestamp(timestamp / divisor, tz=UTC)
+    value = datetime.fromtimestamp(timestamp / divisor, tz=UTC)
+    if not _MIN_SMS_TIMESTAMP <= value < _MAX_SMS_TIMESTAMP:
+        raise ValueError("provider timestamp outside representable range")
+    return value
+
+
+def _timestamp_to_datetime(timestamp: int) -> datetime:
+    value = _provider_timestamp_to_datetime(timestamp, allow_zero=False)
+    assert value is not None
+    return value
 
 
 def _utc(value: datetime) -> datetime:
@@ -110,21 +168,31 @@ def _sync_timestamp_is_stale(
 ) -> bool:
     if synced_at is None:
         return True
-    synced = _timestamp_to_datetime(synced_at)
+    synced = _provider_timestamp_to_datetime(synced_at, allow_zero=True)
+    if synced is None:
+        return True
     return now - synced > timedelta(seconds=stale_after_seconds)
 
 
 def _validate_message_timestamp(message: PhoneSmsMessage) -> datetime:
     try:
-        occurred_at = _timestamp_to_datetime(message.timestamp)
+        occurred_at = _provider_timestamp_to_datetime(message.timestamp, allow_zero=False)
     except (OverflowError, OSError, ValueError) as exc:
         raise PhoneSmsMalformedData("PhoneGate returned an invalid SMS timestamp") from exc
-    if not _MIN_SMS_TIMESTAMP <= occurred_at < _MAX_SMS_TIMESTAMP:
-        raise PhoneSmsMalformedData("PhoneGate returned an out-of-range SMS timestamp")
+    assert occurred_at is not None
     return occurred_at
 
 
-def _validate_page(page: PhoneSmsPage) -> None:
+def _validate_page(page: PhoneSmsPage, *, requested_limit: int) -> None:
+    try:
+        if page.synced_at is not None:
+            _provider_timestamp_to_datetime(page.synced_at, allow_zero=True)
+    except (OverflowError, OSError, ValueError, TypeError) as exc:
+        raise PhoneSmsMalformedData("PhoneGate returned an invalid SMS sync timestamp") from exc
+    if requested_limit < 1:
+        raise PhoneSmsMalformedData("SMS history limit is invalid")
+    if len(page.messages) >= requested_limit:
+        raise PhoneSmsBacklogOverflow("PhoneGate SMS history reached its supported page limit")
     if page.count > len(page.messages):
         raise PhoneSmsBacklogOverflow("PhoneGate SMS history page is incomplete")
     if page.count < len(page.messages) or page.count < 0:
@@ -270,7 +338,9 @@ async def _persist_message(
         async with db.begin_nested():
             db.add(sms_session)
             await db.flush()
-    except IntegrityError:
+    except IntegrityError as exc:
+        if not _is_sms_external_id_conflict(exc):
+            raise
         existing = await _existing_sms(db, external_id=message.id)
         if existing is None:
             raise
@@ -283,9 +353,11 @@ async def _persist_message(
             await _ensure_turn(
                 db, sms_session=sms_session, message=message, occurred_at=occurred_at
             )
-    except IntegrityError:
+    except IntegrityError as exc:
         # A concurrent importer may have won the (session_id, seq) race. Reload
         # the row; propagate unrelated integrity failures.
+        if not _is_turn_sequence_conflict(exc):
+            raise
         turn = await db.scalar(
             select(CommunicationTurn).where(
                 CommunicationTurn.session_id == sms_session.id,
@@ -297,6 +369,22 @@ async def _persist_message(
     return sms_session, duplicate
 
 
+def _is_sms_external_id_conflict(exc: IntegrityError) -> bool:
+    text = str(exc.orig or exc).lower()
+    return "uq_communication_sessions_transport_channel_external_id" in text or (
+        "communication_sessions.transport" in text
+        and "communication_sessions.channel" in text
+        and "communication_sessions.transport_external_id" in text
+    )
+
+
+def _is_turn_sequence_conflict(exc: IntegrityError) -> bool:
+    text = str(exc.orig or exc).lower()
+    return "uq_communication_turns_session_seq" in text or (
+        "communication_turns.session_id" in text and "communication_turns.seq" in text
+    )
+
+
 async def _ingest_with_client(
     client: SmsHistoryClient,
     *,
@@ -305,29 +393,40 @@ async def _ingest_with_client(
     sync_marker: SmsSyncMarker,
     sleeper: Callable[[float], Awaitable[object]],
     now_factory: Callable[[], datetime],
+    generation: str,
 ) -> dict[str, int]:
     page = await client.sms_history(limit=settings.phone_sms_batch)
-    _validate_page(page)
+    _validate_page(page, requested_limit=settings.phone_sms_batch)
     sync_performed = 0
     now = now_factory()
-    marker_timestamp = await sync_marker.get()
-    marker_stale = marker_timestamp is None or _sync_timestamp_is_stale(
-        marker_timestamp,
-        now=now,
-        stale_after_seconds=settings.phone_sms_sync_stale_after_seconds,
-    )
-    gateway_stale = _sync_timestamp_is_stale(
-        page.synced_at,
-        now=now,
-        stale_after_seconds=settings.phone_sms_sync_stale_after_seconds,
-    )
+    marker = await sync_marker.get()
+    try:
+        marker_stale = (
+            marker is None
+            or marker.generation != generation
+            or _sync_timestamp_is_stale(
+                marker.last_success_at if marker is not None else None,
+                now=now,
+                stale_after_seconds=settings.phone_sms_sync_stale_after_seconds,
+            )
+        )
+    except (OverflowError, OSError, ValueError, TypeError) as exc:
+        raise PhoneSmsMalformedData("PhoneGate returned an invalid SMS marker timestamp") from exc
+    try:
+        gateway_stale = _sync_timestamp_is_stale(
+            page.synced_at,
+            now=now,
+            stale_after_seconds=settings.phone_sms_sync_stale_after_seconds,
+        )
+    except (OverflowError, OSError, ValueError, TypeError) as exc:
+        raise PhoneSmsMalformedData("PhoneGate returned an invalid SMS sync timestamp") from exc
     if marker_stale or gateway_stale or page.syncing:
         await client.sync_sms()
         sync_performed = 1
         previous_synced_at = page.synced_at
         for attempt in range(settings.phone_sms_sync_poll_attempts):
             page = await client.sms_history(limit=settings.phone_sms_batch)
-            _validate_page(page)
+            _validate_page(page, requested_limit=settings.phone_sms_batch)
             if not page.syncing and _synced_at_is_fresh(
                 page.synced_at,
                 previous=previous_synced_at,
@@ -353,9 +452,11 @@ async def _ingest_with_client(
     async with session_factory() as db:
         profile = await _profile_for_sms(db)
         if profile is None:
-            result["unlinked"] = sum(1 for m in page.messages if m.direction == "incoming")
-            await sync_marker.mark_success(int(now_factory().timestamp() * 1000))
-            return result
+            raise PhoneSmsProfileUnavailable("No local profile is available for SMS import")
+        # End the read-only profile lookup before concurrent SQLite writers
+        # begin. This avoids two read transactions attempting an impossible
+        # lock upgrade; the external-ID constraint still arbitrates the race.
+        await db.commit()
         for message in page.messages:
             if message.direction != "incoming":
                 result["outgoing_ignored"] += 1
@@ -400,7 +501,7 @@ async def _ingest_with_client(
                 if len(matches) > 1:
                     result["ambiguous"] += 1
         await db.commit()
-    await sync_marker.mark_success(int(now_factory().timestamp() * 1000))
+    await sync_marker.mark_success(generation, int(now_factory().timestamp() * 1000))
     return result
 
 
@@ -412,12 +513,15 @@ async def ingest_phonegate_sms(
     sync_marker: SmsSyncMarker | None = None,
     sleeper: Callable[[float], Awaitable[object]] | None = None,
     now_factory: Callable[[], datetime] | None = None,
+    boot_id: str | None = None,
 ) -> dict[str, int]:
     """Synchronize and import a bounded PhoneGate SMS history page."""
     current_settings = settings or get_settings()
     factory = session_factory or async_session_factory
     sleep = sleeper or asyncio.sleep
     now = now_factory or (lambda: datetime.now(UTC))
+    generation = boot_id or SMS_SYNC_BOOT_ID
+    _validate_generation(generation)
     if client is not None:
         marker = sync_marker or MemorySmsSyncMarker()
         try:
@@ -428,6 +532,7 @@ async def ingest_phonegate_sms(
                 sync_marker=marker,
                 sleeper=sleep,
                 now_factory=now,
+                generation=generation,
             )
         finally:
             if sync_marker is None and isinstance(marker, RedisSmsSyncMarker):
@@ -459,6 +564,7 @@ async def ingest_phonegate_sms(
                 sync_marker=marker,
                 sleeper=sleep,
                 now_factory=now,
+                generation=generation,
             )
     finally:
         if sync_marker is None and isinstance(marker, RedisSmsSyncMarker):

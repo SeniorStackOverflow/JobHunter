@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import utcnow
@@ -26,6 +28,53 @@ def speaker_from_phonegate(value: str) -> TurnSpeaker:
 
 
 class SessionStore:
+    async def _lock_session_for_turn(self, session: AsyncSession, session_id: UUID) -> None:
+        bind = session.get_bind()
+        if bind.dialect.name == "postgresql":
+            await session.scalar(
+                select(CommunicationSession.id)
+                .where(CommunicationSession.id == session_id)
+                .with_for_update()
+            )
+
+    async def _flush_turn_with_retry(
+        self, session: AsyncSession, turn: CommunicationTurn, *, transcript_id: int | None
+    ) -> CommunicationTurn | None:
+        for attempt in range(5):
+            try:
+                async with session.begin_nested():
+                    session.add(turn)
+                    await session.flush()
+                return turn
+            except IntegrityError as exc:
+                message = str(exc.orig or exc).lower()
+                if transcript_id is not None:
+                    existing = await session.scalar(
+                        select(CommunicationTurn).where(
+                            CommunicationTurn.session_id == turn.session_id,
+                            CommunicationTurn.phonegate_transcript_id == transcript_id,
+                        )
+                    )
+                    if existing is not None:
+                        return None
+                if "uq_communication_turns_session_seq" not in message and (
+                    "communication_turns.session_id" not in message
+                    or "communication_turns.seq" not in message
+                ):
+                    raise
+            except OperationalError as exc:
+                if "locked" not in str(exc.orig or exc).lower() or attempt == 4:
+                    raise
+            if attempt < 4:
+                max_seq = await session.scalar(
+                    select(func.max(CommunicationTurn.seq)).where(
+                        CommunicationTurn.session_id == turn.session_id
+                    )
+                )
+                turn.seq = int(max_seq or 0) + 1
+                await asyncio.sleep(0)
+        raise RuntimeError("turn sequence allocation exhausted")
+
     async def find_open(self, session: AsyncSession) -> CommunicationSession | None:
         return cast(
             CommunicationSession | None,
@@ -133,15 +182,16 @@ class SessionStore:
         )
         if exists is not None:
             return None
-        count = await session.scalar(
-            select(func.count(CommunicationTurn.id)).where(
+        await self._lock_session_for_turn(session, session_id)
+        max_seq = await session.scalar(
+            select(func.max(CommunicationTurn.seq)).where(
                 CommunicationTurn.session_id == session_id
             )
         )
         turn = CommunicationTurn(
             session_id=session_id,
             phonegate_transcript_id=entry.id,
-            seq=int(count or 0) + 1,
+            seq=int(max_seq or 0) + 1,
             speaker=speaker_from_phonegate(entry.speaker),
             text=entry.text,
             raw_text=entry.text,
@@ -152,9 +202,7 @@ class SessionStore:
             if entry.timestamp_ms
             else datetime.now(UTC),
         )
-        session.add(turn)
-        await session.flush()
-        return turn
+        return await self._flush_turn_with_retry(session, turn, transcript_id=entry.id)
 
     async def record_assistant_turn(
         self,
@@ -166,15 +214,16 @@ class SessionStore:
         delivery_status: TurnDeliveryStatus,
         occurred_at: datetime,
     ) -> CommunicationTurn:
-        count = await session.scalar(
-            select(func.count(CommunicationTurn.id)).where(
+        await self._lock_session_for_turn(session, session_id)
+        max_seq = await session.scalar(
+            select(func.max(CommunicationTurn.seq)).where(
                 CommunicationTurn.session_id == session_id
             )
         )
         turn = CommunicationTurn(
             session_id=session_id,
             phonegate_transcript_id=phonegate_transcript_id,
-            seq=int(count or 0) + 1,
+            seq=int(max_seq or 0) + 1,
             speaker=TurnSpeaker.ASSISTANT,
             text=spoken_text,
             raw_text=spoken_text,
@@ -182,9 +231,11 @@ class SessionStore:
             delivery_status=delivery_status,
             occurred_at=occurred_at,
         )
-        session.add(turn)
-        await session.flush()
-        return turn
+        result = await self._flush_turn_with_retry(
+            session, turn, transcript_id=phonegate_transcript_id
+        )
+        assert result is not None
+        return result
 
     async def set_turn_delivery(
         self, session: AsyncSession, *, turn_id: UUID, status: TurnDeliveryStatus

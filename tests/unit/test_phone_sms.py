@@ -14,14 +14,19 @@ from app.models.enums import (
     CommunicationOutcome,
     TurnSpeaker,
 )
+from app.phone.client import PhoneGateClient
 from app.phone.schemas import PhoneSmsMessage, PhoneSmsPage
 from app.phone.sms import (
     PhoneSmsBacklogOverflow,
     PhoneSmsMalformedData,
+    PhoneSmsProfileUnavailable,
     PhoneSmsSyncUnavailable,
+    RedisSmsSyncMarker,
+    SmsSyncState,
     ingest_phonegate_sms,
 )
 from app.settings import Settings
+from tests.fixtures.fake_phonegate import FakePhoneGate
 
 
 class StubPhoneGate:
@@ -54,14 +59,14 @@ class SequencedPhoneGate(StubPhoneGate):
 
 class MemorySyncMarker:
     def __init__(self, value: int | None = None) -> None:
-        self.value = value
+        self.value = SmsSyncState("test", value) if value is not None else None
         self.marked: list[int] = []
 
-    async def get(self) -> int | None:
+    async def get(self) -> SmsSyncState | None:
         return self.value
 
-    async def mark_success(self, timestamp: int) -> None:
-        self.value = timestamp
+    async def mark_success(self, generation: str, timestamp: int) -> None:
+        self.value = SmsSyncState(generation, timestamp)
         self.marked.append(timestamp)
 
 
@@ -290,6 +295,77 @@ async def test_incomplete_phonegate_page_fails_without_persisting_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_exact_supported_limit_is_rejected_before_import(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    messages = [sms(ident=f"m-{n}", timestamp=1_720_000_000_000 + n) for n in range(150)]
+    gateway = SequencedPhoneGate(
+        [PhoneSmsPage(messages=messages, count=150, synced_at=1_720_000_000_000)]
+    )
+
+    with pytest.raises(PhoneSmsBacklogOverflow):
+        await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    async with sqlite_session_factory() as db:
+        assert await db.scalar(select(CommunicationSession)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [150, 151])
+async def test_real_fake_phonegate_cap_is_rejected_without_writes(
+    sqlite_session_factory: async_sessionmaker[AsyncSession], count: int
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    fake = FakePhoneGate()
+    for number in range(count):
+        fake.add_sms(
+            id=f"m-{number}",
+            address="+37360000000",
+            text="message",
+            timestamp=1_720_000_000_000 + number,
+        )
+    async with PhoneGateClient(
+        base_url="http://fake",
+        token="test",
+        transport=fake.transport(),
+    ) as gateway:
+        with pytest.raises(PhoneSmsBacklogOverflow):
+            await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    async with sqlite_session_factory() as db:
+        assert await db.scalar(select(CommunicationSession)) is None
+
+
+@pytest.mark.asyncio
+async def test_real_fake_phonegate_149_message_page_is_complete(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    fake = FakePhoneGate()
+    for number in range(149):
+        fake.add_sms(
+            id=f"m-{number}",
+            address="+37360000000",
+            text="message",
+            timestamp=1_720_000_000_000 + number,
+        )
+    async with PhoneGateClient(
+        base_url="http://fake", token="test", transport=fake.transport()
+    ) as gateway:
+        result = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    assert result["imported"] == 149
+
+
+@pytest.mark.asyncio
 async def test_missing_marker_forces_sync_then_marks_only_complete_snapshot(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -303,12 +379,83 @@ async def test_missing_marker_forces_sync_then_marks_only_complete_snapshot(
     marker = MemorySyncMarker()
 
     result = await ingest_phonegate_sms(
-        client=gateway, session_factory=sqlite_session_factory, sync_marker=marker
+        client=gateway, session_factory=sqlite_session_factory, sync_marker=marker, boot_id="test"
     )
 
     assert gateway.sync_calls == 1
     assert len(marker.marked) == 1
     assert result["imported"] == 1
+
+
+@pytest.mark.asyncio
+async def test_new_worker_generation_forces_sync_with_fresh_marker(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="m-1", timestamp=1_720_000_000_000)])
+    marker = MemorySyncMarker()
+
+    await ingest_phonegate_sms(
+        client=gateway,
+        session_factory=sqlite_session_factory,
+        sync_marker=marker,
+        boot_id="worker-a",
+    )
+    await ingest_phonegate_sms(
+        client=gateway,
+        session_factory=sqlite_session_factory,
+        sync_marker=marker,
+        boot_id="worker-b",
+    )
+    assert gateway.sync_calls == 2
+    assert len(marker.marked) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_profile_is_degradation_and_does_not_advance_marker(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    marker = MemorySyncMarker()
+    gateway = StubPhoneGate([sms(ident="m-1", timestamp=1_720_000_000_000)])
+
+    with pytest.raises(PhoneSmsProfileUnavailable):
+        await ingest_phonegate_sms(
+            client=gateway,
+            session_factory=sqlite_session_factory,
+            sync_marker=marker,
+            boot_id="worker-a",
+        )
+    assert marker.marked == []
+
+
+class _FakeRedis:
+    def __init__(self, value: str | None = None) -> None:
+        self.value = value
+
+    async def get(self, _key: str) -> str | None:
+        return self.value
+
+    async def set(self, _key: str, value: str) -> None:
+        self.value = value
+
+
+@pytest.mark.asyncio
+async def test_redis_marker_is_strict_json_and_preserves_generation() -> None:
+    redis = _FakeRedis()
+    marker = RedisSmsSyncMarker(redis)  # type: ignore[arg-type]
+    await marker.mark_success("worker-a", 1_720_000_000_000)
+    state = await marker.get()
+    assert state is not None
+    assert state.generation == "worker-a"
+    assert state.last_success_at == 1_720_000_000_000
+    redis.value = "not-json"
+    assert await marker.get() is None
+    redis.value = '{"generation":"worker-a","last_success_at":999999999999999999}'
+    with pytest.raises(PhoneSmsMalformedData):
+        await marker.get()
 
 
 @pytest.mark.asyncio
