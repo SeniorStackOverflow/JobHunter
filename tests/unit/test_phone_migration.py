@@ -149,6 +149,12 @@ def test_postgresql_downgrade_replaces_summary_check_before_adding_legacy_check(
         for index, (name, args) in enumerate(recorder.calls)
         if name == "execute" and "ADD CONSTRAINT" in str(args[0])
     )
+    assert (
+        "drop_constraint",
+        (migration._RELATED_SESSION_FK, "communication_sessions"),
+    ) in {
+        (name, args[:2]) for name, args in recorder.calls
+    }
     assert drop_current < add_legacy
 
 

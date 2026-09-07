@@ -450,6 +450,36 @@ async def test_malformed_transcript_event_is_skipped_not_fatal(
     assert loop._cursor == 7
 
 
+async def test_late_transcript_after_idle_is_attached_to_just_closed_call(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """A delayed event batch must not lose RX lines merely because status is IDLE."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+        status = await client.device_status()
+        await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        fake.answer()
+        await _drain(loop)
+        fake.hangup()
+        await _drain(loop)
+        late_id = fake.transcript(speaker="rx", text="отложенная реплика работодателя")
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        turn = await session.scalar(
+            select(CommunicationTurn).where(
+                CommunicationTurn.phonegate_transcript_id == late_id
+            )
+        )
+    assert turn is not None
+
+
 async def test_savepoint_rollback_restores_open_session_id(
     profiled_factory: async_sessionmaker[AsyncSession],
     redis: FakeAsyncRedis,

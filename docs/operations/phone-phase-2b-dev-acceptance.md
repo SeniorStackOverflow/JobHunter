@@ -8,22 +8,23 @@ raw SMS, or employer transcript.
 
 ## DEV Compose
 
-The DEV project used the worktree `docker-compose.yml` and the local port
-override at `/home/andrei/.config/jobhunter/docker-compose.dev.local.yml`.
-The sibling checkout compose file was excluded after it was found to omit the
-`phone` worker queue. The application image was rebuilt from this worktree;
-the image identifier was recorded as `sha256:0ae26c6c…` and was created at
-2026-09-07 13:27:19+03:00.
+The DEV project used this worktree’s `docker-compose.yml`, the local port
+override at `/home/andrei/.config/jobhunter/docker-compose.dev.local.yml`, and a
+secret-free temporary live override outside the repository. The sibling
+checkout compose file was excluded because it omits the `phone` worker queue.
+Only DEV containers were rebuilt and recreated. The migration reached head
+`b7c8d9e0f1a2` and exited 0; PostgreSQL uses the bounded
+`fk_communication_sessions_related_session` identifier.
 
-At 13:30:56 the rebuilt migration container failed because PostgreSQL rejected
-the old default credentials. The retry used the existing DEV database
-credentials through the local process environment only. The migration then
-reached head `b7c8d9e0f1a2` and exited 0. During that upgrade PostgreSQL
-reported that the generated self-referential foreign-key name exceeded its
-63-character identifier limit; the migration now uses the bounded name
-`fk_communication_sessions_related_session`.
+The base and production Compose definitions now declare the durable named
+volume `phone_evidence` at `/data/phone_evidence`. The call agent, DEV worker,
+and production control worker mount it read-write; the API mounts it
+read-only. `PHONE_EVIDENCE_DIR` is propagated to every relevant service. The
+runtime image creates the directory for UID 10001 before the volume is first
+used. Blank phone summary transport settings fall back to llmRouter base URL,
+key, and model; explicit phone overrides still win.
 
-At 13:36:28 the DEV services were healthy:
+At 14:07 the DEV services were healthy:
 
 | Service | Result |
 | --- | --- |
@@ -32,7 +33,7 @@ At 13:36:28 the DEV services were healthy:
 | API | healthy |
 | Celery worker | healthy; `phone` queue present |
 | Celery beat | healthy |
-| Phone agent | healthy; dormant because DEV PhoneGate credentials were not configured |
+| Phone agent | healthy; connected to DEV PhoneGate |
 
 The API container returned `{"status":"ok"}` from `/health` and
 `{"status":"ready","checks":{"database":{"ok":true},"redis":{"ok":true}}}`
@@ -41,27 +42,18 @@ operations detected.`
 
 ## Restart recovery
 
-The DEV worker was restarted at 13:33:19 and was healthy again at 13:33:34.
-Its logs show a clean warm shutdown, Redis reconnect, and `ready` state. A
-post-restart database check reported `duplicate_transport_groups|0` and
-`pending_calls|0`. No real pending call existed in this run, so a duplicate
-post-crash task delivery could not be exercised with live call data.
+The call agent and worker were recreated several times from the worktree and
+returned healthy. The live harness also re-imported the DEV PhoneGate event
+cursor after a failed call; no production project or data was touched.
 
-## Automated checks
+## Automated and live checks
 
-The opt-in real-call module was executed with:
-
-```text
-uv run pytest -q -m realcall tests/realcall/test_realcall_phase_2b.py
-```
-
-Result: 4 skipped. The environment did not provide
-`ENABLE_REALCALL_TESTS`, PhoneGate endpoint/authentication, llmRouter
-credentials, Telegram credentials, or A06/A14 rig values. Consequently no
-real llmRouter request, Telegram delivery, PhoneGate request, GSM call, or
-SMS was attempted. Matching and conflicting SMS checks remain blocked on the
-approved employer-side SMS rig; the harness intentionally has no outbound SMS
-operation.
+The root acceptance run completed the five real llmRouter verification cases
+with `LLMROUTER_PREFER=fast` and a 120-second timeout. The real PhoneGate
+health, device, read-only SMS history, and audio endpoints also passed. No
+Telegram credentials were present, so the DEV override recorded Telegram as
+`disabled`; no message was sent or claimed. Outbound SMS matching/conflict
+checks remain unavailable on the approved employer-side rig.
 
 The local A06 harness checks passed:
 
@@ -72,30 +64,37 @@ uv run pytest tests/unit/test_realcall_a06_rig.py tests/unit/test_realcall_preco
 
 ## Task 12 llmRouter contract follow-up
 
-On 2026-09-07 the authorized DEV environment was loaded for only
-`LLMROUTER_BASE_URL`, `LLMROUTER_API_KEY`, `LLMROUTER_PREFER`, and
-`OPENAI_MODEL`; no values were recorded here. The verification request boundary
-now normalizes every Extractor, Verifier, Arbiter, and SMS JSON schema so every
-object property is required. Defaulted fields are nullable in the wire schema
-and remain accepted by the typed Pydantic result models. The completion budget
-was raised from 1200 to 1536 after a reasoning backend returned truncated JSON.
-
-The focused regression and the complete phone unit module passed:
+The verification request boundary normalizes every Extractor, Verifier,
+Arbiter, and SMS JSON schema so every object property is required. Focused
+phone verification tests passed. The real five-case result is recorded above;
+no provider response body or credential is stored here.
 
 ```text
 uv run pytest -q tests/unit/test_phone_verification.py
 16 passed
 ```
 
-An authorized direct Extractor request returned HTTP 200 with the normalized
-schema. The initial full opt-in run still encountered one sanitized HTTP 400;
-the repeated five-fixture run no longer showed the original schema rejection,
-completed the absolute fixture's Extractor and Verifier passes, then stopped on
-an llmRouter timeout in the Arbiter pass after 278.12 seconds. This is an
-external provider-capacity limit in this run; the real llmRouter acceptance
-therefore remains partial.
 No provider response body, credential, transcript, or raw identifier is stored
 in this artifact.
+
+## GSM acceptance observations
+
+The authorized A06→A14 harness reached the DEV call agent multiple times. The
+13:24 and 13:30 calls completed all three verification passes but correctly
+ended `needs_review`: the first injected speech before `listening`, and the
+second exposed global PhoneGate transcript IDs being used as a per-call cursor.
+The latter also exposed ASR time `14.30`, which is now normalized safely to
+`14:30` with ambiguity tests.
+
+The 13:45 call was `skipped` because the rig produced no employer RX turn;
+PhoneGate had only assistant transcript events for that call. A 14:07 retry
+failed before injection because the rig’s Edge-TTS returned `NoAudioReceived`.
+The subsequent retry completed the scripted call but again produced no RX
+turn, so it was skipped. These runs do not constitute a high-confidence GSM
+acceptance and are not represented as one. The harness now waits for
+`listening`, seeds a per-call transcript cursor, recovers delayed post-IDLE
+transcript events by bounded event time, and requires evidence links before
+high-confidence facts can pass.
 
 ## Admin browser acceptance
 
@@ -119,7 +118,7 @@ The final checks ran after the DEV and browser checks:
 | --- | --- |
 | `uv run ruff check .` | passed |
 | `uv run mypy app fixture_site` | passed; 120 source files |
-| `uv run pytest -q` | 912 passed, 16 skipped, 135.56s |
+| `uv run pytest -q` | 922 passed, 16 skipped, 134.94s |
 | `git diff --check` | passed |
 | `uv run ruff format --check .` | blocked by six pre-existing unformatted Phase 1/2 design and plan Markdown files; changed Python and acceptance files pass targeted format checks |
 
@@ -129,8 +128,7 @@ reformatted to force the repository-wide format check green.
 
 ## Known limits
 
-The live acceptance remains incomplete until the operator supplies the
-authorized DEV Telegram and PhoneGate configuration and the approved SMS rig,
-and until the llmRouter Arbiter pass completes within its timeout budget. The
-final manual operator call is intentionally still pending and must occur only
-after Sol review.
+Telegram delivery and outbound SMS comparison remain unverified because the
+authorized credentials/rig were unavailable. A fresh GSM run with a working
+Edge-TTS/ASR path is still required to record a truthful high-confidence live
+call; the current evidence is deliberately reported as incomplete.

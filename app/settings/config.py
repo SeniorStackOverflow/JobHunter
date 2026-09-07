@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     phone_evidence_max_total_mb: int = Field(default=500, ge=10, le=10_000)
 
     phone_summary_llm_enabled: bool = False
-    phone_summary_llm_base_url: str = "http://127.0.0.1:4000"
+    phone_summary_llm_base_url: str = ""
     phone_summary_llm_api_key: SecretStr | None = None
     phone_summary_llm_model: str = ""
     phone_summary_llm_prefer: Literal["fast", "cheap", "quality", "balanced"] = "quality"
@@ -209,6 +209,14 @@ class Settings(BaseSettings):
     @property
     def effective_summary_model(self) -> str:
         return self.phone_summary_llm_model.strip() or (self.openai_model or "").strip()
+
+    @property
+    def effective_phone_summary_base_url(self) -> str:
+        return self.phone_summary_llm_base_url.strip() or self.llmrouter_base_url.strip()
+
+    @property
+    def effective_phone_summary_api_key(self) -> SecretStr | None:
+        return self.phone_summary_llm_api_key or self.llmrouter_api_key
 
     @property
     def effective_phone_verification_extractor_model(self) -> str:

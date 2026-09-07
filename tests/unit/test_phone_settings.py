@@ -163,6 +163,34 @@ def test_phone_verification_defaults_and_model_fallbacks() -> None:
     assert s.effective_phone_verification_sms_model == "gpt-x"
 
 
+def test_phone_summary_transport_falls_back_to_llmrouter_and_honors_overrides() -> None:
+    s = Settings(
+        _env_file=None,
+        llmrouter_base_url="https://router.example",
+        llmrouter_api_key="router-key",
+        openai_model="router-model",
+        phone_summary_llm_base_url="",
+        phone_summary_llm_api_key=None,
+    )
+    assert s.effective_phone_summary_base_url == "https://router.example"
+    assert s.effective_phone_summary_api_key is not None
+    assert s.effective_phone_summary_api_key.get_secret_value() == "router-key"
+
+    explicit = Settings(
+        _env_file=None,
+        llmrouter_base_url="https://router.example",
+        llmrouter_api_key="router-key",
+        openai_model="router-model",
+        phone_summary_llm_base_url="https://phone-router.example",
+        phone_summary_llm_api_key="phone-key",
+        phone_summary_llm_model="phone-model",
+    )
+    assert explicit.effective_phone_summary_base_url == "https://phone-router.example"
+    assert explicit.effective_phone_summary_api_key is not None
+    assert explicit.effective_phone_summary_api_key.get_secret_value() == "phone-key"
+    assert explicit.effective_summary_model == "phone-model"
+
+
 def test_production_enabled_verification_requires_effective_models() -> None:
     base = _prod_base() | {
         "phone_summary_llm_enabled": True,

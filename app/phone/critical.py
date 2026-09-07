@@ -118,7 +118,10 @@ _ADDRESS_RE = re.compile(
     re.IGNORECASE,
 )
 _NUMERIC_TIME_RE = re.compile(r"(?<!\d)(?P<hour>\d{1,2}):(?P<minute>\d{2})(?!\d)")
-_CONTEXT_TIME_RE = re.compile(r"(?<!\w)(?:в|на)\s+(?P<hour>\d{1,2})(?!\d|\s*:)")
+_NUMERIC_DOT_TIME_RE = re.compile(r"(?<!\d)(?P<hour>\d{1,2})\.(?P<minute>\d{2})(?!\d)")
+_CONTEXT_TIME_RE = re.compile(
+    r"(?<!\w)(?:в|на)\s+(?P<hour>\d{1,2})(?!\d|\s*[:.]\s*\d{2})"
+)
 _HOUR_PHRASE_RE = re.compile(
     r"(?<!\w)(?:(?:в|на)\s+)?(?P<number>[а-яё]+(?:\s+[а-яё]+)?)\s+"
     r"час(?:а|ов)?(?:\s+(?P<period>утра|дня|вечера|ночи))?(?!\w)",
@@ -198,6 +201,15 @@ def _parse_time(raw: str) -> str | None:
 
     candidates: list[tuple[int, int]] = []
     for match in _NUMERIC_TIME_RE.finditer(text):
+        hour, minute = int(match.group("hour")), int(match.group("minute"))
+        if hour > 23 or minute > 59:
+            return None
+        candidates.append((hour, minute))
+
+    # ASR commonly renders a spoken time separator as a period (``14.30``).
+    # Accept that form only when it is an unambiguous HH.MM expression; the
+    # surrounding ambiguity checks above still reject alternatives and ranges.
+    for match in _NUMERIC_DOT_TIME_RE.finditer(text):
         hour, minute = int(match.group("hour")), int(match.group("minute"))
         if hour > 23 or minute > 59:
             return None

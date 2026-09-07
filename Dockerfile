@@ -32,7 +32,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 jobagent \
     && useradd --system --uid 10001 --gid jobagent --home-dir /srv/job-agent jobagent \
-    && install -d -o jobagent -g jobagent -m 0750 /srv/job-agent /data/resumes
+    && install -d -o jobagent -g jobagent -m 0750 /srv/job-agent /data/resumes /data/phone_evidence
 
 COPY --from=builder /opt/venv /opt/venv
 

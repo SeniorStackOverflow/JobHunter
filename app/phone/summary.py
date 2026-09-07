@@ -335,9 +335,9 @@ async def _job_company_vacancy(
 
 
 def _build_provider(settings: Settings) -> PhoneSummaryProvider:
-    api_key = settings.phone_summary_llm_api_key or settings.llmrouter_api_key
+    api_key = settings.effective_phone_summary_api_key
     return PhoneSummaryProvider(
-        base_url=settings.phone_summary_llm_base_url,
+        base_url=settings.effective_phone_summary_base_url,
         api_key=api_key.get_secret_value() if api_key is not None else "",
         model=settings.effective_summary_model,
         prefer=settings.phone_summary_llm_prefer,
@@ -347,9 +347,9 @@ def _build_provider(settings: Settings) -> PhoneSummaryProvider:
 
 def _build_verification_provider(settings: Settings) -> PostCallVerificationProvider:
     """Construct the independent pass provider from typed application settings."""
-    api_key = settings.phone_summary_llm_api_key or settings.llmrouter_api_key
+    api_key = settings.effective_phone_summary_api_key
     return PostCallVerificationProvider(
-        base_url=settings.phone_summary_llm_base_url,
+        base_url=settings.effective_phone_summary_base_url,
         api_key=api_key.get_secret_value() if api_key is not None else "",
         model=settings.effective_summary_model,
         extractor_model=settings.effective_phone_verification_extractor_model,

@@ -10,6 +10,7 @@ x-app: &app
     DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://job_agent:change-me@postgres:5432/job_agent}
     REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     RESUME_STORAGE_PATH: /data/resumes
+    PHONE_EVIDENCE_DIR: ${PHONE_EVIDENCE_DIR:-/data/phone_evidence}
     REAL_EMAIL_DELIVERY_ENABLED: ${REAL_EMAIL_DELIVERY_ENABLED:-false}
     EMAIL_PROVIDER: ${EMAIL_PROVIDER:-fake}
   networks:
@@ -97,6 +98,7 @@ services:
         condition: service_healthy
     volumes:
       - resumes:/data/resumes
+      - phone_evidence:/data/phone_evidence
     healthcheck:
       <<: *app-healthcheck
       test:
@@ -125,6 +127,7 @@ services:
         condition: service_healthy
     volumes:
       - resumes:/data/resumes
+      - phone_evidence:/data/phone_evidence
     shm_size: 1gb
     healthcheck:
       <<: *app-healthcheck
@@ -176,6 +179,8 @@ services:
           test -n "$$(find /tmp/phone-agent-alive -mmin -2)"
     restart: unless-stopped
     stop_grace_period: 15s
+    volumes:
+      - phone_evidence:/data/phone_evidence
     logging: *default-logging
 
   caddy:
@@ -283,6 +288,7 @@ volumes:
   caddy_data:
   caddy_config:
   backup_data:
+  phone_evidence:
 
 networks:
   backend:

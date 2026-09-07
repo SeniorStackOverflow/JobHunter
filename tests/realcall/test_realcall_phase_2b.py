@@ -36,8 +36,20 @@ from tests.realcall.a06_originate import A06Rig
 
 _CRITICAL_PHRASE = (
     "Звоню по вакансии кладовщика. Собеседование двенадцатого сентября в "
-    "четырнадцать тридцать, по адресу улица Индепенденцей десять."
+    "четырнадцать тридцать, по адресу улица Индепенденцей десять, по "
+    "кишинёвскому времени."
 )
+
+
+def _telegram_state_allowed(summary: dict[str, object], *, configured: bool) -> bool:
+    """Accept only delivered Telegram cards when credentials were configured.
+
+    The DEV GSM acceptance remains valid with Telegram deliberately disabled, but
+    it must record that state instead of claiming a delivery that did not happen.
+    """
+    telegram = summary.get("telegram")
+    state = telegram.get("state") if isinstance(telegram, dict) else None
+    return state == "sent" if configured else state in {"disabled", "pending"}
 
 
 def _require_real_env(*names: str) -> dict[str, str]:
@@ -214,6 +226,22 @@ async def test_realcall_phase_2b_gsm_acceptance(a06_rig: A06Rig) -> None:
             + 30,
         )
         assert connected is not None, "DEV call was not auto-answered"
+        per_block_ceiling = (
+            settings.phone_speak_fence_timeout_seconds
+            + settings.phone_tx_idle_timeout_seconds
+            + settings.phone_inter_block_listen_seconds
+        )
+        listening = await _wait_for_session(
+            lambda call: call.script_stage == "listening",
+            since=started_at,
+            timeout_seconds=(
+                settings.phone_answer_connect_timeout_seconds
+                + settings.phone_post_connect_wait_seconds
+                + 4 * per_block_ceiling
+                + 15
+            ),
+        )
+        assert listening is not None, "DEV call did not reach listening before speech injection"
         a06_rig.inject_uplink_speech(_CRITICAL_PHRASE)
         finished = await _wait_for_session(
             lambda call: call.ended_at is not None,
@@ -233,7 +261,8 @@ async def test_realcall_phase_2b_gsm_acceptance(a06_rig: A06Rig) -> None:
     assert accepted is not None, "Celery did not finalize the DEV call"
     assert accepted.summary_state.value == "done"
     assert accepted.verification_status is PhoneVerificationStatus.HIGH_CONFIDENCE
-    assert accepted.summary.get("telegram", {}).get("state") == "sent"
+    telegram_configured = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+    assert _telegram_state_allowed(accepted.summary, configured=telegram_configured)
     assert accepted.ended_at is not None
 
     async with async_session_factory() as db:

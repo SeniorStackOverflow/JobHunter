@@ -162,6 +162,12 @@ class CallOrchestrator:
         # call, so the clock starts here — GREETING counts against it too.
         answer_start = time.monotonic()
 
+        # PhoneGate transcript IDs are global across calls.  Seed the cursor
+        # immediately after this call is connected so the listening loop cannot
+        # mistake an old employer line for a new one (and capture its audio
+        # under the current session).
+        seen_transcript_id = await self._latest_transcript_cursor()
+
         async with self._sf() as db:
             call = await db.get(CommunicationSession, session_id)
             if call is not None:
@@ -195,7 +201,6 @@ class CallOrchestrator:
         # LISTENING ---------------------------------------------------
         await self._set_stage("listening")
         last_activity = time.monotonic()
-        seen_transcript_id = 0
         observed_rx_entries: list[str] = []
         while True:
             cmd = await self._cmd()
@@ -353,6 +358,14 @@ class CallOrchestrator:
         tx_id = tx_lines[-1].id
         self._last_tx_transcript_id = tx_id
         return tx_id
+
+    async def _latest_transcript_cursor(self) -> int:
+        """Return the global transcript high-water mark at call start."""
+        try:
+            page = await self._client.transcript(after_id=0, limit=250)
+        except (PhoneGateUnavailable, PhoneGateError):
+            return 0
+        return max([page.latest_id, *(entry.id for entry in page.entries)], default=0)
 
     async def _call_active(self) -> bool:
         """Whether the call is still ``IN_CALL``. On an unreachable PhoneGate we

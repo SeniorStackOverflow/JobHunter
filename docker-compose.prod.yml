@@ -17,7 +17,28 @@ x-production-app: &production-app
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     OPENAI_MODEL: ${OPENAI_MODEL:-}
     GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+    LLMROUTER_BASE_URL: ${LLMROUTER_BASE_URL:-http://llmrouter:4000}
+    LLMROUTER_API_KEY: ${LLMROUTER_API_KEY:-}
+    LLMROUTER_PREFER: ${LLMROUTER_PREFER:-quality}
     RESUME_STORAGE_PATH: /data/resumes
+    PHONE_EVIDENCE_DIR: /data/phone_evidence
+    PHONEGATE_URL: ${PHONEGATE_URL:-}
+    PHONEGATE_AUTH_TOKEN: ${PHONEGATE_AUTH_TOKEN:-}
+    PHONE_AGENT_ENABLED: ${PHONE_AGENT_ENABLED:-false}
+    PHONE_AUTO_ANSWER_ENABLED: ${PHONE_AUTO_ANSWER_ENABLED:-false}
+    PHONE_SUMMARY_LLM_ENABLED: ${PHONE_SUMMARY_LLM_ENABLED:-false}
+    PHONE_SUMMARY_LLM_BASE_URL: ${PHONE_SUMMARY_LLM_BASE_URL:-}
+    PHONE_SUMMARY_LLM_API_KEY: ${PHONE_SUMMARY_LLM_API_KEY:-}
+    PHONE_SUMMARY_LLM_MODEL: ${PHONE_SUMMARY_LLM_MODEL:-}
+    PHONE_SUMMARY_LLM_PREFER: ${PHONE_SUMMARY_LLM_PREFER:-quality}
+    PHONE_VERIFICATION_EXTRACTOR_MODEL: ${PHONE_VERIFICATION_EXTRACTOR_MODEL:-}
+    PHONE_VERIFICATION_VERIFIER_MODEL: ${PHONE_VERIFICATION_VERIFIER_MODEL:-}
+    PHONE_VERIFICATION_ARBITER_MODEL: ${PHONE_VERIFICATION_ARBITER_MODEL:-}
+    PHONE_VERIFICATION_SMS_MODEL: ${PHONE_VERIFICATION_SMS_MODEL:-}
+    TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
   security_opt:
     - no-new-privileges:true
@@ -65,6 +86,7 @@ services:
       - "127.0.0.1:8091:8000"
     volumes:
       - resumes:/data/resumes
+      - phone_evidence:/data/phone_evidence:ro
 
   worker:
     <<: *production-app
@@ -82,6 +104,7 @@ services:
       - --max-memory-per-child=600000
     volumes:
       - resumes:/data/resumes:ro
+      - phone_evidence:/data/phone_evidence
 
   matching-worker:
     image: job-agent:local
@@ -151,6 +174,7 @@ services:
         condition: service_healthy
     volumes:
       - resumes:/data/resumes:ro
+      - phone_evidence:/data/phone_evidence
     networks:
       - backend
     init: true
@@ -176,6 +200,8 @@ services:
   call-agent:
     <<: *production-app
     command: ["job-agent", "phone-agent"]
+    volumes:
+      - phone_evidence:/data/phone_evidence
 
   caddy:
     profiles: ["container-edge"]

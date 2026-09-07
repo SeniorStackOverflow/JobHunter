@@ -364,7 +364,7 @@ def _downgrade_postgresql() -> None:
         )
     )
     op.drop_constraint(
-        "fk_communication_sessions_related_session_id_communication_sessions",
+        _RELATED_SESSION_FK,
         "communication_sessions",
         type_="foreignkey",
     )

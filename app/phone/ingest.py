@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.audit import record_audit_event
 from app.database.base import utcnow
 from app.models.entities import CommunicationSession, PhoneDeviceSnapshot
-from app.models.enums import CommunicationOutcome
+from app.models.enums import CommunicationChannel, CommunicationOutcome
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
@@ -586,10 +586,32 @@ class IngestLoop:
             # is the only writer that knows the spoken_text / delivery status.
             return
         open_row = await self._open_session_this_generation(session)
-        if open_row is None:
-            if status.call_state == "IDLE":
+        if open_row is None and status.call_state == "IDLE":
+            # Event delivery can lag the device-status poll. Recover a
+            # transcript emitted during a just-closed call by matching its
+            # gateway timestamp to the completed local session.
+            event_at = (
+                datetime.fromtimestamp(event.timestamp / 1000, UTC)
+                if event.timestamp > 0
+                else None
+            )
+            if event_at is not None:
+                open_row = await session.scalar(
+                    select(CommunicationSession)
+                    .where(
+                        CommunicationSession.channel == CommunicationChannel.CALL,
+                        CommunicationSession.phonegate_generation == self._generation,
+                        CommunicationSession.started_at <= event_at + timedelta(seconds=2),
+                        CommunicationSession.ended_at >= event_at - timedelta(seconds=2),
+                    )
+                    .order_by(CommunicationSession.started_at.desc())
+                    .limit(1)
+                )
+            if open_row is None:
                 logger.info("phone_transcript_after_call_end", transcript_id=entry.id)
                 return
+
+        if open_row is None:
             correlation = await self._correlation.resolve(session, status.caller_number)
             if correlation is None:
                 return

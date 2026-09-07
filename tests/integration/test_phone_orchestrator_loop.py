@@ -152,6 +152,7 @@ async def test_agent_captures_evidence_clip_during_listening(
     clip written under ``phone_evidence_dir/<session_id>/<transcript_id>.wav``."""
     fake = FakePhoneGate()
     fake.set_call_audio(b"RIFFclip")
+    old_id = fake.transcript(speaker="rx", text="вчера был старый адрес 99")
     redis = FakeAsyncRedis()
 
     class _RedisMod:
@@ -222,3 +223,4 @@ async def test_agent_captures_evidence_clip_during_listening(
 
     clip = evidence_dir / str(session_id) / f"{rx_id}.wav"
     assert clip.read_bytes() == b"RIFFclip"
+    assert not (evidence_dir / str(session_id) / f"{old_id}.wav").exists()
