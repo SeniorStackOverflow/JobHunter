@@ -186,14 +186,12 @@ def _controlled_alternatives(call: object, field: str) -> list[tuple[str, str]]:
                 candidate.get("normalized_value") or candidate.get("raw_expression"), limit=160
             )
             try:
-                source_turn_id = UUID(str(candidate.get("source_turn_id", "")))
+                UUID(str(candidate.get("source_turn_id", "")))
             except (TypeError, ValueError, AttributeError):
-                source_turn_id = None
-            quote = (
-                _short_quote(candidate.get("supporting_quote"))
-                if source_turn_id is not None
-                else ""
-            )
+                continue
+            quote = _short_quote(candidate.get("supporting_quote"))
+            if not quote:
+                continue
             pair = (value, quote)
             if value and pair not in out:
                 out.append(pair)
@@ -295,7 +293,16 @@ def render_call_notification(
                 alternatives.append(f"{label}: значение не установлено")
                 continue
             marker = "Подтверждено" if fact.state is CallFactState.CONFIRMED else "Предварительно"
-            lines.append(f"{marker} — {escape(label)}: {escape(value)}")
+            supporting_quote = next(
+                (
+                    quote
+                    for candidate, quote in _controlled_alternatives(call, fact.field)
+                    if candidate == value and quote
+                ),
+                "",
+            )
+            quote_suffix = f" (фраза: «{supporting_quote}»)" if supporting_quote else ""
+            lines.append(f"{marker} — {escape(label)}: {escape(value + quote_suffix)}")
         if alternatives:
             lines.append("Варианты для проверки:")
             lines.extend(f"• {escape(item)}" for item in alternatives)

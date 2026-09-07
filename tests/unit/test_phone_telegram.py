@@ -273,6 +273,40 @@ def test_render_reads_summary_text_from_persisted_mapping() -> None:
     assert "ул. 1" in text
 
 
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {"normalized_value": "10:00", "supporting_quote": "в 10:00"},
+        {"normalized_value": "10:00", "source_turn_id": str(uuid4())},
+        {
+            "normalized_value": "10:00",
+            "source_turn_id": str(uuid4()),
+            "quote": "в 10:00",
+        },
+    ],
+)
+def test_render_conflict_requires_persisted_source_and_supporting_quote(candidate: dict) -> None:
+    call = _call(
+        PhoneVerificationStatus.NEEDS_REVIEW,
+        summary={
+            "verification": {
+                "decision": {
+                    "facts": [{"field": "interview_time", "state": "conflict", **candidate}]
+                }
+            }
+        },
+    )
+    fact = CallFact(
+        field="interview_time",
+        raw_expression="в 10:00",
+        normalized_value="10:00",
+        state=CallFactState.CONFLICT,
+    )
+    text = render_call_notification(call=call, facts=[fact], base_url=None)
+    assert "значение расходится" in text
+    assert "10:00 (фраза" not in text
+
+
 def test_render_confirmed_and_high_confidence_labels_only():
     confirmed = _call(PhoneVerificationStatus.CONFIRMED)
     confirmed_fact = CallFact(
@@ -302,6 +336,46 @@ def test_render_confirmed_and_high_confidence_labels_only():
     )
     assert "Высокая уверенность" in high_text
     assert "Подтверждено" not in high_text
+
+
+def test_render_ordinary_fact_uses_only_persisted_evidence_quote():
+    call = _call(
+        PhoneVerificationStatus.HIGH_CONFIDENCE,
+        summary={
+            "verification": {
+                "decision": {
+                    "facts": [
+                        {
+                            "field": "interview_date",
+                            "normalized_value": "2026-09-07",
+                            "state": "candidate",
+                            "source_turn_id": str(uuid4()),
+                            "supporting_quote": "завтра <b>",
+                        }
+                    ]
+                }
+            }
+        },
+    )
+    fact = CallFact(
+        field="interview_date",
+        raw_expression="завтра",
+        normalized_value="2026-09-07",
+        state=CallFactState.CANDIDATE,
+    )
+    text = render_call_notification(call=call, facts=[fact], base_url=None)
+    assert "&lt;b&gt;" in text
+
+
+@pytest.mark.parametrize(
+    ("status", "label"),
+    [
+        (PhoneVerificationStatus.PENDING, "Ожидает проверки"),
+        (PhoneVerificationStatus.NOT_APPLICABLE, "Статус не определён"),
+    ],
+)
+def test_render_pending_and_not_applicable_labels(status, label):
+    assert label in render_call_notification(_call(status), base_url=None)
 
 
 def test_render_limits_utf8_message_length():

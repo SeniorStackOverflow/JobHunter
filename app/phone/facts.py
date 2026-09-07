@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -167,6 +167,61 @@ def _fact_snapshot(fact: CallFact) -> dict[str, object]:
     }
 
 
+def _fact_trust_state(facts: Sequence[CallFact]) -> dict[str, dict[str, object]]:
+    return {
+        fact.field: {
+            **_fact_snapshot(fact),
+            "confirmation_source": (
+                fact.confirmation_source.value if fact.confirmation_source is not None else None
+            ),
+            "confirmed_by_turn_id": (
+                str(fact.confirmed_by_turn_id) if fact.confirmed_by_turn_id else None
+            ),
+            "confirmed_at": fact.confirmed_at.isoformat() if fact.confirmed_at else None,
+        }
+        for fact in sorted(facts, key=lambda item: item.field)
+    }
+
+
+def _comparison_input(comparison: SmsComparisonResult) -> list[dict[str, str]]:
+    return sorted(
+        ({"field": item.field, "relation": item.relation} for item in comparison.comparisons),
+        key=lambda item: (item["field"], item["relation"]),
+    )
+
+
+def _supporter_state(value: object) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(field): sorted(str(item) for item in values if isinstance(item, str))
+        for field, values in value.items()
+        if isinstance(values, list)
+    }
+
+
+def _sms_replay_is_equivalent(
+    *,
+    existing_entry: dict[str, Any],
+    comparison: SmsComparisonResult,
+    metadata: ModelCallMeta,
+    facts: Sequence[CallFact],
+    supporters: object,
+    status: PhoneVerificationStatus,
+) -> bool:
+    if existing_entry.get("status") == "unlinked":
+        return False
+    if existing_entry.get("metadata") != _safe_sms_metadata(metadata):
+        return False
+    if existing_entry.get("comparison_input") != _comparison_input(comparison):
+        return False
+    if existing_entry.get("fact_state") != _fact_trust_state(facts):
+        return False
+    if _supporter_state(existing_entry.get("supporters")) != _supporter_state(supporters):
+        return False
+    return existing_entry.get("status") == status.value
+
+
 def _restore_fact_snapshot(fact: CallFact, snapshot: Mapping[str, object]) -> None:
     state = snapshot.get("state")
     if state not in {item.value for item in CallFactState}:
@@ -250,15 +305,24 @@ async def apply_sms_confirmation(
         None,
     )
     facts = list((await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all())
+    supporters = verification.get("sms_supporters", {})
+    if not isinstance(supporters, dict):
+        supporters = {}
+    if existing_entry is not None and _sms_replay_is_equivalent(
+        existing_entry=existing_entry,
+        comparison=comparison,
+        metadata=metadata,
+        facts=facts,
+        supporters=supporters,
+        status=call.verification_status,
+    ):
+        return call.verification_status
     by_field = {cast(CriticalField, fact.field): fact for fact in facts}
     reasons: list[str] = []
     matched_fields: set[CriticalField] = set()
     previous: dict[str, dict[str, object]] = {}
     valid_fields: set[CriticalField] = set()
     sms_text = _folded(turn.text)
-    supporters = verification.get("sms_supporters", {})
-    if not isinstance(supporters, dict):
-        supporters = {}
     originals = verification.get("sms_originals", {})
     if not isinstance(originals, dict):
         originals = {}
@@ -345,10 +409,12 @@ async def apply_sms_confirmation(
         "status": status.value,
         "pipeline_version": verification.get("pipeline_version", _SMS_PIPELINE_VERSION),
         "metadata": _safe_sms_metadata(metadata),
+        "comparison_input": _comparison_input(comparison),
         "comparisons": _safe_comparison_json(comparison, valid_fields=valid_fields),
         "reason_codes": reasons,
         "previous": previous,
         "supporters": {field: list(value) for field, value in supporters.items()},
+        "fact_state": _fact_trust_state(facts),
     }
     if existing_entry is not None:
         comparisons_history = [item for item in comparisons_history if item is not existing_entry]
