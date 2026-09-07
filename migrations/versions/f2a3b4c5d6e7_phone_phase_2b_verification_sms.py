@@ -47,6 +47,7 @@ _SUMMARY_STATE_CHECK_SQL = (
 _LEGACY_SUMMARY_STATE_CHECK_SQL = (
     "summary_state IN ('not_applicable', 'pending', 'done', 'failed', 'skipped')"
 )
+_RELATED_SESSION_FK = "fk_communication_sessions_related_session"
 
 
 def _find_duplicate_facts(bind: sa.Connection) -> list[dict[str, object]]:
@@ -146,7 +147,7 @@ def _upgrade_sqlite() -> None:
                 sa.Uuid(),
                 sa.ForeignKey(
                     "communication_sessions.id",
-                    name="fk_communication_sessions_related_session_id_communication_sessions",
+                    name=_RELATED_SESSION_FK,
                     ondelete="SET NULL",
                 ),
             )
@@ -221,7 +222,7 @@ def _upgrade_postgresql() -> None:
             sa.Uuid(),
             sa.ForeignKey(
                 "communication_sessions.id",
-                name="fk_communication_sessions_related_session_id_communication_sessions",
+                name=_RELATED_SESSION_FK,
                 ondelete="SET NULL",
             ),
         ),

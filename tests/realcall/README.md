@@ -1,4 +1,4 @@
-# Real-call harness (Phase 2a merge gate)
+# Real-call harness (Phase 2a and Phase 2b DEV acceptance)
 
 `pytest -m realcall` places REAL GSM calls A06 -> A14. Never runs in CI.
 
@@ -46,6 +46,34 @@ REALCALL_A14_NUMBER=... REALCALL_A06_NUMBER=... \
 REALCALL_A14_SERIAL=... REALCALL_A06_SERIAL=... \
 uv run pytest -q -m realcall tests/realcall/
 ```
+
+## Phase 2b DEV acceptance
+
+The Phase 2b module is opt-in and uses only configured DEV endpoints. It runs
+five Russian llmRouter fixtures (absolute date, relative date, correction,
+ambiguity, and contradiction), a real Telegram card, and read-only PhoneGate
+health, device, SMS, and evidence checks. The GSM scenario has A06 call the
+DEV PhoneGate line and inject this exact phrase:
+
+> Звоню по вакансии кладовщика. Собеседование двенадцатого сентября в четырнадцать тридцать, по адресу улица Индепенденцей десять.
+
+It then waits for the Celery verification result, evidence link, SMS-request
+closing, and Telegram delivery. It never sends an SMS through the JobHunter
+PhoneGate client. Matching and conflicting SMS checks require the approved
+employer-side SMS rig; when that rig is unavailable, record the limitation in
+the acceptance artifact rather than substituting an outbound JobHunter SMS.
+
+```bash
+ENABLE_REALCALL_TESTS=true \
+LLMROUTER_BASE_URL=... LLMROUTER_API_KEY=... OPENAI_MODEL=... \
+PHONEGATE_URL=... PHONEGATE_AUTH_TOKEN=... \
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+uv run pytest -q -m realcall tests/realcall/test_realcall_phase_2b.py -vv
+```
+
+The command must target the DEV Compose project and a DEV PhoneGate line. Do
+not use production URLs, tokens, numbers, or databases. The test output and
+the acceptance document contain only masked numbers and sanitized IDs.
 
 ## 2a "done" checklist
 
