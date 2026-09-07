@@ -84,7 +84,11 @@ The authorized A06→A14 harness reached the DEV call agent multiple times. The
 ended `needs_review`: the first injected speech before `listening`, and the
 second exposed global PhoneGate transcript IDs being used as a per-call cursor.
 The latter also exposed ASR time `14.30`, which is now normalized safely to
-`14:30` with ambiguity tests.
+`14:30` with ambiguity tests.  Calendar-like continuations such as
+`12.09.2026` are rejected as times, while sentence punctuation after a dotted
+time remains supported.  The real llmRouter fixture harness requires a
+correction to select the normalized Tuesday value or remain explicitly unsafe,
+and checks that a conflicting address has no accepted arbitration decision.
 
 The 13:45 call was `skipped` because the rig produced no employer RX turn;
 PhoneGate had only assistant transcript events for that call. A 14:07 retry

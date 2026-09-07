@@ -110,7 +110,7 @@ async def test_real_llmrouter_verification_cases() -> None:
         "relative": ("Собеседование завтра в 10:00 по видеосвязи.", "2026-09-08"),
         "correction": (
             "Сначала сказали в понедельник, но поправка: собеседование во вторник в 11:00.",
-            None,
+            "2026-09-08",
         ),
         "ambiguity": ("Собеседование в понедельник утром, точное время уточним.", None),
         "contradiction": (
@@ -133,24 +133,46 @@ async def test_real_llmrouter_verification_cases() -> None:
             assert meta.latency_ms >= 1
             assert meta.attempts >= 1
 
-        if expected_date is not None:
+        if name == "correction":
+            all_facts = [*extracted.facts, *verified.facts]
+            date_decisions = [
+                item for item in arbitration.decisions if item.field == "interview_date"
+            ]
+            accepted_dates = {
+                item.accepted_value for item in date_decisions if item.accepted
+            }
+            explicitly_unsafe = bool(
+                extracted.review_reasons
+                or verified.review_reasons
+                or any(fact.ambiguity for fact in all_facts)
+            )
+            assert "2026-09-07" not in accepted_dates, (
+                "superseded Monday was accepted for the correction fixture"
+            )
+            assert (
+                "2026-09-08" in accepted_dates or explicitly_unsafe
+            ), "correction must select Tuesday or remain explicitly unsafe"
+        elif expected_date is not None:
             date_values = {
                 fact.normalized_value
                 for fact in [*extracted.facts, *verified.facts]
                 if fact.field == "interview_date"
             }
             assert expected_date in date_values, f"{name} did not normalize the expected date"
-        elif name in {"correction", "ambiguity"}:
+        elif name == "ambiguity":
             assert (
                 extracted.review_reasons
                 or verified.review_reasons
                 or any(fact.ambiguity for fact in [*extracted.facts, *verified.facts])
             ), f"{name} was not marked ambiguous"
         else:
-            assert any(
-                not item.accepted or "конфликт" in item.reason.casefold()
-                for item in arbitration.decisions
-            ), "contradictory address should not be unconditionally accepted"
+            address_decisions = [
+                item for item in arbitration.decisions if item.field == "address"
+            ]
+            assert address_decisions, "contradictory fixture produced no address decision"
+            assert not any(item.accepted for item in address_decisions), (
+                "a conflicting address must never be accepted"
+            )
 
 
 @pytest.mark.realcall

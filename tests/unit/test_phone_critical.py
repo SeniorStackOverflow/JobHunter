@@ -41,6 +41,8 @@ def test_canonical_critical_values_compare_safe_variants(field: str, left: str, 
         ("interview_date", "12.09.2026", "2026-09-12"),
         ("interview_time", "в 14:30", "14:30"),
         ("interview_time", "в 14.30", "14:30"),
+        ("interview_time", "в 14.30.", "14:30"),
+        ("interview_time", "в 14.30,", "14:30"),
         ("interview_time", "в два часа дня", "14:00"),
         ("format", "у нас в офисе", "onsite"),
         ("format", "по видеосвязи", "remote"),
@@ -64,6 +66,18 @@ def test_unsupported_timezone_key_returns_none() -> None:
             "завтра",
             reference_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
             timezone="/etc/passwd",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("raw", ["12.09.2026", "12.09.20", "14.30.5"])
+def test_dotted_calendar_continuations_are_not_times(raw: str) -> None:
+    assert (
+        normalize_critical_value(
+            "interview_time",
+            raw,
+            reference_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
         )
         is None
     )

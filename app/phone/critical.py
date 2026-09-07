@@ -118,7 +118,9 @@ _ADDRESS_RE = re.compile(
     re.IGNORECASE,
 )
 _NUMERIC_TIME_RE = re.compile(r"(?<!\d)(?P<hour>\d{1,2}):(?P<minute>\d{2})(?!\d)")
-_NUMERIC_DOT_TIME_RE = re.compile(r"(?<!\d)(?P<hour>\d{1,2})\.(?P<minute>\d{2})(?!\d)")
+_NUMERIC_DOT_TIME_RE = re.compile(
+    r"(?<![\d.])(?P<hour>\d{1,2})\.(?P<minute>\d{2})(?!\d|\.\d)"
+)
 _CONTEXT_TIME_RE = re.compile(
     r"(?<!\w)(?:в|на)\s+(?P<hour>\d{1,2})(?!\d|\s*[:.]\s*\d{2})"
 )
