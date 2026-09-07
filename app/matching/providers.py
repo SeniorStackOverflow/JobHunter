@@ -455,8 +455,14 @@ class LLMRouterProvider:
                     if response.status_code >= 400:
                         last_failure = f"http_{response.status_code}"
                         if response.status_code == 400 and structured:
-                            switch_to_unstructured = True
-                            break
+                            try:
+                                error_payload = response.json()
+                            except json.JSONDecodeError:
+                                error_payload = {}
+                            error = error_payload.get("error") if isinstance(error_payload, dict) else None
+                            if isinstance(error, dict) and error.get("retryable_without_structured_output") is True:
+                                switch_to_unstructured = True
+                                break
                         retryable = response.status_code == 429 or response.status_code >= 500
                         if response.status_code == 429:
                             raw_retry_after = response.headers.get("Retry-After", "").strip()
@@ -483,7 +489,7 @@ class LLMRouterProvider:
                                     payload_retry = 0.0
                                 raise LLMProviderUnavailable(
                                     "llmrouter",
-                                    max(1, int(max(retry_after_seconds, payload_retry, 60.0))),
+                                    max(1, int(max(retry_after_seconds, payload_retry))),
                                 )
                             retry_after_seconds = min(60.0, retry_after_seconds)
                         if not retryable:

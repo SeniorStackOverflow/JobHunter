@@ -84,7 +84,7 @@ async def _matching_provider_backoff_remaining(settings: Settings) -> int:
 
 
 async def _set_matching_provider_backoff(settings: Settings, retry_after_seconds: int) -> int:
-    ttl = max(60, min(int(retry_after_seconds), settings.matching_provider_failure_retry_seconds))
+    ttl = max(1, min(int(retry_after_seconds), settings.matching_provider_failure_retry_seconds))
     if settings.environment == "test":
         return ttl
     client: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -546,10 +546,9 @@ class MatchingService:
         source_job_id: UUID,
         profile_id: UUID | None = None,
     ) -> MatchEvaluation:
-        # Serialize matching with crawler updates so the evaluation hash and the
-        # SourceJob fields are an atomic view of one publication revision.
+        # Evaluate without holding a row lock; re-lock and verify the revision before persist.
         job = await session.scalar(
-            select(SourceJob).where(SourceJob.id == source_job_id).with_for_update()
+            select(SourceJob).where(SourceJob.id == source_job_id)
         )
         if job is None:
             raise LookupError(f"source job {source_job_id} does not exist")
@@ -560,6 +559,9 @@ class MatchingService:
         if profile is None:
             raise ValueError("a user profile is required before job analysis")
         preference = await profile_service.get_preferences(session, profile.id)
+        expected_matching_hash = job.matching_content_hash
+        expected_content_hash = job.content_hash
+        expected_canonical_job_id = job.canonical_job_id
 
         resume = await _select_resume(session, profile.id, job)
         resume_category = resume.category if resume is not None else None
@@ -586,9 +588,22 @@ class MatchingService:
                 resume_fit=resume_fit,
                 resume_category=resume_category,
             )
+        current_job = await session.scalar(
+            select(SourceJob)
+            .where(SourceJob.id == source_job_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if current_job is None:
+            raise LookupError(f"source job {source_job_id} does not exist")
+        if (
+            current_job.matching_content_hash != expected_matching_hash
+            or current_job.canonical_job_id != expected_canonical_job_id
+        ):
+            raise ValueError("source job changed during analysis")
         evaluation = MatchEvaluation(
             profile_id=profile.id,
-            canonical_job_id=job.canonical_job_id,
+            canonical_job_id=expected_canonical_job_id,
             source_job_id=job.id,
             resume_fit=result.resume_fit,
             preference_fit=result.preference_fit,
@@ -601,8 +616,8 @@ class MatchingService:
             decision=result.decision,
             model=self.provider.model_name,
             prompt_rules_version=MATCHING_RULES_VERSION,
-            source_content_hash=job.content_hash,
-            source_matching_hash=job.matching_content_hash,
+            source_content_hash=expected_content_hash,
+            source_matching_hash=expected_matching_hash,
             resume_id=resume.id if resume is not None else None,
             resume_sha256=resume.sha256 if resume is not None else None,
             profile_fingerprint=profile_fingerprint(profile),
@@ -778,6 +793,10 @@ async def process_unprocessed_jobs() -> int:
                         error_type=type(exc).__name__,
                     )
                     continue
+                # Release the short SourceJob row lock before the next LLM call.
+                # Without this commit, locks acquired after the SAVEPOINT can survive
+                # until the end of the whole batch and recreate the crawler deadlock window.
+                await session.commit()
                 processed += 1
                 if (
                     needs_ai
