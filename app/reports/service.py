@@ -269,21 +269,67 @@ async def _generate(session: AsyncSession) -> DailyReport:
                 "automatic": automatic,
             }
         )
-    prepared = int(
+    created_policy_rows = (
+        await session.execute(
+            select(Application.policy_decision, func.count(Application.id))
+            .where(
+                Application.created_at >= start,
+                Application.created_at < end,
+            )
+            .group_by(Application.policy_decision)
+        )
+    ).all()
+    created_policy_counts = {decision: int(count) for decision, count in created_policy_rows}
+    prepared = sum(created_policy_counts.values())
+    auto_approved = created_policy_counts.get(PolicyDecision.AUTO_APPROVED, 0)
+    created_today_pending_review = created_policy_counts.get(PolicyDecision.PENDING_REVIEW, 0)
+    created_today_blocked = created_policy_counts.get(PolicyDecision.BLOCKED, 0)
+    created_today_skipped = created_policy_counts.get(PolicyDecision.SKIPPED, 0)
+    created_today_unclassified = created_policy_counts.get(None, 0)
+
+    sent_today_created_today = int(
         await session.scalar(
-            select(func.count(Application.id)).where(
+            select(func.count(EmailDelivery.id))
+            .join(Application, Application.id == EmailDelivery.application_id)
+            .where(
+                EmailDelivery.status == DeliveryStatus.SENT,
+                Application.sent_at >= start,
+                Application.sent_at < end,
                 Application.created_at >= start,
                 Application.created_at < end,
             )
         )
         or 0
     )
-    auto_approved = int(
+    sent_today_from_backlog = int(
+        await session.scalar(
+            select(func.count(EmailDelivery.id))
+            .join(Application, Application.id == EmailDelivery.application_id)
+            .where(
+                EmailDelivery.status == DeliveryStatus.SENT,
+                Application.sent_at >= start,
+                Application.sent_at < end,
+                Application.created_at < start,
+            )
+        )
+        or 0
+    )
+    sent_today_unclassified_origin = max(
+        0, len(sent_applications) - sent_today_created_today - sent_today_from_backlog
+    )
+
+    unsent_auto_approved_backlog = int(
         await session.scalar(
             select(func.count(Application.id)).where(
-                Application.created_at >= start,
-                Application.created_at < end,
-                Application.policy_decision == PolicyDecision.AUTO_APPROVED,
+                Application.status == ApplicationStatus.AUTO_APPROVED
+            )
+        )
+        or 0
+    )
+    pending_review_backlog = int(
+        await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.status == ApplicationStatus.PENDING_REVIEW
             )
         )
         or 0
@@ -329,10 +375,25 @@ async def _generate(session: AsyncSession) -> DailyReport:
         ),
         "duplicates_merged": max(0, new_source_jobs - new_canonical_jobs),
         **matching_metrics,
+        # Legacy counters are retained for compatibility. The explicit fields below
+        # distinguish today's application cohort from send events that may drain
+        # applications created on earlier days.
         "prepared": prepared,
         "auto_approved": auto_approved,
+        "applications_created_today": prepared,
+        "created_today_auto_approved": auto_approved,
+        "created_today_pending_review": created_today_pending_review,
+        "created_today_blocked": created_today_blocked,
+        "created_today_skipped": created_today_skipped,
+        "created_today_unclassified": created_today_unclassified,
         "automatically_sent": automatically_sent,
         "sent_total": len(sent_applications),
+        "sent_today": len(sent_applications),
+        "sent_today_created_today": sent_today_created_today,
+        "sent_today_from_backlog": sent_today_from_backlog,
+        "sent_today_unclassified_origin": sent_today_unclassified_origin,
+        "unsent_auto_approved_backlog": unsent_auto_approved_backlog,
+        "pending_review_backlog": pending_review_backlog,
         "sent_applications": sent_applications,
         "pending_review": int(
             await session.scalar(
@@ -357,6 +418,25 @@ async def _generate(session: AsyncSession) -> DailyReport:
         "errors": scan_errors + delivery_errors,
         "email_delivery_errors": delivery_errors,
         "failed_scans": sum(scan.status == RunStatus.FAILED for scan in scans),
+        "data_integrity": {
+            "status": (
+                "ok"
+                if created_today_unclassified == 0 and sent_today_unclassified_origin == 0
+                else "INCONSISTENT_REPORT_DATA"
+            ),
+            "issues": [
+                *(
+                    [f"created_today_unclassified:{created_today_unclassified}"]
+                    if created_today_unclassified
+                    else []
+                ),
+                *(
+                    [f"sent_today_unclassified_origin:{sent_today_unclassified_origin}"]
+                    if sent_today_unclassified_origin
+                    else []
+                ),
+            ],
+        },
         **limit_metrics,
     }
     from app.learning.shadow import shadow_scorecard
