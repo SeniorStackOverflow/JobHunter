@@ -1,7 +1,21 @@
+x-production-build: &production-build
+  image: jobhunter-prod:${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+      APP_BUILD_FLAVOR: production
+
 x-production-app: &production-app
+  <<: *production-build
   environment: &production-environment
     ENVIRONMENT: production
     DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required in production}
+    JOBHUNTER_RUNTIME_PREFLIGHT: "1"
+    EXPECTED_BUILD_FLAVOR: production
+    EXPECTED_APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+    EXPECTED_DATABASE_ROLE: jobhunter_app
     REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required in production}@redis:6379/0
     PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required in production}
     SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required in production}
@@ -77,6 +91,16 @@ services:
 
   migrate:
     <<: *production-app
+    env_file:
+      - path: /etc/jobhunter/migrator.env
+        required: true
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: ""
+      JOBHUNTER_RUNTIME_PREFLIGHT: "1"
+      EXPECTED_BUILD_FLAVOR: production
+      EXPECTED_APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+      EXPECTED_DATABASE_ROLE: jobhunter_migrator
     restart: "no"
     read_only: true
 
@@ -107,7 +131,7 @@ services:
       - phone_evidence:/data/phone_evidence
 
   matching-worker:
-    image: job-agent:local
+    <<: *production-build
     env_file:
       - path: .env
         required: false
@@ -152,7 +176,7 @@ services:
     stop_grace_period: 45s
 
   control-worker:
-    image: job-agent:local
+    <<: *production-build
     env_file:
       - path: .env
         required: false
