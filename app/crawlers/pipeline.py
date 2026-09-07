@@ -102,6 +102,12 @@ def scan_has_pending_reference_failures(run: ScanRun) -> bool:
     )
 
 
+def _completed_scan_status(run: ScanRun) -> RunStatus:
+    if run.parsing_errors > 0 or scan_has_pending_reference_failures(run):
+        return RunStatus.PARTIAL
+    return RunStatus.SUCCEEDED
+
+
 class ScanService:
     def __init__(
         self,
@@ -429,7 +435,7 @@ class ScanService:
                 source.health_status = SourceHealth.HEALTHY
                 if recovering_automatic_pause:
                     source.automatic_actions_paused = False
-                run.status = RunStatus.SUCCEEDED if run.parsing_errors == 0 else RunStatus.PARTIAL
+                run.status = _completed_scan_status(run)
             source.last_scan_status = run.status
             run.finished_at = datetime.now(UTC)
             await record_audit_event(
@@ -562,6 +568,16 @@ class ScanService:
             ]
         else:
             progressed.adapter_state.pop("failed_reference_attempts", None)
+        failures = progressed.adapter_state.get("failed_reference_attempts", {})
+        failed_ids = (
+            {k for k, v in failures.items() if isinstance(k, str) and isinstance(v, int) and v > 0}
+            if isinstance(failures, dict)
+            else set()
+        )
+        if failed_ids:
+            progressed.yielded_external_ids = [
+                value for value in progressed.yielded_external_ids if value not in failed_ids
+            ]
         if mutable.entrypoint_index < persisted.entrypoint_index:
             progressed.entrypoint_index = persisted.entrypoint_index
             progressed.page_url = persisted.page_url
