@@ -287,18 +287,21 @@ ENABLE_LIVE_RABOTA_SMOKE_TEST=true uv run pytest -m live
 
 ## Production-развёртывание
 
-После заполнения production `.env` и secret manager:
+После заполнения production `.env` и secret manager используйте только
+`deploy/prod-compose.sh`: wrapper привязывает image к текущему PROD Git SHA и
+не допускает общий DEV/PROD tag. `migrate` использует защищённый
+`/etc/jobhunter/migrator.env` и запускается только как `jobhunter_migrator`.
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build --pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres redis
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm migrate
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+./deploy/prod-compose.sh config --quiet
+./deploy/prod-compose.sh build --pull
+./deploy/prod-compose.sh up -d postgres redis
+./deploy/prod-compose.sh run --rm migrate
+./deploy/prod-compose.sh \
   run --rm --no-deps api job-agent seed
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+./deploy/prod-compose.sh \
   up -d api worker beat caddy
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+./deploy/prod-compose.sh ps
 ```
 
 Перед upgrade поставьте auto-send на паузу, дождитесь/остановите writers, создайте

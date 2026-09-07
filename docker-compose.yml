@@ -2,7 +2,10 @@ x-app: &app
   build:
     context: .
     dockerfile: Dockerfile
-  image: job-agent:local
+    args:
+      APP_REVISION: ${JOBHUNTER_IMAGE_TAG:-dev}
+      APP_BUILD_FLAVOR: ${JOBHUNTER_BUILD_FLAVOR:-development}
+  image: ${JOBHUNTER_IMAGE:-jobhunter-dev:local}
   env_file:
     - path: .env
       required: false

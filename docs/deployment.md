@@ -66,21 +66,28 @@ secrets; `.env` допустим только на защищённом хост
 Следующие команды являются ожидаемым интерфейсом корневых Compose-файлов:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build --pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres redis
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm migrate
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+./deploy/prod-compose.sh build --pull
+./deploy/prod-compose.sh up -d postgres redis
+./deploy/prod-compose.sh run --rm migrate
+./deploy/prod-compose.sh up -d
+./deploy/prod-compose.sh ps
 ```
 
-Сервисы приложения используют локально собираемый образ `job-agent:local`.
-Поэтому отдельный `docker compose pull` не обновляет приложение; `build --pull`
-заново собирает его и одновременно проверяет свежую базовую image. Команда может
-получить готовые образы PostgreSQL, Redis и Caddy при последующем `up`.
+Production-сервисы приложения используют отдельный immutable-style namespace
+`jobhunter-prod:<git-sha>`. Wrapper `deploy/prod-compose.sh` вычисляет 12-символьный
+SHA текущего PROD HEAD и экспортирует его как `JOBHUNTER_IMAGE_TAG`; прямой запуск
+production Compose без этого тега намеренно отклоняется. DEV использует отдельный
+namespace `jobhunter-dev:*`, поэтому DEV build больше не может перетереть PROD image.
+
+Каждый production image содержит build flavor и revision. Container entrypoint
+проверяет их до запуска процесса. API/workers дополнительно требуют DB-role
+`jobhunter_app`, а `migrate` получает credentials из `/etc/jobhunter/migrator.env`
+и требует `jobhunter_migrator`. При несовпадении роли, flavor или revision контейнер
+завершается до Alembic/application startup.
 
 Миграции должны завершиться успешно до запуска worker/beat. Команда использует
-одноразовый сервис `migrate`, принятый в корневом Compose; фактическую команду
-Alembic и revision проверяйте в Compose-файле.
+одноразовый сервис `migrate`; фактическую команду Alembic и revision проверяйте в
+Compose-файле.
 
 Не создавайте параллельно несколько экземпляров Beat: иначе одинаковые
 периодические задания будут опубликованы несколько раз. Распределённые locks и
@@ -130,10 +137,10 @@ curl --fail --silent --show-error https://job-agent.example/ready
 Дополнительно проверьте:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
-docker compose -f docker-compose.yml -f docker-compose.prod.yml logs --tail=100 api worker beat caddy
-docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T api alembic current
-docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T worker celery -A app.scheduler.celery_app:celery_app inspect ping
+./deploy/prod-compose.sh ps
+./deploy/prod-compose.sh logs --tail=100 api worker beat caddy
+./deploy/prod-compose.sh exec -T api alembic current
+./deploy/prod-compose.sh exec -T worker celery -A app.scheduler.celery_app:celery_app inspect ping
 ```
 
 Имя Celery application может отличаться; если так, используйте значение из
@@ -181,11 +188,11 @@ Redis не является источником истины для вакан�
 Ожидаемая последовательность:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build --pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml stop worker beat
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm migrate
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+./deploy/prod-compose.sh build --pull
+./deploy/prod-compose.sh stop worker beat
+./deploy/prod-compose.sh run --rm migrate
+./deploy/prod-compose.sh up -d --remove-orphans
+./deploy/prod-compose.sh ps
 ```
 
 Worker и Beat останавливаются до изменения схемы, чтобы старый код не выполнял
@@ -216,7 +223,7 @@ API и worker можно масштабировать независимо, ес
 Канонический путь — Compose-сервисы профиля `ops`, а не прямой `pg_dump` с host:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+./deploy/prod-compose.sh \
   --profile ops run --rm backup
 ```
 
