@@ -107,7 +107,7 @@ A06 instead of A14.
 duration and exits on its own; `stop_downlink_recording()` kills the
 process early and pulls whatever was captured. Every multi-step call
 (injection, recording) raises `RuntimeError` with the failing step's
-stderr on the first non-zero exit, rather than continuing silently —
+step and exit status on the first non-zero exit, without raw stderr or command text —
 unlike `dial()`/`hangup()`, which a human could just retry by hand.
 
 `CallStreamer` takes an integer-second duration and loops the injected PCM

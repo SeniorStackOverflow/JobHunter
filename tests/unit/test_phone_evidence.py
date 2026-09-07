@@ -43,6 +43,23 @@ def test_is_important_false(text):
     assert is_important_utterance(text, min_chars=60) is False
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["Звоню по вакансии кладовщика.", "Должность грузчика", "Нужен кладовщик", "Работа водителем"],
+)
+@pytest.mark.asyncio
+async def test_capturer_keeps_short_vacancy_and_job_title_evidence(tmp_path, text):
+    settings = get_settings().model_copy(
+        update={"phone_evidence_dir": tmp_path, "phone_evidence_min_chars": 60}
+    )
+    sid = uuid4()
+    cap = EvidenceCapturer(client=_FakeClient(), settings=settings, session_id=sid)
+
+    await cap.maybe_capture([_entry(8, text)])
+
+    assert (tmp_path / str(sid) / "8.wav").read_bytes() == b"RIFFwav"
+
+
 class _FakeClient:
     def __init__(self, audio=b"RIFFwav", exc=None):
         self.audio, self.exc, self.calls = audio, exc, 0

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import pytest
+
 from app.models.enums import CallFactState, PhoneVerificationStatus
 from app.phone.reconciliation import reconcile_verification
 from app.phone.verification import (
@@ -110,6 +112,70 @@ def test_independent_agreement_with_quote_and_evidence_is_high_confidence() -> N
     assert decision.facts[0].state is CallFactState.CANDIDATE
     assert decision.facts[0].normalized_value == "2026-09-07"
     assert decision.facts[0].source_turn_id == TURN_ID
+
+
+@pytest.mark.parametrize("violation", [None, "whole_sentence", "translation", "missing_evidence"])
+def test_field_only_russian_values_keep_all_acceptance_gates(violation: str | None) -> None:
+    text = (
+        "По вакансии кладовщика. Собеседование 12 сентября в 14.30, "
+        "улица Индепенденцей 10, по кишинёвскому времени."
+    )
+    values = [
+        ("vacancy", "кладовщика", "кладовщика"),
+        ("interview_date", "12 сентября", "2026-09-12"),
+        ("interview_time", "14.30", "14:30"),
+        ("address", "улица Индепенденцей 10", "улица Индепенденцей 10"),
+        ("timezone", "по кишинёвскому времени", "Europe/Chisinau"),
+    ]
+    extracted = [
+        FactCandidate(
+            field=field,
+            raw_expression=raw,
+            normalized_value=value,
+            quote=text,
+            turn_seq=1,
+            confidence=0.99,
+        )
+        for field, raw, value in values
+    ]
+    verified = [item.model_copy() for item in extracted]
+    if violation == "whole_sentence":
+        verified = [item.model_copy(update={"raw_expression": text}) for item in verified]
+    if violation == "translation":
+        verified[0] = verified[0].model_copy(update={"normalized_value": "Warehouse keeper"})
+    decision = _decide(
+        extracted=extracted,
+        verified=verified,
+        arbitration=[
+            ArbitrationItem(
+                field=field,
+                accepted_value=value,
+                supporting_quote=text,
+                accepted=True,
+                reason="совпадает",
+            )
+            for field, _, value in values
+        ],
+        transcript=[
+            VerificationTurn(
+                seq=1, turn_id=TURN_ID, speaker="employer", text=text, asr_confidence=0.98
+            )
+        ],
+        evidence=[] if violation == "missing_evidence" else [TURN_ID],
+    )
+    if violation is None:
+        assert decision.status is PhoneVerificationStatus.HIGH_CONFIDENCE
+        assert {fact.field: fact.normalized_value for fact in decision.facts} == {
+            "vacancy": "кладовщика",
+            "interview_date": "2026-09-12",
+            "interview_time": "14:30",
+            "address": "улица Индепенденцей 10",
+            "timezone": "Europe/Chisinau",
+        }
+        assert all(fact.state is CallFactState.CANDIDATE for fact in decision.facts)
+    else:
+        assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+        assert any(fact.state is CallFactState.UNKNOWN for fact in decision.facts)
 
 
 def test_quote_absence_keeps_fact_unknown_for_review() -> None:

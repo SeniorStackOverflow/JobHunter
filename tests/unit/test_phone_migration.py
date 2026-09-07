@@ -152,9 +152,7 @@ def test_postgresql_downgrade_replaces_summary_check_before_adding_legacy_check(
     assert (
         "drop_constraint",
         (migration._RELATED_SESSION_FK, "communication_sessions"),
-    ) in {
-        (name, args[:2]) for name, args in recorder.calls
-    }
+    ) in {(name, args[:2]) for name, args in recorder.calls}
     assert drop_current < add_legacy
 
 

@@ -591,9 +591,7 @@ class IngestLoop:
             # transcript emitted during a just-closed call by matching its
             # gateway timestamp to the completed local session.
             event_at = (
-                datetime.fromtimestamp(event.timestamp / 1000, UTC)
-                if event.timestamp > 0
-                else None
+                datetime.fromtimestamp(event.timestamp / 1000, UTC) if event.timestamp > 0 else None
             )
             if event_at is not None:
                 open_row = await session.scalar(

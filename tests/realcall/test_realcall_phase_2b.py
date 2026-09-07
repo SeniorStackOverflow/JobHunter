@@ -3,6 +3,8 @@
 The module is deliberately separate from the CI integration suite.  It never
 prints credentials or provider payloads and is skipped unless the operator has
 explicitly enabled real-call checks with the required DEV endpoints.
+
+PYTEST_DONT_REWRITE: live assertions must not render raw summaries or transcripts.
 """
 
 # ruff: noqa: RUF001 — Russian acceptance fixtures intentionally use Cyrillic.
@@ -157,9 +159,8 @@ async def test_real_llmrouter_verification_cases() -> None:
             assert not unexpected_accepted_dates, (
                 "correction accepted a date outside the normalized Tuesday value"
             )
-            assert (
-                accepted_dates <= allowed_dates
-                and ("2026-09-08" in accepted_dates or explicitly_unsafe)
+            assert accepted_dates <= allowed_dates and (
+                "2026-09-08" in accepted_dates or explicitly_unsafe
             ), "correction must select Tuesday or remain explicitly unsafe"
         elif expected_date is not None:
             date_values = {
@@ -175,9 +176,7 @@ async def test_real_llmrouter_verification_cases() -> None:
                 or any(fact.ambiguity for fact in [*extracted.facts, *verified.facts])
             ), f"{name} was not marked ambiguous"
         else:
-            address_decisions = [
-                item for item in arbitration.decisions if item.field == "address"
-            ]
+            address_decisions = [item for item in arbitration.decisions if item.field == "address"]
             assert address_decisions, "contradictory fixture produced no address decision"
             assert not any(item.accepted for item in address_decisions), (
                 "a conflicting address must never be accepted"
@@ -290,8 +289,17 @@ async def test_realcall_phase_2b_gsm_acceptance(a06_rig: A06Rig) -> None:
         timeout_seconds=max(240, settings.phone_verification_processing_lease_seconds),
     )
     assert accepted is not None, "Celery did not finalize the DEV call"
-    assert accepted.summary_state.value == "done"
-    assert accepted.verification_status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert accepted.summary_state.value == "done", "DEV post-call processing did not complete"
+    assert accepted.verification_status is PhoneVerificationStatus.HIGH_CONFIDENCE, (
+        "DEV verification requires review; inspect the authenticated call detail"
+    )
+    verification = accepted.summary.get("verification", {})
+    assert set(verification.get("pass_results", {})) == {"extractor", "verifier", "arbiter"}, (
+        "DEV verification did not persist all three passes"
+    )
+    assert set(verification.get("pass_metadata", {})) == {"extractor", "verifier", "arbiter"}, (
+        "DEV verification did not persist all three pass metadata records"
+    )
     telegram_configured = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
     assert _telegram_state_allowed(accepted.summary, configured=telegram_configured)
     assert accepted.ended_at is not None

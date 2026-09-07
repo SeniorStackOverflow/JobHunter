@@ -175,6 +175,62 @@ async def test_verifier_request_contains_original_context_only() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pass_name", ["extractor", "verifier", "arbiter"])
+async def test_sent_verification_contract_separates_expressions_from_context(
+    pass_name: str,
+) -> None:
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if pass_name == "extractor":
+            return _response(
+                {"summary_text": "", "outcome_guess": "unclear", "facts": [], "review_reasons": []}
+            )
+        if pass_name == "arbiter":
+            return _response({"decisions": []})
+        return _response({"facts": [], "review_reasons": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = PostCallVerificationProvider(
+            base_url="http://router", api_key="secret-token", model="model", client=client
+        )
+        if pass_name == "arbiter":
+            await provider.arbitrate(
+                _context(),
+                ExtractionResult(
+                    summary_text="", outcome_guess="unclear", facts=[], review_reasons=[]
+                ),
+                VerificationResult(facts=[], review_reasons=[]),
+            )
+        else:
+            await getattr(provider, "extract" if pass_name == "extractor" else "verify")(_context())
+
+    body = bodies[0]
+    system = body["messages"][0]["content"]
+    assert "raw_expression" in system
+    assert "одного поля" in system
+    assert "не переводите" in system.casefold()
+    assert "падеж" in system.casefold()
+    assert "не удаляйте" in system.casefold()  # uncertainty must survive short extraction
+    schema = body["response_format"]["json_schema"]["schema"]
+    definition = schema["$defs"]["ArbitrationItem" if pass_name == "arbiter" else "FactCandidate"]
+    props = definition["properties"]
+    if pass_name == "arbiter":
+        assert "Russian" in props["accepted_value"]["description"]
+        assert "bounded" in props["supporting_quote"]["description"]
+    else:
+        assert "shortest exact" in props["raw_expression"]["description"]
+        assert "single field" in props["raw_expression"]["description"]
+        assert "uncertainty" in props["raw_expression"]["description"]
+        assert "Russian" in props["normalized_value"]["description"]
+        assert "inflection" in props["normalized_value"]["description"]
+        assert "bounded" in props["quote"]["description"]
+        # Independent passes still receive only the untouched source context.
+        assert json.loads(body["messages"][1]["content"]) == _context().model_dump(mode="json")
+
+
+@pytest.mark.asyncio
 async def test_provider_parses_fenced_json_and_records_metadata() -> None:
     payload = {"facts": [], "review_reasons": []}
     response = httpx.Response(

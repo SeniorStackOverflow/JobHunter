@@ -80,9 +80,26 @@ class FactCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     field: CriticalField
-    raw_expression: str
-    normalized_value: str | None
-    quote: str
+    raw_expression: str = Field(
+        description=(
+            "The shortest exact transcript substring expressing this single field, not the "
+            "whole multi-field sentence. Keep uncertainty, alternatives and negation intact."
+        )
+    )
+    normalized_value: str | None = Field(
+        description=(
+            "Canonical value or null when ambiguous. Dates: YYYY-MM-DD; times: HH:MM; "
+            "explicit timezones: IANA/UTC offset; format: onsite/remote/phone. For Russian "
+            "address/company/vacancy preserve raw_expression spelling, case, inflection and "
+            "words/digits, collapsing whitespace only; never translate or paraphrase."
+        )
+    )
+    quote: str = Field(
+        description=(
+            "Non-empty exact bounded sentence or clause from the source employer turn, "
+            "containing raw_expression and its relevant context."
+        )
+    )
     turn_seq: int | None
     confidence: float = Field(ge=0, le=1)
     ambiguity: str | None = None
@@ -108,8 +125,15 @@ class ArbitrationItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     field: CriticalField
-    accepted_value: str | None
-    supporting_quote: str
+    accepted_value: str | None = Field(
+        description=(
+            "The agreed canonical value, or null when unsupported. Preserve Russian lexical "
+            "values from raw_expression without translation, inflection changes or paraphrase."
+        )
+    )
+    supporting_quote: str = Field(
+        description="Exact bounded sentence or clause from the supporting employer turn."
+    )
     accepted: bool
     reason: str
 
@@ -214,21 +238,38 @@ def _strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+_FIELD_CONTRACT = (
+    " raw_expression — кратчайшая точная подстрока транскрипта для одного поля; "
+    "не включайте соседние дату, время, адрес или часовой пояс. Не удаляйте слова "
+    "неопределённости, отрицания и альтернативы: неоднозначное поле остаётся null с ambiguity. "
+    "quote (у Арбитра supporting_quote) — точная непустая цитата одного предложения "
+    "или части предложения с нужным контекстом из указанной реплики работодателя. "
+    "normalized_value и accepted_value: дата YYYY-MM-DD, время HH:MM, явно названный "
+    "часовой пояс IANA/UTC, format onsite/remote/phone только при прямом указании формата. "
+    "Для address, company и vacancy сохраняйте русское написание raw_expression: "
+    "не переводите, не перефразируйте, не меняйте регистр, падеж, слова или цифры; "
+    "допустимо лишь убрать лишние пробелы. Например, из «По вакансии грузчика» "
+    "raw_expression и normalized_value поля vacancy равны «грузчика». "
+    "Из «Встреча 18 сентября в 09:45, улица Мира 7, по кишинёвскому времени» "
+    "raw_expression даты = «18 сентября», времени = «09:45», адреса = «улица Мира 7», "
+    "часового пояса = «по кишинёвскому времени»; цитата хранит контекст предложения. "
+    "Примеры показывают форму ответа, а факты берите только из текущего транскрипта."
+)
 _EXTRACTOR_SYSTEM = (
     "Вы извлекаете проверяемые факты из записи телефонного разговора на русском языке. "
     "Верните только JSON по схеме. Сохраняйте исходные выражения и точные цитаты; "
     "не выдумывайте значения и указывайте неоднозначность."
-)
+) + _FIELD_CONTRACT
 _VERIFIER_SYSTEM = (
     "Вы независимо проверяете критические факты телефонного разговора на русском языке. "
     "Верните только JSON по схеме. Работайте исключительно с исходным контекстом и "
     "транскриптом; не предполагайте ответы другого проверяющего."
-)
+) + _FIELD_CONTRACT
 _ARBITER_SYSTEM = (
     "Вы принимаете консервативное решение по двум независимым результатам проверки "
     "разговора на русском языке. Принимайте значение только при прямой однозначной "
     "цитате в транскрипте. Верните только JSON по схеме."
-)
+) + _FIELD_CONTRACT
 _SMS_SYSTEM = (
     "Вы сравниваете SMS работодателя с уже сохранёнными фактами разговора. "
     "Верните только JSON по схеме, отмечая каждое поле как matches, conflicts, "

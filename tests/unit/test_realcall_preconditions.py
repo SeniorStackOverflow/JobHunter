@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+
+import httpx
 import pytest
 
 from tests.realcall.a06_originate import A06Rig
@@ -23,6 +26,38 @@ def test_preconditions_return_reasons_when_ssh_fails(monkeypatch) -> None:
     )
     reasons = rig.check_preconditions()
     assert reasons and any("ssh" in r.lower() for r in reasons)
+
+
+@pytest.mark.parametrize("failure", ["ssh", "stderr", "http"])
+def test_precondition_reasons_do_not_expose_transport_details(monkeypatch, failure) -> None:
+    private = "private-token employer content"
+    rig = A06Rig(
+        "host",
+        "22",
+        "user",
+        "",
+        "",
+        "",
+        a14_number="fake",
+        phonegate_url="http://gate",
+        phonegate_token=private,
+    )
+
+    def ssh(*args, **kwargs):
+        if failure == "ssh":
+            raise OSError(private)
+        return subprocess.CompletedProcess(
+            [], 1 if failure == "stderr" else 0, stdout="", stderr=private
+        )
+
+    def get(*args, **kwargs):
+        raise httpx.ConnectError(private)
+
+    monkeypatch.setattr(rig, "_ssh", ssh)
+    monkeypatch.setattr(httpx, "get", get)
+    reasons = rig.check_preconditions()
+    assert reasons
+    assert private not in repr(reasons)
 
 
 @pytest.mark.parametrize("state", ["disabled", "pending"])

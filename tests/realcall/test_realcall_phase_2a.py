@@ -1,3 +1,5 @@
+"""Opt-in GSM tests. PYTEST_DONT_REWRITE keeps live transcript assertions private."""
+
 from __future__ import annotations
 
 import asyncio

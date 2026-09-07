@@ -34,20 +34,28 @@ class A06Rig:
     ssh_user: str
     a14_serial: str  # e.g. "100.106.163.104:43369"; "" -> auto-detect
     a06_serial: str  # e.g. "100.100.224.9:38557"
-    a06_number: str  # A06's number (for incoming calls)
-    a14_number: str = ""  # A14's number (for A06 to dial)
+    a06_number: str = field(repr=False)  # A06's number (for incoming calls)
+    a14_number: str = field(default="", repr=False)  # A14's number (for A06 to dial)
     phonegate_url: str = ""
-    phonegate_token: str = ""
+    phonegate_token: str = field(default="", repr=False)
     _downlink_remote_pcm: str = field(default="", init=False, repr=False)
 
     def _ssh(self, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["ssh", "-p", self.ssh_port, f"{self.ssh_user}@{self.ssh_host}", cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        __tracebackhide__ = True
+        failure = ""
+        try:
+            return subprocess.run(
+                ["ssh", "-p", self.ssh_port, f"{self.ssh_user}@{self.ssh_host}", cmd],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            failure = type(exc).__name__
+        # Raise outside the handler: subprocess exceptions retain the command,
+        # which can contain speech or a number. Never chain that exception.
+        raise RuntimeError(f"rig SSH failed ({failure})")
 
     def _adb(self, serial: str, cmd: str, timeout: int = 25) -> str:
         return self._ssh(f"adb -s {serial} shell '{cmd}'", timeout).stdout.strip()
@@ -55,7 +63,7 @@ class A06Rig:
     def _run_or_raise(
         self, cmd: str, *, what: str, timeout: int = 30
     ) -> subprocess.CompletedProcess[str]:
-        """Run a command on the rig over SSH; raise with stderr on failure.
+        """Run a command on the rig over SSH; raise a sanitized step on failure.
 
         Unlike dial()/hangup() (fire-and-forget button presses a human could
         just retry), the injection/recording pipeline is several sequential
@@ -63,19 +71,26 @@ class A06Rig:
         a half-configured state (e.g. forwarding enabled with nothing to
         stream) — surface failures immediately instead.
         """
-        result = self._ssh(cmd, timeout=timeout)
+        __tracebackhide__ = True
+        failure = ""
+        try:
+            result = self._ssh(cmd, timeout=timeout)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            failure = type(exc).__name__
+        if failure:
+            raise RuntimeError(f"{what} failed ({failure})")
         if result.returncode != 0:
-            raise RuntimeError(f"{what} failed (exit {result.returncode}): {result.stderr.strip()}")
+            raise RuntimeError(f"{what} failed (exit {result.returncode})")
         return result
 
     def check_preconditions(self) -> list[str]:
         reasons: list[str] = []
         try:
             devs = self._ssh("adb devices -l", timeout=15)
-        except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-            return [f"ssh/adb unreachable: {exc}"]
+        except (subprocess.SubprocessError, OSError, RuntimeError) as exc:
+            return [f"ssh/adb unreachable: {type(exc).__name__}"]
         if devs.returncode != 0:
-            reasons.append(f"adb devices failed: {devs.stderr.strip()[:200]}")
+            reasons.append(f"adb devices failed (exit {devs.returncode})")
         if self.a14_serial and self.a14_serial not in devs.stdout:
             reasons.append(f"A14 {self.a14_serial} not in adb devices")
         if self.a06_serial and self.a06_serial not in devs.stdout:
@@ -89,12 +104,9 @@ class A06Rig:
                 )
                 st = r.json()
                 if not st.get("connected") or st.get("mode") != "Zero-ADB":
-                    reasons.append(
-                        f"PhoneGate not ready: connected={st.get('connected')} "
-                        f"mode={st.get('mode')}"
-                    )
+                    reasons.append("PhoneGate not ready: expected connected Zero-ADB device")
             except (httpx.HTTPError, ValueError) as exc:
-                reasons.append(f"PhoneGate status unreachable: {exc}")
+                reasons.append(f"PhoneGate status unreachable: {type(exc).__name__}")
         if not self.a14_number:
             reasons.append("a14_number not configured (A06 needs it to dial A14)")
         return reasons
@@ -202,7 +214,7 @@ class A06Rig:
             # Temp synthesis artifacts live on the VPS, not in pytest's local tmpdir.
             # Clean them even when synthesis/conversion/push/streaming fails midway.
             # Cleanup itself is best-effort and must never mask the original failure.
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
+            with contextlib.suppress(OSError, subprocess.SubprocessError, RuntimeError):
                 self._ssh(f"rm -f {remote_mp3} {remote_pcm}", timeout=10)
 
     def start_downlink_recording(self) -> str:
@@ -263,9 +275,7 @@ class A06Rig:
                 check=False,
             )
             if scp.returncode != 0:
-                raise RuntimeError(
-                    f"scp of downlink recording failed: {scp.stderr.decode(errors='replace')}"
-                )
+                raise RuntimeError(f"scp of downlink recording failed (exit {scp.returncode})")
             with open(local_path, "rb") as f:
                 return f.read()
         finally:

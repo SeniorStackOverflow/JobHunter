@@ -473,9 +473,7 @@ async def test_late_transcript_after_idle_is_attached_to_just_closed_call(
 
     async with profiled_factory() as session:
         turn = await session.scalar(
-            select(CommunicationTurn).where(
-                CommunicationTurn.phonegate_transcript_id == late_id
-            )
+            select(CommunicationTurn).where(CommunicationTurn.phonegate_transcript_id == late_id)
         )
     assert turn is not None
 
