@@ -90,6 +90,59 @@ def test_verification_models_are_recursive_strict() -> None:
     assert "comparisons" in SmsComparisonResult.model_json_schema()["required"]
 
 
+def test_strict_request_schemas_require_every_property_and_keep_defaults_nullable() -> None:
+    provider = PostCallVerificationProvider(
+        base_url="http://router",
+        api_key="secret-token",
+        model="model",
+    )
+    schemas = [
+        provider._body("extractor", "system", "user", ExtractionResult)["response_format"][
+            "json_schema"
+        ]["schema"],
+        provider._body("verifier", "system", "user", VerificationResult)["response_format"][
+            "json_schema"
+        ]["schema"],
+        provider._body("arbiter", "system", "user", ArbitrationResult)["response_format"][
+            "json_schema"
+        ]["schema"],
+        provider._body("sms", "system", "user", SmsComparisonResult)["response_format"][
+            "json_schema"
+        ]["schema"],
+    ]
+
+    def assert_all_properties_are_required(value: object) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                assert set(value.get("required", [])) == set(properties)
+            for nested in value.values():
+                assert_all_properties_are_required(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                assert_all_properties_are_required(nested)
+
+    for schema in schemas:
+        assert_all_properties_are_required(schema)
+
+    fact_schema = schemas[0]["$defs"]["FactCandidate"]
+    assert {"type": "null"} in fact_schema["properties"]["ambiguity"]["anyOf"]
+    candidate = FactCandidate.model_validate(_candidate() | {"ambiguity": None})
+    assert candidate.ambiguity is None
+
+
+def test_strict_requests_allow_reasoning_backends_to_finish_json() -> None:
+    provider = PostCallVerificationProvider(
+        base_url="http://router",
+        api_key="secret-token",
+        model="model",
+    )
+
+    body = provider._body("extractor", "system", "user", ExtractionResult)
+
+    assert body["max_tokens"] == 1536
+
+
 @pytest.mark.asyncio
 async def test_verifier_request_contains_original_context_only() -> None:
     bodies: list[dict[str, object]] = []

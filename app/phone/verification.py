@@ -13,9 +13,10 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 
 import httpx
@@ -84,7 +85,7 @@ class FactCandidate(BaseModel):
     quote: str
     turn_seq: int | None
     confidence: float = Field(ge=0, le=1)
-    ambiguity: str = ""
+    ambiguity: str | None = None
 
 
 class ExtractionResult(BaseModel):
@@ -166,6 +167,51 @@ def _strip_fence(text: str) -> str:
     ):
         return "\n".join(lines[1:-1]).strip()
     return text.strip()
+
+
+def _nullable_schema(schema: dict[str, Any]) -> None:
+    """Make a property nullable while preserving its validation constraints."""
+
+    if "anyOf" in schema and isinstance(schema["anyOf"], list):
+        if not any(item == {"type": "null"} for item in schema["anyOf"]):
+            schema["anyOf"].append({"type": "null"})
+        schema.pop("default", None)
+        return
+
+    title = schema.get("title")
+    inner = deepcopy(schema)
+    inner.pop("default", None)
+    inner.pop("title", None)
+    schema.clear()
+    if title is not None:
+        schema["title"] = title
+    schema["anyOf"] = [inner, {"type": "null"}]
+
+
+def _strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Pydantic schema for strict OpenAI-compatible providers."""
+
+    normalized = deepcopy(schema)
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                original_required = set(node.get("required", []))
+                node["required"] = list(properties)
+                for name, property_schema in properties.items():
+                    if isinstance(property_schema, dict) and (
+                        name not in original_required or "default" in property_schema
+                    ):
+                        _nullable_schema(property_schema)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(normalized)
+    return normalized
 
 
 _EXTRACTOR_SYSTEM = (
@@ -269,13 +315,15 @@ class PostCallVerificationProvider:
             ],
             "stream": False,
             "temperature": 0,
-            "max_tokens": 1200,
+            # Reasoning backends consume completion budget before emitting the
+            # structured JSON; 1536 leaves enough room for the fact payload.
+            "max_tokens": 1536,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
                     "name": f"phone_verification_{pass_name}",
                     "strict": True,
-                    "schema": schema_model.model_json_schema(),
+                    "schema": _strict_json_schema(schema_model.model_json_schema()),
                 },
             },
         }

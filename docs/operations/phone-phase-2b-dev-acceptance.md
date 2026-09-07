@@ -70,6 +70,33 @@ uv run pytest tests/unit/test_realcall_a06_rig.py tests/unit/test_realcall_preco
 3 passed
 ```
 
+## Task 12 llmRouter contract follow-up
+
+On 2026-09-07 the authorized DEV environment was loaded for only
+`LLMROUTER_BASE_URL`, `LLMROUTER_API_KEY`, `LLMROUTER_PREFER`, and
+`OPENAI_MODEL`; no values were recorded here. The verification request boundary
+now normalizes every Extractor, Verifier, Arbiter, and SMS JSON schema so every
+object property is required. Defaulted fields are nullable in the wire schema
+and remain accepted by the typed Pydantic result models. The completion budget
+was raised from 1200 to 1536 after a reasoning backend returned truncated JSON.
+
+The focused regression and the complete phone unit module passed:
+
+```text
+uv run pytest -q tests/unit/test_phone_verification.py
+16 passed
+```
+
+An authorized direct Extractor request returned HTTP 200 with the normalized
+schema. The initial full opt-in run still encountered one sanitized HTTP 400;
+the repeated five-fixture run no longer showed the original schema rejection,
+completed the absolute fixture's Extractor and Verifier passes, then stopped on
+an llmRouter timeout in the Arbiter pass after 278.12 seconds. This is an
+external provider-capacity limit in this run; the real llmRouter acceptance
+therefore remains partial.
+No provider response body, credential, transcript, or raw identifier is stored
+in this artifact.
+
 ## Admin browser acceptance
 
 With Playwright Chromium installed locally, the complete admin review suite
@@ -92,7 +119,7 @@ The final checks ran after the DEV and browser checks:
 | --- | --- |
 | `uv run ruff check .` | passed |
 | `uv run mypy app fixture_site` | passed; 120 source files |
-| `uv run pytest` | 910 passed, 16 skipped, 132.92s |
+| `uv run pytest -q` | 912 passed, 16 skipped, 135.56s |
 | `git diff --check` | passed |
 | `uv run ruff format --check .` | blocked by six pre-existing unformatted Phase 1/2 design and plan Markdown files; changed Python and acceptance files pass targeted format checks |
 
@@ -103,6 +130,7 @@ reformatted to force the repository-wide format check green.
 ## Known limits
 
 The live acceptance remains incomplete until the operator supplies the
-authorized DEV llmRouter, Telegram, and PhoneGate configuration and the
-approved SMS rig. The final manual operator call is intentionally still
-pending and must occur only after Sol review.
+authorized DEV Telegram and PhoneGate configuration and the approved SMS rig,
+and until the llmRouter Arbiter pass completes within its timeout budget. The
+final manual operator call is intentionally still pending and must occur only
+after Sol review.

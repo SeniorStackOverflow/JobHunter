@@ -95,7 +95,7 @@ def _inspect_candidate(
         candidate.field, deterministic
     ):
         reasons.append("normalized value mismatch")
-    if candidate.ambiguity.strip():
+    if candidate.ambiguity and candidate.ambiguity.strip():
         reasons.append(f"ambiguity: {candidate.ambiguity.strip()}")
     turn = next((item for item in context.transcript if item.seq == candidate.turn_seq), None)
     source_id: UUID | None = None
