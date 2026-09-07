@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -14,19 +15,54 @@ from app.models.enums import (
     TurnSpeaker,
 )
 from app.phone.schemas import PhoneSmsMessage, PhoneSmsPage
-from app.phone.sms import ingest_phonegate_sms
+from app.phone.sms import (
+    PhoneSmsBacklogOverflow,
+    PhoneSmsMalformedData,
+    PhoneSmsSyncUnavailable,
+    ingest_phonegate_sms,
+)
+from app.settings import Settings
 
 
 class StubPhoneGate:
     def __init__(self, messages: list[PhoneSmsMessage]) -> None:
         self.messages = messages
         self.sync_calls = 0
+        self.synced_at = int(time.time() * 1000)
 
     async def sms_history(self, *, limit: int = 200, number: str | None = None) -> PhoneSmsPage:
-        return PhoneSmsPage(messages=self.messages, count=len(self.messages), synced_at=0)
+        return PhoneSmsPage(
+            messages=self.messages, count=len(self.messages), synced_at=self.synced_at
+        )
 
     async def sync_sms(self) -> None:
         self.sync_calls += 1
+        self.synced_at = int(time.time() * 1000)
+
+
+class SequencedPhoneGate(StubPhoneGate):
+    def __init__(self, pages: list[PhoneSmsPage]) -> None:
+        super().__init__([])
+        self.pages = pages
+        self.history_calls = 0
+
+    async def sms_history(self, *, limit: int = 200, number: str | None = None) -> PhoneSmsPage:
+        page = self.pages[min(self.history_calls, len(self.pages) - 1)]
+        self.history_calls += 1
+        return page
+
+
+class MemorySyncMarker:
+    def __init__(self, value: int | None = None) -> None:
+        self.value = value
+        self.marked: list[int] = []
+
+    async def get(self) -> int | None:
+        return self.value
+
+    async def mark_success(self, timestamp: int) -> None:
+        self.value = timestamp
+        self.marked.append(timestamp)
 
 
 def sms(
@@ -231,3 +267,127 @@ async def test_no_completed_call_is_stored_unlinked(
     assert imported is not None
     assert imported.related_session_id is None
     assert imported.diagnostics["sms_correlation"]["reason"] == "no_matching_completed_call"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_phonegate_page_fails_without_persisting_snapshot(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    messages = [sms(ident=f"m-{n}", timestamp=1_720_000_000_000 + n) for n in range(150)]
+    gateway = SequencedPhoneGate(
+        [PhoneSmsPage(messages=messages, count=151, synced_at=1_720_000_000_000)]
+    )
+
+    with pytest.raises(PhoneSmsBacklogOverflow):
+        await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    async with sqlite_session_factory() as db:
+        assert await db.scalar(select(CommunicationSession)) is None
+
+
+@pytest.mark.asyncio
+async def test_missing_marker_forces_sync_then_marks_only_complete_snapshot(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    message = sms(ident="m-1", timestamp=1_720_000_000_000)
+    page = PhoneSmsPage(messages=[message], count=1, synced_at=1_900_000_000_000, syncing=False)
+    gateway = SequencedPhoneGate([page, page])
+    marker = MemorySyncMarker()
+
+    result = await ingest_phonegate_sms(
+        client=gateway, session_factory=sqlite_session_factory, sync_marker=marker
+    )
+
+    assert gateway.sync_calls == 1
+    assert len(marker.marked) == 1
+    assert result["imported"] == 1
+
+
+@pytest.mark.asyncio
+async def test_syncing_timeout_is_retriable_and_does_not_write_database(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    stale = PhoneSmsPage(messages=[], count=0, synced_at=1_600_000_000_000, syncing=False)
+    pending = PhoneSmsPage(
+        messages=[sms(ident="m-1", timestamp=1_720_000_000_000)],
+        count=1,
+        synced_at=1_600_000_000_000,
+        syncing=True,
+    )
+    gateway = SequencedPhoneGate([stale, pending, pending, pending])
+    marker = MemorySyncMarker(1_600_000_000_000)
+
+    with pytest.raises(PhoneSmsSyncUnavailable):
+        await ingest_phonegate_sms(
+            client=gateway,
+            session_factory=sqlite_session_factory,
+            sync_marker=marker,
+            settings=Settings(
+                _env_file=None, phone_sms_sync_poll_attempts=2, phone_sms_sync_poll_delay_seconds=0
+            ),
+        )
+    assert marker.marked == []
+    async with sqlite_session_factory() as db:
+        assert await db.scalar(select(CommunicationSession)) is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_timestamp_fails_without_partial_write(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="m-1", timestamp=0)])
+
+    with pytest.raises(PhoneSmsMalformedData):
+        await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+    async with sqlite_session_factory() as db:
+        assert await db.scalar(select(CommunicationSession)) is None
+
+
+@pytest.mark.asyncio
+async def test_existing_sms_session_without_turn_is_repaired_idempotently(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    message = sms(ident="already-imported", timestamp=1_720_000_000_000)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        db.add(
+            CommunicationSession(
+                profile_id=profile.id,
+                channel=CommunicationChannel.SMS,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                remote_address="+37360000000",
+                remote_raw=message.address,
+                transport_external_id=message.id,
+                started_at=datetime.fromtimestamp(message.timestamp / 1000, tz=UTC),
+                ended_at=datetime.fromtimestamp(message.timestamp / 1000, tz=UTC),
+            )
+        )
+        await db.commit()
+    gateway = StubPhoneGate([message])
+
+    result = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    async with sqlite_session_factory() as db:
+        turns = list((await db.scalars(select(CommunicationTurn))).all())
+    assert result["duplicates"] == 1
+    assert len(turns) == 1
+    assert turns[0].seq == 1

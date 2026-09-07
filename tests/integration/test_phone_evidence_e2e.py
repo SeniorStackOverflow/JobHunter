@@ -146,7 +146,7 @@ async def test_evidence_capture_then_finalize_links_and_summarizes(
         turn = CommunicationTurn(
             session_id=session_id,
             phonegate_transcript_id=transcript_id,
-            seq=1,
+            seq=99,
             speaker=TurnSpeaker.EMPLOYER,
             text="в четверг в 14:00 на Индустриальной 12",
             occurred_at=datetime.now(UTC),

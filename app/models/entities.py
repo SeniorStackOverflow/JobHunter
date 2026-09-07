@@ -699,6 +699,7 @@ class CommunicationTurn(UUIDPrimaryKeyMixin, Base):
             "phonegate_transcript_id",
             name="uq_communication_turns_session_transcript",
         ),
+        UniqueConstraint("session_id", "seq", name="uq_communication_turns_session_seq"),
     )
 
     session_id: Mapped[UUID] = mapped_column(

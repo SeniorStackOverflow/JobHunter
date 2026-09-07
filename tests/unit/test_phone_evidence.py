@@ -218,7 +218,9 @@ class _PruneEnv:
             turn = CommunicationTurn(
                 session_id=session_uuid,
                 phonegate_transcript_id=tid,
-                seq=1,
+                # Evidence fixtures can link several clips to one session; the
+                # sequence uniqueness constraint requires distinct turn slots.
+                seq=tid,
                 speaker=TurnSpeaker.EMPLOYER,
                 text="test",
                 audio_evidence_path=f"{session_uuid}/{tid}.wav",

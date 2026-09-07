@@ -24,6 +24,7 @@ def test_phone_beat_entries_present() -> None:
     assert bs["prune-phone-evidence"]["options"]["queue"] == "phone"
     assert bs["ingest-phonegate-sms"]["options"]["queue"] == "phone"
     assert bs["ingest-phonegate-sms"]["schedule"] == 60.0
+    assert bs["ingest-phonegate-sms"]["options"]["expires"] == 55.0
 
 
 def test_finalize_task_keeps_atomic_entrypoint() -> None:

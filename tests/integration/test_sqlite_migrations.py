@@ -31,7 +31,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision == ("a6b7c8d9e0f1",)
+        assert revision == ("b7c8d9e0f1a2",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -92,6 +92,10 @@ def test_fresh_sqlite_database_migrations_round_trip(
         }
         assert "uq_call_facts_session_field" in {
             constraint["name"] for constraint in database.get_unique_constraints("call_facts")
+        }
+        assert "uq_communication_turns_session_seq" in {
+            constraint["name"]
+            for constraint in database.get_unique_constraints("communication_turns")
         }
         assert {
             "review_feedback_events",
@@ -169,4 +173,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("a6b7c8d9e0f1",)
+    assert revision == ("b7c8d9e0f1a2",)

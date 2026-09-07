@@ -21,6 +21,8 @@ from app.observability.metrics import CELERY_TASK_DURATION, CELERY_TASKS
 from app.settings import get_settings
 
 settings = get_settings()
+_sms_poll_interval = float(settings.phone_sms_poll_interval_seconds)
+_sms_poll_expires = max(1.0, _sms_poll_interval - 5.0)
 
 celery_app = Celery(
     "job-agent",
@@ -108,8 +110,8 @@ celery_app.conf.update(
         },
         "ingest-phonegate-sms": {
             "task": "job_agent.scheduler.ingest_phonegate_sms",
-            "schedule": float(settings.phone_sms_poll_interval_seconds),
-            "options": {"queue": "phone", "expires": 55},
+            "schedule": _sms_poll_interval,
+            "options": {"queue": "phone", "expires": _sms_poll_expires},
         },
     },
     task_routes={

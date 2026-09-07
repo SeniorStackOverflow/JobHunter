@@ -178,6 +178,9 @@ class FakePhoneGate:
     def set_sms_synced_at(self, timestamp: int | None) -> None:
         self._sms_synced_at = timestamp
 
+    def set_sms_syncing(self, value: bool) -> None:
+        self._sms_syncing = value
+
     def set_ring_polls_after_answer(self, n: int) -> None:
         """After the next accepted /api/call/answer, report RINGING for ``n``
         more /api/device/status polls before call_state flips to IN_CALL."""

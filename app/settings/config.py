@@ -98,6 +98,8 @@ class Settings(BaseSettings):
     phone_sms_sync_stale_after_seconds: int = Field(default=300, ge=60, le=86_400)
     phone_sms_correlation_pre_skew_seconds: int = Field(default=300, ge=0, le=3600)
     phone_sms_correlation_post_window_hours: int = Field(default=24, ge=1, le=168)
+    phone_sms_sync_poll_attempts: int = Field(default=3, ge=1, le=10)
+    phone_sms_sync_poll_delay_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
 
     telegram_enabled: bool = False
     telegram_bot_token: SecretStr | None = None
