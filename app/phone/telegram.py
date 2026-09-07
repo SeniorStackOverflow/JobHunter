@@ -265,9 +265,9 @@ def render_call_notification(
             "interview_date": "Дата",
             "interview_time": "Время",
             "timezone": "Часовой пояс",
-            "interview_format": "Формат",
+            "format": "Формат",
             "address": "Место",
-            "meeting_link": "Ссылка",
+            "meeting_url": "Ссылка",
         }
         alternatives: list[str] = []
         for fact in facts:

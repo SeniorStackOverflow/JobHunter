@@ -164,11 +164,68 @@ async def test_matching_sms_confirms_only_explicitly_mentioned_fact(
         )
         await db.commit()
 
-    assert status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert status is PhoneVerificationStatus.HIGH_CONFIDENCE
     assert fact.state is CallFactState.CONFIRMED
     assert fact.confirmation_source is CallFactConfirmationSource.SMS
     assert fact.confirmed_by_turn_id == SMS_TURN_ID
     assert other.state is CallFactState.CANDIDATE
+
+
+@pytest.mark.asyncio
+async def test_sms_confirms_appointment_with_candidate_association_fact(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call, sms, date_fact = await _call_with_sms(db, profile)
+        time_fact = CallFact(
+            session_id=call.id,
+            field="interview_time",
+            raw_expression="10:00",
+            normalized_value="10:00",
+            state=CallFactState.CANDIDATE,
+        )
+        vacancy_fact = CallFact(
+            session_id=call.id,
+            field="vacancy",
+            raw_expression="кладовщика",
+            normalized_value="кладовщика",
+            state=CallFactState.CANDIDATE,
+        )
+        db.add_all([time_fact, vacancy_fact])
+        await db.flush()
+
+        status = await apply_sms_confirmation(
+            db,
+            call=call,
+            sms_session=sms,
+            comparison=SmsComparisonResult(
+                comparisons=[
+                    SmsFieldComparison(
+                        field="interview_date",
+                        relation="matches",
+                        sms_expression="сегодня",
+                        call_expression="завтра",
+                        reason="same date",
+                    ),
+                    SmsFieldComparison(
+                        field="interview_time",
+                        relation="matches",
+                        sms_expression="10:00",
+                        call_expression="10:00",
+                        reason="same time",
+                    ),
+                ]
+            ),
+            metadata=ModelCallMeta("llmrouter", "sms-model", 4, 1),
+        )
+
+    assert status is PhoneVerificationStatus.CONFIRMED
+    assert date_fact.state is CallFactState.CONFIRMED
+    assert time_fact.state is CallFactState.CONFIRMED
+    assert vacancy_fact.state is CallFactState.CANDIDATE
 
 
 @pytest.mark.asyncio
@@ -619,6 +676,7 @@ async def test_replace_current_facts_is_idempotent_and_keeps_history(
             pass_results=results,
         )
         await db.flush()
+        assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
         assert call.verification_revision == 1
         await replace_current_facts(
             db,

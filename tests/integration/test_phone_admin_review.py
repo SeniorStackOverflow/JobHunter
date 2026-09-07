@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 from datetime import UTC, datetime
@@ -208,6 +209,40 @@ async def test_unknown_review_creates_missing_fact_and_audits(review_context) ->
         assert audit.sanitized_details["new_normalized_value"] is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["onsite", "remote", "phone"])
+async def test_fact_review_accepts_canonical_interview_format(review_context, value: str) -> None:
+    client, call_id, _sms_id, factory = review_context
+    async with factory() as db:
+        db.add(
+            CallFact(
+                session_id=call_id,
+                field="format",
+                raw_expression="формат не определён",
+                state=CallFactState.UNKNOWN,
+            )
+        )
+        await db.commit()
+    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    document = HTMLParser(page.text)
+    csrf = document.css_first("input[name='csrf_token']").attributes["value"]
+    assert document.css_first("select[name='value']") is not None
+
+    response = await client.post(
+        f"/admin/phone/calls/{call_id}/facts/format/review",
+        data={"action": "correct", "value": value, "csrf_token": csrf},
+    )
+
+    assert response.status_code == 303
+    async with factory() as db:
+        fact = await db.scalar(
+            select(CallFact).where(CallFact.session_id == call_id, CallFact.field == "format")
+        )
+        assert fact is not None
+        assert fact.normalized_value == value
+        assert fact.state is CallFactState.CONFIRMED
+
+
 async def _force_stale_revision(db: Any, call_id: Any) -> None:
     from sqlalchemy import update
 
@@ -288,6 +323,77 @@ async def test_sms_link_sqlite_cas_loss_does_not_persist_relation_or_audit(
         assert sms is not None and sms.related_session_id is None
         assert call is not None and call.verification_revision == 0
         assert audit is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sms_link_has_exactly_one_call_owner(
+    review_context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, first_call_id, sms_id, factory = review_context
+    async with factory() as db:
+        first = await db.get(CommunicationSession, first_call_id)
+        assert first is not None
+        second = CommunicationSession(
+            profile_id=first.profile_id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address=first.remote_address,
+            started_at=first.started_at,
+            verification_status=PhoneVerificationStatus.NEEDS_REVIEW,
+        )
+        db.add(second)
+        await db.commit()
+        second_call_id = second.id
+
+    original = phone_routes._get_sms_for_call
+    both_loaded = asyncio.Event()
+    loaded = 0
+
+    async def synchronize_after_read(db: Any, call: Any, requested_sms_id: Any) -> Any:
+        nonlocal loaded
+        sms = await original(db, call, requested_sms_id)
+        loaded += 1
+        if loaded == 2:
+            both_loaded.set()
+        await asyncio.wait_for(both_loaded.wait(), timeout=2)
+        return sms
+
+    monkeypatch.setattr(phone_routes, "_get_sms_for_call", synchronize_after_read)
+    page = await client.get(f"/?view=calls&tab=history&session={first_call_id}")
+    csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
+    responses = await asyncio.gather(
+        client.post(
+            f"/admin/phone/calls/{first_call_id}/sms/{sms_id}/link",
+            data={"csrf_token": csrf},
+        ),
+        client.post(
+            f"/admin/phone/calls/{second_call_id}/sms/{sms_id}/link",
+            data={"csrf_token": csrf},
+        ),
+    )
+
+    assert sorted(response.status_code for response in responses) == [303, 409]
+    async with factory() as db:
+        sms = await db.get(CommunicationSession, sms_id)
+        calls = [
+            await db.get(CommunicationSession, first_call_id),
+            await db.get(CommunicationSession, second_call_id),
+        ]
+        assert sms is not None and sms.related_session_id in {first_call_id, second_call_id}
+        owners = [
+            call
+            for call in calls
+            if call is not None
+            and str(
+                (call.summary or {})
+                .get("verification", {})
+                .get("sms_reconciliation", {})
+                .get("sms_turn_id", "")
+            )
+        ]
+        assert len(owners) == 1
+        assert owners[0].id == sms.related_session_id
 
 
 @pytest.mark.asyncio
@@ -419,6 +525,14 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
         call = await db.get(CommunicationSession, call_id)
         assert call is not None
         call.summary_state = PhoneSummaryState.PENDING
+        db.add(
+            CallFact(
+                session_id=call_id,
+                field="format",
+                raw_expression="формат не определён",
+                state=CallFactState.UNKNOWN,
+            )
+        )
         await db.commit()
     response = await client.get(f"/?view=calls&tab=history&session={call_id}")
     assert response.status_code == 200
@@ -432,6 +546,10 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
         assert await page.get_by_text("Связанных SMS нет").count() == 1
         assert await page.get_by_text("Ожидает обработки").count() >= 1
         assert await page.locator("form[action*='/facts/interview_date/review']").count() >= 1
+        assert (
+            await page.locator("form[action*='/facts/format/review'] select[name='value']").count()
+            == 1
+        )
         has_horizontal_overflow = await page.evaluate(
             "document.documentElement.scrollWidth > document.documentElement.clientWidth"
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ruff: noqa: RUF001 — Russian correction phrases are intentional test data.
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -184,6 +185,132 @@ def test_quote_absence_keeps_fact_unknown_for_review() -> None:
     assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
     assert decision.facts[0].state is CallFactState.UNKNOWN
     assert "quote" in decision.facts[0].reason
+
+
+def test_raw_expression_must_be_bound_to_the_supporting_quote() -> None:
+    text = "Собеседование будет, подробности позже."
+    hallucinated = _candidate(raw="12 сентября", normalized="2026-09-12", quote=text)
+    decision = _decide(
+        extracted=[hallucinated],
+        verified=[hallucinated],
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.95,
+            )
+        ],
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-12",
+                supporting_quote=text,
+                accepted=True,
+                reason="совпадает",
+            )
+        ],
+    )
+
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert decision.facts[0].state is CallFactState.UNKNOWN
+    assert "raw expression" in decision.facts[0].reason
+
+
+def test_arbiter_quote_must_contain_the_accepted_expression() -> None:
+    text = "Собеседование завтра. Подробности позже."
+    candidate = _candidate(quote="Собеседование завтра.")
+    decision = _decide(
+        extracted=[candidate],
+        verified=[candidate],
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.95,
+            )
+        ],
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-07",
+                supporting_quote="Подробности позже.",
+                accepted=True,
+                reason="совпадает",
+            )
+        ],
+    )
+
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert decision.facts[0].state is CallFactState.UNKNOWN
+    assert "arbiter expression" in decision.facts[0].reason
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_same_turn_correction_selects_last_expression(reverse: bool) -> None:
+    text = "Собеседование не 12 сентября, а 13 сентября."
+    old = _candidate(raw="12 сентября", normalized="2026-09-12", quote=text)
+    new = _candidate(raw="13 сентября", normalized="2026-09-13", quote=text)
+    candidates = [new, old] if reverse else [old, new]
+    decision = _decide(
+        extracted=candidates,
+        verified=[item.model_copy() for item in candidates],
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.95,
+            )
+        ],
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-13",
+                supporting_quote=text,
+                accepted=True,
+                reason="исправление",
+            )
+        ],
+    )
+
+    assert decision.status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert decision.facts[0].normalized_value == "2026-09-13"
+
+
+def test_same_turn_correction_rejects_arbiter_selecting_negated_value() -> None:
+    text = "Собеседование не 12 сентября, а 13 сентября."
+    old = _candidate(raw="12 сентября", normalized="2026-09-12", quote=text)
+    new = _candidate(raw="13 сентября", normalized="2026-09-13", quote=text)
+    decision = _decide(
+        extracted=[old, new],
+        verified=[old.model_copy(), new.model_copy()],
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.95,
+            )
+        ],
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-12",
+                supporting_quote=text,
+                accepted=True,
+                reason="ошибка",
+            )
+        ],
+    )
+
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert decision.facts[0].state is CallFactState.CONFLICT
 
 
 def test_differing_normalized_dates_are_conflict() -> None:

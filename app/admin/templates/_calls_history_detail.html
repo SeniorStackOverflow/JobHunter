@@ -52,7 +52,17 @@
         <form method="post" action="/admin/phone/calls/{{ s.id }}/facts/{{ fact.field }}/review">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="action" value="correct">
-          <label class="muted">Исправить <input name="value" value="{{ fact.value or '' }}" required></label>
+          <label class="muted">Исправить
+            {% if fact.field == 'format' %}
+            <select name="value" required>
+              <option value="onsite"{% if fact.value == 'onsite' %} selected{% endif %}>Очно</option>
+              <option value="remote"{% if fact.value == 'remote' %} selected{% endif %}>Онлайн</option>
+              <option value="phone"{% if fact.value == 'phone' %} selected{% endif %}>По телефону</option>
+            </select>
+            {% else %}
+            <input name="value" value="{{ fact.value or '' }}" required>
+            {% endif %}
+          </label>
           <button class="btn btn-sm" type="submit">Сохранить</button>
         </form>
       </div>

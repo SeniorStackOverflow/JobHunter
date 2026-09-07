@@ -11,7 +11,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Select
@@ -789,12 +789,20 @@ async def link_call_sms(
     if sms.related_session_id is not None and sms.related_session_id != call.id:
         raise HTTPException(status_code=404, detail="SMS уже связано с другим звонком")
     turn = await _sms_turn(session, sms)
-    call = await _reserve_call_mutation(session, call)
-    await session.refresh(sms)
-    if sms.related_session_id is not None and sms.related_session_id != call.id:
+    from app.models.entities import CommunicationSession
+
+    claimed = await session.execute(
+        update(CommunicationSession)
+        .where(
+            CommunicationSession.id == sms.id,
+            CommunicationSession.related_session_id.is_(None),
+        )
+        .values(related_session_id=call.id)
+        .execution_options(synchronize_session=False)
+    )
+    if int(getattr(claimed, "rowcount", 0)) != 1:
         raise HTTPException(status_code=409, detail="SMS уже связано с другим звонком")
-    if sms.related_session_id == call.id:
-        raise HTTPException(status_code=409, detail="SMS уже связано с этим звонком")
+    call = await _reserve_call_mutation(session, call)
     summary = dict(call.summary or {})
     verification = summary.get("verification")
     if not isinstance(verification, dict):

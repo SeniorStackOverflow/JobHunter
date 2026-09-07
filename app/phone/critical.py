@@ -280,6 +280,8 @@ def _parse_format(raw: str) -> str | None:
     text = _clean(raw).lower()
     if not text:
         return None
+    if text in {"onsite", "remote", "phone"}:
+        return text
     if re.search(r"\b(?:или|либо|возможно|наверное|примерно)\b", text):
         return None
     matches: set[str] = set()

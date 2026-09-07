@@ -412,7 +412,7 @@ async def test_finalize_runs_independent_passes_in_order(
 
 
 @pytest.mark.asyncio
-async def test_finalize_persists_evidence_backed_critical_fact(
+async def test_finalize_keeps_incomplete_evidence_backed_interview_in_review(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = await finalize_env(llm_enabled=True, with_clip_for_tid=7)
@@ -479,7 +479,8 @@ async def test_finalize_persists_evidence_backed_critical_fact(
     assert fact.state is CallFactState.CANDIDATE
     assert fact.source_turn_id == turn.id
     assert turn.audio_evidence_path == f"{env.session_id}/7.wav"
-    assert call.verification_status.value == "high_confidence"
+    assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert call.needs_review is True
 
 
 @pytest.mark.asyncio

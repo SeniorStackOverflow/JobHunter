@@ -319,11 +319,31 @@ def derive_verification_status(
         required = {"interview_date", "interview_time"}
         by_field = {fact.field: fact for fact in facts_list}
         if any(
-            by_field.get(field) is None or by_field[field].state is not CallFactState.CONFIRMED
+            by_field.get(field) is None
+            or by_field[field].state not in {CallFactState.CANDIDATE, CallFactState.CONFIRMED}
             for field in required
         ):
             return PhoneVerificationStatus.NEEDS_REVIEW
-    if facts_list and all(fact.state is CallFactState.CONFIRMED for fact in facts_list):
+    confirmation_fields = {
+        "interview_date",
+        "interview_time",
+        "timezone",
+        "format",
+        "address",
+        "meeting_url",
+    }
+    mentioned_confirmation_facts = [
+        fact for fact in facts_list if fact.field in confirmation_fields
+    ]
+    association_facts = [fact for fact in facts_list if fact.field in {"company", "vacancy"}]
+    if (
+        mentioned_confirmation_facts
+        and all(fact.state is CallFactState.CONFIRMED for fact in mentioned_confirmation_facts)
+        and all(
+            fact.state in {CallFactState.CANDIDATE, CallFactState.CONFIRMED}
+            for fact in association_facts
+        )
+    ):
         return PhoneVerificationStatus.CONFIRMED
     stored = verification_data.get("decision", {})
     if isinstance(stored, dict):
@@ -693,17 +713,6 @@ async def replace_current_facts(
             verification[key] = old_verification[key]
     current["verification"] = verification
     call.summary = current
-    current_facts = list(
-        (await db.scalars(select(CallFact).where(CallFact.session_id == call.id))).all()
-    )
-    call.verification_status = derive_verification_status(
-        call,
-        current_facts,
-        review=decision.status is PhoneVerificationStatus.NEEDS_REVIEW,
-        verification=verification,
-    )
-    call.needs_review = call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
-
     existing = {
         fact.field: fact
         for fact in (
@@ -719,6 +728,7 @@ async def replace_current_facts(
         if fact is None:
             fact = CallFact(session_id=call.id, field=reconciled.field)
             db.add(fact)
+            existing[reconciled.field] = fact
         fact.source_turn_id = reconciled.source_turn_id
         fact.raw_expression = reconciled.raw_expression
         fact.normalized_value = reconciled.normalized_value
@@ -726,10 +736,13 @@ async def replace_current_facts(
         fact.llm_confidence = reconciled.llm_confidence
         fact.state = reconciled.state
 
-    persisted_conflict = any(fact.state is CallFactState.CONFLICT for fact in existing.values())
-    if persisted_conflict:
-        call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
-        call.needs_review = True
+    call.verification_status = derive_verification_status(
+        call,
+        list(existing.values()),
+        review=decision.status is PhoneVerificationStatus.NEEDS_REVIEW,
+        verification=verification,
+    )
+    call.needs_review = call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
     if changed_input:
         refresh_telegram_notification(call)
         flag_modified(call, "summary")

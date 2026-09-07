@@ -338,6 +338,30 @@ def test_render_confirmed_and_high_confidence_labels_only():
     assert "Подтверждено" not in high_text
 
 
+def test_render_uses_russian_labels_for_format_and_meeting_url() -> None:
+    call = _call(PhoneVerificationStatus.HIGH_CONFIDENCE)
+    facts = [
+        CallFact(
+            field="format",
+            raw_expression="по видеосвязи",
+            normalized_value="remote",
+            state=CallFactState.CANDIDATE,
+        ),
+        CallFact(
+            field="meeting_url",
+            raw_expression="https://meet.example/room",
+            normalized_value="https://meet.example/room",
+            state=CallFactState.CANDIDATE,
+        ),
+    ]
+
+    text = render_call_notification(call=call, facts=facts, base_url=None)
+
+    assert "Формат: remote" in text
+    assert "Ссылка: https://meet.example/room" in text
+    assert "meeting_url" not in text
+
+
 def test_render_ordinary_fact_uses_only_persisted_evidence_quote():
     call = _call(
         PhoneVerificationStatus.HIGH_CONFIDENCE,

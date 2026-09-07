@@ -119,19 +119,30 @@ after the external checks. PhoneGate accepted the new token with HTTP 200 and
 rejected the old token with HTTP 401. The rebuilt API, worker, and call-agent
 were verified to hold the current token without printing it.
 
+## Whole-branch review follow-up
+
+The mandatory Sol review found two critical and four important defects. The
+follow-up binds every raw expression to its quoted source, orders corrections
+within one turn by transcript position, keeps incomplete interview proposals
+in review, derives SMS confirmation separately for appointment and association
+facts, atomically assigns one SMS to one call, and makes canonical interview
+format values editable in the admin UI. Telegram labels now use the persisted
+`format` and `meeting_url` field names. Adversarial and concurrency regressions
+cover each finding.
+
 ## Admin browser acceptance
 
 With Playwright Chromium installed locally, the complete admin review suite
-was run three consecutive times at 13:36:52, 13:37:05, and 13:37:19:
+was run three consecutive times after the final Sol review fixes:
 
 ```text
 RUN_PLAYWRIGHT_TESTS=1 uv run pytest tests/integration/test_phone_admin_review.py -q
 ```
 
-Each run returned `9 passed` (run durations 10.45s, 10.66s, and 9.77s).
+Each run returned `13 passed` (run durations 13.86s, 13.69s, and 13.13s).
 The browser workflow covered narrow layout, fact review states, evidence
 empty state, SMS linkage controls, audit state, Telegram state, processing,
-failure, conflict, and empty states.
+failure, conflict, empty states, and the canonical interview-format control.
 
 ## Final repository checks
 
@@ -141,7 +152,7 @@ The final checks ran after the DEV and browser checks:
 | --- | --- |
 | `uv run ruff check .` | passed |
 | `uv run mypy app fixture_site` | passed; 121 source files |
-| `uv run pytest -q` | 961 passed, 16 skipped, 135.27s |
+| `uv run pytest -q` | 972 passed, 16 skipped, 135.47s |
 | `git diff --check` | passed |
 | `uv run ruff format --check app fixture_site tests migrations` | passed; 212 Python files |
 | `uv run ruff format --check .` | blocked only by six pre-existing unformatted Phase 1/2 design and plan Markdown files |

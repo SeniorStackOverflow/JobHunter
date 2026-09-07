@@ -70,6 +70,7 @@ class _CandidateEvidence:
     deterministic_value: str | None
     source_turn_id: UUID | None
     turn_seq: int
+    expression_offset: int
     asr_confidence: float | None
     supported: bool
     reasons: tuple[str, ...]
@@ -100,14 +101,26 @@ def _inspect_candidate(
     turn = next((item for item in context.transcript if item.seq == candidate.turn_seq), None)
     source_id: UUID | None = None
     turn_seq = candidate.turn_seq or 0
+    expression_offset = -1
     asr_confidence: float | None = None
     if turn is None or turn.speaker.casefold() != "employer":
         reasons.append("source turn unresolved")
     else:
         asr_confidence = turn.asr_confidence
         source_id = turn.turn_id
-        if _normalized_text(candidate.quote) not in _normalized_text(turn.text):
+        normalized_turn = _normalized_text(turn.text).casefold()
+        normalized_quote = _normalized_text(candidate.quote).casefold()
+        normalized_expression = _normalized_text(candidate.raw_expression).casefold()
+        if normalized_quote not in normalized_turn:
             reasons.append("quote not found")
+        if (
+            not normalized_expression
+            or normalized_expression not in normalized_quote
+            or normalized_expression not in normalized_turn
+        ):
+            reasons.append("raw expression not found in quote and source turn")
+        else:
+            expression_offset = normalized_turn.rfind(normalized_expression)
         if source_id is None or source_id not in evidence_turn_ids:
             reasons.append("evidence missing")
         if asr_confidence is not None and asr_confidence < asr_floor:
@@ -119,6 +132,7 @@ def _inspect_candidate(
         deterministic_value=deterministic,
         source_turn_id=source_id,
         turn_seq=turn_seq,
+        expression_offset=expression_offset,
         asr_confidence=asr_confidence,
         supported=not reasons,
         reasons=tuple(reasons),
@@ -186,7 +200,7 @@ def reconcile_verification(
         elif len(groups) > 1:
             latest = max(
                 (item for items in groups.values() for item in items),
-                key=lambda item: item.turn_seq,
+                key=lambda item: (item.turn_seq, item.expression_offset),
             )
             latest_group = groups[_comparison_value(field, latest.deterministic_value)]
             source_turn = next((t for t in context.transcript if t.seq == latest.turn_seq), None)
@@ -208,8 +222,8 @@ def reconcile_verification(
             actual = _comparison_value(field, arbiter.accepted_value)
             if not arbiter.accepted or actual != expected:
                 field_reasons.append("arbiter value mismatch")
-            arbiter_quote = _normalized_text(arbiter.supporting_quote)
-            selected = max(accepted_group, key=lambda item: item.turn_seq)
+            arbiter_quote = _normalized_text(arbiter.supporting_quote).casefold()
+            selected = max(accepted_group, key=lambda item: (item.turn_seq, item.expression_offset))
             selected_turn = next(
                 (turn for turn in context.transcript if turn.seq == selected.turn_seq),
                 None,
@@ -217,9 +231,12 @@ def reconcile_verification(
             if (
                 not arbiter_quote
                 or selected_turn is None
-                or arbiter_quote not in _normalized_text(selected_turn.text)
+                or arbiter_quote not in _normalized_text(selected_turn.text).casefold()
             ):
                 field_reasons.append("arbiter quote not found")
+            selected_expression = _normalized_text(selected.candidate.raw_expression).casefold()
+            if not selected_expression or selected_expression not in arbiter_quote:
+                field_reasons.append("arbiter expression not found in quote")
         if correction_applied:
             field_reasons.extend(reason for item in accepted_group for reason in item.reasons)
             reasons.extend(
@@ -243,10 +260,10 @@ def reconcile_verification(
                 )
                 else CallFactState.UNKNOWN
             )
-            chosen = max(candidates, key=lambda item: item.turn_seq)
+            chosen = max(candidates, key=lambda item: (item.turn_seq, item.expression_offset))
         else:
             state = CallFactState.CANDIDATE
-            chosen = max(accepted_group, key=lambda item: item.turn_seq)
+            chosen = max(accepted_group, key=lambda item: (item.turn_seq, item.expression_offset))
         reason_parts = [*field_reasons]
         if chosen.reasons:
             reason_parts.extend(chosen.reasons)
