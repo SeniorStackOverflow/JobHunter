@@ -135,6 +135,127 @@ async def test_create_scan_reuses_active_logical_scan(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_create_scan_starts_fresh_unless_resume_is_explicit(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    service = ScanService(sqlite_session_factory, build_default_registry())
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Fresh scan fixture"),
+    )
+    async with sqlite_session_factory() as session:
+        previous = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.PARTIAL,
+            checkpoint={
+                "yielded_external_ids": ["stale-id"],
+                "adapter_state": {"failed_reference_attempts": {"stale-id": 1}},
+            },
+            finished_at=datetime.now(UTC),
+        )
+        session.add(previous)
+        await session.commit()
+        previous_id = previous.id
+
+    fresh = await service.create_scan(source_id, ScanType.INCREMENTAL)
+    assert fresh.checkpoint == {}
+    assert fresh.diagnostics == {}
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(ScanRun, fresh.id)
+        assert stored is not None
+        stored.status = RunStatus.FAILED
+        await session.commit()
+
+    resumed = await service.create_scan(
+        source_id,
+        ScanType.INCREMENTAL,
+        resume_scan_id=previous_id,
+    )
+    assert resumed.checkpoint["yielded_external_ids"] == ["stale-id"]
+    assert resumed.diagnostics["resume_parent_scan_id"] == str(previous_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_zero_job_resume_is_not_source_degradation(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    service = ScanService(sqlite_session_factory, build_default_registry())
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Resume degradation fixture"),
+    )
+    async with sqlite_session_factory() as session:
+        previous = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.SUCCEEDED,
+            found_jobs=42,
+            finished_at=datetime.now(UTC) - timedelta(minutes=2),
+        )
+        resume = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.RUNNING,
+            found_jobs=0,
+            diagnostics={"resume_parent_scan_id": str(previous.id)},
+            checkpoint={"adapter_state": {"failed_reference_attempts": {"120561": 2}}},
+        )
+        session.add_all([previous, resume])
+        await session.flush()
+
+        assert await service._detect_degradation(session, resume) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resumed_success_is_not_a_fresh_count_baseline(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    service = ScanService(sqlite_session_factory, build_default_registry())
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Resume baseline fixture"),
+    )
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        fresh_baseline = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.SUCCEEDED,
+            found_jobs=100,
+            finished_at=now - timedelta(minutes=3),
+        )
+        resumed_success = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.SUCCEEDED,
+            found_jobs=1,
+            diagnostics={"resume_parent_scan_id": str(fresh_baseline.id)},
+            finished_at=now - timedelta(minutes=1),
+        )
+        current = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.RUNNING,
+            found_jobs=10,
+        )
+        session.add_all([fresh_baseline, resumed_success, current])
+        await session.flush()
+
+        assert (
+            await service._detect_degradation(session, current)
+            == "source result count dropped by more than 80%"
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_degradation_baseline_does_not_compare_full_and_incremental_scans(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
     generic_source_configuration: dict[str, Any],
@@ -224,8 +345,14 @@ async def test_failed_detail_is_retried_from_checkpoint_without_data_loss(
     assert "fx-002" not in interrupted.checkpoint["yielded_external_ids"]
     assert interrupted.checkpoint["adapter_state"]["failed_reference_attempts"] == {"fx-002": 1}
 
-    resumed = await run_full_scan(service, source_id)
+    resumed_queued = await service.create_scan(
+        source_id,
+        ScanType.FULL,
+        resume_scan_id=interrupted.id,
+    )
+    resumed = await service.run_scan(resumed_queued.id)
     assert resumed.status == RunStatus.SUCCEEDED
+    assert resumed.diagnostics["resume_parent_scan_id"] == str(interrupted.id)
     assert resumed.checkpoint["adapter_state"]["failed_reference_attempts"] == {}
     async with sqlite_session_factory() as session:
         ids = set(
@@ -236,6 +363,48 @@ async def test_failed_detail_is_retried_from_checkpoint_without_data_loss(
             ).all()
         )
     assert ids == {f"fx-{index:03d}" for index in range(1, 10)} | {"fx-011"}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_partial_resume_does_not_heal_degraded_source_until_completion(
+    fixture_site_client: httpx.AsyncClient,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    fetcher = OneTimeDetailFailureFetcher(fixture_site_client)
+    service = ScanService(
+        sqlite_session_factory,
+        build_default_registry(client_factory=lambda _source: fetcher),
+    )
+    source = make_source(
+        generic_source_configuration,
+        name="Degraded resume recovery fixture",
+    )
+    source.health_status = SourceHealth.DEGRADED
+    source.automatic_actions_paused = True
+    source_id = await persist_source(sqlite_session_factory, source)
+
+    interrupted = await run_full_scan(service, source_id)
+    assert interrupted.status == RunStatus.PARTIAL
+    async with sqlite_session_factory() as session:
+        stored_source = await session.get(JobSource, source_id)
+        assert stored_source is not None
+        assert stored_source.health_status == SourceHealth.DEGRADED
+        assert stored_source.automatic_actions_paused is True
+
+    queued = await service.create_scan(
+        source_id,
+        ScanType.FULL,
+        resume_scan_id=interrupted.id,
+    )
+    resumed = await service.run_scan(queued.id)
+    assert resumed.status == RunStatus.SUCCEEDED
+    async with sqlite_session_factory() as session:
+        stored_source = await session.get(JobSource, source_id)
+        assert stored_source is not None
+        assert stored_source.health_status == SourceHealth.HEALTHY
+        assert stored_source.automatic_actions_paused is False
 
 
 @pytest.mark.integration

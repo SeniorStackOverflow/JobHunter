@@ -32,10 +32,10 @@ runbook облачной платформы. Команды ниже предп�
 Базовые команды:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
-docker compose -f docker-compose.yml -f docker-compose.prod.yml logs --since=24h --tail=500 api worker beat
-docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T worker celery -A app.scheduler.celery_app:celery_app inspect ping
-docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T worker celery -A app.scheduler.celery_app:celery_app inspect active
+./deploy/prod-compose.sh ps
+./deploy/prod-compose.sh logs --since=24h --tail=500 api worker beat
+./deploy/prod-compose.sh exec -T worker celery -A app.scheduler.celery_app:celery_app inspect ping
+./deploy/prod-compose.sh exec -T worker celery -A app.scheduler.celery_app:celery_app inspect active
 ```
 
 Если путь Celery application в проекте иной, используйте фактический аргумент
@@ -208,7 +208,7 @@ read/write/scan. При нескольких API-процессах и для п
 окружения Compose и не передаётся аргументом процесса:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+./deploy/prod-compose.sh \
   --profile ops run --rm backup
 ```
 
@@ -231,10 +231,10 @@ manager. Не храните ключ рядом с зашифрованными
 создайте отдельную тестовую БД и укажите точное подтверждение:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T postgres \
+./deploy/prod-compose.sh exec -T postgres \
   sh -ec 'createdb --username="$POSTGRES_USER" job_agent_restore_test'
 
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+./deploy/prod-compose.sh \
   --profile ops run --rm \
   -e POSTGRES_DB=job_agent_restore_test \
   -e BACKUP_FILE=/backups/job-agent-job_agent-YYYYMMDDTHHMMSSZ.dump \
