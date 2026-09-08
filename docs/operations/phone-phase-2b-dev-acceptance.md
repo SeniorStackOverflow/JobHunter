@@ -143,9 +143,11 @@ emitting its structured JSON, returning `finish_reason=length` after only
 48–49 JSON tokens. Commit `a84ba3a` raises the verification response budget to
 4,096 tokens, retries truncated responses, stores only bounded allowlisted
 validation diagnostics, and queues a privacy-safe Telegram review notice when
-verification reaches a terminal failure. A direct request with the same call
-context and the larger budget returned a schema-valid response with
-`finish_reason=stop`. Terra reviewed the final patch and returned `APPROVE`.
+verification reaches a terminal failure. Commit `fef8a8d` ensures that warning
+is shown even when retained facts fill the message to its length limit. A
+direct request with the same call context and the larger budget returned a
+schema-valid response with `finish_reason=stop`. Terra reviewed both patches
+and returned `APPROVE`.
 
 The PhoneGate credential used by DEV appeared in private failed-test output and
 was rotated after the external checks. PhoneGate accepted the replacement with
@@ -206,30 +208,34 @@ The skipped tests are the existing service-backed/live suites plus the
 opt-in real-call module described above. No unrelated documentation was
 reformatted to force the repository-wide format check green.
 
-After `a84ba3a`, the focused verification, finalization, and Telegram suites
-passed, including the new truncation, diagnostic-redaction, terminal-failure,
-and notification cases. The final static checks also passed:
+After `a84ba3a` and `fef8a8d`, the focused verification, finalization, and
+Telegram checks passed, including the new truncation, diagnostic-redaction,
+terminal-failure, long-message, and notification cases. The final static
+checks also passed:
 
 ```text
-uv run pytest -q tests/unit/test_phone_verification.py
+uv run pytest -q -p no:cov tests/unit/test_phone_verification.py
 24 passed
+
+uv run pytest -q -p no:cov tests/unit/test_phone_telegram.py -k render
+17 passed, 22 deselected
 
 uv run ruff check .
 passed
 
 uv run ruff format --check app fixture_site tests
-211 files already formatted
+212 files already formatted
 
 uv run mypy app fixture_site
 Success: no issues found in 121 source files
 
-uv run pytest --collect-only -q
-996 tests collected
+uv run pytest --collect-only -q -p no:cov
+998 tests collected
 ```
 
 The managed execution sandbox then began blocking the SQLite worker used by
 `aiosqlite` and denied Docker socket and DEV host-network access. Consequently,
-the full 996-test suite and persisted-call retry could not be rerun from that
+the full 998-test suite and persisted-call retry could not be rerun from that
 environment. The earlier 974-test full-suite result and the focused post-call
 checks are recorded separately so the evidence is not overstated.
 
@@ -243,7 +249,8 @@ the critical facts remain in manual review instead of being silently accepted.
 
 Outbound SMS comparison remains unverified because no confirming employer SMS
 was received during these calls. The second call's terminal failed session is
-preserved and needs one controlled reset/retry on the `a84ba3a` DEV image to
-verify the corrected 4,096-token post-processing path and its Telegram notice
-against persisted production-shaped data. That retry was blocked only by the
-current managed sandbox denying Docker socket and DEV host-network access.
+preserved and needs one controlled reset/retry on a DEV image containing
+`a84ba3a` and `fef8a8d` to verify the corrected 4,096-token post-processing path
+and its Telegram notice against persisted production-shaped data. That retry
+was blocked only by the current managed sandbox denying Docker socket and DEV
+host-network access.
