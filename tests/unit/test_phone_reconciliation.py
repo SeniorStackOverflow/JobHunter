@@ -313,6 +313,37 @@ def test_same_turn_correction_rejects_arbiter_selecting_negated_value() -> None:
     assert decision.facts[0].state is CallFactState.CONFLICT
 
 
+def test_correction_marker_after_date_candidates_does_not_resolve_date() -> None:
+    text = "Собеседование 12 сентября или 13 сентября; точнее, адрес уточним позже."
+    first = _candidate(raw="12 сентября", normalized="2026-09-12", quote=text)
+    second = _candidate(raw="13 сентября", normalized="2026-09-13", quote=text)
+    decision = _decide(
+        extracted=[first, second],
+        verified=[first.model_copy(), second.model_copy()],
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.95,
+            )
+        ],
+        arbitration=[
+            ArbitrationItem(
+                field="interview_date",
+                accepted_value="2026-09-13",
+                supporting_quote=text,
+                accepted=True,
+                reason="последнее значение",
+            )
+        ],
+    )
+
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert decision.facts[0].state is CallFactState.CONFLICT
+
+
 def test_differing_normalized_dates_are_conflict() -> None:
     old = _candidate(raw="завтра", normalized="2026-09-07")
     new = _candidate(raw="послезавтра", normalized="2026-09-08", quote="Собеседование послезавтра")

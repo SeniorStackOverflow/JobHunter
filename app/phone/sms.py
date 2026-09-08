@@ -13,7 +13,7 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
-from sqlalchemy import String, select, update
+from sqlalchemy import String, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
@@ -370,10 +370,7 @@ async def _mark_sms_comparison_pending(
     locked_call = await db.scalar(call_query)
     if locked_call is None:
         return False
-    already_linked = sms_session.related_session_id == locked_call.id
     if locked_call.claim_token is not None:
-        if not already_linked:
-            sms_session.related_session_id = None
         sms_session.needs_review = True
         sms_session.diagnostics = {
             **sms_session.diagnostics,
@@ -391,8 +388,6 @@ async def _mark_sms_comparison_pending(
             .values(verification_revision=locked_call.verification_revision)
         )
         if cast(int, getattr(result, "rowcount", 0)) != 1:
-            if not already_linked:
-                sms_session.related_session_id = None
             sms_session.needs_review = True
             sms_session.diagnostics = {
                 **sms_session.diagnostics,
@@ -408,6 +403,27 @@ async def _mark_sms_comparison_pending(
     )
     if turn is None:
         return False
+    claimed = await db.execute(
+        update(CommunicationSession)
+        .where(
+            CommunicationSession.id == sms_session.id,
+            or_(
+                CommunicationSession.related_session_id.is_(None),
+                CommunicationSession.related_session_id == locked_call.id,
+            ),
+        )
+        .values(related_session_id=locked_call.id)
+        .execution_options(synchronize_session=False)
+    )
+    if cast(int, getattr(claimed, "rowcount", 0)) != 1:
+        await db.refresh(sms_session)
+        sms_session.needs_review = True
+        sms_session.diagnostics = {
+            **sms_session.diagnostics,
+            "sms_correlation": {"status": "review", "reason": "existing_link_preserved"},
+        }
+        return False
+    await db.refresh(sms_session)
     summary = dict(call.summary or {})
     verification = summary.get("verification")
     if not isinstance(verification, dict):
@@ -418,7 +434,6 @@ async def _mark_sms_comparison_pending(
     turn_id = str(turn.id)
     if turn_id in input_ids:
         return sms_session.related_session_id == locked_call.id
-    sms_session.related_session_id = locked_call.id
     call.verification_revision += 1
     verification["sms_input_ids"] = sorted(
         {*(item for item in input_ids if isinstance(item, str)), turn_id}

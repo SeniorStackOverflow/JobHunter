@@ -53,15 +53,9 @@ def _comparison_value(field: CriticalField, value: str | None) -> str | None:
     return value.casefold() if field == "address" else value
 
 
-def _correction_text(text: str) -> bool:
-    folded = _normalized_text(text).casefold()
-    return bool(
-        re.search(
-            r"\b(?:точнее|исправлен|исправим|перенес|перенесём|перенесем|вместо|давайте тогда)\b",
-            folded,
-        )
-        or re.search(r"\bне\b.+\bа\b", folded)
-    )
+_CORRECTION_MARKER = re.compile(
+    r"\b(?:точнее|исправлен|исправим|перенес|перенесём|перенесем|вместо|давайте тогда)\b"
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +69,40 @@ class _CandidateEvidence:
     supported: bool
     reasons: tuple[str, ...]
     pass_name: str
+
+
+def _correction_applies(
+    text: str,
+    *,
+    latest: _CandidateEvidence,
+    candidates: Collection[_CandidateEvidence],
+) -> bool:
+    """Require the correction marker to precede the selected field expression."""
+    folded = _normalized_text(text).casefold()
+    latest_offset = latest.expression_offset
+    if latest_offset < 0:
+        return False
+    same_turn_prior = [
+        item
+        for item in candidates
+        if item.turn_seq == latest.turn_seq
+        and item.expression_offset >= 0
+        and item.expression_offset < latest_offset
+        and item.deterministic_value != latest.deterministic_value
+    ]
+    for prior in same_turn_prior:
+        prior_expression = _normalized_text(prior.candidate.raw_expression).casefold()
+        between = folded[prior.expression_offset + len(prior_expression) : latest_offset]
+        if _CORRECTION_MARKER.search(between):
+            return True
+        before_prior = folded[: prior.expression_offset]
+        if re.search(r"\bне\s*$", before_prior) and re.search(r"\bа\b", between):
+            return True
+    if same_turn_prior:
+        return False
+    if any(item.turn_seq < latest.turn_seq for item in candidates):
+        return bool(_CORRECTION_MARKER.search(folded[:latest_offset]))
+    return False
 
 
 def _inspect_candidate(
@@ -204,7 +232,9 @@ def reconcile_verification(
             )
             latest_group = groups[_comparison_value(field, latest.deterministic_value)]
             source_turn = next((t for t in context.transcript if t.seq == latest.turn_seq), None)
-            if source_turn is not None and _correction_text(source_turn.text):
+            if source_turn is not None and _correction_applies(
+                source_turn.text, latest=latest, candidates=candidates
+            ):
                 accepted_group = latest_group
                 correction_applied = True
                 for value, group in groups.items():

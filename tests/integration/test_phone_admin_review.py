@@ -160,21 +160,21 @@ async def test_fact_review_requires_csrf_and_confirms_manual_value(review_contex
         assert fact.state is CallFactState.CONFIRMED
         assert fact.confirmation_source.value == "manual"
         assert fact.normalized_value == "2026-09-03"
-        async with factory() as db:
-            call = await db.get(CommunicationSession, call_id)
-            assert call is not None
-            assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
-        page = await client.get(f"/?view=calls&tab=history&session={call_id}")
-        csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
-        response = await client.post(
-            f"/admin/phone/calls/{call_id}/facts/interview_time/review",
-            data={"action": "confirm", "value": "14:00", "csrf_token": csrf},
-        )
-        assert response.status_code == 303
-        async with factory() as db:
-            call = await db.get(CommunicationSession, call_id)
-            assert call is not None
-            assert call.verification_status is PhoneVerificationStatus.CONFIRMED
+    async with factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+        assert call is not None
+        assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
+    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
+    response = await client.post(
+        f"/admin/phone/calls/{call_id}/facts/interview_time/review",
+        data={"action": "confirm", "value": "14:00", "csrf_token": csrf},
+    )
+    assert response.status_code == 303
+    async with factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+        assert call is not None
+        assert call.verification_status is PhoneVerificationStatus.CONFIRMED
 
 
 @pytest.mark.asyncio

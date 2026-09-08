@@ -4,7 +4,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
@@ -26,6 +26,7 @@ from app.phone.sms import (
     PhoneSmsSyncUnavailable,
     RedisSmsSyncMarker,
     SmsSyncState,
+    _mark_sms_comparison_pending,
     ingest_phonegate_sms,
     process_sms_confirmation,
 )
@@ -223,6 +224,72 @@ async def test_ingest_correlates_only_single_completed_call_in_window(
         linked_call = await db.get(CommunicationSession, call.id)
     assert linked_call is not None
     assert linked_call.verification_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_sms_claim_preserves_concurrent_manual_owner(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.flush()
+        automatic_call = await add_call(db, profile, ended_at=ended)
+        manual_call = await add_call(db, profile, ended_at=ended + timedelta(minutes=1))
+        sms_session = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.SMS,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360000000",
+            remote_raw="+37360000000",
+            transport_external_id="claim-race",
+            started_at=ended,
+            ended_at=ended,
+        )
+        db.add(sms_session)
+        await db.flush()
+        db.add(
+            CommunicationTurn(
+                session_id=sms_session.id,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="Собеседование завтра в 10",
+                raw_text="Собеседование завтра в 10",
+                occurred_at=ended,
+            )
+        )
+        await db.commit()
+        automatic_call_id = automatic_call.id
+        manual_call_id = manual_call.id
+        sms_session_id = sms_session.id
+
+    async with sqlite_session_factory() as automatic_db:
+        stale_call = await automatic_db.get(CommunicationSession, automatic_call_id)
+        stale_sms = await automatic_db.get(CommunicationSession, sms_session_id)
+        assert stale_call is not None and stale_sms is not None
+        async with sqlite_session_factory() as manual_db:
+            await manual_db.execute(
+                update(CommunicationSession)
+                .where(CommunicationSession.id == sms_session_id)
+                .values(related_session_id=manual_call_id)
+            )
+            await manual_db.commit()
+
+        marked = await _mark_sms_comparison_pending(
+            automatic_db, call=stale_call, sms_session=stale_sms
+        )
+        await automatic_db.commit()
+
+    async with sqlite_session_factory() as db:
+        refreshed_sms = await db.get(CommunicationSession, sms_session_id)
+        refreshed_automatic = await db.get(CommunicationSession, automatic_call_id)
+    assert marked is False
+    assert refreshed_sms is not None
+    assert refreshed_sms.related_session_id == manual_call_id
+    assert refreshed_automatic is not None
+    assert refreshed_automatic.verification_revision == 0
 
 
 @pytest.mark.asyncio
