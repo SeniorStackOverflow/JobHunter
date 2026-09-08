@@ -152,6 +152,15 @@ direct request with the same call context and the larger budget returned a
 schema-valid response with `finish_reason=stop`. Terra reviewed both patches
 and returned `APPROVE`.
 
+After the final rebuild, the operator ran the controlled persisted-call retry
+outside the managed sandbox. The live worker reported the quality route with a
+4,096-token budget and completed the selected call without a pipeline failure:
+
+```text
+{'max_tokens': 4096, 'prefer': 'quality'}
+{'picked': 1, 'done': 1, 'failed': 0, 'skipped': 0}
+```
+
 The PhoneGate credential used by DEV appeared in private failed-test output and
 was rotated after the external checks. PhoneGate accepted the replacement with
 HTTP 200 and rejected the previous value with HTTP 401. The rebuilt API,
@@ -238,9 +247,10 @@ uv run pytest --collect-only -q -p no:cov
 
 The managed execution sandbox then began blocking the SQLite worker used by
 `aiosqlite` and denied Docker socket and DEV host-network access. Consequently,
-the full 998-test suite and persisted-call retry could not be rerun from that
-environment. The earlier 974-test full-suite result and the focused post-call
-checks are recorded separately so the evidence is not overstated.
+the full 998-test suite could not be rerun from that environment. The persisted
+call retry was subsequently completed successfully from the operator's normal
+shell as recorded above. The earlier 974-test full-suite result and the focused
+post-call checks are recorded separately so the evidence is not overstated.
 
 ## Known limits
 
@@ -251,10 +261,8 @@ path, but neither supplied enough independent evidence for a truthful
 the critical facts remain in manual review instead of being silently accepted.
 
 Outbound SMS comparison remains unverified because no confirming employer SMS
-was received during these calls. The second call's terminal failed session is
-preserved. The DEV image has been rebuilt with `a84ba3a` and `fef8a8d`, and a
-host-side contract check reports `max_tokens=4096` with the quality route. One
-controlled reset/retry is still needed to verify that path and its Telegram
-notice against persisted production-shaped data. The retry was blocked only by
-the current managed sandbox denying Docker access and both PostgreSQL and DEV
-host-network sockets.
+was received during these calls. The second call's original terminal failure
+history remains in its audit metadata, while the controlled retry on the final
+DEV image completed `done` through all three llmRouter passes. The managed
+sandbox still prevents a new full-suite run and direct database inspection;
+these limitations do not invalidate the successful operator-side live result.
