@@ -34,12 +34,16 @@ PhoneGate credential:
 | API | healthy |
 | Celery worker | healthy; `phone` queue present |
 | Celery beat | healthy |
-| Phone agent | healthy; connected to DEV PhoneGate |
+| Phone agent | container healthy; external PhoneGate live recheck deferred |
 
 The API container returned `{"status":"ok"}` from `/health` and
 `{"status":"ready","checks":{"database":{"ok":true},"redis":{"ok":true}}}`
 from `/ready`. `docker exec … alembic check` returned `No new upgrade
 operations detected.`
+
+The post-review rebuild placed API, worker, beat, and call-agent on the same
+image digest `0125eb3d53d4`; all four containers reported healthy. The image
+contains the scoped correction logic and conditional SMS ownership claim.
 
 ## Restart recovery
 
