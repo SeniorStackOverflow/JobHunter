@@ -20,6 +20,7 @@ from app.phone.verification import (
     VerificationResult,
     VerificationTurn,
     VerificationUnavailable,
+    _safe_validation_errors,
 )
 
 
@@ -140,7 +141,90 @@ def test_strict_requests_allow_reasoning_backends_to_finish_json() -> None:
 
     body = provider._body("extractor", "system", "user", ExtractionResult)
 
-    assert body["max_tokens"] == 1536
+    assert body["max_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_truncated_completion_and_records_reason() -> None:
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": '{"facts":'},
+                        }
+                    ]
+                },
+            ),
+            _response({"facts": [], "review_reasons": []}),
+        ]
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(responses))
+    ) as client:
+        provider = PostCallVerificationProvider(
+            base_url="http://router",
+            api_key="secret-token",
+            model="model",
+            max_attempts=2,
+            client=client,
+        )
+        result, metadata = await provider.verify(_context())
+
+    assert result.facts == []
+    assert metadata.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_reports_terminal_truncated_completion() -> None:
+    response = httpx.Response(
+        200,
+        json={"choices": [{"finish_reason": "length", "message": {"content": '{"facts":'}}]},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)) as client:
+        provider = PostCallVerificationProvider(
+            base_url="http://router",
+            api_key="secret-token",
+            model="model",
+            max_attempts=1,
+            client=client,
+        )
+        with pytest.raises(VerificationUnavailable, match="truncated"):
+            await provider.verify(_context())
+
+
+@pytest.mark.asyncio
+async def test_truncated_retry_does_not_reuse_prior_schema_diagnostics() -> None:
+    responses = iter(
+        [
+            _response({"facts": [], "review_reasons": [], "unexpected": "discarded"}),
+            httpx.Response(
+                200,
+                json={
+                    "choices": [{"finish_reason": "length", "message": {"content": '{"facts":'}}]
+                },
+            ),
+        ]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(responses))
+    ) as client:
+        provider = PostCallVerificationProvider(
+            base_url="http://router",
+            api_key="secret-token",
+            model="model",
+            max_attempts=2,
+            client=client,
+        )
+        with pytest.raises(VerificationUnavailable) as caught:
+            await provider.verify(_context())
+
+    assert caught.value.reason == "truncated"
+    assert caught.value.validation_errors == ()
 
 
 @pytest.mark.asyncio
@@ -326,7 +410,7 @@ async def test_provider_schema_failure_has_no_original_exception_context() -> No
                     {
                         "facts": [],
                         "review_reasons": [],
-                        "invalid_output": "employer prompt with phone +37360111222",
+                        "caller +37360111222 transcript": "employer prompt with phone +37360111222",
                     }
                 )
             )
@@ -337,8 +421,35 @@ async def test_provider_schema_failure_has_no_original_exception_context() -> No
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     formatted = "".join(traceback.format_exception(caught.value))
-    assert "invalid_output" not in formatted
+    assert "caller +37360111222 transcript" not in formatted
     assert "+37360111222" not in formatted
+    assert caught.value.validation_errors == (("extra_forbidden", ("<field>",)),)
+    assert "employer prompt" not in repr(caught.value.validation_errors)
+    assert "+37360111222" not in repr(caught.value.validation_errors)
+    assert "+37360111222" not in repr(vars(caught.value))
+
+
+def test_schema_diagnostics_are_bounded_and_deduplicated() -> None:
+    seen_kwargs = {}
+
+    class ErrorLike:
+        def errors(self, **kwargs):
+            seen_kwargs.update(kwargs)
+            return [
+                {"type": "x" * 100, "loc": ("caller +37360111222 transcript", "nested")},
+                *({"type": f"unique_{index}", "loc": (f"field_{index}",)} for index in range(20)),
+            ]
+
+    result = _safe_validation_errors(ErrorLike())  # type: ignore[arg-type]
+    assert len(result) == 16
+    assert len(result[0][0]) == 64
+    assert result[0][1] == ("<field>", "<field>")
+    assert "+37360111222" not in repr(result)
+    assert seen_kwargs == {
+        "include_url": False,
+        "include_context": False,
+        "include_input": False,
+    }
 
 
 @pytest.mark.asyncio

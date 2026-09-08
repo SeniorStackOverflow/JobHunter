@@ -531,12 +531,21 @@ async def test_finalize_requeues_when_transcript_changes_during_pipeline(
 async def test_pipeline_failure_retries_then_marks_needs_review(
     finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    env = await finalize_env(llm_enabled=True)
+    env = await finalize_env(llm_enabled=True, telegram_enabled=True)
     env.settings.phone_verification_max_attempts = 2
 
     class FailingProvider:
         async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
-            raise summary_module.VerificationUnavailable("timeout")
+            raise summary_module.VerificationUnavailable(
+                "schema_mismatch",
+                metadata=ModelCallMeta(
+                    "llmrouter",
+                    "fixture",
+                    1,
+                    1,
+                    (("extra_forbidden", ("caller +37360111222 transcript",)),),
+                ),
+            )
 
     monkeypatch.setattr(
         summary_module, "_build_verification_provider", lambda settings: FailingProvider()
@@ -545,7 +554,7 @@ async def test_pipeline_failure_retries_then_marks_needs_review(
     first = await env.get_session()
     assert first.summary_state is PhoneSummaryState.PENDING
     assert first.summary["model_meta"]["attempts"] == 1
-    assert first.summary["model_meta"]["last_error"] == "timeout"
+    assert first.summary["model_meta"]["last_error"] == "schema_mismatch"
 
     assert await summary_module.finalize_call(env.session_id) == "failed"
     second = await env.get_session()
@@ -556,6 +565,11 @@ async def test_pipeline_failure_retries_then_marks_needs_review(
     assert [entry["attempt"] for entry in attempts] == [1, 2]
     assert attempts[-1]["failed_stage"] == "extractor"
     assert attempts[-1]["stages"]["extractor"]["state"] == "failed"
+    assert attempts[-1]["stages"]["extractor"]["validation_errors"] == [
+        {"type": "extra_forbidden", "loc": ["<field>"]}
+    ]
+    assert "+37360111222" not in repr(attempts)
+    assert second.summary["telegram"]["state"] == "pending"
 
 
 @pytest.mark.asyncio

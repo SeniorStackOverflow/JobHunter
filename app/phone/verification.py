@@ -191,20 +191,99 @@ class ModelCallMeta:
     model: str
     latency_ms: int
     attempts: int
+    validation_errors: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 class VerificationUnavailable(RuntimeError):
     """A verification pass did not produce a usable structured response."""
 
-    def __init__(self, reason: str, *, metadata: ModelCallMeta | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        metadata: ModelCallMeta | None = None,
+        validation_errors: tuple[tuple[str, tuple[str, ...]], ...] = (),
+    ) -> None:
         # Keep this string intentionally code-only.  Provider exceptions may
         # contain prompts, phone numbers, SMS text, or credentials.
         self.reason = reason
         self.metadata = metadata
+        self.validation_errors = validation_errors
         super().__init__(reason)
 
 
 PhoneVerificationUnavailable = VerificationUnavailable
+
+_SAFE_LOCATION_FIELDS = {
+    "accepted",
+    "accepted_value",
+    "ambiguity",
+    "application_status",
+    "asr_confidence",
+    "call_expression",
+    "call_id",
+    "call_started_at",
+    "comparisons",
+    "confidence",
+    "confirmed_facts",
+    "decisions",
+    "evidence_reference",
+    "facts",
+    "field",
+    "format",
+    "interview_date",
+    "interview_time",
+    "meeting_url",
+    "normalized_value",
+    "outcome_guess",
+    "quote",
+    "raw_expression",
+    "reason",
+    "relation",
+    "review_reasons",
+    "sms_expression",
+    "speaker",
+    "state",
+    "summary_text",
+    "supporting_quote",
+    "text",
+    "timezone",
+    "transcript",
+    "turn_id",
+    "turn_seq",
+    "vacancy",
+}
+
+
+def _sanitize_validation_errors(
+    errors: Sequence[object],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    safe: list[tuple[str, tuple[str, ...]]] = []
+    for item in errors:
+        if isinstance(item, dict):
+            error_type = str(item.get("type", "validation_error"))[:64]
+            raw_loc = item.get("loc", ())
+        elif isinstance(item, tuple) and len(item) == 2:
+            error_type, raw_loc = item
+            error_type = str(error_type)[:64]
+        else:
+            continue
+        if not isinstance(raw_loc, (list, tuple)):
+            raw_loc = ()
+        loc = tuple(
+            part
+            if isinstance(part, str) and part in _SAFE_LOCATION_FIELDS
+            else "[index]"
+            if isinstance(part, int)
+            else "<field>"
+            for part in raw_loc
+        )[:8]
+        value = (error_type, loc)
+        if value not in safe:
+            safe.append(value)
+            if len(safe) == 16:
+                break
+    return tuple(safe)
 
 
 def _strip_fence(text: str) -> str:
@@ -216,6 +295,16 @@ def _strip_fence(text: str) -> str:
     ):
         return "\n".join(lines[1:-1]).strip()
     return text.strip()
+
+
+def _safe_validation_errors(
+    error: ValidationError,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Keep only bounded Pydantic error codes and locations."""
+
+    return _sanitize_validation_errors(
+        error.errors(include_url=False, include_context=False, include_input=False)
+    )
 
 
 def _nullable_schema(schema: dict[str, Any]) -> None:
@@ -382,8 +471,8 @@ class PostCallVerificationProvider:
             "stream": False,
             "temperature": 0,
             # Reasoning backends consume completion budget before emitting the
-            # structured JSON; 1536 leaves enough room for the fact payload.
-            "max_tokens": 1536,
+            # structured JSON; 4096 leaves enough room for the fact payload.
+            "max_tokens": 4096,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -411,9 +500,11 @@ class PostCallVerificationProvider:
         started = time.perf_counter()
         attempts = 0
         terminal_reason: str | None = None
+        validation_errors: tuple[tuple[str, tuple[str, ...]], ...] = ()
         try:
             while attempts < self._max_attempts:
                 attempts += 1
+                validation_errors = ()
                 response: httpx.Response | None = None
                 request_reason: str | None = None
                 try:
@@ -449,13 +540,21 @@ class PostCallVerificationProvider:
 
                 parse_reason: str | None = None
                 content: object = None
+                finish_reason: object = None
                 try:
                     payload = response.json()
-                    content = payload["choices"][0]["message"]["content"]
+                    choice = payload["choices"][0]
+                    content = choice["message"]["content"]
+                    finish_reason = choice.get("finish_reason")
                 except (ValueError, KeyError, IndexError, TypeError):
                     parse_reason = "malformed_envelope"
                 if parse_reason is not None:
                     terminal_reason = parse_reason
+                    if attempts < self._max_attempts:
+                        continue
+                    break
+                if finish_reason == "length":
+                    terminal_reason = "truncated"
                     if attempts < self._max_attempts:
                         continue
                     break
@@ -467,8 +566,15 @@ class PostCallVerificationProvider:
 
                 try:
                     result = schema_model.model_validate_json(_strip_fence(content))
-                except (ValidationError, ValueError):
+                except ValidationError as exc:
                     terminal_reason = "schema_mismatch"
+                    validation_errors = _safe_validation_errors(exc)
+                    if attempts < self._max_attempts:
+                        continue
+                    break
+                except ValueError:
+                    terminal_reason = "schema_mismatch"
+                    validation_errors = ()
                     if attempts < self._max_attempts:
                         continue
                     break
@@ -479,7 +585,9 @@ class PostCallVerificationProvider:
                 )
 
             latency = max(1, round((time.perf_counter() - started) * 1000))
-            metadata = ModelCallMeta("llmrouter", self._models[pass_name], latency, attempts)
+            metadata = ModelCallMeta(
+                "llmrouter", self._models[pass_name], latency, attempts, validation_errors
+            )
         finally:
             if owns_client:
                 await client.aclose()
@@ -487,7 +595,11 @@ class PostCallVerificationProvider:
         # This raise is intentionally outside all exception handlers.  It keeps
         # transport and validation details out of __cause__, __context__, and
         # traceback rendering for callers that persist the failure.
-        raise VerificationUnavailable(terminal_reason or "exhausted", metadata=metadata)
+        raise VerificationUnavailable(
+            terminal_reason or "exhausted",
+            metadata=metadata,
+            validation_errors=validation_errors,
+        )
 
     async def extract(self, ctx: VerificationContext) -> tuple[ExtractionResult, ModelCallMeta]:
         return await self._complete_json(

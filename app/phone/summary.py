@@ -38,6 +38,7 @@ from app.phone.verification import (
     VerificationContext,
     VerificationTurn,
     VerificationUnavailable,
+    _sanitize_validation_errors,
 )
 from app.settings.config import Settings, get_settings
 
@@ -597,13 +598,19 @@ def _safe_failure_reason(exc: BaseException) -> str:
 def _meta_record(metadata: ModelCallMeta | None, model: str, state: str) -> dict[str, object]:
     if metadata is None:
         return {"state": state, "provider": "llmrouter", "model": model}
-    return {
+    record = {
         "state": state,
         "provider": metadata.provider,
         "model": metadata.model,
         "latency_ms": metadata.latency_ms,
         "attempts": metadata.attempts,
     }
+    if metadata.validation_errors:
+        record["validation_errors"] = [
+            {"type": error_type, "loc": list(location)}
+            for error_type, location in _sanitize_validation_errors(metadata.validation_errors)
+        ]
+    return record
 
 
 def _append_attempt_history(call: CommunicationSession, record: dict[str, object]) -> None:
@@ -696,6 +703,7 @@ async def _record_pipeline_failure(
             call.summary_state = PhoneSummaryState.FAILED
             call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
             call.needs_review = True
+            refresh_telegram_notification(call)
         else:
             call.summary_state = PhoneSummaryState.PENDING
             call.verification_status = PhoneVerificationStatus.PENDING

@@ -3,6 +3,7 @@
 Telegram has no idempotency key. A short claim lease and an explicit
 ambiguous terminal state make that limitation visible to operators.
 """
+# ruff: noqa: RUF001 — Russian notification text is intentional.
 
 from __future__ import annotations
 
@@ -327,7 +328,12 @@ def render_call_notification(
             lines.append(f"🕒 {escape(proposed_datetime)}")
         if proposed_address:
             lines.append(f"📍 {escape(proposed_address)}")
-        if getattr(call, "needs_review", False):
+        if getattr(call, "summary_state", None) == "failed":
+            lines.append(
+                "⚠️ Обработка звонка завершилась с ошибкой. Требуется проверка — "
+                "откройте запись звонка."
+            )
+        elif getattr(call, "needs_review", False):
             lines.append("⚠️ Требуется проверка — откройте запись звонка.")
     return _truncate("\n".join(lines) + _admin_link(base_url, actual_session_id))
 
@@ -394,7 +400,7 @@ def _due_query(
         select(CommunicationSession)
         .where(
             CommunicationSession.channel == CommunicationChannel.CALL,
-            CommunicationSession.summary_state == "done",
+            CommunicationSession.summary_state.in_(("done", "failed")),
             CommunicationSession.summary["telegram"]["state"]
             .as_string()
             .in_(("pending", "retrying")),
@@ -471,7 +477,7 @@ async def _mark_disabled(now: datetime) -> int:
                 await db.scalars(
                     select(CommunicationSession).where(
                         CommunicationSession.channel == CommunicationChannel.CALL,
-                        CommunicationSession.summary_state == "done",
+                        CommunicationSession.summary_state.in_(("done", "failed")),
                     )
                 )
             ).all()

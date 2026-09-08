@@ -6,12 +6,14 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+# ruff: noqa: RUF001 — Russian notification text is intentional.
 from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import (
     CallFactConfirmationSource,
     CallFactState,
     CommunicationChannel,
     CommunicationDirection,
+    PhoneSummaryState,
     PhoneVerificationStatus,
     TurnSpeaker,
 )
@@ -534,6 +536,56 @@ async def test_disabled_worker_marks_pending_without_network(
 
 
 @pytest.mark.asyncio
+async def test_disabled_worker_marks_failed_pending_without_network(
+    sqlite_session_factory, monkeypatch: pytest.MonkeyPatch
+):
+    from app.models.entities import UserProfile
+    from app.models.enums import CommunicationOutcome, PhoneSummaryState
+
+    settings = Settings(_env_file=None, telegram_enabled=False)
+    monkeypatch.setattr(telegram_module, "get_settings", lambda: settings)
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="p", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+            outcome=CommunicationOutcome.COMPLETED,
+            summary_state=PhoneSummaryState.FAILED,
+            summary={"telegram": {"state": "pending", "input_revision": 0}},
+        )
+        db.add(call)
+        await db.commit()
+    result = await telegram_module.deliver_pending_phone_notifications()
+    assert result["disabled"] == 1
+    async with sqlite_session_factory() as db:
+        stored = await db.get(CommunicationSession, call.id)
+        assert stored is not None
+        assert stored.summary["telegram"]["state"] == "disabled"
+
+
+def test_render_failed_no_facts_describes_review_without_transcript_or_number():
+    call = _call(
+        PhoneVerificationStatus.NEEDS_REVIEW,
+        summary={"model_meta": {"last_error": "schema_mismatch"}},
+    )
+    call.needs_review = True
+    call.summary_state = PhoneSummaryState.FAILED
+    call.remote_address = "+373 60 111 222"
+    text = render_call_notification(call=call, base_url=None)
+    assert "Требуется проверка" in text
+    assert "Обработка звонка завершилась с ошибкой" in text
+    assert "+373" not in text
+    assert "schema_mismatch" not in text
+
+
+@pytest.mark.asyncio
 async def test_retryable_failure_is_due_again_with_bounded_backoff(
     sqlite_session_factory, monkeypatch: pytest.MonkeyPatch
 ):
@@ -868,7 +920,7 @@ async def test_revision_change_on_error_path_never_writes_old_retry(
 
 
 @pytest.mark.asyncio
-async def test_due_query_skips_terminal_and_not_due_rows_before_window(
+async def test_due_query_includes_failed_and_skips_not_due_rows_before_window(
     sqlite_session_factory, monkeypatch: pytest.MonkeyPatch
 ):
     from app.models.entities import UserProfile
@@ -924,9 +976,23 @@ async def test_due_query_skips_terminal_and_not_due_rows_before_window(
                     "telegram": {
                         "state": "retrying",
                         "input_revision": 0,
-                        "next_attempt_at": (now - timedelta(seconds=1)).isoformat(),
+                        "next_attempt_at": (now + timedelta(seconds=1)).isoformat(),
                     }
                 },
+            )
+        )
+        rows.append(
+            CommunicationSession(
+                profile_id=profile.id,
+                channel=CommunicationChannel.CALL,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                started_at=now,
+                ended_at=now - timedelta(seconds=1),
+                outcome=CommunicationOutcome.COMPLETED,
+                summary_state=PhoneSummaryState.FAILED,
+                needs_review=True,
+                summary={"telegram": {"state": "pending", "input_revision": 0}},
             )
         )
         db.add_all(rows)
