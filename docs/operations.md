@@ -235,20 +235,21 @@ manager. Не храните ключ рядом с зашифрованными
 ## Тестовое восстановление
 
 Проверяйте backup только в изолированном disposable PostgreSQL container с
-отдельным data volume и отдельной Docker network. Подключите `backup_data` в
+отдельным data volume и без Docker network. Подключите `backup_data` в
 него read-only, создайте внутри этого контейнера тестовую БД и восстановите dump
 через `pg_restore`. Используйте отдельные throwaway credentials; не подключайте
 контейнер к PROD PostgreSQL и не создавайте временную БД в PROD-кластере:
 
 ```bash
 RESTORE_NAME=jobhunter-restore-check
-docker network create "$RESTORE_NAME-net"
+RESTORE_ENV_FILE=$(mktemp)
+chmod 0600 "$RESTORE_ENV_FILE"
+printf 'POSTGRES_DB=restore_check\nPOSTGRES_USER=restore_check\nPOSTGRES_PASSWORD=%s\n' \
+  "$(openssl rand -hex 32)" > "$RESTORE_ENV_FILE"
 docker volume create "$RESTORE_NAME-data"
 docker run -d --rm --name "$RESTORE_NAME" \
-  --network "$RESTORE_NAME-net" \
-  -e POSTGRES_DB=restore_check \
-  -e POSTGRES_USER=restore_check \
-  -e POSTGRES_PASSWORD="$RESTORE_PASSWORD" \
+  --network none \
+  --env-file "$RESTORE_ENV_FILE" \
   -v "$RESTORE_NAME-data:/var/lib/postgresql/data" \
   -v jobhunter-prod_backup_data:/backups:ro \
   postgres:16-alpine
@@ -258,16 +259,16 @@ docker exec "$RESTORE_NAME" pg_isready -U restore_check -d restore_check
 docker exec "$RESTORE_NAME" sh -ec \
   'pg_restore --list /backups/job-agent-job_agent-YYYYMMDDTHHMMSSZ.dump >/dev/null && \
    pg_restore --clean --if-exists --exit-on-error --no-owner --no-acl \
-     --dbname=postgresql://restore_check:"$POSTGRES_PASSWORD"@127.0.0.1:5432/restore_check \
+     --username=restore_check --dbname=restore_check \
      /backups/job-agent-job_agent-YYYYMMDDTHHMMSSZ.dump'
 
 docker rm -f "$RESTORE_NAME"
 docker volume rm "$RESTORE_NAME-data"
-docker network rm "$RESTORE_NAME-net"
+rm -f "$RESTORE_ENV_FILE"
 ```
 
-Замените имя файла на фактическое значение команды backup и передайте
-`RESTORE_PASSWORD` только через защищённое окружение. Если выполняется
+Замените имя файла на фактическое значение команды backup. Одноразовый пароль
+передаётся только через файл mode `0600`, не через argv. Если выполняется
 checksum-проверка, проверяйте соседний `.sha256` до запуска `pg_restore`.
 Восстановление использует `--clean`, `--if-exists`, `--exit-on-error`,
 `--no-owner` и `--no-acl`; служебные PROD БД для этого drill не используются.
