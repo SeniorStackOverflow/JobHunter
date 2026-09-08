@@ -24,7 +24,8 @@ runtime image creates the directory for UID 10001 before the volume is first
 used. Blank phone summary transport settings fall back to llmRouter base URL,
 key, and model; explicit phone overrides still win.
 
-After the final rebuild and credential rotation the DEV services were healthy:
+After the final rebuild the DEV services were healthy with the operator-injected
+PhoneGate credential:
 
 | Service | Result |
 | --- | --- |
@@ -114,10 +115,12 @@ same Russian phrase passed after this change with five correctly typed fields
 on the first attempt. The reconciliation rule still requires two independent
 passes plus transcript/audio evidence and matching Arbiter confirmation.
 
-The DEV PhoneGate token that appeared in private failed-test output was rotated
-after the external checks. PhoneGate accepted the new token with HTTP 200 and
-rejected the old token with HTTP 401. The rebuilt API, worker, and call-agent
-were verified to hold the current token without printing it.
+The PhoneGate credential used by DEV appeared in private failed-test output and
+was rotated after the external checks. PhoneGate accepted the replacement with
+HTTP 200 and rejected the previous value with HTTP 401. The rebuilt API,
+worker, and call-agent were verified to hold the operator-injected replacement
+without printing it. PhoneGate is an external production dependency; future
+rotation and service operations belong to its own deployment workflow.
 
 ## Whole-branch review follow-up
 
@@ -130,6 +133,14 @@ format values editable in the admin UI. Telegram labels now use the persisted
 `format` and `meeting_url` field names. Adversarial and concurrency regressions
 cover each finding.
 
+A second Sol pass found two further important races. Correction markers are now
+required to precede and connect the selected field expression, so a later
+correction about an address cannot resolve two ambiguous dates. Automatic SMS
+correlation now claims an unowned SMS conditionally before changing the call;
+a concurrently committed manual owner is preserved. Both findings have focused
+red/green regression coverage. Sol reviewed commit `930bc11` and returned
+`APPROVE` with no remaining critical or important blockers.
+
 ## Admin browser acceptance
 
 With Playwright Chromium installed locally, the complete admin review suite
@@ -139,7 +150,8 @@ was run three consecutive times after the final Sol review fixes:
 RUN_PLAYWRIGHT_TESTS=1 uv run pytest tests/integration/test_phone_admin_review.py -q
 ```
 
-Each run returned `13 passed` (run durations 13.86s, 13.69s, and 13.13s).
+The latest three runs returned `13 passed` (run durations 16.86s, 13.92s, and
+13.00s).
 The browser workflow covered narrow layout, fact review states, evidence
 empty state, SMS linkage controls, audit state, Telegram state, processing,
 failure, conflict, empty states, and the canonical interview-format control.
@@ -152,7 +164,7 @@ The final checks ran after the DEV and browser checks:
 | --- | --- |
 | `uv run ruff check .` | passed |
 | `uv run mypy app fixture_site` | passed; 121 source files |
-| `uv run pytest -q` | 972 passed, 16 skipped, 135.47s |
+| `uv run pytest -q` | 974 passed, 16 skipped, 139.26s |
 | `git diff --check` | passed |
 | `uv run ruff format --check app fixture_site tests migrations` | passed; 212 Python files |
 | `uv run ruff format --check .` | blocked only by six pre-existing unformatted Phase 1/2 design and plan Markdown files |
@@ -169,3 +181,8 @@ real call, ASR, evidence, persistence, and conservative review path. A fresh
 manual GSM call is still required to record a truthful post-fix
 `high_confidence` result; it must be performed only after the whole-branch Sol
 review is clean.
+
+PhoneGate became temporarily unavailable after the recorded live checks. No
+new live call or PhoneGate mutation was attempted during that outage; the final
+manual-call acceptance remains deferred until the operator restores the
+external service.
