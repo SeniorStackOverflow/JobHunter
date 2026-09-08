@@ -652,7 +652,7 @@ async def test_mute_command_during_listening_records_diagnostic(
 
     async def command_check() -> str | None:
         calls["n"] += 1
-        # Call 1 = the pre-answer check, calls 2-5 = the 4 greeting blocks —
+        # Call 1 = the pre-answer check, calls 2-3 = the 2 greeting blocks;
         # call 6+ is safely inside LISTENING.
         return "mute" if calls["n"] >= 6 else None
 

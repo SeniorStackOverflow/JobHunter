@@ -10,7 +10,12 @@ from app.phone.script import (
 
 
 def test_greeting_blocks_are_short_nonempty_strings() -> None:
-    assert len(SCRIPT_GREETING) >= 3
+    assert SCRIPT_GREETING == (
+        "Здравствуйте. Я голосовой ассистент Андрея и помогаю от его имени "
+        "согласовать собеседования.",
+        "Назовите, пожалуйста, вакансию, дату, время, адрес и часовой пояс.",
+    )
+    assert "от его имени" in " ".join(SCRIPT_GREETING)
     for block in SCRIPT_GREETING:
         assert isinstance(block, str)
         assert 0 < len(block) <= 200  # short blocks keep Piper + GSM quality up
