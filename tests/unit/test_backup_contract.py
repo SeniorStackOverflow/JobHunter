@@ -15,9 +15,9 @@ def _backup_test_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     backup_dir = tmp_path / "backups"
     script = tmp_path / "backup.sh"
     script.write_text(
-        (ROOT / "deploy/backup.sh").read_text(encoding="utf-8").replace(
-            "/backups", str(backup_dir)
-        ),
+        (ROOT / "deploy/backup.sh")
+        .read_text(encoding="utf-8")
+        .replace("/backups", str(backup_dir)),
         encoding="utf-8",
     )
     args_file = tmp_path / "pg_dump.args"
@@ -25,9 +25,9 @@ def _backup_test_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     (fake_bin / "pg_dump").write_text(
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$@\" > {args_file}\n"
-        f"printf 'PGDATABASE=%s\\nPGPASSWORD=%s\\n' \"$PGDATABASE\" \"$PGPASSWORD\" > {env_file}\n"
-        "for arg in \"$@\"; do\n"
-        "  case \"$arg\" in --file=*) file=${arg#--file=} ;; esac\n"
+        f'printf \'PGDATABASE=%s\\nPGPASSWORD=%s\\n\' "$PGDATABASE" "$PGPASSWORD" > {env_file}\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in --file=*) file=${arg#--file=} ;; esac\n'
         "done\n"
         "printf 'fake dump\\n' > \"$file\"\n",
         encoding="utf-8",
@@ -42,9 +42,7 @@ def test_production_backup_uses_root_only_migrator_env() -> None:
     compose = yaml.safe_load((ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8"))
     backup = compose["services"]["backup"]
 
-    assert backup["env_file"] == [
-        {"path": "/etc/jobhunter/migrator.env", "required": True}
-    ]
+    assert backup["env_file"] == [{"path": "/etc/jobhunter/migrator.env", "required": True}]
     assert backup["environment"] == {
         "POSTGRES_HOST": "",
         "POSTGRES_PORT": "",
