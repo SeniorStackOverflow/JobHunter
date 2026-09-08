@@ -204,13 +204,21 @@ read/write/scan. При нескольких API-процессах и для п
 
 ## Backup PostgreSQL
 
-Канонический backup выполняет Compose-сервис профиля `ops`; пароль берётся из
-окружения Compose и не передаётся аргументом процесса:
+Канонический production backup выполняет Compose-сервис профиля `ops`; он получает
+`MIGRATOR_DATABASE_URL` из root-only `/etc/jobhunter/migrator.env` и не передаёт
+секрет в лог или аргументы shell. В DEV при отсутствии этого значения сохраняется
+fallback через `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DB`/`POSTGRES_USER` и
+`POSTGRES_PASSWORD`:
 
 ```bash
 ./deploy/prod-compose.sh \
   --profile ops run --rm backup
 ```
+
+Перед rollout backup должен пройти изолированную restore-проверку в отдельном
+одноразовом PostgreSQL container и data volume; временную базу внутри PROD
+кластера для этой проверки не создавайте. Разрушительная процедура восстановления
+в существующий PROD описана отдельно ниже и требует отдельного решения оператора.
 
 Сервис создаёт custom-format dump атомарно через временный файл, проверяет его
 `pg_restore --list`, сохраняет в volume `backup_data` с mode `0600` и создаёт
@@ -226,27 +234,43 @@ manager. Не храните ключ рядом с зашифрованными
 
 ## Тестовое восстановление
 
-Восстановление использует только `.dump` непосредственно из того же
-`backup_data`. Оно очищает существующие объекты целевой БД, поэтому сначала
-создайте отдельную тестовую БД и укажите точное подтверждение:
+Проверяйте backup только в изолированном disposable PostgreSQL container с
+отдельным data volume и отдельной Docker network. Подключите `backup_data` в
+него read-only, создайте внутри этого контейнера тестовую БД и восстановите dump
+через `pg_restore`. Используйте отдельные throwaway credentials; не подключайте
+контейнер к PROD PostgreSQL и не создавайте временную БД в PROD-кластере:
 
 ```bash
-./deploy/prod-compose.sh exec -T postgres \
-  sh -ec 'createdb --username="$POSTGRES_USER" job_agent_restore_test'
+RESTORE_NAME=jobhunter-restore-check
+docker network create "$RESTORE_NAME-net"
+docker volume create "$RESTORE_NAME-data"
+docker run -d --rm --name "$RESTORE_NAME" \
+  --network "$RESTORE_NAME-net" \
+  -e POSTGRES_DB=restore_check \
+  -e POSTGRES_USER=restore_check \
+  -e POSTGRES_PASSWORD="$RESTORE_PASSWORD" \
+  -v "$RESTORE_NAME-data:/var/lib/postgresql/data" \
+  -v jobhunter-prod_backup_data:/backups:ro \
+  postgres:16-alpine
 
-./deploy/prod-compose.sh \
-  --profile ops run --rm \
-  -e POSTGRES_DB=job_agent_restore_test \
-  -e BACKUP_FILE=/backups/job-agent-job_agent-YYYYMMDDTHHMMSSZ.dump \
-  -e RESTORE_CONFIRM=restore:job_agent_restore_test \
-  restore
+# Wait for readiness, then run pg_restore inside the disposable container.
+docker exec "$RESTORE_NAME" pg_isready -U restore_check -d restore_check
+docker exec "$RESTORE_NAME" sh -ec \
+  'pg_restore --list /backups/job-agent-job_agent-YYYYMMDDTHHMMSSZ.dump >/dev/null && \
+   pg_restore --clean --if-exists --exit-on-error --no-owner --no-acl \
+     --dbname=postgresql://restore_check:"$POSTGRES_PASSWORD"@127.0.0.1:5432/restore_check \
+     /backups/job-agent-job_agent-YYYYMMDDTHHMMSSZ.dump'
+
+docker rm -f "$RESTORE_NAME"
+docker volume rm "$RESTORE_NAME-data"
+docker network rm "$RESTORE_NAME-net"
 ```
 
-Замените имя файла на фактическое значение команды backup. Restore проверяет
-`.sha256`, если он существует, валидирует архив и использует `--clean`,
-`--if-exists`, `--exit-on-error`, `--no-owner` и `--no-acl`. Значение
-`RESTORE_CONFIRM` должно в точности совпадать с `restore:<POSTGRES_DB>`; служебные
-БД PostgreSQL запрещены.
+Замените имя файла на фактическое значение команды backup и передайте
+`RESTORE_PASSWORD` только через защищённое окружение. Если выполняется
+checksum-проверка, проверяйте соседний `.sha256` до запуска `pg_restore`.
+Восстановление использует `--clean`, `--if-exists`, `--exit-on-error`,
+`--no-owner` и `--no-acl`; служебные PROD БД для этого drill не используются.
 
 Затем:
 
@@ -256,9 +280,11 @@ manager. Не храните ключ рядом с зашифрованными
 4. не запускайте worker/beat и реальную отправку против restored БД;
 5. удалите тестовые данные согласно политике retention.
 
+## Destructive restore production database
+
 Для восстановления рабочей БД сначала включите глобальную паузу и server-side
 real-send kill switch, остановите `api`, `worker` и `beat`, сохраните текущую БД
-отдельным backup и только затем запускайте тот же `restore` с явно указанной
+отдельным backup и только затем запускайте production `restore` с явно указанной
 целевой БД. Не выполняйте destructive restore поверх работающего приложения.
 
 ## Ротация ключей и credentials
