@@ -1,6 +1,6 @@
 # Phone Phase 2b DEV acceptance
 
-Acceptance run date: 2026-09-07 (Europe/Chisinau)
+Acceptance run date: 2026-09-08 (Europe/Chisinau)
 
 This artifact records the DEV checks completed from the `phone-2b-impl`
 worktree. It contains no provider credentials, PhoneGate tokens, phone numbers,
@@ -34,7 +34,7 @@ PhoneGate credential:
 | API | healthy |
 | Celery worker | healthy; `phone` queue present |
 | Celery beat | healthy |
-| Phone agent | container healthy; external PhoneGate live recheck deferred |
+| Phone agent | healthy; PhoneGate connected in `Zero-ADB`, call state `IDLE` |
 
 The API container returned `{"status":"ok"}` from `/health` and
 `{"status":"ready","checks":{"database":{"ok":true},"redis":{"ok":true}}}`
@@ -42,8 +42,11 @@ from `/ready`. `docker exec … alembic check` returned `No new upgrade
 operations detected.`
 
 The post-review rebuild placed API, worker, beat, and call-agent on the same
-image digest `0125eb3d53d4`; all four containers reported healthy. The image
-contains the scoped correction logic and conditional SMS ownership claim.
+image digest `0125eb3d53d4`; all four containers reported healthy. A later DEV
+rebuild completed from commit `a84ba3a` after the manual-call findings. It
+contains the scoped correction logic, conditional SMS ownership claim,
+expanded structured-output budget, safe validation diagnostics, and terminal
+failure notification handling.
 
 ## Restart recovery
 
@@ -56,10 +59,11 @@ cursor after a failed call; no production project or data was touched.
 The root acceptance run completed the five real llmRouter verification cases
 with `LLMROUTER_PREFER=fast` and a 120-second timeout (`1 passed` in 22.81s).
 The real PhoneGate health, device, read-only SMS history, and audio endpoints
-also passed (`1 passed` in 0.28s). No Telegram credentials were present, so the
-DEV override recorded Telegram as `disabled`; no message was sent or claimed.
-Outbound SMS matching/conflict checks remain unavailable on the approved
-employer-side rig.
+also passed (`1 passed` in 0.28s). Telegram was subsequently enabled with an
+operator-supplied credential stored outside the repository. A direct bot
+delivery succeeded, and the first manual call notification was delivered on
+the first attempt. Outbound SMS matching/conflict checks remain unavailable on
+the approved employer-side rig.
 
 The local A06 harness checks passed:
 
@@ -119,6 +123,30 @@ same Russian phrase passed after this change with five correctly typed fields
 on the first attempt. The reconciliation rule still requires two independent
 passes plus transcript/audio evidence and matching Arbiter confirmation.
 
+Two subsequent operator-led Russian calls completed over the real GSM path.
+The first produced the correct vacancy, date, time, and address, retained a
+weak timezone for review, delivered the SMS-confirmation closing, and sent the
+Telegram review notification on the first attempt. It safely ended
+`done/needs_review`; no weak critical field was promoted.
+
+The second call exercised the shortened two-part greeting. The first greeting
+audio began 1.56 seconds after answer, and the second began 11.37 seconds after
+the first. The previous four-part greeting took 26.19 seconds from its first to
+fourth block, so the change materially reduced the opening delay. PhoneGate
+captured and queued 34 employer RX frames with zero drops. ASR split the time
+and address across low-confidence fragments, and the closing again requested
+an SMS confirmation. The conservative review outcome was therefore correct.
+
+That call also exposed a post-processing transport defect. The reasoning
+backend could spend nearly all of the 1,536-token response budget before
+emitting its structured JSON, returning `finish_reason=length` after only
+48–49 JSON tokens. Commit `a84ba3a` raises the verification response budget to
+4,096 tokens, retries truncated responses, stores only bounded allowlisted
+validation diagnostics, and queues a privacy-safe Telegram review notice when
+verification reaches a terminal failure. A direct request with the same call
+context and the larger budget returned a schema-valid response with
+`finish_reason=stop`. Terra reviewed the final patch and returned `APPROVE`.
+
 The PhoneGate credential used by DEV appeared in private failed-test output and
 was rotated after the external checks. PhoneGate accepted the replacement with
 HTTP 200 and rejected the previous value with HTTP 401. The rebuilt API,
@@ -162,7 +190,8 @@ failure, conflict, empty states, and the canonical interview-format control.
 
 ## Final repository checks
 
-The final checks ran after the DEV and browser checks:
+The full-suite baseline ran after the DEV and browser checks and before the
+post-call hardening patch:
 
 | Command | Result |
 | --- | --- |
@@ -177,16 +206,44 @@ The skipped tests are the existing service-backed/live suites plus the
 opt-in real-call module described above. No unrelated documentation was
 reformatted to force the repository-wide format check green.
 
+After `a84ba3a`, the focused verification, finalization, and Telegram suites
+passed, including the new truncation, diagnostic-redaction, terminal-failure,
+and notification cases. The final static checks also passed:
+
+```text
+uv run pytest -q tests/unit/test_phone_verification.py
+24 passed
+
+uv run ruff check .
+passed
+
+uv run ruff format --check app fixture_site tests
+211 files already formatted
+
+uv run mypy app fixture_site
+Success: no issues found in 121 source files
+
+uv run pytest --collect-only -q
+996 tests collected
+```
+
+The managed execution sandbox then began blocking the SQLite worker used by
+`aiosqlite` and denied Docker socket and DEV host-network access. Consequently,
+the full 996-test suite and persisted-call retry could not be rerun from that
+environment. The earlier 974-test full-suite result and the focused post-call
+checks are recorded separately so the evidence is not overstated.
+
 ## Known limits
 
-Telegram delivery and outbound SMS comparison remain unverified because the
-authorized credentials/rig were unavailable. The automated GSM run proves the
-real call, ASR, evidence, persistence, and conservative review path. A fresh
-manual GSM call is still required to record a truthful post-fix
-`high_confidence` result; it must be performed only after the whole-branch Sol
-review is clean.
+PhoneGate connectivity, two manual calls, llmRouter processing, and Telegram
+delivery have been verified. The calls exercised the intended conservative
+path, but neither supplied enough independent evidence for a truthful
+`high_confidence` result. This is expected for fragmented, low-confidence ASR:
+the critical facts remain in manual review instead of being silently accepted.
 
-PhoneGate became temporarily unavailable after the recorded live checks. No
-new live call or PhoneGate mutation was attempted during that outage; the final
-manual-call acceptance remains deferred until the operator restores the
-external service.
+Outbound SMS comparison remains unverified because no confirming employer SMS
+was received during these calls. The second call's terminal failed session is
+preserved and needs one controlled reset/retry on the `a84ba3a` DEV image to
+verify the corrected 4,096-token post-processing path and its Telegram notice
+against persisted production-shaped data. That retry was blocked only by the
+current managed sandbox denying Docker socket and DEV host-network access.
