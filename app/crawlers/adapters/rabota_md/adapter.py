@@ -14,7 +14,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from selectolax.parser import HTMLParser
 
-from app.crawlers.browser import StealthPlaywrightBrowser
+from app.crawlers.browser import BrowserNavigationError, StealthPlaywrightBrowser
 from app.crawlers.http import HttpFetcher, SecureHttpClient
 from app.crawlers.schemas import (
     AccessPolicyResult,
@@ -694,7 +694,12 @@ class RabotaMdAdapter:
         )
         try:
             response = await self._get_public_page(url)
-        except (httpx.TimeoutException, httpx.NetworkError, RabotaMdTemporaryError) as exc:
+        except (
+            BrowserNavigationError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            RabotaMdTemporaryError,
+        ) as exc:
             return JobRecheckResult(exists=None, temporary_error=str(exc))
         except (RabotaMdAccessDenied, RabotaMdDegradedError) as exc:
             return JobRecheckResult(

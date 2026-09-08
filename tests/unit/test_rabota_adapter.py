@@ -15,6 +15,7 @@ from app.crawlers.adapters.rabota_md import (
     RabotaMdAdapter,
     RabotaMdConfig,
 )
+from app.crawlers.browser import BrowserNavigationError
 from app.crawlers.registry.registry import build_default_registry
 from app.crawlers.schemas import RawJobReference, ScanCheckpoint
 from app.models.entities import JobSource
@@ -519,3 +520,26 @@ async def test_recheck_distinguishes_closed_absent_and_temporary_errors() -> Non
     assert absent.explicitly_closed is False
     assert temporary.exists is None
     assert temporary.temporary_error == "Rabota.md returned HTTP 503"
+
+
+@pytest.mark.asyncio
+async def test_recheck_treats_browser_navigation_failure_as_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = RabotaMdAdapter(adapter_config(), http_fetcher=FixtureFetcher(routes()))
+
+    async def fail_navigation(_url: str) -> httpx.Response:
+        raise BrowserNavigationError("browser navigation timed out")
+
+    monkeypatch.setattr(adapter, "_get_public_page", fail_navigation)
+    result = await adapter.recheck_job(
+        {
+            "external_job_id": "5002",
+            "canonical_url": f"{BASE}/ru/locuri-de-munca/temporary-browser/5002",
+            "content_hash": "old",
+        }
+    )
+
+    assert result.exists is None
+    assert result.temporary_error == "browser navigation timed out"
+    assert result.adapter_degraded is False

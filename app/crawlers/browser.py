@@ -140,6 +140,14 @@ class StealthPlaywrightBrowser:
             return
         await route.continue_()
 
+    async def _goto_committed(self, page: Any, target: str) -> Any:
+        try:
+            return await page.goto(target, wait_until="commit", timeout=self.timeout_ms)
+        except Exception as exc:
+            raise BrowserNavigationError(
+                f"browser navigation failed before response headers: {type(exc).__name__}"
+            ) from exc
+
     async def get(self, url: str) -> httpx.Response:
         target = await self._validated_url(url)
         await self.start()
@@ -161,11 +169,7 @@ class StealthPlaywrightBrowser:
 
             page.on("response", capture_challenge_result)
             try:
-                navigation = await page.goto(
-                    target,
-                    wait_until="domcontentloaded",
-                    timeout=self.timeout_ms,
-                )
+                navigation = await self._goto_committed(page, target)
                 headers = await navigation.all_headers() if navigation is not None else {}
                 is_waf_challenge = (
                     navigation is not None
@@ -184,9 +188,17 @@ class StealthPlaywrightBrowser:
                             timeout=self.timeout_ms,
                         )
                         headers = await navigation.all_headers()
-                    except TimeoutError as exc:
+                    except Exception as exc:
                         raise BrowserNavigationError(
                             "AWS WAF challenge did not resolve before the browser timeout"
+                        ) from exc
+                else:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+                    except Exception as exc:
+                        raise BrowserNavigationError(
+                            "browser navigation did not reach DOMContentLoaded: "
+                            f"{type(exc).__name__}"
                         ) from exc
             finally:
                 page.remove_listener("response", capture_challenge_result)

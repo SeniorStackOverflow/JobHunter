@@ -268,3 +268,25 @@ async def test_persistent_browser_stops_started_playwright_runtime(
     await browser.aclose()
     assert browser._playwright is None
     assert runtime.stopped is True
+
+
+class FakeNavigationTimeoutPage(FakeChallengePage):
+    async def goto(self, _url: str, **_kwargs: Any) -> FakeNavigation:
+        raise RuntimeError("synthetic Playwright TimeoutError")
+
+
+@pytest.mark.asyncio
+async def test_persistent_browser_normalizes_navigation_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakeNavigationTimeoutPage(resolves=False)
+    browser = StealthPlaywrightBrowser(
+        allowed_domains=("rabota.md",), requests_per_minute=600, minimum_interval_seconds=0
+    )
+    browser._page = page
+    monkeypatch.setattr(browser, "_validated_url", _same_url)
+    with pytest.raises(
+        BrowserNavigationError, match="browser navigation failed before response headers"
+    ):
+        await browser.get("https://www.rabota.md/ru/vacancies")
+    assert page.listeners == []
