@@ -260,6 +260,10 @@ def render_call_notification(
         "not_applicable": "Статус не определён",
     }
     lines.append(f"Статус: {escape(labels.get(status, 'Требуется проверка'))}")
+    if getattr(call, "summary_state", None) == "failed":
+        lines.append(
+            "⚠️ Обработка звонка завершилась с ошибкой. Требуется проверка — откройте запись звонка."
+        )
 
     if facts:
         field_labels = {
@@ -328,13 +332,12 @@ def render_call_notification(
             lines.append(f"🕒 {escape(proposed_datetime)}")
         if proposed_address:
             lines.append(f"📍 {escape(proposed_address)}")
-        if getattr(call, "summary_state", None) == "failed":
-            lines.append(
-                "⚠️ Обработка звонка завершилась с ошибкой. Требуется проверка — "
-                "откройте запись звонка."
-            )
-        elif getattr(call, "needs_review", False):
-            lines.append("⚠️ Требуется проверка — откройте запись звонка.")
+    if (
+        getattr(call, "summary_state", None) != "failed"
+        and not facts
+        and getattr(call, "needs_review", False)
+    ):
+        lines.append("⚠️ Требуется проверка — откройте запись звонка.")
     return _truncate("\n".join(lines) + _admin_link(base_url, actual_session_id))
 
 

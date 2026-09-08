@@ -585,6 +585,42 @@ def test_render_failed_no_facts_describes_review_without_transcript_or_number():
     assert "schema_mismatch" not in text
 
 
+def test_render_failed_with_facts_still_describes_processing_error():
+    call = _call(PhoneVerificationStatus.NEEDS_REVIEW)
+    call.summary_state = PhoneSummaryState.FAILED
+    fact = CallFact(
+        field="interview_date",
+        raw_expression="12 сентября",
+        normalized_value="2026-09-12",
+        state=CallFactState.CANDIDATE,
+    )
+
+    text = render_call_notification(call=call, facts=[fact], base_url=None)
+
+    assert "Предварительно — Дата" in text
+    assert "Обработка звонка завершилась с ошибкой" in text
+
+
+def test_render_failed_warning_survives_long_fact_content():
+    call = _call(PhoneVerificationStatus.NEEDS_REVIEW)
+    call.summary_state = PhoneSummaryState.FAILED
+    facts = [
+        CallFact(
+            field="address",
+            raw_expression="подробный адрес",
+            normalized_value="подробный адрес " * 30,
+            state=CallFactState.CANDIDATE,
+        )
+        for _ in range(30)
+    ]
+
+    text = render_call_notification(call=call, facts=facts, base_url=None)
+
+    assert len(text.encode("utf-8")) <= 4096
+    assert text.startswith("📞 Неизвестная компания\nСтатус: Требуется проверка\n")
+    assert "Обработка звонка завершилась с ошибкой" in text
+
+
 @pytest.mark.asyncio
 async def test_retryable_failure_is_due_again_with_bounded_backoff(
     sqlite_session_factory, monkeypatch: pytest.MonkeyPatch
