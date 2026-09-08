@@ -46,7 +46,10 @@ image digest `0125eb3d53d4`; all four containers reported healthy. A later DEV
 rebuild completed from commit `a84ba3a` after the manual-call findings. It
 contains the scoped correction logic, conditional SMS ownership claim,
 expanded structured-output budget, safe validation diagnostics, and terminal
-failure notification handling.
+failure notification handling. A final rebuild from HEAD `06d37a3`, including
+the length-safe Telegram warning in `fef8a8d`, completed successfully and
+started API, worker, beat, and call-agent. The managed sandbox denied the
+subsequent Docker health inspection.
 
 ## Restart recovery
 
@@ -249,8 +252,9 @@ the critical facts remain in manual review instead of being silently accepted.
 
 Outbound SMS comparison remains unverified because no confirming employer SMS
 was received during these calls. The second call's terminal failed session is
-preserved and needs one controlled reset/retry on a DEV image containing
-`a84ba3a` and `fef8a8d` to verify the corrected 4,096-token post-processing path
-and its Telegram notice against persisted production-shaped data. That retry
-was blocked only by the current managed sandbox denying Docker socket and DEV
-host-network access.
+preserved. The DEV image has been rebuilt with `a84ba3a` and `fef8a8d`, and a
+host-side contract check reports `max_tokens=4096` with the quality route. One
+controlled reset/retry is still needed to verify that path and its Telegram
+notice against persisted production-shaped data. The retry was blocked only by
+the current managed sandbox denying Docker access and both PostgreSQL and DEV
+host-network sockets.
