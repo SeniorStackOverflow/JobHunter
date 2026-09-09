@@ -36,6 +36,44 @@ def test_empty_token_is_unset() -> None:
     assert settings.phonegate_auth_token is None
 
 
+def test_phonegate_token_can_be_loaded_from_file(tmp_path) -> None:
+    token_file = tmp_path / "phonegate-token"
+    token_file.write_text("file-token-value\n", encoding="utf-8")
+
+    settings = Settings(_env_file=None, phonegate_auth_token_file=token_file)
+
+    assert settings.phonegate_auth_token is not None
+    assert settings.phonegate_auth_token.get_secret_value() == "file-token-value"
+
+
+def test_phonegate_token_file_rejects_ambiguous_or_invalid_sources(tmp_path) -> None:
+    token_file = tmp_path / "phonegate-token"
+    token_file.write_text("file-token-value\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="only one of"):
+        Settings(
+            _env_file=None,
+            phonegate_auth_token="environment-token",
+            phonegate_auth_token_file=token_file,
+        )
+    with pytest.raises(ValueError, match="could not be read"):
+        Settings(_env_file=None, phonegate_auth_token_file=tmp_path / "missing")
+
+
+def test_production_phonegate_token_file_must_be_absolute(tmp_path, monkeypatch) -> None:
+    token_file = tmp_path / "phonegate-token"
+    token_file.write_text("file-token-value\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    base = _prod_base()
+
+    with pytest.raises(ValueError, match="must be absolute"):
+        Settings(
+            **base,
+            phonegate_auth_token_file="phonegate-token",
+            phonegate_url="https://phonegate.example.com",
+        )
+
+
 def _prod_base() -> dict[str, object]:
     return dict(
         _env_file=None,
@@ -80,11 +118,29 @@ def test_production_rejects_loopback_phonegate_url_when_agent_enabled() -> None:
         phonegate_url="https://pg.example/",
     )  # no raise
     # a schemeless URL is reported as such, not as "loopback"
-    with pytest.raises(ValueError, match="absolute http"):
+    with pytest.raises(ValueError, match="absolute HTTPS"):
         Settings(
             **base,
             phonegate_auth_token="a-real-token",
             phonegate_url="phonegate.internal:8888",
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://phonegate.example.com",
+        "https://user:pass@phonegate.example.com",
+        "https://phonegate.example.com?token=x",
+        "https://phonegate.example.com#fragment",
+    ],
+)
+def test_production_phonegate_url_requires_clean_https(url: str) -> None:
+    with pytest.raises(ValueError, match="PHONEGATE_URL"):
+        Settings(
+            **_prod_base(),
+            phonegate_auth_token="a-real-token",
+            phonegate_url=url,
         )
 
 

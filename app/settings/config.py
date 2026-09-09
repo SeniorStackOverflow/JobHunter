@@ -52,6 +52,7 @@ class Settings(BaseSettings):
 
     phonegate_url: str = "http://127.0.0.1:8888"
     phonegate_auth_token: SecretStr | None = None
+    phonegate_auth_token_file: Path | None = None
     phone_agent_enabled: bool = False
     phone_poll_idle_seconds: float = Field(default=1.0, ge=0.1, le=10)
     phone_poll_active_seconds: float = Field(default=0.3, ge=0.05, le=5)
@@ -186,6 +187,13 @@ class Settings(BaseSettings):
         raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
         return None if not raw.strip() else value
 
+    @field_validator("phonegate_auth_token_file", mode="before")
+    @classmethod
+    def empty_path_is_unset(cls, value: object) -> object | None:
+        if value is None:
+            return None
+        return None if not str(value).strip() else value
+
     @field_validator("google_admin_emails")
     @classmethod
     def normalize_google_admin_emails(cls, value: list[str]) -> list[str]:
@@ -236,6 +244,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_secure_production(self) -> Settings:
+        token_file = self.phonegate_auth_token_file
+        if token_file is not None:
+            if self.phonegate_auth_token is not None:
+                raise ValueError(
+                    "configure only one of PHONEGATE_AUTH_TOKEN and PHONEGATE_AUTH_TOKEN_FILE"
+                )
+            if self.environment == "production" and not token_file.is_absolute():
+                raise ValueError("PHONEGATE_AUTH_TOKEN_FILE must be absolute in production")
+            try:
+                if token_file.stat().st_size > 4096:
+                    raise ValueError("PHONEGATE_AUTH_TOKEN_FILE is too large")
+                token = token_file.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as exc:
+                raise ValueError("PHONEGATE_AUTH_TOKEN_FILE could not be read") from exc
+            if not token or "\n" in token or "\r" in token:
+                raise ValueError("PHONEGATE_AUTH_TOKEN_FILE must contain one non-empty token")
+            self.phonegate_auth_token = SecretStr(token)
         if self.environment != "production":
             return self
         secret = self.secret_key.get_secret_value()
@@ -288,13 +313,30 @@ class Settings(BaseSettings):
         if self.phone_agent_enabled and self.phonegate_auth_token is None:
             raise ValueError("PHONEGATE_AUTH_TOKEN is required when PHONE_AGENT_ENABLED is true")
         if self.phone_agent_enabled:
-            parts = urlsplit(self.phonegate_url)
-            if not parts.scheme or not parts.hostname:
+            try:
+                parts = urlsplit(self.phonegate_url)
+                _ = parts.port
+            except ValueError as exc:
+                raise ValueError("PHONEGATE_URL must be a valid HTTPS URL") from exc
+            if (
+                parts.scheme != "https"
+                or not parts.hostname
+                or parts.username is not None
+                or parts.password is not None
+                or parts.query
+                or parts.fragment
+                or parts.path not in {"", "/"}
+            ):
                 raise ValueError(
-                    "PHONEGATE_URL must be an absolute http(s) URL when "
+                    "PHONEGATE_URL must be an absolute HTTPS origin when "
                     "PHONE_AGENT_ENABLED is true in production"
                 )
-            if parts.hostname.lower() in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}:
+            if parts.hostname.rstrip(".").lower() in {
+                "127.0.0.1",
+                "localhost",
+                "0.0.0.0",
+                "::1",
+            }:
                 raise ValueError(
                     "PHONEGATE_URL must be a routable address (not loopback) when "
                     "PHONE_AGENT_ENABLED is true in production"

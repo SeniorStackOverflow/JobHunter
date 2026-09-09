@@ -1,0 +1,30 @@
+x-phonegate-environment: &phonegate-environment
+  PHONE_AGENT_ENABLED: "true"
+  PHONE_AUTO_ANSWER_ENABLED: "true"
+  PHONE_SUMMARY_LLM_ENABLED: "true"
+  PHONEGATE_URL: ${PHONEGATE_URL:-https://phonegate.46-225-103-75.sslip.io}
+  PHONEGATE_AUTH_TOKEN: ""
+  PHONEGATE_AUTH_TOKEN_FILE: /run/secrets/phonegate_auth_token
+
+services:
+  api:
+    environment:
+      <<: *phonegate-environment
+    secrets:
+      - phonegate_auth_token
+
+  control-worker:
+    environment:
+      <<: *phonegate-environment
+    secrets:
+      - phonegate_auth_token
+
+  call-agent:
+    environment:
+      <<: *phonegate-environment
+    secrets:
+      - phonegate_auth_token
+
+secrets:
+  phonegate_auth_token:
+    file: ${PHONEGATE_AUTH_TOKEN_FILE_HOST:-/etc/jobhunter/secrets/phonegate-auth-token}

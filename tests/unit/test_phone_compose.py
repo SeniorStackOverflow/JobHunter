@@ -60,3 +60,41 @@ def test_runtime_image_prepares_writable_phone_evidence_directory() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "install -d -o jobagent -g jobagent -m 0750 /srv/job-agent /data/resumes" in dockerfile
     assert "/data/phone_evidence" in dockerfile
+
+
+def test_production_phonegate_overlay_uses_file_secret_and_existing_https_relay() -> None:
+    compose = _load("docker-compose.phonegate.prod.yml")
+    secret = compose["secrets"]["phonegate_auth_token"]
+    assert secret["file"].startswith("${PHONEGATE_AUTH_TOKEN_FILE_HOST:-/etc/jobhunter/")
+
+    for name in ("api", "control-worker", "call-agent"):
+        service = compose["services"][name]
+        environment = service["environment"]
+        assert environment["PHONE_AGENT_ENABLED"] == "true"
+        assert environment["PHONEGATE_AUTH_TOKEN"] == ""
+        assert environment["PHONEGATE_AUTH_TOKEN_FILE"] == ("/run/secrets/phonegate_auth_token")
+        assert "https://phonegate." in environment["PHONEGATE_URL"]
+        assert "phonegate_auth_token" in service["secrets"]
+
+    assert compose["services"]["call-agent"]["environment"]["PHONE_AUTO_ANSWER_ENABLED"] == "true"
+    assert compose["services"]["call-agent"]["environment"]["PHONE_SUMMARY_LLM_ENABLED"] == "true"
+
+
+def test_production_phonegate_wrapper_includes_overlay() -> None:
+    wrapper = (ROOT / "deploy/prod-phone-compose.sh").read_text(encoding="utf-8")
+    assert "docker-compose.phonegate.prod.yml" in wrapper
+    assert "JOBHUNTER_IMAGE_TAG" in wrapper
+
+    standard_wrapper = (ROOT / "deploy/prod-compose.sh").read_text(encoding="utf-8")
+    assert "/etc/jobhunter/phone-agent-enabled" in standard_wrapper
+    assert "docker-compose.phonegate.prod.yml" in standard_wrapper
+
+
+def test_phonegate_activation_never_places_raw_token_in_prod_env() -> None:
+    script = (ROOT / "deploy/activate-prod-phonegate.sh").read_text(encoding="utf-8")
+    assert "PHONEGATE_AUTH_TOKEN_FILE" in script
+    assert "dotenv_values" in script
+    assert "PHONEGATE_AUTH_TOKEN_FILE_HOST=$PHONEGATE_SECRET_FILE" in script
+    assert "/api/call/speak" not in script
+    assert "marker_preexisting" in script
+    assert "os.fsync" in script

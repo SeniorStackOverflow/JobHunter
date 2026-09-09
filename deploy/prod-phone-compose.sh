@@ -9,11 +9,8 @@ if [ -n "${JOBHUNTER_IMAGE_TAG:-}" ] && [ "$JOBHUNTER_IMAGE_TAG" != "$SHORT_HEAD
   exit 64
 fi
 export JOBHUNTER_IMAGE_TAG=$SHORT_HEAD
-if [ -e /etc/jobhunter/phone-agent-enabled ]; then
-  exec docker compose \
-    -f docker-compose.yml \
-    -f docker-compose.prod.yml \
-    -f docker-compose.phonegate.prod.yml \
-    "$@"
-fi
-exec docker compose -f docker-compose.yml -f docker-compose.prod.yml "$@"
+exec docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.prod.yml \
+  -f docker-compose.phonegate.prod.yml \
+  "$@"

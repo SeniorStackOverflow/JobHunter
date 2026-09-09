@@ -85,6 +85,31 @@ namespace `jobhunter-dev:*`, поэтому DEV build больше не може
 и требует `jobhunter_migrator`. При несовпадении роли, flavor или revision контейнер
 завершается до Alembic/application startup.
 
+### PhoneGate без нового host listener
+
+PhoneGate остаётся привязан к `127.0.0.1:8888`. JobHunter обращается к уже
+существующему HTTPS endpoint Caddy через `docker-compose.phonegate.prod.yml`;
+отдельный TCP relay и публикация порта PhoneGate не требуются.
+
+Активация выполняется root-командой:
+
+```bash
+./deploy/activate-prod-phonegate.sh
+```
+
+Скрипт читает токен из локального `/srv/phonegate/.env`, атомарно создаёт
+`/etc/jobhunter/secrets/phonegate-auth-token` и монтирует его только в `api`,
+`control-worker` и `call-agent`. Токен не записывается в JobHunter `.env`, image
+или environment контейнера. До перезапуска сервисов выполняются TLS, auth и
+device-status проверки. TTS не вызывается во время preflight: такой запрос имеет
+внешний эффект и проверяется только во время контролируемого реального звонка.
+
+После успешной проверки создаётся root-owned marker
+`/etc/jobhunter/phone-agent-enabled`. Обычный `deploy/prod-compose.sh` видит marker
+и автоматически добавляет PhoneGate overlay во время последующих rollout.
+Удаление marker и пересоздание `api`, `control-worker`, `call-agent` базовым
+wrapper выключает интеграцию, не меняя схему БД и основной PROD `.env`.
+
 Миграции должны завершиться успешно до запуска worker/beat. Команда использует
 одноразовый сервис `migrate`; фактическую команду Alembic и revision проверяйте в
 Compose-файле.
