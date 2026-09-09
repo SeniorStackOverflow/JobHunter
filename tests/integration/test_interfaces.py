@@ -3038,7 +3038,7 @@ async def test_settings_page_playwright_narrow_view(
 async def test_rest_resume_delete_activate_deactivate(
     interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
 ) -> None:
-    application, settings = interface_app
+    application, _ = interface_app
     headers = {"Authorization": f"Bearer {API_KEY}"}
     async with sqlite_session_factory() as session:
         profile = UserProfile(name="REST resume owner", is_default=True)
@@ -3069,6 +3069,10 @@ async def test_rest_resume_delete_activate_deactivate(
         assert deleted.status_code == 200
         assert deleted.json() == {"id": resume_id, "deleted": True}
 
+        bad_id = uuid4()
+        not_found = await client.post(f"/api/v1/resumes/{bad_id}/activate", headers=headers)
+        assert not_found.status_code == 404
+
     async with sqlite_session_factory() as session:
         assert await session.get(Resume, UUID(resume_id)) is None
         actions = set((await session.scalars(select(AuditEvent.action))).all())
@@ -3090,3 +3094,5 @@ async def test_rest_resume_delete_conflicts_when_referenced(
             headers={"Authorization": f"Bearer {API_KEY}"},
         )
         assert response.status_code == 409
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, seeded["resume_id"]) is not None

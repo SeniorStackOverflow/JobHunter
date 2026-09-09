@@ -308,7 +308,10 @@ async def deactivate_resume_endpoint(
     actor: str = Depends(require_api_actor),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    item = await ResumeService(get_settings()).deactivate(session, resume_id)
+    try:
+        item = await ResumeService(get_settings()).deactivate(session, resume_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     await record_audit_event(
         session,
         actor=actor,
@@ -329,6 +332,8 @@ async def activate_resume_endpoint(
 ) -> dict[str, Any]:
     try:
         item = await ResumeService(get_settings()).activate(session, resume_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     await record_audit_event(
