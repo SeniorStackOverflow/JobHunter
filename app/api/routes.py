@@ -376,6 +376,8 @@ async def delete_resume_endpoint(
             details=deletion.audit_details(),
         )
         await session.commit()
+    # LookupError / ResumeInUseError are raised by ResumeService.delete before any
+    # transaction marker is written, so these paths need no rollback/reconcile.
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:

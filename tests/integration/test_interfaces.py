@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -2659,6 +2660,9 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
     assert resume_path.exists()
 
     # Simulate a process crash after the DB commit but before physical unlink.
+    # Reconcile only sweeps markers older than its grace window, so age the
+    # marker to represent a crash that happened well before this reconcile runs.
+    _age_transaction_markers(settings)
     async with sqlite_session_factory() as session:
         await service.reconcile_file_transactions(session)
 
@@ -2666,6 +2670,73 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
     assert not list((settings.resume_storage_path / ".transactions").glob("*.json"))
     async with sqlite_session_factory() as session:
         assert await session.get(Resume, resume_id) is None
+
+
+def _age_transaction_markers(settings: Settings) -> None:
+    """Backdate every file-transaction marker past the reconcile grace window."""
+    from app.profiles.service import RESUME_TRANSACTION_GRACE_SECONDS
+
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    aged = time.time() - RESUME_TRANSACTION_GRACE_SECONDS - 5
+    for marker in transaction_dir.glob("*"):
+        os.utime(marker, (aged, aged))
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_fresh_upload_marker_for_uncommitted_resume(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    """A marker written 'just now' may belong to a concurrent upload that has
+    written its file but not yet committed its Resume row; reconcile triggered by
+    an unrelated failing request must not delete that live file."""
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    service = ResumeService(settings)
+
+    storage_key = "in-flight-upload.pdf"
+    live_file = settings.resume_storage_path / storage_key
+    live_file.write_bytes(b"%PDF-1.4\nin flight\n%%EOF")
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    transaction_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (transaction_dir / "upload-fresh.json").write_text(
+        json.dumps({"operation": "upload", "storage_key": storage_key}), encoding="utf-8"
+    )
+
+    async with sqlite_session_factory() as session:
+        await service.reconcile_file_transactions(session)
+
+    assert live_file.exists()
+    assert list(transaction_dir.glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sweeps_stale_tmp_marker_files(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    """A crash between write_text and os.replace leaves an orphan '.tmp'; reconcile
+    removes it once older than the grace window but keeps a fresh one."""
+    from app.profiles.service import RESUME_TRANSACTION_GRACE_SECONDS, ResumeService
+
+    _application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    service = ResumeService(settings)
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    transaction_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    stale_tmp = transaction_dir / "upload-stale.tmp"
+    stale_tmp.write_text("{}", encoding="utf-8")
+    aged = time.time() - RESUME_TRANSACTION_GRACE_SECONDS - 5
+    os.utime(stale_tmp, (aged, aged))
+    fresh_tmp = transaction_dir / "upload-fresh.tmp"
+    fresh_tmp.write_text("{}", encoding="utf-8")
+
+    async with sqlite_session_factory() as session:
+        await service.reconcile_file_transactions(session)
+
+    assert not stale_tmp.exists()
+    assert fresh_tmp.exists()
 
 
 @pytest.mark.asyncio
@@ -3059,9 +3130,19 @@ async def test_admin_create_profile_cleans_uploaded_pdf_when_transaction_fails(
             await session.scalar(select(UserProfile).where(UserProfile.name == "Rollback profile"))
         ) is None
         assert (await session.scalar(select(Resume).where(Resume.name == "Rollback CV"))) is None
-    assert not list(settings.resume_storage_path.glob("*.pdf"))
+
+    # The failing request leaves an orphan file + marker; reconcile's grace period
+    # defers cleanup so it can never race a concurrent upload. A later reconcile
+    # (startup, or another request) sweeps it once the marker ages out.
+    from app.profiles.service import ResumeService
+
     transaction_dir = settings.resume_storage_path / ".transactions"
-    assert not transaction_dir.exists() or not list(transaction_dir.glob("*.json"))
+    assert list(transaction_dir.glob("*.json"))
+    _age_transaction_markers(settings)
+    async with sqlite_session_factory() as session:
+        await ResumeService(settings).reconcile_file_transactions(session)
+    assert not list(settings.resume_storage_path.glob("*.pdf"))
+    assert not list(transaction_dir.glob("*.json"))
 
 
 @pytest.mark.asyncio

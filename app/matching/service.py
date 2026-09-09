@@ -587,12 +587,18 @@ class MatchingService:
                 resume_category=resume_category,
             )
         if resume is not None:
+            # FOR SHARE, not FOR UPDATE: analyze never writes the resume row, it
+            # only needs it to stay unchanged until persist. An exclusive lock
+            # here serializes every analysis in a profile on its default resume.
             current_resume = await session.scalar(
                 select(Resume)
                 .where(Resume.id == resume.id)
                 .execution_options(populate_existing=True)
-                .with_for_update()
+                .with_for_update(read=True)
             )
+            # The sha256 comparison is defence-in-depth: a resume's sha256 is
+            # never reassigned after insert today, but pin it anyway so a future
+            # in-place content swap cannot slip through mid-analysis.
             if (
                 current_resume is None
                 or current_resume.sha256 != resume.sha256

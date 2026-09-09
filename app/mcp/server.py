@@ -486,6 +486,8 @@ async def delete_resume(resume_id: str) -> dict[str, Any]:
                 details=deletion.audit_details(),
             )
             await session.commit()
+        # LookupError / ResumeInUseError are raised by ResumeService.delete before
+        # any transaction marker is written, so this path needs no rollback/reconcile.
         except (LookupError, ResumeInUseError) as exc:
             raise ValueError(str(exc)) from exc
         except Exception:

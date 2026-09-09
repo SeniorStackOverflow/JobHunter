@@ -32,15 +32,18 @@ mcp_asgi = streamable_http_app()
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.resume_storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        from app.database.session import async_session_factory
-        from app.profiles import ResumeService
+    # Hoisted above the try so an import regression fails loudly at startup
+    # instead of silently disabling reconcile forever.
+    from app.database.session import async_session_factory
+    from app.profiles import ResumeService
 
+    try:
         async with async_session_factory() as session:
             await ResumeService(settings).reconcile_file_transactions(session)
     except Exception as exc:
-        logger.warning(
+        logger.error(
             "resume_file_reconciliation_failed",
+            message="startup resume file transaction reconcile failed",
             error_type=type(exc).__name__,
         )
     async with mcp_asgi.router.lifespan_context(mcp_asgi):

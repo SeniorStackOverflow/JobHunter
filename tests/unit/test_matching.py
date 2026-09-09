@@ -953,6 +953,76 @@ async def test_analyze_revalidates_resume_after_provider_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_rejects_resume_deactivated_during_analysis() -> None:
+    """The revalidation guard must also fire on the active/verified/sha256 branch:
+    the resume row still exists but was flipped inactive mid-analysis."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        source = JobSource(
+            name="Fixture",
+            base_url="https://jobs.example.test",
+            adapter_type="fixture_source",
+            configuration={},
+            enabled=True,
+            health_status=SourceHealth.HEALTHY,
+            automatic_actions_paused=False,
+        )
+        canonical = CanonicalJob(
+            normalized_company="example employer",
+            normalized_title="python developer",
+            normalized_location="chisinau",
+            canonical_fingerprint="a" * 64,
+            status=JobStatus.ACTIVE,
+        )
+        session.add_all([source, canonical])
+        await session.flush()
+        job = make_job(
+            source_id=source.id,
+            canonical_job_id=canonical.id,
+            title="Python developer",
+            category="engineering",
+            categories_seen=["engineering"],
+        )
+        profile = make_profile()
+        profile.id = uuid4()
+        preference = make_preference(
+            profile_id=profile.id,
+            allowed_categories=["engineering"],
+        )
+        resume = Resume(
+            profile_id=profile.id,
+            name="Engineering CV",
+            category="engineering",
+            storage_key="engineering-deactivate.pdf",
+            original_filename="engineering.pdf",
+            mime_type="application/pdf",
+            sha256="7" * 64,
+            active=True,
+            verified=True,
+            is_default=True,
+        )
+        session.add_all([job, profile, preference, resume])
+        await session.flush()
+
+        class DeactivatingProvider:
+            model_name = "deactivating-provider"
+
+            async def evaluate(self, _request: MatchRequest) -> MatchResult:
+                resume.active = False
+                await session.flush()
+                return make_result()
+
+        service = MatchingService(Settings(environment="test"), DeactivatingProvider())  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="resume changed during analysis"):
+            await service.analyze(session, job.id)
+        assert await session.scalar(select(MatchEvaluation).limit(1)) is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

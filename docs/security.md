@@ -140,6 +140,11 @@ OAuth-подключение; бесшовная ротация требует �
 filesystem path. Download требует authz и отдаёт безопасный `Content-Disposition`,
 `nosniff`; resume directory не публикуется Caddy как static.
 
+Подкаталог `<resume_storage_path>/.transactions/` — внутреннее состояние
+crash-recovery (маркеры двухфазной записи файлов, см. `ResumeService`). Оператору
+при ручной работе с volume или rsync следует относиться к нему как к служебному:
+не переносить выборочно и не считать содержимым резюме.
+
 Аутентифицированная admin session может открыть собственное загруженное резюме в
 браузере (`GET /admin/resumes/{id}/file`, inline PDF). Это не регрессия правила
 «MCP не отдаёт resume path и содержимое»: оно ограничивает менее доверенный MCP

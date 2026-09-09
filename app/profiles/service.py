@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -30,6 +31,13 @@ from app.security.files import UnsafeResumeError, safe_storage_path, validate_re
 from app.settings import Settings
 
 logger = structlog.get_logger(__name__)
+
+# A file-transaction marker younger than this may belong to a request that is
+# still running in another worker: it has written the marker and the physical
+# file but has not yet committed (or rolled back) its Resume row. Reconcile skips
+# such markers so it never deletes a live upload's file or strands an in-flight
+# delete. 60s is comfortably longer than any single upload/delete request.
+RESUME_TRANSACTION_GRACE_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -210,15 +218,16 @@ class ResumeService:
         self.settings = settings
 
     def _transaction_dir(self) -> Path:
-        path = self.settings.resume_storage_path / self._TRANSACTION_DIR
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return path
+        # Pure path computation, no side effect: only _write_marker needs the
+        # directory to exist, so the cleanup-only finalize_* paths do not recreate it.
+        return self.settings.resume_storage_path / self._TRANSACTION_DIR
 
     def _marker_path(self, operation: str, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self._transaction_dir() / f"{operation}-{digest}.json"
 
     def _write_marker(self, operation: str, *, key: str, payload: dict[str, str]) -> Path:
+        self._transaction_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
         marker = self._marker_path(operation, key)
         temporary = marker.with_suffix(".tmp")
         temporary.write_text(json.dumps({"operation": operation, **payload}), encoding="utf-8")
@@ -252,10 +261,32 @@ class ResumeService:
         return True
 
     async def reconcile_file_transactions(self, session: AsyncSession) -> None:
+        """Sweep orphaned file-transaction markers left by a crashed request.
+
+        Recovers from a crashed process or container restart: markers plus
+        ``os.replace`` are atomic against other processes, so a half-finished
+        upload or delete is completed or rolled back here on the next start (or
+        in a request's ``except`` path). It does NOT protect against host power
+        loss -- nothing in this protocol is fsync'd, so a hard crash can lose a
+        marker while keeping its file, or keep a marker whose file was already
+        written.
+
+        Markers younger than ``RESUME_TRANSACTION_GRACE_SECONDS`` are skipped
+        entirely: they may belong to a request still in flight in another worker
+        that has written the marker and the file but not yet committed (or rolled
+        back) its ``Resume`` row.
+        """
         transaction_dir = self.settings.resume_storage_path / self._TRANSACTION_DIR
         if not transaction_dir.is_dir():
             return
         for marker in transaction_dir.glob("*.json"):
+            try:
+                age_seconds = time.time() - marker.stat().st_mtime
+            except OSError:
+                # A concurrent finalize_* removed the marker between glob and stat.
+                continue
+            if age_seconds < RESUME_TRANSACTION_GRACE_SECONDS:
+                continue
             try:
                 payload = json.loads(marker.read_text(encoding="utf-8"))
                 operation = str(payload["operation"])
@@ -296,6 +327,25 @@ class ResumeService:
                 marker=marker.name,
                 operation=operation,
             )
+
+        # A crash between ``write_text`` and ``os.replace`` in _write_marker
+        # leaves a ``.tmp`` that the ``*.json`` sweep never sees; upload keys are
+        # uuid-prefixed so these would otherwise accumulate unbounded.
+        for stale_tmp in transaction_dir.glob("*.tmp"):
+            try:
+                age_seconds = time.time() - stale_tmp.stat().st_mtime
+            except OSError:
+                continue
+            if age_seconds < RESUME_TRANSACTION_GRACE_SECONDS:
+                continue
+            try:
+                stale_tmp.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "resume_transaction_tmp_cleanup_failed",
+                    marker=stale_tmp.name,
+                    error_type=type(exc).__name__,
+                )
 
     def finalize_upload(self, resume: Resume) -> None:
         self._remove_marker(self._marker_path("upload", resume.storage_key))
