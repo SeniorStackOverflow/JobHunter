@@ -2587,5 +2587,96 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
         await session.commit()
 
     assert unlink_key == storage_key
+
+
+@pytest.mark.asyncio
+async def test_admin_resume_file_view_returns_pdf_bytes(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    pdf = b"%PDF-1.7\nviewable resume\n%%EOF"
     async with sqlite_session_factory() as session:
-        assert await session.get(Resume, resume_id) is None
+        profile = UserProfile(name="Viewer", is_default=True)
+        session.add(profile)
+        await session.flush()
+        profile_id = profile.id
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        upload = await client.post(
+            "/admin/resumes",
+            data={
+                "profile_id": str(profile_id),
+                "name": "Viewable",
+                "category": "ops",
+                "csrf_token": csrf_token,
+            },
+            files={"file": ("viewable.pdf", pdf, "application/pdf")},
+        )
+        assert upload.status_code == 303
+
+        async with sqlite_session_factory() as session:
+            resume = await session.scalar(select(Resume).where(Resume.name == "Viewable"))
+            assert resume is not None
+            resume_id = resume.id
+
+        view = await client.get(
+            f"/admin/resumes/{resume_id}/file", params={"profile_id": str(profile_id)}
+        )
+        assert view.status_code == 200
+        assert view.headers["content-type"] == "application/pdf"
+        assert view.headers["content-disposition"].startswith("inline")
+        assert view.content == pdf
+
+    unauth_transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=unauth_transport, base_url="https://testserver", follow_redirects=False
+    ) as anon:
+        blocked = await anon.get(f"/admin/resumes/{resume_id}/file")
+        assert blocked.status_code == 303
+        assert blocked.headers["location"] == "/login"
+
+
+@pytest.mark.asyncio
+async def test_admin_resume_file_view_404_for_placeholder_and_foreign_profile(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    async with sqlite_session_factory() as session:
+        owner = UserProfile(name="Owner", is_default=True)
+        other = UserProfile(name="Other")
+        session.add_all([owner, other])
+        await session.flush()
+        placeholder = Resume(
+            profile_id=owner.id,
+            name="Pending",
+            category="ops",
+            storage_key="pending/deadbeef",
+            original_filename="pending.pdf",
+            mime_type="application/pdf",
+            sha256="0" * 64,
+            active=False,
+            verified=False,
+            is_default=False,
+        )
+        session.add(placeholder)
+        await session.commit()
+        owner_id, other_id, placeholder_id = owner.id, other.id, placeholder.id
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        await _login_admin(client, settings)
+        placeholder_view = await client.get(
+            f"/admin/resumes/{placeholder_id}/file", params={"profile_id": str(owner_id)}
+        )
+        assert placeholder_view.status_code == 404
+        foreign_view = await client.get(
+            f"/admin/resumes/{placeholder_id}/file", params={"profile_id": str(other_id)}
+        )
+        assert foreign_view.status_code == 404

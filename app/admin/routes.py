@@ -78,6 +78,7 @@ from app.models.enums import (
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.security.auth import CsrfProtector, SessionSigner, verify_password
+from app.security.files import UnsafeResumeError, read_verified_resume
 from app.security.ssrf import public_url_shape_is_safe
 from app.settings import get_settings
 
@@ -1716,6 +1717,42 @@ async def verify_resume(
     return RedirectResponse(
         f"/?view=settings&profile_id={selected_profile.id}&notice=resume_verified",
         status_code=303,
+    )
+
+
+@router.get("/admin/resumes/{resume_id}/file")
+async def admin_resume_file(
+    resume_id: UUID,
+    request: Request,
+    profile_id: UUID | None = None,
+    _: str = Depends(require_admin_page),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    resume = await session.get(Resume, resume_id)
+    selected_profile = await ProfileService().get_profile(session, profile_id)
+    if resume is None or selected_profile is None or resume.profile_id != selected_profile.id:
+        raise HTTPException(status_code=404)
+    if resume.storage_key.startswith("pending/"):
+        raise HTTPException(status_code=404, detail="resume file has not been uploaded")
+    settings = get_settings()
+    try:
+        data = read_verified_resume(
+            settings.resume_storage_path,
+            resume.storage_key,
+            expected_sha256=resume.sha256,
+            expected_mime_type=resume.mime_type,
+            max_bytes=settings.max_resume_bytes,
+        )
+    except UnsafeResumeError as exc:
+        raise HTTPException(status_code=404, detail="resume file is unavailable") from exc
+    filename = quote(resume.original_filename)
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"inline; filename*=UTF-8''{filename}",
+            "Cache-Control": "no-store",
+        },
     )
 
 
