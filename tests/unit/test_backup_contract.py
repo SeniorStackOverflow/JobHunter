@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 from pathlib import Path
+from types import ModuleType
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).parents[2]
+
+
+def _load_backup_entrypoint() -> ModuleType:
+    path = ROOT / "deploy/backup_entrypoint.py"
+    assert path.exists(), "production backup URL parser is missing"
+    spec = importlib.util.spec_from_file_location("backup_entrypoint", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _backup_test_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
@@ -51,41 +64,71 @@ def test_production_backup_uses_root_only_migrator_env() -> None:
         "POSTGRES_PASSWORD": "",
         "BACKUP_DIR": "/backups",
     }
+    assert backup["image"].startswith("jobhunter-backup-prod:")
+    assert backup["build"]["dockerfile"] == "deploy/backup.Dockerfile"
+    assert backup["entrypoint"] == ["python3", "/usr/local/bin/job-agent-backup-entrypoint"]
+    dockerfile = (ROOT / "deploy/backup.Dockerfile").read_text(encoding="utf-8")
+    assert "FROM postgres:16-alpine" in dockerfile
+    assert "apk add --no-cache python3" in dockerfile
 
 
-def test_backup_uses_migrator_url_without_printing_secret(tmp_path: Path) -> None:
-    script, fake_bin, backup_dir, args_file, env_file = _backup_test_fixture(tmp_path)
+def test_backup_entrypoint_extracts_explicit_libpq_fields() -> None:
+    module = _load_backup_entrypoint()
 
-    secret = "migrator-secret-that-must-not-leak"
-    env = {
-        **os.environ,
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "MIGRATOR_DATABASE_URL": (
-            f"postgresql+asyncpg://jobhunter_migrator:{secret}@postgres:5432/job_agent"
-        ),
-        "PGPASSWORD": "stale-password",
-        "BACKUP_DIR": str(backup_dir),
+    values = module.parse_migrator_database_url(
+        "postgresql+asyncpg://jobhunter%5Fmigrator:p%40ss%2Fword@postgres:55432/job%5Fagent"
+    )
+
+    assert values == {
+        "POSTGRES_HOST": "postgres",
+        "POSTGRES_PORT": "55432",
+        "POSTGRES_USER": "jobhunter_migrator",
+        "POSTGRES_PASSWORD": "p@ss/word",
+        "POSTGRES_DB": "job_agent",
     }
-    result = subprocess.run(  # noqa: S603 - test controls the temporary script path
-        ["/bin/sh", str(script)],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
 
-    assert result.returncode == 0, result.stderr
-    assert secret not in result.stdout
-    assert secret not in result.stderr
-    args = args_file.read_text(encoding="utf-8")
-    assert secret not in args
-    captured_env = env_file.read_text(encoding="utf-8")
-    assert (
-        f"PGDATABASE=postgresql://jobhunter_migrator:{secret}@postgres:5432/job_agent"
-        in captured_env
+
+def test_backup_entrypoint_rejects_missing_host() -> None:
+    module = _load_backup_entrypoint()
+
+    with pytest.raises(ValueError, match="host"):
+        module.parse_migrator_database_url("postgresql:///job_agent")
+
+
+def test_backup_entrypoint_keeps_secret_out_of_exec_arguments(monkeypatch) -> None:
+    module = _load_backup_entrypoint()
+    secret = "migrator-secret-that-must-not-leak"
+    monkeypatch.setattr(
+        module.os,
+        "environ",
+        {
+            "MIGRATOR_DATABASE_URL": (
+                f"postgresql+asyncpg://jobhunter_migrator:{secret}@postgres:5432/job_agent"
+            ),
+            "PGPASSWORD": "stale-password",
+        },
     )
-    assert "PGPASSWORD=" in captured_env
-    assert f"Backup created: {backup_dir}/job-agent-job_agent-" in result.stdout
+    captured: dict[str, object] = {}
+
+    def fake_execve(path: str, argv: list[str], environment: dict[str, str]) -> None:
+        captured.update(path=path, argv=argv, environment=environment)
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(module.os, "execve", fake_execve)
+
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        module.main()
+
+    assert captured["path"] == module.BACKUP_EXECUTABLE
+    assert captured["argv"] == [module.BACKUP_EXECUTABLE]
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert environment["POSTGRES_HOST"] == "postgres"
+    assert environment["POSTGRES_PORT"] == "5432"
+    assert environment["POSTGRES_PASSWORD"] == secret
+    assert "MIGRATOR_DATABASE_URL" not in environment
+    assert "PGPASSWORD" not in environment
+    assert secret not in " ".join(captured["argv"])
 
 
 def test_backup_keeps_dev_postgres_fallback(tmp_path: Path) -> None:

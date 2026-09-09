@@ -239,6 +239,12 @@ services:
     profiles: ["never-production"]
 
   backup:
+    image: jobhunter-backup-prod:${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+    build:
+      context: .
+      dockerfile: deploy/backup.Dockerfile
+      args:
+        APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
     env_file:
       - path: /etc/jobhunter/migrator.env
         required: true
@@ -249,6 +255,7 @@ services:
       POSTGRES_USER: ""
       POSTGRES_PASSWORD: ""
       BACKUP_DIR: /backups
+    entrypoint: ["python3", "/usr/local/bin/job-agent-backup-entrypoint"]
     security_opt:
       - no-new-privileges:true
 
