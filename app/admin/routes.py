@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime, time, timedelta
 from functools import lru_cache
 from hashlib import sha256
@@ -62,6 +63,7 @@ from app.models.entities import (
     Resume,
     ScanRun,
     SourceJob,
+    UserProfile,
 )
 from app.models.enums import (
     ApplicationStatus,
@@ -77,8 +79,9 @@ from app.models.enums import (
 )
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
+from app.profiles.service import ResumeInUseError
 from app.security.auth import CsrfProtector, SessionSigner, verify_password
-from app.security.files import UnsafeResumeError, read_verified_resume
+from app.security.files import UnsafeResumeError, read_verified_resume, safe_storage_path
 from app.security.ssrf import public_url_shape_is_safe
 from app.settings import get_settings
 
@@ -180,7 +183,11 @@ _AUDIT_ACTION_LABELS = {
     "oauth.gmail.connected": "Google-аккаунт подключён",
     "oauth.gmail.disconnected": "Google-аккаунт отключён",
     "preferences.updated": "Настройки поиска обновлены",
+    "profile.created": "Профиль создан",
     "profile.updated": "Профиль обновлён",
+    "resume.activated": "Резюме снова активно",
+    "resume.deactivated": "Резюме деактивировано",
+    "resume.deleted": "Резюме удалено",
     "resume.uploaded": "Резюме загружено",
     "resume.verified": "Резюме подтверждено",
     "source.disabled": "Источник выключен",
@@ -217,6 +224,16 @@ _FEEDBACK_NOTICES = {
         "Проверьте его перед использованием в автоматических откликах.",
     ),
     "resume_verified": ("Резюме подтверждено", "Оно доступно для подготовки откликов."),
+    "resume_deactivated": (
+        "Резюме деактивировано",
+        "Оно больше не используется для новых откликов; активировать можно обратно.",
+    ),
+    "resume_activated": ("Резюме активно", "Оно снова доступно для подготовки откликов."),
+    "resume_deleted": ("Резюме удалено", "Файл и запись удалены безвозвратно."),
+    "profile_and_resume_created": (
+        "Профиль и резюме созданы",
+        "Проверьте резюме перед использованием в автоматических откликах.",
+    ),
     "google_disconnected": (
         "Google отключён",
         "Отправка через Gmail остановлена до повторного подключения.",
@@ -937,6 +954,7 @@ async def dashboard(
     match_jobs: dict[UUID, SourceJob] = {}
     scans: list[ScanRun] = []
     resumes: list[Resume] = []
+    resume_usage: dict[UUID, bool] = {}
     audits: list[AuditEvent] = []
     active_alerts: list[Alert] = []
     historical_alerts: list[Alert] = []
@@ -1238,6 +1256,26 @@ async def dashboard(
                 )
             ).all()
         )
+        resume_ids = [item.id for item in resumes]
+        referenced: set[UUID | None] = set()
+        if resume_ids:
+            referenced |= set(
+                (
+                    await session.scalars(
+                        select(Application.resume_id).where(Application.resume_id.in_(resume_ids))
+                    )
+                ).all()
+            )
+            referenced |= set(
+                (
+                    await session.scalars(
+                        select(MatchEvaluation.resume_id).where(
+                            MatchEvaluation.resume_id.in_(resume_ids)
+                        )
+                    )
+                ).all()
+            )
+        resume_usage = {item_id: (item_id in referenced) for item_id in resume_ids}
     elif view == "calls":
         from app.admin.phone_routes import build_calls_context
 
@@ -1374,6 +1412,7 @@ async def dashboard(
             "sources": sources,
             "source_names": source_names,
             "resumes": resumes,
+            "resume_usage": resume_usage,
             "jobs": jobs,
             "matches": matches,
             "match_jobs": match_jobs,
@@ -1716,6 +1755,86 @@ async def verify_resume(
     await session.commit()
     return RedirectResponse(
         f"/?view=settings&profile_id={selected_profile.id}&notice=resume_verified",
+        status_code=303,
+    )
+
+
+async def _owned_resume(
+    session: AsyncSession, resume_id: UUID, profile_id: UUID | None
+) -> tuple[Resume, UserProfile]:
+    resume = await session.get(Resume, resume_id)
+    selected_profile = await ProfileService().get_profile(session, profile_id)
+    if resume is None or selected_profile is None or resume.profile_id != selected_profile.id:
+        raise HTTPException(status_code=404)
+    return resume, selected_profile
+
+
+@router.post("/admin/resumes/{resume_id}/deactivate")
+async def admin_deactivate_resume(
+    resume_id: UUID,
+    request: Request,
+    profile_id: UUID | None = Form(None),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
+    await ResumeService(get_settings()).deactivate(session, resume_id)
+    await _audit_admin(session, "resume.deactivated", "resume", str(resume_id))
+    await session.commit()
+    return RedirectResponse(
+        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_deactivated",
+        status_code=303,
+    )
+
+
+@router.post("/admin/resumes/{resume_id}/activate")
+async def admin_activate_resume(
+    resume_id: UUID,
+    request: Request,
+    profile_id: UUID | None = Form(None),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
+    try:
+        await ResumeService(get_settings()).activate(session, resume_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await _audit_admin(session, "resume.activated", "resume", str(resume_id))
+    await session.commit()
+    return RedirectResponse(
+        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_activated",
+        status_code=303,
+    )
+
+
+@router.post("/admin/resumes/{resume_id}/delete")
+async def admin_delete_resume(
+    resume_id: UUID,
+    request: Request,
+    profile_id: UUID | None = Form(None),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
+    settings = get_settings()
+    try:
+        unlink_key = await ResumeService(settings).delete(session, resume_id)
+    except ResumeInUseError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _audit_admin(session, "resume.deleted", "resume", str(resume_id))
+    await session.commit()
+    if unlink_key is not None:
+        with contextlib.suppress(UnsafeResumeError):
+            safe_storage_path(settings.resume_storage_path, unlink_key).unlink(missing_ok=True)
+    return RedirectResponse(
+        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_deleted",
         status_code=303,
     )
 

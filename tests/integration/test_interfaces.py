@@ -2685,3 +2685,136 @@ async def test_admin_resume_file_view_404_for_placeholder_and_foreign_profile(
         )
         assert foreign_view.status_code == 404
         assert foreign_view.json()["detail"] == "Not Found"
+
+
+@pytest.mark.asyncio
+async def test_admin_resume_deactivate_activate_delete_lifecycle(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Lifecycle", is_default=True)
+        session.add(profile)
+        await session.flush()
+        profile_id = profile.id
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        await client.post(
+            "/admin/resumes",
+            data={
+                "profile_id": str(profile_id),
+                "name": "Lifecycle CV",
+                "category": "ops",
+                "make_default": "on",
+                "csrf_token": csrf_token,
+            },
+            files={"file": ("cv.pdf", b"%PDF-1.7\ncv\n%%EOF", "application/pdf")},
+        )
+        async with sqlite_session_factory() as session:
+            resume = await session.scalar(select(Resume).where(Resume.name == "Lifecycle CV"))
+            assert resume is not None
+            resume_id = resume.id
+
+        no_csrf = await client.post(f"/admin/resumes/{resume_id}/deactivate", data={})
+        assert no_csrf.status_code == 422
+
+        bad_csrf = await client.post(
+            f"/admin/resumes/{resume_id}/deactivate",
+            data={"profile_id": str(profile_id), "csrf_token": "not-the-real-token"},
+        )
+        assert bad_csrf.status_code == 403
+
+        deactivated = await client.post(
+            f"/admin/resumes/{resume_id}/deactivate",
+            data={"profile_id": str(profile_id), "csrf_token": csrf_token},
+        )
+        assert deactivated.status_code == 303
+        async with sqlite_session_factory() as session:
+            row = await session.get(Resume, resume_id)
+            assert row is not None and row.active is False and row.is_default is False
+
+        activated = await client.post(
+            f"/admin/resumes/{resume_id}/activate",
+            data={"profile_id": str(profile_id), "csrf_token": csrf_token},
+        )
+        assert activated.status_code == 303
+        async with sqlite_session_factory() as session:
+            row = await session.get(Resume, resume_id)
+            assert row is not None and row.active is True
+
+        deleted = await client.post(
+            f"/admin/resumes/{resume_id}/delete",
+            data={"profile_id": str(profile_id), "csrf_token": csrf_token},
+        )
+        assert deleted.status_code == 303
+        async with sqlite_session_factory() as session:
+            assert await session.get(Resume, resume_id) is None
+            actions = set((await session.scalars(select(AuditEvent.action))).all())
+            assert {"resume.deactivated", "resume.activated", "resume.deleted"} <= actions
+        assert not (settings.resume_storage_path / "cv.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_admin_resume_delete_conflicts_when_referenced(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="admin-delete-conflict"
+    )
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        conflict = await client.post(
+            f"/admin/resumes/{seeded['resume_id']}/delete",
+            data={"profile_id": str(seeded["profile_id"]), "csrf_token": csrf_token},
+        )
+        assert conflict.status_code == 409
+
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, seeded["resume_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_resume_activate_422_when_binary_missing(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="No binary", is_default=True)
+        session.add(profile)
+        await session.flush()
+        placeholder = Resume(
+            profile_id=profile.id,
+            name="Placeholder",
+            category="ops",
+            storage_key="pending/cafebabe",
+            original_filename="p.pdf",
+            mime_type="application/pdf",
+            sha256="0" * 64,
+            active=False,
+            verified=False,
+            is_default=False,
+        )
+        session.add(placeholder)
+        await session.commit()
+        profile_id, resume_id = profile.id, placeholder.id
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        response = await client.post(
+            f"/admin/resumes/{resume_id}/activate",
+            data={"profile_id": str(profile_id), "csrf_token": csrf_token},
+        )
+        assert response.status_code == 422
