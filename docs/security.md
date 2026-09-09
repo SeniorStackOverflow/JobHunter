@@ -140,6 +140,13 @@ OAuth-подключение; бесшовная ротация требует �
 filesystem path. Download требует authz и отдаёт безопасный `Content-Disposition`,
 `nosniff`; resume directory не публикуется Caddy как static.
 
+Аутентифицированная admin session может открыть собственное загруженное резюме в
+браузере (`GET /admin/resumes/{id}/file`, inline PDF). Это не регрессия правила
+«MCP не отдаёт resume path и содержимое»: оно ограничивает менее доверенный MCP
+bearer interface, а не браузерную сессию оператора. На этом пути
+`read_verified_resume` сохраняет свои проверки: path-safety, `O_NOFOLLOW`, размер,
+сигнатуру `%PDF-` и SHA-256.
+
 Антивирус/Content Disarm можно добавить перед verified, если deployment этого
 требует. Не помечайте файл verified только потому, что расширение `.pdf`.
 
