@@ -86,6 +86,30 @@ def _has_language(profile: UserProfile, code: str) -> bool:
     )
 
 
+_SIGNATURE_CLOSERS = {
+    "ru": "С уважением,",  # noqa: RUF001 - intentional Cyrillic text
+    "ro": "Cu respect,",
+    "en": "Kind regards,",
+}
+_SIGNATURE_CONTACT_LABELS = {
+    "ru": ("Тел.: ", "Email: "),
+    "ro": ("Tel.: ", "Email: "),
+    "en": ("Phone: ", "Email: "),
+}
+
+
+def _letter_signature(profile: UserProfile, language: str) -> str:
+    lines = [_SIGNATURE_CLOSERS[language], profile.name]
+    phone_label, email_label = _SIGNATURE_CONTACT_LABELS[language]
+    phone = (profile.phone or "").strip()
+    email = (profile.contact_email or "").strip()
+    if phone:
+        lines.append(f"{phone_label}{phone}")
+    if email:
+        lines.append(f"{email_label}{email}")
+    return "\n".join(lines)
+
+
 def generate_letter(profile: UserProfile, job: SourceJob) -> tuple[str, str, str, list[str]]:
     requested = (job.page_locale or "en").split("-", maxsplit=1)[0].casefold()
     language: str | None
@@ -107,7 +131,7 @@ def generate_letter(profile: UserProfile, job: SourceJob) -> tuple[str, str, str
             f"Здравствуйте, команда {company}!\n\n"
             f"Хочу откликнуться на вакансию «{job.title}».{relevance} "
             "Буду рад обсудить требования и формат работы.\n\n"
-            f"С уважением,\n{profile.name}"  # noqa: RUF001 - intentional Cyrillic text
+            f"{_letter_signature(profile, language)}"
         )
     elif language == "ro":
         subject = f"Candidatură pentru postul „{job.title}”"
@@ -116,7 +140,7 @@ def generate_letter(profile: UserProfile, job: SourceJob) -> tuple[str, str, str
             f"Bună ziua, echipa {company}!\n\n"
             f"Doresc să candidez pentru postul „{job.title}”.{relevance} "
             "Aș aprecia ocazia de a discuta cerințele și programul.\n\n"
-            f"Cu respect,\n{profile.name}"
+            f"{_letter_signature(profile, language)}"
         )
     else:
         subject = f"Application for {job.title}"
@@ -125,7 +149,7 @@ def generate_letter(profile: UserProfile, job: SourceJob) -> tuple[str, str, str
             f"Hello {company} team,\n\n"
             f"I would like to apply for the {job.title} position.{relevance} "
             "I would welcome a conversation about the requirements and working arrangement.\n\n"
-            f"Kind regards,\n{profile.name}"
+            f"{_letter_signature(profile, language)}"
         )
     return subject, body, language, [fact_id] if fact_id else []
 
