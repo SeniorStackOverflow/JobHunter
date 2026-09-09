@@ -2588,6 +2588,9 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
 
     assert unlink_key == storage_key
 
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, resume_id) is None
+
 
 @pytest.mark.asyncio
 async def test_admin_resume_file_view_returns_pdf_bytes(
@@ -2676,7 +2679,9 @@ async def test_admin_resume_file_view_404_for_placeholder_and_foreign_profile(
             f"/admin/resumes/{placeholder_id}/file", params={"profile_id": str(owner_id)}
         )
         assert placeholder_view.status_code == 404
+        assert placeholder_view.json()["detail"] == "resume file has not been uploaded"
         foreign_view = await client.get(
             f"/admin/resumes/{placeholder_id}/file", params={"profile_id": str(other_id)}
         )
         assert foreign_view.status_code == 404
+        assert foreign_view.json()["detail"] == "Not Found"
