@@ -177,9 +177,12 @@ row = response.json()["sessions"][0]
 assert row["summary_state"] == "done"
 assert row["summary"]["summary_text"]
 assert row["script_stage"] == "greeting_completed"
-assert "audio_evidence_url" in (
-    await api.get(f"/api/v1/phone/sessions/{row['id']}", headers=api_headers)
-).json()["turns"][0]
+assert (
+    "audio_evidence_url"
+    in (await api.get(f"/api/v1/phone/sessions/{row['id']}", headers=api_headers)).json()["turns"][
+        0
+    ]
+)
 ~~~
 
 Run: `uv run pytest tests/integration/test_phone_api.py -q`
@@ -344,10 +347,15 @@ Terra verifies migration safety on SQLite and PostgreSQL semantics, self-FK dele
 
 ~~~python
 CriticalField = Literal[
-    "interview_date", "interview_time", "timezone", "format",
-    "address", "meeting_url", "company", "vacancy",
+    "interview_date",
+    "interview_time",
+    "timezone",
+    "format",
+    "address",
+    "meeting_url",
+    "company",
+    "vacancy",
 ]
-
 ~~~
 
 - `has_confirmation_critical_markers(texts: Sequence[str]) -> bool`
@@ -453,6 +461,7 @@ class FactCandidate(BaseModel):
     confidence: float = Field(ge=0, le=1)
     ambiguity: str = ""
 
+
 class ExtractionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     summary_text: str
@@ -460,10 +469,12 @@ class ExtractionResult(BaseModel):
     facts: list[FactCandidate]
     review_reasons: list[str]
 
+
 class VerificationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     facts: list[FactCandidate]
     review_reasons: list[str]
+
 
 class ArbitrationItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -473,9 +484,11 @@ class ArbitrationItem(BaseModel):
     accepted: bool
     reason: str
 
+
 class ArbitrationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decisions: list[ArbitrationItem]
+
 
 @dataclass(frozen=True)
 class ModelCallMeta:
@@ -483,7 +496,6 @@ class ModelCallMeta:
     model: str
     latency_ms: int
     attempts: int
-
 ~~~
 
 `PostCallVerificationProvider` exposes these exact methods:
@@ -559,12 +571,12 @@ class ReconciledFact:
     state: CallFactState
     reason: str
 
+
 @dataclass(frozen=True)
 class VerificationDecision:
     status: PhoneVerificationStatus
     facts: tuple[ReconciledFact, ...]
     reasons: tuple[str, ...]
-
 ~~~
 
 - `reconcile_verification(*, context: VerificationContext, extracted: ExtractionResult,
@@ -697,13 +709,13 @@ class PhoneSmsMessage(BaseModel):
     direction: Literal["incoming", "outgoing"]
     status: Literal["received", "sending", "sent", "failed", "unknown"]
 
+
 class PhoneSmsPage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     messages: list[PhoneSmsMessage]
     count: int
     synced_at: int | None = None
     syncing: bool = False
-
 ~~~
 
 - `PhoneGateClient.sms_history(*, limit: int = 200,
@@ -772,10 +784,10 @@ class SmsFieldComparison(BaseModel):
     call_expression: str
     reason: str
 
+
 class SmsComparisonResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     comparisons: list[SmsFieldComparison]
-
 ~~~
 
 - `apply_sms_confirmation(db: AsyncSession, *, call: CommunicationSession,
@@ -840,7 +852,6 @@ Terra attempts contradiction, correction, partial-message, duplicate, and wrong-
 @dataclass(frozen=True)
 class TelegramDeliveryResult:
     message_id: int
-
 ~~~
 
 - `send_telegram_message(*, token: str, chat_id: str, text: str,

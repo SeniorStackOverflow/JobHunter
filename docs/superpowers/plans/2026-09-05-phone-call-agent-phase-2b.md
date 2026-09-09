@@ -82,10 +82,14 @@ In `tests/unit/test_phone_entities.py` add:
 ```python
 async def test_communication_session_has_summary_columns(async_session):
     from app.models.enums import PhoneSummaryState
+
     profile = await _make_profile(async_session)
     call = CommunicationSession(
-        profile_id=profile.id, channel=CommunicationChannel.CALL, transport="phonegate",
-        direction=CommunicationDirection.INBOUND, phonegate_event_id_start=1,
+        profile_id=profile.id,
+        channel=CommunicationChannel.CALL,
+        transport="phonegate",
+        direction=CommunicationDirection.INBOUND,
+        phonegate_event_id_start=1,
         started_at=utcnow(),
     )
     async_session.add(call)
@@ -94,8 +98,9 @@ async def test_communication_session_has_summary_columns(async_session):
     assert call.summary_state is PhoneSummaryState.NOT_APPLICABLE
 
 
-async def test_communication_turn_has_audio_evidence_path(async_session):
-    ...  # create a session + turn, assert turn.audio_evidence_path is None
+async def test_communication_turn_has_audio_evidence_path(
+    async_session,
+): ...  # create a session + turn, assert turn.audio_evidence_path is None
 ```
 
 (Reuse the helpers already in `test_phone_entities.py`; match its existing fixture names.)
@@ -152,6 +157,7 @@ Expected: PASS.
 Revision ID: <rev>
 Revises: e5f6a7b8c9d0
 """
+
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -163,20 +169,25 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _SUMMARY_STATE = sa.Enum(
-    "not_applicable", "pending", "done", "failed", "skipped",
-    name="phonesummarystate", native_enum=False,
+    "not_applicable",
+    "pending",
+    "done",
+    "failed",
+    "skipped",
+    name="phonesummarystate",
+    native_enum=False,
 )
 
 
 def upgrade() -> None:
     with op.batch_alter_table("communication_sessions") as batch_op:
-        batch_op.add_column(
-            sa.Column("summary", sa.JSON(), nullable=False, server_default="{}")
-        )
+        batch_op.add_column(sa.Column("summary", sa.JSON(), nullable=False, server_default="{}"))
         batch_op.add_column(
             sa.Column(
-                "summary_state", _SUMMARY_STATE,
-                nullable=False, server_default="not_applicable",
+                "summary_state",
+                _SUMMARY_STATE,
+                nullable=False,
+                server_default="not_applicable",
             )
         )
     with op.batch_alter_table("communication_sessions") as batch_op:
@@ -240,16 +251,21 @@ async def test_recent_call_audio_returns_wav_bytes():
         assert request.url.path == "/api/call/audio"
         assert request.url.params["seconds"] == "8"
         return httpx.Response(200, content=b"RIFFfake", headers={"content-type": "audio/wav"})
-    client = PhoneGateClient(base_url="http://pg", token="t",
-                             transport=httpx.MockTransport(handler))
+
+    client = PhoneGateClient(
+        base_url="http://pg", token="t", transport=httpx.MockTransport(handler)
+    )
     assert await client.recent_call_audio(8) == b"RIFFfake"
     await client.aclose()
 
 
 @pytest.mark.asyncio
 async def test_recent_call_audio_409_raises_phonegate_error():
-    client = PhoneGateClient(base_url="http://pg", token="t",
-        transport=httpx.MockTransport(lambda r: httpx.Response(409, json={"success": False})))
+    client = PhoneGateClient(
+        base_url="http://pg",
+        token="t",
+        transport=httpx.MockTransport(lambda r: httpx.Response(409, json={"success": False})),
+    )
     with pytest.raises(PhoneGateError):
         await client.recent_call_audio(5)
     await client.aclose()
@@ -258,11 +274,14 @@ async def test_recent_call_audio_409_raises_phonegate_error():
 @pytest.mark.asyncio
 async def test_recent_call_audio_clamps_seconds():
     seen = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
         seen["seconds"] = request.url.params["seconds"]
         return httpx.Response(200, content=b"x")
-    client = PhoneGateClient(base_url="http://pg", token="t",
-                             transport=httpx.MockTransport(handler))
+
+    client = PhoneGateClient(
+        base_url="http://pg", token="t", transport=httpx.MockTransport(handler)
+    )
     await client.recent_call_audio(99)
     assert seen["seconds"] == "10"
     await client.aclose()
@@ -304,7 +323,8 @@ Expected: PASS.
 @pytest.mark.asyncio
 async def test_fake_phonegate_serves_recent_call_audio():
     fake = FakePhoneGate()
-    fake.ring("+37360000000"); fake.answer()
+    fake.ring("+37360000000")
+    fake.answer()
     fake.set_call_audio(b"RIFF....WAVEdata")
     client = PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport())
     assert await client.recent_call_audio(5) == b"RIFF....WAVEdata"
@@ -324,21 +344,23 @@ Expected: FAIL — 404 from the fake (no route) → `PhoneGateError`, but `set_c
 In `__init__`: `self._call_audio: bytes | None = None`, `self._fail_next_audio = False`; add `Route("/api/call/audio", self._audio_route)` to the routes list. Add:
 
 ```python
-    def set_call_audio(self, wav_bytes: bytes) -> None:
-        self._call_audio = wav_bytes
+def set_call_audio(self, wav_bytes: bytes) -> None:
+    self._call_audio = wav_bytes
 
-    def fail_next_audio(self) -> None:
-        self._fail_next_audio = True
 
-    async def _audio_route(self, request: Request) -> Response:
-        if not self._auth_ok(request):
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        if self._fail_next_audio:
-            self._fail_next_audio = False
-            return JSONResponse({"success": False, "message": "нет аудио"}, status_code=409)
-        if not self._call_audio:
-            return JSONResponse({"success": False}, status_code=409)
-        return Response(self._call_audio, media_type="audio/wav")
+def fail_next_audio(self) -> None:
+    self._fail_next_audio = True
+
+
+async def _audio_route(self, request: Request) -> Response:
+    if not self._auth_ok(request):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    if self._fail_next_audio:
+        self._fail_next_audio = False
+        return JSONResponse({"success": False, "message": "нет аудио"}, status_code=409)
+    if not self._call_audio:
+        return JSONResponse({"success": False}, status_code=409)
+    return Response(self._call_audio, media_type="audio/wav")
 ```
 
 (Import `Response` from `starlette.responses`.)
@@ -396,16 +418,21 @@ git commit -m "feat: PhoneGateClient.recent_call_audio + FakePhoneGate audio rou
 import pytest
 from app.phone.evidence import is_important_utterance
 
-@pytest.mark.parametrize("text", [
-    "В четверг в четырнадцать ноль ноль",       # digits via words + weekday
-    "приходите на собеседование завтра",         # interview keyword
-    "адрес улица Индустриальная 12",             # address + digit
-    "офис на пятом этаже, кабинет 5",            # digit
-    "a" * 61,                                     # length
-    "vineri la ora zece",                        # RO time
-])
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "В четверг в четырнадцать ноль ноль",  # digits via words + weekday
+        "приходите на собеседование завтра",  # interview keyword
+        "адрес улица Индустриальная 12",  # address + digit
+        "офис на пятом этаже, кабинет 5",  # digit
+        "a" * 61,  # length
+        "vineri la ora zece",  # RO time
+    ],
+)
 def test_is_important_true(text):
     assert is_important_utterance(text, min_chars=60) is True
+
 
 @pytest.mark.parametrize("text", ["да", "хорошо, спасибо", "алло вы меня слышите"])
 def test_is_important_false(text):
@@ -477,6 +504,7 @@ from app.phone.schemas import TranscriptEntry
 class _FakeClient:
     def __init__(self, audio=b"RIFFwav", exc=None):
         self.audio, self.exc, self.calls = audio, exc, 0
+
     async def recent_call_audio(self, seconds):
         self.calls += 1
         if self.exc:
@@ -634,9 +662,11 @@ git commit -m "feat: EvidenceCapturer — deterministic mid-call clip capture"
 @pytest.mark.asyncio
 async def test_close_marks_auto_answered_session_summary_pending(async_session):
     store = SessionStore()
-    call = await _open_call(async_session, store)          # existing helper
+    call = await _open_call(async_session, store)  # existing helper
     await store.mark_auto_answered(call, utcnow())
-    await store.close(async_session, call, outcome=CommunicationOutcome.COMPLETED, ended_at=utcnow())
+    await store.close(
+        async_session, call, outcome=CommunicationOutcome.COMPLETED, ended_at=utcnow()
+    )
     assert call.summary_state is PhoneSummaryState.PENDING
 
 
@@ -686,9 +716,7 @@ Expected: FAIL — no clip file written.
 - in `run()`, right after `self._session_id = session_id`:
 
 ```python
-        self._evidence = EvidenceCapturer(
-            client=self._client, settings=self._s, session_id=session_id
-        )
+self._evidence = EvidenceCapturer(client=self._client, settings=self._s, session_id=session_id)
 ```
 
 - in the `LISTENING` `while True:` loop, replace the `if page.entries:` block so it captures on the rx subset:
@@ -764,7 +792,9 @@ def test_summary_model_falls_back_to_openai_model():
 
 def test_production_requires_telegram_creds_when_enabled():
     with pytest.raises(ValueError, match="TELEGRAM"):
-        _production_settings(telegram_enabled=True)  # local helper mirroring the file's other prod tests
+        _production_settings(
+            telegram_enabled=True
+        )  # local helper mirroring the file's other prod tests
 
 
 def test_production_requires_summary_model_when_enabled():
@@ -819,14 +849,18 @@ Expected: FAIL — unknown fields / no `effective_summary_model`.
 - In `validate_secure_production`, before `return self` (guard each with `self.environment == "production"` already handled by the early return):
 
 ```python
-        if self.telegram_enabled and (
-            self.telegram_bot_token is None or not self.telegram_chat_id
-        ):
-            raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required when TELEGRAM_ENABLED is true")
-        if self.phone_summary_llm_enabled and not self.effective_summary_model:
-            raise ValueError("an explicit summary model is required when PHONE_SUMMARY_LLM_ENABLED is true")
-        if self.phone_summary_llm_enabled and self.phone_summary_llm_api_key is None and self.llmrouter_api_key is None:
-            raise ValueError("a summary LLM API key is required when PHONE_SUMMARY_LLM_ENABLED is true")
+if self.telegram_enabled and (self.telegram_bot_token is None or not self.telegram_chat_id):
+    raise ValueError(
+        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required when TELEGRAM_ENABLED is true"
+    )
+if self.phone_summary_llm_enabled and not self.effective_summary_model:
+    raise ValueError("an explicit summary model is required when PHONE_SUMMARY_LLM_ENABLED is true")
+if (
+    self.phone_summary_llm_enabled
+    and self.phone_summary_llm_api_key is None
+    and self.llmrouter_api_key is None
+):
+    raise ValueError("a summary LLM API key is required when PHONE_SUMMARY_LLM_ENABLED is true")
 ```
 
 - [ ] **Step 5: Run settings tests — expect pass**
@@ -889,57 +923,114 @@ git commit -m "feat: phone 2b settings — summary LLM, Telegram, evidence reten
 
 ```python
 import httpx, json, pytest
-from app.phone.summary import CallSummary, CallSummaryContext, PhoneSummaryProvider, PhoneSummaryUnavailable
+from app.phone.summary import (
+    CallSummary,
+    CallSummaryContext,
+    PhoneSummaryProvider,
+    PhoneSummaryUnavailable,
+)
 
-_CTX = CallSummaryContext(transcript=[("assistant", "Здравствуйте"), ("employer", "Звоню по вакансии грузчика, в четверг в 14")],
-                          company="Example SRL", vacancy="Грузчик", application_status="sent", confirmed_facts={})
+_CTX = CallSummaryContext(
+    transcript=[
+        ("assistant", "Здравствуйте"),
+        ("employer", "Звоню по вакансии грузчика, в четверг в 14"),
+    ],
+    company="Example SRL",
+    vacancy="Грузчик",
+    application_status="sent",
+    confirmed_facts={},
+)
+
 
 def _ok_response(payload: dict) -> httpx.Response:
-    return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
-        "message": {"content": json.dumps(payload)}}]})
+    return httpx.Response(
+        200,
+        json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(payload)}}]},
+    )
+
 
 @pytest.mark.asyncio
 async def test_summarize_parses_valid_json():
-    payload = {"summary_text": "Работодатель предложил собеседование в четверг в 14:00.",
-               "mentioned_vacancy": "Грузчик", "proposed_datetime_text": "в четверг в 14",
-               "proposed_address_text": "", "contact_person_text": "",
-               "outcome_guess": "interview_proposed", "needs_review": False}
+    payload = {
+        "summary_text": "Работодатель предложил собеседование в четверг в 14:00.",
+        "mentioned_vacancy": "Грузчик",
+        "proposed_datetime_text": "в четверг в 14",
+        "proposed_address_text": "",
+        "contact_person_text": "",
+        "outcome_guess": "interview_proposed",
+        "needs_review": False,
+    }
     seen = {}
+
     def handler(request):
         seen["prefer"] = request.headers.get("X-LLMRouter-Prefer")
         seen["url"] = str(request.url)
         return _ok_response(payload)
-    p = PhoneSummaryProvider(base_url="http://r", api_key="k", model="m",
-                             client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    p = PhoneSummaryProvider(
+        base_url="http://r",
+        api_key="k",
+        model="m",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
     result = await p.summarize(_CTX)
     assert result.outcome_guess == "interview_proposed"
     assert result.proposed_datetime_text == "в четверг в 14"
     assert seen["prefer"] == "quality"
     assert seen["url"].endswith("/v1/chat/completions")
 
+
 @pytest.mark.asyncio
 async def test_summarize_rejects_non_json():
-    p = PhoneSummaryProvider(base_url="http://r", api_key="k", model="m",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(200, json={"choices": [{"finish_reason": "stop",
-                "message": {"content": "sorry I cannot"}}]}))))
+    p = PhoneSummaryProvider(
+        base_url="http://r",
+        api_key="k",
+        model="m",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {"finish_reason": "stop", "message": {"content": "sorry I cannot"}}
+                        ]
+                    },
+                )
+            )
+        ),
+    )
     with pytest.raises(PhoneSummaryUnavailable):
         await p.summarize(_CTX)
 
+
 @pytest.mark.asyncio
 async def test_summarize_maps_5xx_and_timeout():
-    p = PhoneSummaryProvider(base_url="http://r", api_key="k", model="m",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503))))
+    p = PhoneSummaryProvider(
+        base_url="http://r",
+        api_key="k",
+        model="m",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503))),
+    )
     with pytest.raises(PhoneSummaryUnavailable):
         await p.summarize(_CTX)
+
 
 @pytest.mark.asyncio
 async def test_summarize_strips_markdown_fence():
     fenced = "```json\n" + json.dumps({"summary_text": "ок"}) + "\n```"
-    p = PhoneSummaryProvider(base_url="http://r", api_key="k", model="m",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(200, json={"choices": [{"finish_reason": "stop",
-                "message": {"content": fenced}}]}))))
+    p = PhoneSummaryProvider(
+        base_url="http://r",
+        api_key="k",
+        model="m",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    200,
+                    json={"choices": [{"finish_reason": "stop", "message": {"content": fenced}}]},
+                )
+            )
+        ),
+    )
     assert (await p.summarize(_CTX)).summary_text == "ок"
 ```
 
@@ -998,15 +1089,24 @@ class PhoneSummaryUnavailable(RuntimeError):
 
 def _strip_fence(text: str) -> str:
     lines = text.strip().splitlines()
-    if len(lines) >= 3 and lines[0].strip().casefold() in {"```json", "```"} and lines[-1].strip() == "```":
+    if (
+        len(lines) >= 3
+        and lines[0].strip().casefold() in {"```json", "```"}
+        and lines[-1].strip() == "```"
+    ):
         return "\n".join(lines[1:-1]).strip()
     return text.strip()
 
 
 class PhoneSummaryProvider:
     def __init__(
-        self, *, base_url: str, api_key: str, model: str,
-        prefer: str = "quality", timeout_seconds: float = 60.0,
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        prefer: str = "quality",
+        timeout_seconds: float = 60.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not model.strip():
@@ -1041,8 +1141,11 @@ class PhoneSummaryProvider:
             "max_tokens": 700,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "call_summary", "strict": True,
-                                "schema": CallSummary.model_json_schema()},
+                "json_schema": {
+                    "name": "call_summary",
+                    "strict": True,
+                    "schema": CallSummary.model_json_schema(),
+                },
             },
         }
 
@@ -1052,7 +1155,9 @@ class PhoneSummaryProvider:
         async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
             return await self._summarize_with(client, ctx)
 
-    async def _summarize_with(self, client: httpx.AsyncClient, ctx: CallSummaryContext) -> CallSummary:
+    async def _summarize_with(
+        self, client: httpx.AsyncClient, ctx: CallSummaryContext
+    ) -> CallSummary:
         headers = {"Authorization": f"Bearer {self._api_key}", "X-LLMRouter-Prefer": self._prefer}
         try:
             response = await client.post(
@@ -1115,45 +1220,84 @@ git commit -m "feat: PhoneSummaryProvider — llmRouter-backed post-call summary
 ```python
 import httpx, pytest
 from app.phone.summary import CallSummary
-from app.phone.telegram import TelegramDeliveryError, render_call_notification, send_telegram_message
+from app.phone.telegram import (
+    TelegramDeliveryError,
+    render_call_notification,
+    send_telegram_message,
+)
+
 
 @pytest.mark.asyncio
 async def test_send_ok():
     seen = {}
+
     def handler(request):
-        seen["url"] = str(request.url); seen["json"] = request.read()
+        seen["url"] = str(request.url)
+        seen["json"] = request.read()
         return httpx.Response(200, json={"ok": True})
-    await send_telegram_message(token="T", chat_id="42", text="hi",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    await send_telegram_message(
+        token="T",
+        chat_id="42",
+        text="hi",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
     assert seen["url"] == "https://api.telegram.org/botT/sendMessage"
+
 
 @pytest.mark.asyncio
 async def test_send_non_2xx_raises():
     with pytest.raises(TelegramDeliveryError):
-        await send_telegram_message(token="T", chat_id="42", text="hi",
-            client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(403))))
+        await send_telegram_message(
+            token="T",
+            chat_id="42",
+            text="hi",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(403))),
+        )
+
 
 @pytest.mark.asyncio
 async def test_send_network_error_raises():
-    def boom(r): raise httpx.ConnectError("down")
+    def boom(r):
+        raise httpx.ConnectError("down")
+
     with pytest.raises(TelegramDeliveryError):
-        await send_telegram_message(token="T", chat_id="42", text="hi",
-            client=httpx.AsyncClient(transport=httpx.MockTransport(boom)))
+        await send_telegram_message(
+            token="T",
+            chat_id="42",
+            text="hi",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(boom)),
+        )
+
 
 def test_render_confident_and_uncertain_hide_caller_number():
-    confident = CallSummary(summary_text="Собеседование в четверг.", outcome_guess="interview_proposed",
-                            proposed_datetime_text="четверг 14:00", proposed_address_text="ул. Индустриальная 12")
-    text = render_call_notification(confident, company="Example SRL", vacancy="Грузчик",
-                                    session_id="abc", base_url="https://jobs.example.com")
+    confident = CallSummary(
+        summary_text="Собеседование в четверг.",
+        outcome_guess="interview_proposed",
+        proposed_datetime_text="четверг 14:00",
+        proposed_address_text="ул. Индустриальная 12",
+    )
+    text = render_call_notification(
+        confident,
+        company="Example SRL",
+        vacancy="Грузчик",
+        session_id="abc",
+        base_url="https://jobs.example.com",
+    )
     assert "Example SRL" in text and "четверг 14:00" in text
     assert "https://jobs.example.com/?view=calls&session=abc" in text
     uncertain = CallSummary(summary_text="Неясно.", needs_review=True)
-    u = render_call_notification(uncertain, company=None, vacancy=None, session_id="abc", base_url=None)
+    u = render_call_notification(
+        uncertain, company=None, vacancy=None, session_id="abc", base_url=None
+    )
     assert "Требуется проверка" in u and "🔗" not in u
+
 
 def test_render_escapes_html():
     s = CallSummary(summary_text="<b>x</b> & y")
-    assert "&lt;b&gt;" in render_call_notification(s, company="A<b>", vacancy=None, session_id="s", base_url=None)
+    assert "&lt;b&gt;" in render_call_notification(
+        s, company="A<b>", vacancy=None, session_id="s", base_url=None
+    )
 ```
 
 - [ ] **Step 2: Run — expect failure**
@@ -1180,11 +1324,19 @@ class TelegramDeliveryError(RuntimeError):
 
 
 async def send_telegram_message(
-    *, token: str, chat_id: str, text: str,
-    timeout: float = 10.0, client: httpx.AsyncClient | None = None,
+    *,
+    token: str,
+    chat_id: str,
+    text: str,
+    timeout: float = 10.0,
+    client: httpx.AsyncClient | None = None,
 ) -> None:
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-               "disable_web_page_preview": True}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     url = f"{_API}/bot{token}/sendMessage"
     owns = client is None
     client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=False)
@@ -1200,8 +1352,12 @@ async def send_telegram_message(
 
 
 def render_call_notification(
-    summary: CallSummary, *, company: str | None, vacancy: str | None,
-    session_id: str, base_url: str | None,
+    summary: CallSummary,
+    *,
+    company: str | None,
+    vacancy: str | None,
+    session_id: str,
+    base_url: str | None,
 ) -> str:
     link = f"\n🔗 {base_url}/?view=calls&session={session_id}" if base_url else ""
     body = escape(summary.summary_text)
@@ -1272,8 +1428,12 @@ async def test_finalize_links_evidence_even_when_llm_disabled(finalize_env):
 @pytest.mark.asyncio
 async def test_finalize_writes_summary_and_bumps_needs_review(finalize_env, monkeypatch):
     env = finalize_env(llm_enabled=True)
-    monkeypatch.setattr("app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(CallSummary(summary_text="итог", outcome_guess="interview_proposed", needs_review=True)))
+    monkeypatch.setattr(
+        "app.phone.summary.PhoneSummaryProvider.summarize",
+        _fake_summarize(
+            CallSummary(summary_text="итог", outcome_guess="interview_proposed", needs_review=True)
+        ),
+    )
     result = await finalize_pending_calls()
     assert result["done"] == 1
     s = await env.get_session()
@@ -1287,8 +1447,10 @@ async def test_finalize_writes_summary_and_bumps_needs_review(finalize_env, monk
 @pytest.mark.asyncio
 async def test_finalize_retries_then_fails_after_max_attempts(finalize_env, monkeypatch):
     env = finalize_env(llm_enabled=True, max_attempts=2)
-    monkeypatch.setattr("app.phone.summary.PhoneSummaryProvider.summarize",
-        _always_raise(PhoneSummaryUnavailable("http_503")))
+    monkeypatch.setattr(
+        "app.phone.summary.PhoneSummaryProvider.summarize",
+        _always_raise(PhoneSummaryUnavailable("http_503")),
+    )
     await finalize_pending_calls()
     assert (await env.get_session()).summary_state is PhoneSummaryState.PENDING
     await finalize_pending_calls()
@@ -1307,10 +1469,13 @@ async def test_finalize_skips_session_with_no_employer_turns(finalize_env):
 @pytest.mark.asyncio
 async def test_finalize_telegram_failure_keeps_done(finalize_env, monkeypatch):
     env = finalize_env(llm_enabled=True, telegram_enabled=True)
-    monkeypatch.setattr("app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(CallSummary(summary_text="ок")))
-    monkeypatch.setattr("app.phone.summary.send_telegram_message",
-        _always_raise(TelegramDeliveryError("http_403")))
+    monkeypatch.setattr(
+        "app.phone.summary.PhoneSummaryProvider.summarize",
+        _fake_summarize(CallSummary(summary_text="ок")),
+    )
+    monkeypatch.setattr(
+        "app.phone.summary.send_telegram_message", _always_raise(TelegramDeliveryError("http_403"))
+    )
     await finalize_pending_calls()
     s = await env.get_session()
     assert s.summary_state is PhoneSummaryState.DONE
@@ -1329,23 +1494,24 @@ Expected: FAIL — `ImportError: finalize_pending_calls`.
 `app/phone/sessions.py`:
 
 ```python
-    async def set_summary(
-        self, call: CommunicationSession, payload: dict[str, Any], state: PhoneSummaryState
-    ) -> None:
-        call.summary = payload
-        call.summary_state = state
+async def set_summary(
+    self, call: CommunicationSession, payload: dict[str, Any], state: PhoneSummaryState
+) -> None:
+    call.summary = payload
+    call.summary_state = state
 
-    async def set_turn_evidence_path(
-        self, session: AsyncSession, *, session_id: UUID, phonegate_transcript_id: int, path: str
-    ) -> None:
-        turn = await session.scalar(
-            select(CommunicationTurn).where(
-                CommunicationTurn.session_id == session_id,
-                CommunicationTurn.phonegate_transcript_id == phonegate_transcript_id,
-            )
+
+async def set_turn_evidence_path(
+    self, session: AsyncSession, *, session_id: UUID, phonegate_transcript_id: int, path: str
+) -> None:
+    turn = await session.scalar(
+        select(CommunicationTurn).where(
+            CommunicationTurn.session_id == session_id,
+            CommunicationTurn.phonegate_transcript_id == phonegate_transcript_id,
         )
-        if turn is not None and turn.audio_evidence_path is None:
-            turn.audio_evidence_path = path
+    )
+    if turn is not None and turn.audio_evidence_path is None:
+        turn.audio_evidence_path = path
 ```
 
 - [ ] **Step 4: `link_session_evidence` in `evidence.py`**
@@ -1363,7 +1529,9 @@ async def link_session_evidence(db: AsyncSession, session_id: UUID, evidence_dir
         except ValueError:
             continue
         await store.set_turn_evidence_path(
-            db, session_id=session_id, phonegate_transcript_id=transcript_id,
+            db,
+            session_id=session_id,
+            phonegate_transcript_id=transcript_id,
             path=f"{session_id}/{clip.name}",
         )
         linked += 1
@@ -1375,11 +1543,18 @@ async def link_session_evidence(db: AsyncSession, session_id: UUID, evidence_dir
 - [ ] **Step 5: `build_summary_context` + `finalize_pending_calls` in `summary.py`**
 
 ```python
-async def build_summary_context(db: AsyncSession, session: CommunicationSession) -> CallSummaryContext:
-    turns = list((await db.scalars(
-        select(CommunicationTurn).where(CommunicationTurn.session_id == session.id)
-        .order_by(CommunicationTurn.seq)
-    )).all())
+async def build_summary_context(
+    db: AsyncSession, session: CommunicationSession
+) -> CallSummaryContext:
+    turns = list(
+        (
+            await db.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.session_id == session.id)
+                .order_by(CommunicationTurn.seq)
+            )
+        ).all()
+    )
     transcript = [
         (t.speaker.value, t.spoken_text if t.speaker is TurnSpeaker.ASSISTANT else t.text)
         for t in turns
@@ -1396,8 +1571,13 @@ async def build_summary_context(db: AsyncSession, session: CommunicationSession)
     if session.application_id is not None:
         app_row = await db.get(Application, session.application_id)
         status = app_row.status.value if app_row is not None else None
-    return CallSummaryContext(transcript=transcript, company=company, vacancy=vacancy,
-                              application_status=status, confirmed_facts=facts)
+    return CallSummaryContext(
+        transcript=transcript,
+        company=company,
+        vacancy=vacancy,
+        application_status=status,
+        confirmed_facts=facts,
+    )
 
 
 async def finalize_pending_calls() -> dict[str, int]:
@@ -1406,12 +1586,16 @@ async def finalize_pending_calls() -> dict[str, int]:
     store = SessionStore()
     provider: PhoneSummaryProvider | None = None
     async with async_session_factory() as db:
-        pending = list((await db.scalars(
-            select(CommunicationSession)
-            .where(CommunicationSession.summary_state == PhoneSummaryState.PENDING)
-            .order_by(CommunicationSession.ended_at)
-            .limit(settings.phone_summary_batch)
-        )).all())
+        pending = list(
+            (
+                await db.scalars(
+                    select(CommunicationSession)
+                    .where(CommunicationSession.summary_state == PhoneSummaryState.PENDING)
+                    .order_by(CommunicationSession.ended_at)
+                    .limit(settings.phone_summary_batch)
+                )
+            ).all()
+        )
         for session in pending:
             counters["picked"] += 1
             await link_session_evidence(db, session.id, settings.phone_evidence_dir)
@@ -1427,7 +1611,7 @@ async def finalize_pending_calls() -> dict[str, int]:
                 await db.commit()
                 continue
             if provider is None:
-                api_key = (settings.phone_summary_llm_api_key or settings.llmrouter_api_key)
+                api_key = settings.phone_summary_llm_api_key or settings.llmrouter_api_key
                 provider = PhoneSummaryProvider(
                     base_url=settings.phone_summary_llm_base_url,
                     api_key=api_key.get_secret_value() if api_key else "",
@@ -1439,9 +1623,14 @@ async def finalize_pending_calls() -> dict[str, int]:
             try:
                 result = await provider.summarize(await build_summary_context(db, session))
             except PhoneSummaryUnavailable as exc:
-                session.summary = {**session.summary,
-                    "model_meta": {**session.summary.get("model_meta", {}),
-                                   "attempts": attempts, "last_error": str(exc)}}
+                session.summary = {
+                    **session.summary,
+                    "model_meta": {
+                        **session.summary.get("model_meta", {}),
+                        "attempts": attempts,
+                        "last_error": str(exc),
+                    },
+                }
                 if attempts >= settings.phone_summary_max_attempts:
                     session.summary_state = PhoneSummaryState.FAILED
                     counters["failed"] += 1
@@ -1456,8 +1645,11 @@ async def finalize_pending_calls() -> dict[str, int]:
                     "contact_person_text": result.contact_person_text,
                     "outcome_guess": result.outcome_guess,
                 },
-                "model_meta": {"provider": "llmrouter", "model": settings.effective_summary_model,
-                               "attempts": attempts},
+                "model_meta": {
+                    "provider": "llmrouter",
+                    "model": settings.effective_summary_model,
+                    "attempts": attempts,
+                },
                 "telegram": {"state": "pending"},
             }
             session.summary = payload
@@ -1471,24 +1663,35 @@ async def finalize_pending_calls() -> dict[str, int]:
 
 
 async def _notify(session: CommunicationSession, result: CallSummary, settings: Settings) -> None:
-    if not settings.telegram_enabled or settings.telegram_bot_token is None or not settings.telegram_chat_id:
+    if (
+        not settings.telegram_enabled
+        or settings.telegram_bot_token is None
+        or not settings.telegram_chat_id
+    ):
         session.summary = {**session.summary, "telegram": {"state": "disabled"}}
         return
-    ctx = await _notify_context(session)   # small helper: company/vacancy for the message
+    ctx = await _notify_context(session)  # small helper: company/vacancy for the message
     text = render_call_notification(
-        result, company=ctx[0], vacancy=ctx[1], session_id=str(session.id),
+        result,
+        company=ctx[0],
+        vacancy=ctx[1],
+        session_id=str(session.id),
         base_url=settings.public_base_url,
     )
     try:
         await send_telegram_message(
             token=settings.telegram_bot_token.get_secret_value(),
-            chat_id=settings.telegram_chat_id, text=text,
+            chat_id=settings.telegram_chat_id,
+            text=text,
         )
-        session.summary = {**session.summary, "telegram": {"state": "sent",
-                                                           "sent_at": utcnow().isoformat()}}
+        session.summary = {
+            **session.summary,
+            "telegram": {"state": "sent", "sent_at": utcnow().isoformat()},
+        }
     except TelegramDeliveryError as exc:
-        logger.warning("phone_telegram_delivery_failed", session_id=str(session.id),
-                       error=type(exc).__name__)
+        logger.warning(
+            "phone_telegram_delivery_failed", session_id=str(session.id), error=type(exc).__name__
+        )
         session.summary = {**session.summary, "telegram": {"state": "failed", "error": str(exc)}}
 ```
 
@@ -1528,9 +1731,10 @@ git commit -m "feat: finalize_pending_calls — link evidence, summarize, notify
 @pytest.mark.asyncio
 async def test_prune_removes_by_age_and_nulls_pointer(prune_env):
     env = prune_env(retention_days=7)
-    env.make_clip(session_dir="s1", tid=3, age_days=30)          # stale
-    env.make_clip(session_dir="s1", tid=4, age_days=1)           # fresh
-    await env.link(session_id="s1", tid=3); await env.link(session_id="s1", tid=4)
+    env.make_clip(session_dir="s1", tid=3, age_days=30)  # stale
+    env.make_clip(session_dir="s1", tid=4, age_days=1)  # fresh
+    await env.link(session_id="s1", tid=3)
+    await env.link(session_id="s1", tid=4)
     result = await prune_phone_evidence()
     assert result["removed"] == 1
     assert not env.clip_exists("s1", 3) and env.clip_exists("s1", 4)
@@ -1557,8 +1761,9 @@ async def test_prune_noop_on_missing_root(prune_env):
 @pytest.mark.asyncio
 async def test_prune_tolerates_already_deleted_file(prune_env):
     env = prune_env(retention_days=7)
-    env.make_clip("s1", 9, age_days=30); (env.root / "s1" / "9.wav").unlink()
-    await prune_phone_evidence()   # must not raise
+    env.make_clip("s1", 9, age_days=30)
+    (env.root / "s1" / "9.wav").unlink()
+    await prune_phone_evidence()  # must not raise
 ```
 
 Provide `prune_env` in the file.
@@ -1603,7 +1808,9 @@ async def prune_phone_evidence() -> dict[str, int]:
         for path in to_remove:
             sid, tid = path.parent.name, path.stem
             try:
-                await store.clear_turn_evidence_path(db, session_id_text=sid, transcript_id_text=tid)
+                await store.clear_turn_evidence_path(
+                    db, session_id_text=sid, transcript_id_text=tid
+                )
             except (ValueError, LookupError):
                 pass
             try:
@@ -1654,8 +1861,10 @@ In the scheduler test file:
 def test_finalize_pending_calls_task_registered():
     assert "job_agent.scheduler.finalize_pending_calls" in celery_app.tasks
 
+
 def test_prune_phone_evidence_task_registered():
     assert "job_agent.scheduler.prune_phone_evidence" in celery_app.tasks
+
 
 def test_phone_beat_entries_present():
     bs = celery_app.conf.beat_schedule
@@ -1802,15 +2011,22 @@ async def test_calls_context_history_lists_sessions_newest_first(admin_client, s
     ctx = await build_calls_context(seeded_calls.db, tab="history", page=1, filter_="all", query="")
     assert [r["id"] for r in ctx["call_rows"]] == seeded_calls.newest_first_ids
 
+
 @pytest.mark.asyncio
 async def test_calls_context_filter_needs_review(admin_client, seeded_calls):
-    ctx = await build_calls_context(seeded_calls.db, tab="history", page=1, filter_="needs_review", query="")
+    ctx = await build_calls_context(
+        seeded_calls.db, tab="history", page=1, filter_="needs_review", query=""
+    )
     assert all(r["needs_review"] for r in ctx["call_rows"])
+
 
 @pytest.mark.asyncio
 async def test_calls_context_search_by_company(admin_client, seeded_calls):
-    ctx = await build_calls_context(seeded_calls.db, tab="history", page=1, filter_="all", query="Example")
+    ctx = await build_calls_context(
+        seeded_calls.db, tab="history", page=1, filter_="all", query="Example"
+    )
     assert ctx["call_rows"] and all("Example" in (r["company"] or "") for r in ctx["call_rows"])
+
 
 @pytest.mark.asyncio
 async def test_calls_view_renders(admin_client):
@@ -1818,8 +2034,10 @@ async def test_calls_view_renders(admin_client):
     assert resp.status_code == 200
     assert "Звонки" in resp.text
 
+
 def test_calls_in_view_titles():
     from app.admin.routes import _VIEW_TITLES
+
     assert _VIEW_TITLES["calls"] == "Звонки"
 ```
 
@@ -1853,7 +2071,8 @@ Expected: FAIL — `_VIEW_TITLES` has no `calls`, `build_calls_context` missing.
 - Add `counts["phone_review"]`:
 
 ```python
-    counts["phone_review"] = int(await session.scalar(
+counts["phone_review"] = int(
+    await session.scalar(
         select(func.count(CommunicationSession.id)).where(
             CommunicationSession.channel == CommunicationChannel.CALL,
             or_(
@@ -1861,7 +2080,9 @@ Expected: FAIL — `_VIEW_TITLES` has no `calls`, `build_calls_context` missing.
                 CommunicationSession.summary_state == PhoneSummaryState.FAILED,
             ),
         )
-    ) or 0)
+    )
+    or 0
+)
 ```
 
 - [ ] **Step 4: `build_calls_context` in `phone_routes.py`**
@@ -1870,8 +2091,11 @@ Implement per the Interfaces block. History query:
 
 ```python
 async def build_calls_context(session, *, tab, page, filter_, query):
-    ctx: dict[str, Any] = {"tab": tab if tab in {"live", "history", "evidence"} else "live",
-                           "filter": filter_, "query": query}
+    ctx: dict[str, Any] = {
+        "tab": tab if tab in {"live", "history", "evidence"} else "live",
+        "filter": filter_,
+        "query": query,
+    }
     ctx["calls_health"] = await phone_health_context(session)
     if ctx["tab"] == "history":
         stmt = (
@@ -1882,13 +2106,20 @@ async def build_calls_context(session, *, tab, page, filter_, query):
         stmt = _apply_call_filter(stmt, filter_)
         if query:
             like = f"%{query}%"
-            stmt = stmt.outerjoin(CanonicalJob, CommunicationSession.canonical_job_id == CanonicalJob.id).where(
-                or_(CanonicalJob.normalized_company.ilike(like), CanonicalJob.normalized_title.ilike(like),
-                    CommunicationSession.remote_address.ilike(like))
+            stmt = stmt.outerjoin(
+                CanonicalJob, CommunicationSession.canonical_job_id == CanonicalJob.id
+            ).where(
+                or_(
+                    CanonicalJob.normalized_company.ilike(like),
+                    CanonicalJob.normalized_title.ilike(like),
+                    CommunicationSession.remote_address.ilike(like),
+                )
             )
         per_page = 25
         total = int(await session.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
-        rows = list((await session.scalars(stmt.limit(per_page).offset((page - 1) * per_page))).all())
+        rows = list(
+            (await session.scalars(stmt.limit(per_page).offset((page - 1) * per_page))).all()
+        )
         ctx["call_rows"] = [await _call_row(session, r) for r in rows]
         ctx["pagination"] = _pagination(total, page, per_page)
     # live tab uses ctx["calls_health"]["auto_answer"] / ["active_call"] already built
@@ -1971,11 +2202,18 @@ git commit -m "feat: Звонки admin section — nav, Live and История
 ```python
 @pytest.mark.asyncio
 async def test_calls_detail_exposes_summary_and_evidence_url(admin_client, seeded_calls):
-    ctx = await build_calls_context(seeded_calls.db, tab="history", page=1, filter_="all",
-                                    query="", session_id=seeded_calls.summarized_id)
+    ctx = await build_calls_context(
+        seeded_calls.db,
+        tab="history",
+        page=1,
+        filter_="all",
+        query="",
+        session_id=seeded_calls.summarized_id,
+    )
     d = ctx["detail"]
     assert d["summary"]["summary_text"]
     assert any(t["audio_evidence_url"] for t in d["turns"])
+
 
 @pytest.mark.asyncio
 async def test_calls_detail_page_renders(admin_client, seeded_calls):
@@ -1993,30 +2231,47 @@ Expected: FAIL — `build_calls_context` has no `session_id` param.
 Extend `build_calls_context(..., session_id: str | None = None)`. In `routes.py`'s `elif view == "calls"` pass `session_id=request.query_params.get("session")`. When `session_id` is a valid UUID and the session exists:
 
 ```python
-    call = await session.get(CommunicationSession, uuid.UUID(session_id))
-    if call is not None:
-        turns = list((await session.scalars(
-            select(CommunicationTurn).where(CommunicationTurn.session_id == call.id)
-            .order_by(CommunicationTurn.seq))).all())
-        audits = list((await session.scalars(
-            select(AuditEvent).where(AuditEvent.entity_id == str(call.id))
-            .order_by(AuditEvent.timestamp))).all())
-        ctx["detail"] = {
-            "session": _call_row(session, call),  # plus script_stage, diagnostics, rx_frame_stats
-            "summary": call.summary,
-            "summary_state": call.summary_state.value,
-            "turns": [{
-                "seq": t.seq, "speaker": t.speaker.value,
+call = await session.get(CommunicationSession, uuid.UUID(session_id))
+if call is not None:
+    turns = list(
+        (
+            await session.scalars(
+                select(CommunicationTurn)
+                .where(CommunicationTurn.session_id == call.id)
+                .order_by(CommunicationTurn.seq)
+            )
+        ).all()
+    )
+    audits = list(
+        (
+            await session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.entity_id == str(call.id))
+                .order_by(AuditEvent.timestamp)
+            )
+        ).all()
+    )
+    ctx["detail"] = {
+        "session": _call_row(session, call),  # plus script_stage, diagnostics, rx_frame_stats
+        "summary": call.summary,
+        "summary_state": call.summary_state.value,
+        "turns": [
+            {
+                "seq": t.seq,
+                "speaker": t.speaker.value,
                 "text": t.spoken_text if t.speaker is TurnSpeaker.ASSISTANT else t.text,
                 "delivery_status": t.delivery_status.value,
                 "asr_confidence": t.asr_confidence,
                 "audio_evidence_url": (
                     f"/admin/phone/evidence/{call.id}/{t.phonegate_transcript_id}.wav"
-                    if t.audio_evidence_path else None
+                    if t.audio_evidence_path
+                    else None
                 ),
-            } for t in turns],
-            "audit_events": [{"action": a.action, "at": a.timestamp.isoformat()} for a in audits],
-        }
+            }
+            for t in turns
+        ],
+        "audit_events": [{"action": a.action, "at": a.timestamp.isoformat()} for a in audits],
+    }
 ```
 
 - [ ] **Step 4: `_calls_history_detail.html`**
@@ -2058,25 +2313,31 @@ async def test_evidence_stream_returns_wav(admin_client, seeded_calls, tmp_evide
     assert resp.status_code == 200 and resp.headers["content-type"].startswith("audio/wav")
     assert resp.content == b"RIFFxx"
 
+
 @pytest.mark.asyncio
 async def test_evidence_stream_404_when_missing(admin_client, seeded_calls):
     resp = await admin_client.get(f"/admin/phone/evidence/{seeded_calls.summarized_id}/999.wav")
     assert resp.status_code == 404
+
 
 @pytest.mark.asyncio
 async def test_evidence_stream_rejects_path_traversal(admin_client):
     resp = await admin_client.get("/admin/phone/evidence/..%2f..%2fetc/0.wav")
     assert resp.status_code in (404, 422)
 
+
 @pytest.mark.asyncio
 async def test_evidence_stream_requires_auth(unauth_client, seeded_calls):
     resp = await unauth_client.get(f"/admin/phone/evidence/{seeded_calls.summarized_id}/7.wav")
     assert resp.status_code in (302, 401, 403)
 
+
 @pytest.mark.asyncio
 async def test_evidence_tab_lists_clips(admin_client, seeded_calls, tmp_evidence):
     tmp_evidence.write(seeded_calls.summarized_id, tid=7, data=b"RIFFxx")
-    ctx = await build_calls_context(seeded_calls.db, tab="evidence", page=1, filter_="all", query="")
+    ctx = await build_calls_context(
+        seeded_calls.db, tab="evidence", page=1, filter_="all", query=""
+    )
     assert ctx["evidence_rows"] and ctx["evidence_rows"][0]["url"].endswith("/7.wav")
 ```
 
@@ -2092,7 +2353,9 @@ Expected: FAIL — route 404 (not registered).
 ```python
 @router.get("/admin/phone/evidence/{session_id}/{transcript_id}.wav")
 async def stream_evidence_clip(
-    session_id: str, transcript_id: str, request: Request,
+    session_id: str,
+    transcript_id: str,
+    request: Request,
 ) -> Response:
     require_admin(request)
     try:
@@ -2105,8 +2368,11 @@ async def stream_evidence_clip(
     target = (root / str(sid) / f"{transcript_id}.wav").resolve()
     if root not in target.parents or not target.is_file():
         raise HTTPException(status_code=404)
-    return Response(target.read_bytes(), media_type="audio/wav",
-                    headers={"Cache-Control": "private, max-age=60"})
+    return Response(
+        target.read_bytes(),
+        media_type="audio/wav",
+        headers={"Cache-Control": "private, max-age=60"},
+    )
 ```
 
 - [ ] **Step 4: Evidence tab context + template**
@@ -2149,10 +2415,12 @@ async def test_sessions_list_includes_2b_fields(api_client, seeded_calls):
     row = next(r for r in body["sessions"] if r["id"] == seeded_calls.summarized_id)
     assert row["auto_answered"] is True and row["summary_state"] == "done"
 
+
 @pytest.mark.asyncio
 async def test_sessions_list_filter_needs_review(api_client, seeded_calls):
     body = (await api_client.get("/api/v1/phone/sessions?filter=needs_review")).json()
     assert all(r["needs_review"] for r in body["sessions"])
+
 
 @pytest.mark.asyncio
 async def test_session_detail_includes_summary_and_evidence(api_client, seeded_calls):
@@ -2211,14 +2479,20 @@ async def test_evidence_capture_then_finalize_links_and_summarizes(phone_e2e_env
         await env.wait_for_state("IN_CALL")
         await env.wait_for_script_stage("listening")
         env.fake.transcript("rx", "в четверг в 14:00 на Индустриальной 12")
-        await env.wait_for_evidence_clip()          # file appears under storage/phone_evidence/<sid>/
+        await env.wait_for_evidence_clip()  # file appears under storage/phone_evidence/<sid>/
         env.fake.hangup()
         await env.wait_for_session_closed()
     # session is now summary_state='pending'
-    monkeypatch.setattr("app.phone.summary.PhoneSummaryProvider.summarize",
-        _fake_summarize(CallSummary(summary_text="Собеседование в четверг.",
-                                    outcome_guess="interview_proposed",
-                                    proposed_datetime_text="в четверг в 14:00")))
+    monkeypatch.setattr(
+        "app.phone.summary.PhoneSummaryProvider.summarize",
+        _fake_summarize(
+            CallSummary(
+                summary_text="Собеседование в четверг.",
+                outcome_guess="interview_proposed",
+                proposed_datetime_text="в четверг в 14:00",
+            )
+        ),
+    )
     result = await finalize_pending_calls()
     assert result["done"] == 1
     session = await env.get_session()

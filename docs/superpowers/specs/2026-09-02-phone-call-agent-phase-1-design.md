@@ -266,15 +266,18 @@ class ContactType(StrEnum):
     EMAIL = "email"
     APPLICATION_URL = "application_url"
     INTERNAL_JOB_BOARD = "internal_job_board"
-    PHONE = "phone"                     # new
+    PHONE = "phone"  # new
+
 
 class CommunicationChannel(StrEnum):
     CALL = "call"
     SMS = "sms"
 
+
 class CommunicationDirection(StrEnum):
     INBOUND = "inbound"
     OUTBOUND = "outbound"
+
 
 class CommunicationOutcome(StrEnum):
     MISSED = "missed"
@@ -282,11 +285,13 @@ class CommunicationOutcome(StrEnum):
     ABANDONED = "abandoned"
     UNKNOWN = "unknown"
 
+
 class TurnSpeaker(StrEnum):
     EMPLOYER = "employer"
     ASSISTANT = "assistant"
     OPERATOR = "operator"
     SYSTEM = "system"
+
 
 class CallFactState(StrEnum):
     CANDIDATE = "candidate"
@@ -294,17 +299,20 @@ class CallFactState(StrEnum):
     CONFLICT = "conflict"
     UNKNOWN = "unknown"
 
+
 class InterviewFormat(StrEnum):
     ONSITE = "onsite"
     REMOTE = "remote"
     PHONE = "phone"
     UNKNOWN = "unknown"
 
+
 class InterviewStatus(StrEnum):
     PROPOSED = "proposed"
     CONFIRMED = "confirmed"
     NEEDS_REVIEW = "needs_review"
     CANCELLED = "cancelled"
+
 
 class PhoneComponentStatus(StrEnum):
     HEALTHY = "healthy"
@@ -666,7 +674,7 @@ fake.answer()
 fake.transcript(speaker="rx", text="Здравствуйте, по поводу вакансии", confidence=0.82)
 fake.transcript(speaker="rx", text="в четверг в два часа")
 fake.hangup()
-fake.restart()          # resets event ids, keeps status
+fake.restart()  # resets event ids, keeps status
 ```
 
 Mounted into `PhoneGateClient` via `httpx.ASGITransport`. Mirrors the

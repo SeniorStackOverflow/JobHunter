@@ -287,11 +287,27 @@ async def test_turn_unique_transcript_id_per_session(db: AsyncSession) -> None:
     )
     db.add(call)
     await db.flush()
-    db.add(CommunicationTurn(session_id=call.id, phonegate_transcript_id=7, seq=1,
-                             speaker=TurnSpeaker.EMPLOYER, text="a", occurred_at=datetime.now(UTC)))
+    db.add(
+        CommunicationTurn(
+            session_id=call.id,
+            phonegate_transcript_id=7,
+            seq=1,
+            speaker=TurnSpeaker.EMPLOYER,
+            text="a",
+            occurred_at=datetime.now(UTC),
+        )
+    )
     await db.flush()
-    db.add(CommunicationTurn(session_id=call.id, phonegate_transcript_id=7, seq=2,
-                             speaker=TurnSpeaker.EMPLOYER, text="b", occurred_at=datetime.now(UTC)))
+    db.add(
+        CommunicationTurn(
+            session_id=call.id,
+            phonegate_transcript_id=7,
+            seq=2,
+            speaker=TurnSpeaker.EMPLOYER,
+            text="b",
+            occurred_at=datetime.now(UTC),
+        )
+    )
     with pytest.raises(Exception):
         await db.flush()
 ```
@@ -346,9 +362,7 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
     ringing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    outcome: Mapped[CommunicationOutcome | None] = mapped_column(
-        enum_column(CommunicationOutcome)
-    )
+    outcome: Mapped[CommunicationOutcome | None] = mapped_column(enum_column(CommunicationOutcome))
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     rx_frame_stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
@@ -364,7 +378,8 @@ class CommunicationTurn(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "communication_turns"
     __table_args__ = (
         UniqueConstraint(
-            "session_id", "phonegate_transcript_id",
+            "session_id",
+            "phonegate_transcript_id",
             name="uq_communication_turns_session_transcript",
         ),
     )
@@ -870,7 +885,8 @@ async def test_scripted_call_produces_ordered_events() -> None:
     fake.hangup()
 
     async with httpx.AsyncClient(
-        transport=fake.transport(), base_url="http://phonegate",
+        transport=fake.transport(),
+        base_url="http://phonegate",
         headers={"Authorization": "Bearer test"},
     ) as client:
         status = (await client.get("/api/device/status")).json()
@@ -900,7 +916,8 @@ async def test_restart_resets_event_ids() -> None:
     fake.restart()
     fake.transcript(speaker="rx", text="after restart")
     async with httpx.AsyncClient(
-        transport=fake.transport(), base_url="http://phonegate",
+        transport=fake.transport(),
+        base_url="http://phonegate",
         headers={"Authorization": "Bearer t"},
     ) as client:
         events = (await client.get("/api/events", params={"after_id": 0})).json()
@@ -946,24 +963,34 @@ class FakePhoneGate:
         self._mode = "Zero-ADB"
         self._daemon_version = "0.2.30"
         self._rx_stats = {"captured_frames": 0, "queued_frames": 0, "dropped_frames": 0}
-        self.app = Starlette(routes=[
-            Route("/api/health", self._health),
-            Route("/api/device/status", self._status),
-            Route("/api/events", self._events_route),
-            Route("/api/call/transcript", self._transcript_route),
-        ])
+        self.app = Starlette(
+            routes=[
+                Route("/api/health", self._health),
+                Route("/api/device/status", self._status),
+                Route("/api/events", self._events_route),
+                Route("/api/call/transcript", self._transcript_route),
+            ]
+        )
 
     # ---- scripting API -------------------------------------------------
     def _emit(self, event_type: str, data: dict[str, Any]) -> int:
-        event = {"id": self._next_event_id, "type": event_type,
-                 "timestamp": int(time.time() * 1000), "data": data}
+        event = {
+            "id": self._next_event_id,
+            "type": event_type,
+            "timestamp": int(time.time() * 1000),
+            "data": data,
+        }
         self._next_event_id += 1
         self._events.append(event)
         return event["id"]
 
     def _call_state_data(self) -> dict[str, Any]:
-        return {"state": self._call_state, "duration": "00:00", "caller_number": self._caller,
-                "caller_name": ""}
+        return {
+            "state": self._call_state,
+            "duration": "00:00",
+            "caller_number": self._caller,
+            "caller_name": "",
+        }
 
     def ring(self, caller: str) -> None:
         self._call_state, self._caller = "RINGING", caller
@@ -974,11 +1001,25 @@ class FakePhoneGate:
         self._call_state = "IN_CALL"
         self._emit("call_state", self._call_state_data())
 
-    def transcript(self, *, speaker: str, text: str, backend: str = "groq",
-                   confidence: float | None = 0.9, meta: str = "") -> int:
-        record = {"id": self._next_transcript_id, "speaker": speaker, "text": text,
-                  "meta": meta, "backend": backend, "confidence": confidence,
-                  "timestamp": "00:00:00", "timestamp_ms": int(time.time() * 1000)}
+    def transcript(
+        self,
+        *,
+        speaker: str,
+        text: str,
+        backend: str = "groq",
+        confidence: float | None = 0.9,
+        meta: str = "",
+    ) -> int:
+        record = {
+            "id": self._next_transcript_id,
+            "speaker": speaker,
+            "text": text,
+            "meta": meta,
+            "backend": backend,
+            "confidence": confidence,
+            "timestamp": "00:00:00",
+            "timestamp_ms": int(time.time() * 1000),
+        }
         self._next_transcript_id += 1
         self._transcripts.append(record)
         self._emit("transcript", {"transcript": record})
@@ -1014,23 +1055,29 @@ class FakePhoneGate:
     async def _status(self, request: Request) -> JSONResponse:
         if not self._auth_ok(request):
             return JSONResponse({"detail": "auth"}, status_code=401)
-        return JSONResponse({
-            "connected": self._connected,
-            "mode": self._mode if self._connected else "Ожидание daemon",
-            "local_asr_enabled": False,
-            "device": {"device_name": "A14", "battery": 87, "operator": "Orange",
-                       "sim_operator": "Orange"},
-            "daemon_version": self._daemon_version,
-            "rx_audio_stats": dict(self._rx_stats),
-            "call_state": self._call_state,
-            "call_duration_seconds": 0,
-            "caller_number": self._caller,
-            "caller_name": "",
-            "tx_active": False,
-            "tx_preparing": False,
-            "transcript_count": len(self._transcripts),
-            "latest_event_id": self._next_event_id - 1,
-        })
+        return JSONResponse(
+            {
+                "connected": self._connected,
+                "mode": self._mode if self._connected else "Ожидание daemon",
+                "local_asr_enabled": False,
+                "device": {
+                    "device_name": "A14",
+                    "battery": 87,
+                    "operator": "Orange",
+                    "sim_operator": "Orange",
+                },
+                "daemon_version": self._daemon_version,
+                "rx_audio_stats": dict(self._rx_stats),
+                "call_state": self._call_state,
+                "call_duration_seconds": 0,
+                "caller_number": self._caller,
+                "caller_name": "",
+                "tx_active": False,
+                "tx_preparing": False,
+                "transcript_count": len(self._transcripts),
+                "latest_event_id": self._next_event_id - 1,
+            }
+        )
 
     async def _events_route(self, request: Request) -> JSONResponse:
         if not self._auth_ok(request):
@@ -1038,22 +1085,38 @@ class FakePhoneGate:
         after_id = int(request.query_params.get("after_id", "0"))
         limit = int(request.query_params.get("limit", "100"))
         event_type = request.query_params.get("event_type")
-        rows = [e for e in self._events
-                if e["id"] > after_id and (event_type is None or e["type"] == event_type)]
-        last_incoming = next((e for e in reversed(self._events) if e["type"] == "incoming_call"), None)
-        return JSONResponse({"events": rows[:limit], "count": len(rows[:limit]),
-                             "latest_id": self._next_event_id - 1,
-                             "last_incoming_call": last_incoming})
+        rows = [
+            e
+            for e in self._events
+            if e["id"] > after_id and (event_type is None or e["type"] == event_type)
+        ]
+        last_incoming = next(
+            (e for e in reversed(self._events) if e["type"] == "incoming_call"), None
+        )
+        return JSONResponse(
+            {
+                "events": rows[:limit],
+                "count": len(rows[:limit]),
+                "latest_id": self._next_event_id - 1,
+                "last_incoming_call": last_incoming,
+            }
+        )
 
     async def _transcript_route(self, request: Request) -> JSONResponse:
         if not self._auth_ok(request):
             return JSONResponse({"detail": "auth"}, status_code=401)
         after_id = int(request.query_params.get("after_id", "0"))
         rows = [t for t in self._transcripts if t["id"] > after_id]
-        return JSONResponse({"entries": rows, "count": len(rows),
-                             "latest_id": self._next_transcript_id - 1,
-                             "call_state": self._call_state, "caller_number": self._caller,
-                             "rx_audio_stats": dict(self._rx_stats)})
+        return JSONResponse(
+            {
+                "entries": rows,
+                "count": len(rows),
+                "latest_id": self._next_transcript_id - 1,
+                "call_state": self._call_state,
+                "caller_number": self._caller,
+                "rx_audio_stats": dict(self._rx_stats),
+            }
+        )
 ```
 
 - [ ] **Step 4: Run the tests**
@@ -1111,11 +1174,18 @@ from app.phone.states import TelephonyState, telephony_state_from_call_state
 
 
 def test_device_status_parses_and_ignores_extra() -> None:
-    status = DeviceStatus.model_validate({
-        "connected": True, "mode": "Zero-ADB", "call_state": "RINGING",
-        "caller_number": "+37360111222", "rx_audio_stats": {"dropped_frames": 2},
-        "device": {"battery": 87}, "latest_event_id": 12, "unknown_field": "x",
-    })
+    status = DeviceStatus.model_validate(
+        {
+            "connected": True,
+            "mode": "Zero-ADB",
+            "call_state": "RINGING",
+            "caller_number": "+37360111222",
+            "rx_audio_stats": {"dropped_frames": 2},
+            "device": {"battery": 87},
+            "latest_event_id": 12,
+            "unknown_field": "x",
+        }
+    )
     assert status.is_daemon_mode is True
     assert status.rx_audio_stats.dropped_frames == 2
     assert status.rx_audio_stats.captured_frames == 0
@@ -1123,17 +1193,25 @@ def test_device_status_parses_and_ignores_extra() -> None:
 
 def test_device_status_adb_fallback_not_daemon_mode() -> None:
     status = DeviceStatus.model_validate(
-        {"connected": True, "mode": "ADB fallback", "call_state": "IDLE",
-         "rx_audio_stats": {}, "device": {}}
+        {
+            "connected": True,
+            "mode": "ADB fallback",
+            "call_state": "IDLE",
+            "rx_audio_stats": {},
+            "device": {},
+        }
     )
     assert status.is_daemon_mode is False
 
 
 def test_events_page_and_transcript_page() -> None:
-    page = EventsPage.model_validate({
-        "events": [{"id": 3, "type": "transcript", "data": {"transcript": {"id": 1}}}],
-        "latest_id": 3, "last_incoming_call": None,
-    })
+    page = EventsPage.model_validate(
+        {
+            "events": [{"id": 3, "type": "transcript", "data": {"transcript": {"id": 1}}}],
+            "latest_id": 3,
+            "last_incoming_call": None,
+        }
+    )
     assert page.events[0].id == 3
     tp = TranscriptPage.model_validate({"entries": [], "latest_id": 0})
     assert tp.call_state == "IDLE"
@@ -1472,10 +1550,18 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import (
-    Application, CanonicalJob, EmployerContact, JobSource, SourceJob, UserProfile,
+    Application,
+    CanonicalJob,
+    EmployerContact,
+    JobSource,
+    SourceJob,
+    UserProfile,
 )
 from app.models.enums import (
-    ApplicationStatus, ContactType, JobStatus, VerificationStatus,
+    ApplicationStatus,
+    ContactType,
+    JobStatus,
+    VerificationStatus,
 )
 from app.phone.correlation import CallerCorrelation
 
@@ -1492,14 +1578,25 @@ async def _job_with_phone(db: AsyncSession, phone: str) -> tuple[SourceJob, Cano
     src = JobSource(name="s", base_url="https://x", adapter_type="fixture_source")
     db.add(src)
     await db.flush()
-    canonical = CanonicalJob(normalized_company="ACME", normalized_title="Loader",
-                             canonical_fingerprint=uuid4().hex, status=JobStatus.ACTIVE)
+    canonical = CanonicalJob(
+        normalized_company="ACME",
+        normalized_title="Loader",
+        canonical_fingerprint=uuid4().hex,
+        status=JobStatus.ACTIVE,
+    )
     db.add(canonical)
     await db.flush()
     job = SourceJob(
-        source_id=src.id, canonical_job_id=canonical.id, external_job_id=uuid4().hex,
-        canonical_url="https://x/1", title="Loader", content_hash="h", matching_content_hash="m",
-        source_fingerprint="f", public_phone=phone, status=JobStatus.ACTIVE,
+        source_id=src.id,
+        canonical_job_id=canonical.id,
+        external_job_id=uuid4().hex,
+        canonical_url="https://x/1",
+        title="Loader",
+        content_hash="h",
+        matching_content_hash="m",
+        source_fingerprint="f",
+        public_phone=phone,
+        status=JobStatus.ACTIVE,
     )
     db.add(job)
     await db.flush()
@@ -1524,17 +1621,32 @@ async def test_unknown_number_falls_back_to_default_profile(db: AsyncSession) ->
 async def test_matches_existing_phone_contact_and_application(db: AsyncSession) -> None:
     job, canonical = await _job_with_phone(db, "+37360111222")
     profile = (await db.scalars(UserProfile.__table__.select())).first()
-    db.add(EmployerContact(
-        canonical_job_id=canonical.id, source_job_id=job.id, value="+37360111222",
-        contact_type=ContactType.PHONE, discovery_source="test",
-        verification_status=VerificationStatus.UNVERIFIED, confidence=0.6,
-        evidence_url="https://x/1",
-    ))
-    db.add(Application(
-        profile_id=profile.id, canonical_job_id=canonical.id, source_job_id=job.id,
-        resume_id=uuid4(), recipient_contact_id=uuid4(), subject="s", body="b",
-        language="ru", status=ApplicationStatus.PENDING_REVIEW, idempotency_key=uuid4().hex,
-    ))
+    db.add(
+        EmployerContact(
+            canonical_job_id=canonical.id,
+            source_job_id=job.id,
+            value="+37360111222",
+            contact_type=ContactType.PHONE,
+            discovery_source="test",
+            verification_status=VerificationStatus.UNVERIFIED,
+            confidence=0.6,
+            evidence_url="https://x/1",
+        )
+    )
+    db.add(
+        Application(
+            profile_id=profile.id,
+            canonical_job_id=canonical.id,
+            source_job_id=job.id,
+            resume_id=uuid4(),
+            recipient_contact_id=uuid4(),
+            subject="s",
+            body="b",
+            language="ru",
+            status=ApplicationStatus.PENDING_REVIEW,
+            idempotency_key=uuid4().hex,
+        )
+    )
     await db.flush()
 
     result = await CallerCorrelation().resolve(db, "+373 60 111 222")
@@ -1599,9 +1711,7 @@ class CallerCorrelation:
     def __init__(self, *, region: str = "MD") -> None:
         self._region = region
 
-    async def resolve(
-        self, session: AsyncSession, remote_raw: str
-    ) -> CorrelationResult | None:
+    async def resolve(self, session: AsyncSession, remote_raw: str) -> CorrelationResult | None:
         default_profile_id = await session.scalar(
             select(UserProfile.id).where(UserProfile.is_default.is_(True)).limit(1)
         )
@@ -1737,8 +1847,14 @@ def _corr(profile_id: object) -> CorrelationResult:
 async def test_open_find_close(db: AsyncSession) -> None:
     store = SessionStore()
     now = datetime.now(UTC)
-    call = await store.open(db, remote_raw="+37360111222", remote_address="+37360111222",
-                            event_id=3, correlation=_corr(db.info["profile_id"]), opened_at=now)
+    call = await store.open(
+        db,
+        remote_raw="+37360111222",
+        remote_address="+37360111222",
+        event_id=3,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
     await db.commit()
 
     open_row = await store.find_open(db)
@@ -1893,12 +2009,19 @@ async def test_append_turn_is_idempotent(db: AsyncSession) -> None:
 
     store = SessionStore()
     now = datetime.now(UTC)
-    call = await store.open(db, remote_raw="+3736011", remote_address="+3736011",
-                            event_id=1, correlation=_corr(db.info["profile_id"]), opened_at=now)
+    call = await store.open(
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
+    )
     await db.flush()
 
-    entry = TranscriptEntry(id=5, speaker="rx", text="Здравствуйте", confidence=0.8,
-                            backend="groq", timestamp_ms=1)
+    entry = TranscriptEntry(
+        id=5, speaker="rx", text="Здравствуйте", confidence=0.8, backend="groq", timestamp_ms=1
+    )
     first = await store.append_turn(db, session_id=call.id, entry=entry)
     assert first is not None and first.seq == 1 and first.speaker == TurnSpeaker.EMPLOYER
     second = await store.append_turn(db, session_id=call.id, entry=entry)
@@ -1932,53 +2055,49 @@ from app.phone.schemas import TranscriptEntry  # add
 
 
 def speaker_from_phonegate(value: str) -> TurnSpeaker:
-    return {"rx": TurnSpeaker.EMPLOYER, "tx": TurnSpeaker.OPERATOR}.get(
-        value, TurnSpeaker.SYSTEM
-    )
+    return {"rx": TurnSpeaker.EMPLOYER, "tx": TurnSpeaker.OPERATOR}.get(value, TurnSpeaker.SYSTEM)
 ```
 
 Add the method to `SessionStore`:
 
 ```python
-    async def append_turn(
-        self,
-        session: AsyncSession,
-        *,
-        session_id: UUID,
-        entry: TranscriptEntry,
-    ) -> CommunicationTurn | None:
-        exists = await session.scalar(
-            select(CommunicationTurn.id).where(
-                CommunicationTurn.session_id == session_id,
-                CommunicationTurn.phonegate_transcript_id == entry.id,
-            )
+async def append_turn(
+    self,
+    session: AsyncSession,
+    *,
+    session_id: UUID,
+    entry: TranscriptEntry,
+) -> CommunicationTurn | None:
+    exists = await session.scalar(
+        select(CommunicationTurn.id).where(
+            CommunicationTurn.session_id == session_id,
+            CommunicationTurn.phonegate_transcript_id == entry.id,
         )
-        if exists is not None:
-            return None
-        count = await session.scalar(
-            select(func.count(CommunicationTurn.id)).where(
-                CommunicationTurn.session_id == session_id
-            )
-        )
-        from datetime import UTC, datetime
+    )
+    if exists is not None:
+        return None
+    count = await session.scalar(
+        select(func.count(CommunicationTurn.id)).where(CommunicationTurn.session_id == session_id)
+    )
+    from datetime import UTC, datetime
 
-        turn = CommunicationTurn(
-            session_id=session_id,
-            phonegate_transcript_id=entry.id,
-            seq=int(count or 0) + 1,
-            speaker=speaker_from_phonegate(entry.speaker),
-            text=entry.text,
-            raw_text=entry.text,
-            asr_backend=entry.backend or None,
-            asr_confidence=entry.confidence,
-            asr_meta=entry.meta or None,
-            occurred_at=datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=UTC)
-            if entry.timestamp_ms
-            else datetime.now(UTC),
-        )
-        session.add(turn)
-        await session.flush()
-        return turn
+    turn = CommunicationTurn(
+        session_id=session_id,
+        phonegate_transcript_id=entry.id,
+        seq=int(count or 0) + 1,
+        speaker=speaker_from_phonegate(entry.speaker),
+        text=entry.text,
+        raw_text=entry.text,
+        asr_backend=entry.backend or None,
+        asr_confidence=entry.confidence,
+        asr_meta=entry.meta or None,
+        occurred_at=datetime.fromtimestamp(entry.timestamp_ms / 1000, tz=UTC)
+        if entry.timestamp_ms
+        else datetime.now(UTC),
+    )
+    session.add(turn)
+    await session.flush()
+    return turn
 ```
 
 (Move the `from datetime import ...` to the top of the module instead of inline —
@@ -2039,8 +2158,13 @@ from app.phone.schemas import DeviceStatus
 
 
 def _status(**kw: object) -> DeviceStatus:
-    base = {"connected": True, "mode": "Zero-ADB", "call_state": "IDLE",
-            "rx_audio_stats": {}, "device": {"sim_operator": "Orange"}}
+    base = {
+        "connected": True,
+        "mode": "Zero-ADB",
+        "call_state": "IDLE",
+        "rx_audio_stats": {},
+        "device": {"sim_operator": "Orange"},
+    }
     base.update(kw)
     return DeviceStatus.model_validate(base)
 
@@ -2248,7 +2372,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.entities import CommunicationSession, UserProfile
 from app.models.enums import (
-    CommunicationChannel, CommunicationDirection, CommunicationOutcome,
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
 )
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
@@ -2296,18 +2422,32 @@ async def test_reconcile_closes_dangling_open_session_when_idle(
         p = UserProfile(name="d", is_default=True)
         session.add(p)
         await session.flush()
-        session.add(CommunicationSession(
-            profile_id=p.id, channel=CommunicationChannel.CALL, transport="phonegate",
-            direction=CommunicationDirection.INBOUND, remote_address="", remote_raw="",
-            phonegate_event_id_start=1, started_at=datetime.now(UTC),
-        ))
+        session.add(
+            CommunicationSession(
+                profile_id=p.id,
+                channel=CommunicationChannel.CALL,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                remote_address="",
+                remote_raw="",
+                phonegate_event_id_start=1,
+                started_at=datetime.now(UTC),
+            )
+        )
         await session.commit()
 
     loop = _loop(sqlite_session_factory, redis)
-    await loop.reconcile(DeviceStatus.model_validate(
-        {"connected": True, "mode": "Zero-ADB", "call_state": "IDLE",
-         "rx_audio_stats": {}, "device": {}}
-    ))
+    await loop.reconcile(
+        DeviceStatus.model_validate(
+            {
+                "connected": True,
+                "mode": "Zero-ADB",
+                "call_state": "IDLE",
+                "rx_audio_stats": {},
+                "device": {},
+            }
+        )
+    )
 
     async with sqlite_session_factory() as session:
         row = await SessionStore().find_open(session)
@@ -2497,8 +2637,11 @@ async def test_full_scripted_call_persists_session_and_turns(
         base_url="http://pg", token="t", transport=fake.transport()
     ) as client:
         loop = IngestLoop(
-            client=client, session_factory=profiled_factory, redis=redis,
-            correlation=CallerCorrelation(), health=HealthTracker(),
+            client=client,
+            session_factory=profiled_factory,
+            redis=redis,
+            correlation=CallerCorrelation(),
+            health=HealthTracker(),
             settings=Settings(_env_file=None),
         )
         await loop.load_cursor()
@@ -2517,7 +2660,8 @@ async def test_full_scripted_call_persists_session_and_turns(
     assert calls[0].outcome == CommunicationOutcome.COMPLETED
     assert calls[0].answered_at is not None
     assert [t.text for t in sorted(turns, key=lambda t: t.seq)] == [
-        "Здравствуйте, по вакансии", "в четверг в два",
+        "Здравствуйте, по вакансии",
+        "в четверг в два",
     ]
 
 
@@ -2526,10 +2670,17 @@ async def test_missed_call_outcome(
     profiled_factory: async_sessionmaker[AsyncSession], redis: object
 ) -> None:
     fake = FakePhoneGate()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        loop = IngestLoop(client=client, session_factory=profiled_factory, redis=redis,
-                          correlation=CallerCorrelation(), health=HealthTracker(),
-                          settings=Settings(_env_file=None))
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = IngestLoop(
+            client=client,
+            session_factory=profiled_factory,
+            redis=redis,
+            correlation=CallerCorrelation(),
+            health=HealthTracker(),
+            settings=Settings(_env_file=None),
+        )
         await loop.load_cursor()
         fake.ring("+37360111222")
         fake.hangup()
@@ -2545,15 +2696,24 @@ async def test_reingest_is_idempotent(
     profiled_factory: async_sessionmaker[AsyncSession], redis: object
 ) -> None:
     fake = FakePhoneGate()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        loop = IngestLoop(client=client, session_factory=profiled_factory, redis=redis,
-                          correlation=CallerCorrelation(), health=HealthTracker(),
-                          settings=Settings(_env_file=None))
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = IngestLoop(
+            client=client,
+            session_factory=profiled_factory,
+            redis=redis,
+            correlation=CallerCorrelation(),
+            health=HealthTracker(),
+            settings=Settings(_env_file=None),
+        )
         await loop.load_cursor()
-        fake.ring("+37360111222"); fake.answer()
-        fake.transcript(speaker="rx", text="a"); fake.hangup()
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.transcript(speaker="rx", text="a")
+        fake.hangup()
         await _drain(loop)
-        await loop.save_cursor(0)   # replay every event
+        await loop.save_cursor(0)  # replay every event
         await _drain(loop)
     async with profiled_factory() as session:
         turns = (await session.scalars(select(CommunicationTurn))).all()
@@ -2567,14 +2727,22 @@ async def test_phonegate_restart_closes_open_session(
     profiled_factory: async_sessionmaker[AsyncSession], redis: object
 ) -> None:
     fake = FakePhoneGate()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        loop = IngestLoop(client=client, session_factory=profiled_factory, redis=redis,
-                          correlation=CallerCorrelation(), health=HealthTracker(),
-                          settings=Settings(_env_file=None))
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = IngestLoop(
+            client=client,
+            session_factory=profiled_factory,
+            redis=redis,
+            correlation=CallerCorrelation(),
+            health=HealthTracker(),
+            settings=Settings(_env_file=None),
+        )
         await loop.load_cursor()
-        fake.ring("+37360111222"); fake.answer()
+        fake.ring("+37360111222")
+        fake.answer()
         await _drain(loop, 3)
-        fake.hangup()            # emit IDLE, then restart drops it below the cursor
+        fake.hangup()  # emit IDLE, then restart drops it below the cursor
         fake.restart()
         await _drain(loop, 3)
     async with profiled_factory() as session:
@@ -2604,157 +2772,179 @@ from app.phone.schemas import PhoneEvent
 Add methods to `IngestLoop`:
 
 ```python
-    async def run_forever(self, *, should_stop: Callable[[], bool]) -> None:
+async def run_forever(self, *, should_stop: Callable[[], bool]) -> None:
+    status = await self._client.device_status()
+    await self.reconcile(status)
+    while not should_stop():
+        active = await self.run_cycle()
+        interval = (
+            self._settings.phone_poll_active_seconds
+            if active
+            else self._settings.phone_poll_idle_seconds
+        )
+        await asyncio.sleep(interval)
+
+
+async def run_cycle(self) -> bool:
+    """One poll iteration. Returns True when a call is currently active."""
+    try:
         status = await self._client.device_status()
-        await self.reconcile(status)
-        while not should_stop():
-            active = await self.run_cycle()
-            interval = (
-                self._settings.phone_poll_active_seconds
-                if active
-                else self._settings.phone_poll_idle_seconds
-            )
-            await asyncio.sleep(interval)
+    except Exception as exc:  # PhoneGateUnavailable / PhoneGateError
+        self._health.record_transport_error(type(exc).__name__)
+        await self._persist_health()
+        logger.warning("phone_status_poll_failed", error_type=type(exc).__name__)
+        return False
 
-    async def run_cycle(self) -> bool:
-        """One poll iteration. Returns True when a call is currently active."""
-        try:
-            status = await self._client.device_status()
-        except Exception as exc:  # PhoneGateUnavailable / PhoneGateError
-            self._health.record_transport_error(type(exc).__name__)
-            await self._persist_health()
-            logger.warning("phone_status_poll_failed", error_type=type(exc).__name__)
-            return False
+    self._health.record_status(status)
 
-        self._health.record_status(status)
-
-        try:
-            page = await self._client.events(after_id=self._cursor, limit=250)
-        except Exception as exc:
-            self._health.record_transport_error(type(exc).__name__)
-            await self._persist_health()
-            return status.call_state != "IDLE"
-
-        if page.latest_id < self._cursor:
-            logger.warning("phone_events_reset", latest_id=page.latest_id, cursor=self._cursor)
-            await self.reconcile(status)
-            await self.save_cursor(page.latest_id)
-        elif page.events:
-            ordered = sorted(page.events, key=lambda e: e.id)
-            if ordered[0].id > self._cursor + 1:
-                logger.warning(
-                    "phone_events_gap", first=ordered[0].id, cursor=self._cursor
-                )
-                await self._flag_open_session_gap()
-            async with self._session_factory() as session:
-                for event in ordered:
-                    await self._dispatch(session, event, status)
-                await session.commit()
-            await self.save_cursor(max(self._cursor, page.latest_id, ordered[-1].id))
-
-        self._health.mark_poll_ok()
+    try:
+        page = await self._client.events(after_id=self._cursor, limit=250)
+    except Exception as exc:
+        self._health.record_transport_error(type(exc).__name__)
         await self._persist_health()
         return status.call_state != "IDLE"
 
-    async def _flag_open_session_gap(self) -> None:
+    if page.latest_id < self._cursor:
+        logger.warning("phone_events_reset", latest_id=page.latest_id, cursor=self._cursor)
+        await self.reconcile(status)
+        await self.save_cursor(page.latest_id)
+    elif page.events:
+        ordered = sorted(page.events, key=lambda e: e.id)
+        if ordered[0].id > self._cursor + 1:
+            logger.warning("phone_events_gap", first=ordered[0].id, cursor=self._cursor)
+            await self._flag_open_session_gap()
         async with self._session_factory() as session:
-            open_row = await self._store.find_open(session)
-            if open_row is not None:
-                open_row.needs_review = True
-                open_row.diagnostics = {**open_row.diagnostics, "note": "events_gap"}
-                await session.commit()
-
-    async def _persist_health(self) -> None:
-        async with self._session_factory() as session:
-            await self._health.persist(session)
+            for event in ordered:
+                await self._dispatch(session, event, status)
             await session.commit()
+        await self.save_cursor(max(self._cursor, page.latest_id, ordered[-1].id))
 
-    async def _dispatch(
-        self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
-    ) -> None:
-        if event.type == "incoming_call":
-            await self._on_incoming_call(session, event)
-        elif event.type == "call_state":
-            await self._on_call_state(session, event, status)
-        elif event.type == "transcript":
-            await self._on_transcript(session, event, status)
+    self._health.mark_poll_ok()
+    await self._persist_health()
+    return status.call_state != "IDLE"
 
-    async def _on_incoming_call(self, session: AsyncSession, event: PhoneEvent) -> None:
-        raw = str(event.data.get("caller_number") or "")
+
+async def _flag_open_session_gap(self) -> None:
+    async with self._session_factory() as session:
         open_row = await self._store.find_open(session)
         if open_row is not None:
-            if open_row.remote_raw == raw or (raw and open_row.remote_address == raw):
-                return
-            await self._store.close(
-                session, open_row, outcome=CommunicationOutcome.ABANDONED,
-                ended_at=utcnow(), note="superseded_by_new_caller",
-            )
-        correlation = await self._correlation.resolve(session, raw)
+            open_row.needs_review = True
+            open_row.diagnostics = {**open_row.diagnostics, "note": "events_gap"}
+            await session.commit()
+
+
+async def _persist_health(self) -> None:
+    async with self._session_factory() as session:
+        await self._health.persist(session)
+        await session.commit()
+
+
+async def _dispatch(self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus) -> None:
+    if event.type == "incoming_call":
+        await self._on_incoming_call(session, event)
+    elif event.type == "call_state":
+        await self._on_call_state(session, event, status)
+    elif event.type == "transcript":
+        await self._on_transcript(session, event, status)
+
+
+async def _on_incoming_call(self, session: AsyncSession, event: PhoneEvent) -> None:
+    raw = str(event.data.get("caller_number") or "")
+    open_row = await self._store.find_open(session)
+    if open_row is not None:
+        if open_row.remote_raw == raw or (raw and open_row.remote_address == raw):
+            return
+        await self._store.close(
+            session,
+            open_row,
+            outcome=CommunicationOutcome.ABANDONED,
+            ended_at=utcnow(),
+            note="superseded_by_new_caller",
+        )
+    correlation = await self._correlation.resolve(session, raw)
+    if correlation is None:
+        logger.error("phone_no_default_profile", caller=mask_phone(raw))
+        return
+    from app.phone.numbers import normalize_e164
+
+    call = await self._store.open(
+        session,
+        remote_raw=raw,
+        remote_address=normalize_e164(raw, region=self._settings.phone_caller_region) or "",
+        event_id=event.id,
+        correlation=correlation,
+        opened_at=utcnow(),
+    )
+    self._open_session_id = call.id
+    await record_audit_event(
+        session,
+        actor="phone-agent",
+        action="communication_session.opened",
+        entity_type="communication_session",
+        entity_id=str(call.id),
+        correlation_id=str(call.id),
+        details={
+            "caller": mask_phone(raw),
+            "application_id": str(correlation.application_id),
+            "profile_id": str(correlation.profile_id),
+        },
+    )
+
+
+async def _on_call_state(
+    self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
+) -> None:
+    state = str(event.data.get("state") or "")
+    open_row = await self._store.find_open(session)
+    if state == "RINGING" and open_row is not None:
+        await self._store.touch_ringing(open_row, utcnow())
+    elif state == "IN_CALL" and open_row is not None:
+        await self._store.touch_answered(open_row, utcnow())
+    elif state == "IDLE" and open_row is not None:
+        outcome = (
+            CommunicationOutcome.COMPLETED
+            if open_row.answered_at is not None
+            else CommunicationOutcome.MISSED
+        )
+        await self._store.close(
+            session,
+            open_row,
+            outcome=outcome,
+            ended_at=utcnow(),
+            rx_stats=status.rx_audio_stats.model_dump(),
+        )
+        self._open_session_id = None
+
+
+async def _on_transcript(
+    self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
+) -> None:
+    payload = event.data.get("transcript")
+    if not isinstance(payload, dict):
+        return
+    from app.phone.schemas import TranscriptEntry
+
+    entry = TranscriptEntry.model_validate(payload)
+    open_row = await self._store.find_open(session)
+    if open_row is None:
+        if status.call_state == "IDLE":
+            logger.info("phone_transcript_after_call_end", transcript_id=entry.id)
+            return
+        correlation = await self._correlation.resolve(session, status.caller_number)
         if correlation is None:
-            logger.error("phone_no_default_profile", caller=mask_phone(raw))
             return
-        from app.phone.numbers import normalize_e164
-
-        call = await self._store.open(
-            session, remote_raw=raw,
-            remote_address=normalize_e164(raw, region=self._settings.phone_caller_region) or "",
-            event_id=event.id, correlation=correlation, opened_at=utcnow(),
+        open_row = await self._store.open(
+            session,
+            remote_raw=status.caller_number,
+            remote_address="",
+            event_id=event.id,
+            correlation=correlation,
+            opened_at=utcnow(),
+            needs_review=True,
+            note="transcript_before_session_start",
         )
-        self._open_session_id = call.id
-        await record_audit_event(
-            session, actor="phone-agent", action="communication_session.opened",
-            entity_type="communication_session", entity_id=str(call.id),
-            correlation_id=str(call.id),
-            details={"caller": mask_phone(raw), "application_id": str(correlation.application_id),
-                     "profile_id": str(correlation.profile_id)},
-        )
-
-    async def _on_call_state(
-        self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
-    ) -> None:
-        state = str(event.data.get("state") or "")
-        open_row = await self._store.find_open(session)
-        if state == "RINGING" and open_row is not None:
-            await self._store.touch_ringing(open_row, utcnow())
-        elif state == "IN_CALL" and open_row is not None:
-            await self._store.touch_answered(open_row, utcnow())
-        elif state == "IDLE" and open_row is not None:
-            outcome = (
-                CommunicationOutcome.COMPLETED
-                if open_row.answered_at is not None
-                else CommunicationOutcome.MISSED
-            )
-            await self._store.close(
-                session, open_row, outcome=outcome, ended_at=utcnow(),
-                rx_stats=status.rx_audio_stats.model_dump(),
-            )
-            self._open_session_id = None
-
-    async def _on_transcript(
-        self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
-    ) -> None:
-        payload = event.data.get("transcript")
-        if not isinstance(payload, dict):
-            return
-        from app.phone.schemas import TranscriptEntry
-
-        entry = TranscriptEntry.model_validate(payload)
-        open_row = await self._store.find_open(session)
-        if open_row is None:
-            if status.call_state == "IDLE":
-                logger.info("phone_transcript_after_call_end", transcript_id=entry.id)
-                return
-            correlation = await self._correlation.resolve(session, status.caller_number)
-            if correlation is None:
-                return
-            open_row = await self._store.open(
-                session, remote_raw=status.caller_number,
-                remote_address="", event_id=event.id, correlation=correlation,
-                opened_at=utcnow(), needs_review=True,
-                note="transcript_before_session_start",
-            )
-            self._open_session_id = open_row.id
-        await self._store.append_turn(session, session_id=open_row.id, entry=entry)
+        self._open_session_id = open_row.id
+    await self._store.append_turn(session, session_id=open_row.id, entry=entry)
 ```
 
 Clean up: move the two inline `from app.phone.numbers import normalize_e164` /
@@ -2876,9 +3066,12 @@ async def _run_loop(*, lease_lost: "callable[[], bool]") -> None:
         timeout=settings.phone_http_timeout_seconds,
     )
     ingest = IngestLoop(
-        client=client, session_factory=async_session_factory, redis=async_redis,
+        client=client,
+        session_factory=async_session_factory,
+        redis=async_redis,
         correlation=CallerCorrelation(region=settings.phone_caller_region),
-        health=HealthTracker(), settings=settings,
+        health=HealthTracker(),
+        settings=settings,
     )
     await ingest.load_cursor()
 
@@ -2893,8 +3086,7 @@ async def _run_loop(*, lease_lost: "callable[[], bool]") -> None:
             active = await ingest.run_cycle()
             HEARTBEAT_PATH.touch()
             await asyncio.sleep(
-                settings.phone_poll_active_seconds if active
-                else settings.phone_poll_idle_seconds
+                settings.phone_poll_active_seconds if active else settings.phone_poll_idle_seconds
             )
     finally:
         await client.aclose()
@@ -2993,11 +3185,17 @@ import pytest_asyncio
 from app.database import get_session
 from app.main import app
 from app.models.entities import (
-    CommunicationSession, CommunicationTurn, PhoneChannelHealth, UserProfile,
+    CommunicationSession,
+    CommunicationTurn,
+    PhoneChannelHealth,
+    UserProfile,
 )
 from app.models.enums import (
-    CommunicationChannel, CommunicationDirection, CommunicationOutcome,
-    PhoneComponentStatus, TurnSpeaker,
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
+    PhoneComponentStatus,
+    TurnSpeaker,
 )
 
 
@@ -3008,11 +3206,11 @@ async def client(sqlite_session_factory, monkeypatch) -> httpx.AsyncClient:
             yield session
 
     app.dependency_overrides[get_session] = _override
-    monkeypatch.setattr("app.api.dependencies.get_settings",
-                        lambda: _settings_with_key())
+    monkeypatch.setattr("app.api.dependencies.get_settings", lambda: _settings_with_key())
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t",
-                                 headers={"Authorization": "Bearer secret"}) as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://t", headers={"Authorization": "Bearer secret"}
+    ) as c:
         yield c
     app.dependency_overrides.clear()
 
@@ -3027,14 +3225,20 @@ def _settings_with_key():
 @pytest.mark.asyncio
 async def test_status_endpoint_reports_channel(client, sqlite_session_factory) -> None:
     async with sqlite_session_factory() as session:
-        session.add(PhoneChannelHealth(
-            component="phonegate_transport", status=PhoneComponentStatus.HEALTHY,
-            updated_at=datetime.now(UTC),
-        ))
-        session.add(PhoneChannelHealth(
-            component="a14_daemon", status=PhoneComponentStatus.DEGRADED,
-            updated_at=datetime.now(UTC),
-        ))
+        session.add(
+            PhoneChannelHealth(
+                component="phonegate_transport",
+                status=PhoneComponentStatus.HEALTHY,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            PhoneChannelHealth(
+                component="a14_daemon",
+                status=PhoneComponentStatus.DEGRADED,
+                updated_at=datetime.now(UTC),
+            )
+        )
         await session.commit()
 
     body = (await client.get("/api/v1/phone/status")).json()
@@ -3049,17 +3253,29 @@ async def test_sessions_list_and_detail(client, sqlite_session_factory) -> None:
         session.add(profile)
         await session.flush()
         call = CommunicationSession(
-            profile_id=profile.id, channel=CommunicationChannel.CALL, transport="phonegate",
-            direction=CommunicationDirection.INBOUND, remote_address="+37360111222",
-            remote_raw="+37360111222", phonegate_event_id_start=1,
-            started_at=datetime.now(UTC), ended_at=datetime.now(UTC),
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            remote_raw="+37360111222",
+            phonegate_event_id_start=1,
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
             outcome=CommunicationOutcome.COMPLETED,
         )
         session.add(call)
         await session.flush()
-        session.add(CommunicationTurn(session_id=call.id, phonegate_transcript_id=1, seq=1,
-                                      speaker=TurnSpeaker.EMPLOYER, text="hi",
-                                      occurred_at=datetime.now(UTC)))
+        session.add(
+            CommunicationTurn(
+                session_id=call.id,
+                phonegate_transcript_id=1,
+                seq=1,
+                speaker=TurnSpeaker.EMPLOYER,
+                text="hi",
+                occurred_at=datetime.now(UTC),
+            )
+        )
         await session.commit()
         call_id = call.id
 
@@ -3108,9 +3324,7 @@ router = APIRouter(prefix="/api/v1/phone", tags=["phone"])
 @router.get("/status", dependencies=[Depends(require_api_actor)])
 async def phone_status(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     rows = list((await session.scalars(select(PhoneChannelHealth))).all())
-    components = [
-        HealthComponent(r.component, r.status, r.detail, r.last_ok_at) for r in rows
-    ]
+    components = [HealthComponent(r.component, r.status, r.detail, r.last_ok_at) for r in rows]
     agent_row = next((r for r in rows if r.component == "agent"), None)
     newest = await session.scalar(
         select(CommunicationSession).order_by(desc(CommunicationSession.started_at)).limit(1)
@@ -3222,6 +3436,7 @@ In `app/main.py`, after `app.include_router(admin_router)` add:
 
 ```python
 from app.api.phone_routes import router as phone_router
+
 app.include_router(phone_router)
 ```
 
@@ -3269,10 +3484,13 @@ async def test_diagnostics_shows_phone_channel(admin_client, db_session) -> None
     from app.models.entities import PhoneChannelHealth
     from app.models.enums import PhoneComponentStatus
 
-    db_session.add(PhoneChannelHealth(
-        component="phonegate_transport", status=PhoneComponentStatus.HEALTHY,
-        updated_at=datetime.now(UTC),
-    ))
+    db_session.add(
+        PhoneChannelHealth(
+            component="phonegate_transport",
+            status=PhoneComponentStatus.HEALTHY,
+            updated_at=datetime.now(UTC),
+        )
+    )
     await db_session.commit()
 
     body = (await admin_client.get("/?view=diagnostics")).text
@@ -3301,8 +3519,12 @@ async def _phone_health(session: AsyncSession) -> dict[str, Any]:
     return {
         "channel": channel_status(components).value if components else "unknown",
         "components": [
-            {"component": r.component, "status": r.status.value, "detail": r.detail,
-             "last_ok_at": r.last_ok_at}
+            {
+                "component": r.component,
+                "status": r.status.value,
+                "detail": r.detail,
+                "last_ok_at": r.last_ok_at,
+            }
             for r in sorted(rows, key=lambda r: r.component)
         ],
         "configured": get_settings().phone_agent_enabled,
@@ -3491,9 +3713,14 @@ async def redis():
 
 
 def _loop(client, factory, redis):
-    return IngestLoop(client=client, session_factory=factory, redis=redis,
-                      correlation=CallerCorrelation(), health=HealthTracker(),
-                      settings=Settings(_env_file=None))
+    return IngestLoop(
+        client=client,
+        session_factory=factory,
+        redis=redis,
+        correlation=CallerCorrelation(),
+        health=HealthTracker(),
+        settings=Settings(_env_file=None),
+    )
 
 
 @pytest.mark.asyncio
@@ -3506,7 +3733,8 @@ async def test_agent_restart_reconciles_dangling_session(sqlite_session_factory,
     async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as c1:
         loop1 = _loop(c1, sqlite_session_factory, redis)
         await loop1.load_cursor()
-        fake.ring("+37360111222"); fake.answer()
+        fake.ring("+37360111222")
+        fake.answer()
         for _ in range(3):
             await loop1.run_cycle()
 

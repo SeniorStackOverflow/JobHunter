@@ -176,7 +176,9 @@ columns and `PhoneSummaryState`.
 
 ```python
 class EvidenceCapturer:
-    def __init__(self, *, client: PhoneGateClient, settings: Settings, session_id: UUID) -> None: ...
+    def __init__(
+        self, *, client: PhoneGateClient, settings: Settings, session_id: UUID
+    ) -> None: ...
     async def maybe_capture(self, rx_entries: list[TranscriptEntry]) -> None: ...  # never raises
 ```
 
@@ -291,9 +293,9 @@ Invalid JSON / schema mismatch / timeout / transport error → `PhoneSummaryUnav
 
 ```python
 class CallSummary(BaseModel):
-    summary_text: str                     # 2–4 Russian sentences
+    summary_text: str  # 2–4 Russian sentences
     mentioned_vacancy: str = ""
-    proposed_datetime_text: str = ""      # verbatim from the caller — NOT normalized
+    proposed_datetime_text: str = ""  # verbatim from the caller — NOT normalized
     proposed_address_text: str = ""
     contact_person_text: str = ""
     outcome_guess: Literal[

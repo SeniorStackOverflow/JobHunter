@@ -178,9 +178,7 @@ def upgrade() -> None:
 
     with op.batch_alter_table("communication_sessions") as batch_op:
         batch_op.add_column(
-            sa.Column(
-                "auto_answered", sa.Boolean(), nullable=False, server_default=sa.false()
-            )
+            sa.Column("auto_answered", sa.Boolean(), nullable=False, server_default=sa.false())
         )
         batch_op.add_column(sa.Column("script_stage", sa.String(length=32), nullable=True))
     with op.batch_alter_table("communication_sessions") as batch_op:
@@ -362,7 +360,9 @@ async def test_answer_speak_hangup_and_tx_cycle() -> None:
     transport = fake.transport()
     async with httpx.AsyncClient(transport=transport, base_url="http://pg") as c:
         # speak before answer -> 409
-        r = await c.post("/api/call/speak", json={"text": "hi"}, headers={"authorization": "Bearer t"})
+        r = await c.post(
+            "/api/call/speak", json={"text": "hi"}, headers={"authorization": "Bearer t"}
+        )
         assert r.status_code == 409
 
         r = await c.post("/api/call/answer", headers={"authorization": "Bearer t"})
@@ -370,10 +370,14 @@ async def test_answer_speak_hangup_and_tx_cycle() -> None:
         st = (await c.get("/api/device/status", headers={"authorization": "Bearer t"})).json()
         assert st["call_state"] == "IN_CALL"
 
-        r = await c.post("/api/call/speak", json={"text": "Здравствуйте"}, headers={"authorization": "Bearer t"})
+        r = await c.post(
+            "/api/call/speak", json={"text": "Здравствуйте"}, headers={"authorization": "Bearer t"}
+        )
         assert r.status_code == 200
         # a tx transcript line was written
-        tr = (await c.get("/api/call/transcript?after_id=0", headers={"authorization": "Bearer t"})).json()
+        tr = (
+            await c.get("/api/call/transcript?after_id=0", headers={"authorization": "Bearer t"})
+        ).json()
         assert any(e["speaker"] == "tx" and e["text"] == "Здравствуйте" for e in tr["entries"])
         # TX runs preparing -> active -> idle across status polls
         seen = []
@@ -395,10 +399,14 @@ async def test_fail_next_speak_409_and_timeout() -> None:
     async with httpx.AsyncClient(transport=fake.transport(), base_url="http://pg") as c:
         await c.post("/api/call/answer", headers={"authorization": "Bearer t"})
         fake.fail_next_speak(mode="409_tx_busy")
-        r = await c.post("/api/call/speak", json={"text": "x"}, headers={"authorization": "Bearer t"})
+        r = await c.post(
+            "/api/call/speak", json={"text": "x"}, headers={"authorization": "Bearer t"}
+        )
         assert r.status_code == 409
         # next call succeeds
-        r = await c.post("/api/call/speak", json={"text": "y"}, headers={"authorization": "Bearer t"})
+        r = await c.post(
+            "/api/call/speak", json={"text": "y"}, headers={"authorization": "Bearer t"}
+        )
         assert r.status_code == 200
 ```
 
@@ -430,20 +438,22 @@ For `FakeAsyncRedis.delete`, in `tests/unit/` wherever `FakeAsyncRedis` is unit-
   ```
 - Add the three routes to the `Starlette(routes=[...])` list:
   ```python
-  Route("/api/call/answer", self._answer_route, methods=["POST"]),
-  Route("/api/call/speak", self._speak_route, methods=["POST"]),
-  Route("/api/call/hangup", self._hangup_route, methods=["POST"]),
+  (Route("/api/call/answer", self._answer_route, methods=["POST"]),)
+  (Route("/api/call/speak", self._speak_route, methods=["POST"]),)
+  (Route("/api/call/hangup", self._hangup_route, methods=["POST"]),)
   ```
 - Add scripting helpers:
   ```python
   def set_tx_auto_advance(self, value: bool) -> None:
       self._tx_auto_advance = value
 
+
   def advance_tx(self) -> None:
       # 0 -> 1 (preparing) -> 2 (active) -> 0 (idle)
       self._tx_stage = (self._tx_stage + 1) % 3
       self._tx_preparing = self._tx_stage == 1
       self._tx_active = self._tx_stage == 2
+
 
   def fail_next_speak(self, *, mode: str) -> None:
       self._fail_next_speak = mode
@@ -468,6 +478,7 @@ For `FakeAsyncRedis.delete`, in `tests/unit/` wherever `FakeAsyncRedis` is unit-
       self._emit("call_state", self._call_state_data())
       return JSONResponse({"success": True})
 
+
   async def _speak_route(self, request: Request) -> JSONResponse:
       if not self._auth_ok(request):
           return JSONResponse({"detail": "auth"}, status_code=401)
@@ -483,13 +494,20 @@ For `FakeAsyncRedis.delete`, in `tests/unit/` wherever `FakeAsyncRedis` is unit-
       tid = self._next_transcript_id
       self._next_transcript_id += 1
       record = {
-          "id": tid, "speaker": "tx", "text": text, "meta": "", "backend": "piper",
-          "confidence": None, "timestamp": "00:00:00", "timestamp_ms": int(time.time() * 1000),
+          "id": tid,
+          "speaker": "tx",
+          "text": text,
+          "meta": "",
+          "backend": "piper",
+          "confidence": None,
+          "timestamp": "00:00:00",
+          "timestamp_ms": int(time.time() * 1000),
       }
       self._transcripts.append(record)
       self._emit("transcript", {"transcript": record})
       self._tx_stage, self._tx_preparing, self._tx_active = 1, True, False
       return JSONResponse({"success": True, "text": text})
+
 
   async def _hangup_route(self, request: Request) -> JSONResponse:
       if not self._auth_ok(request):
@@ -629,14 +647,16 @@ Add a `_post` method next to `_get`:
 Add the three methods after `transcript()`:
 
 ```python
-    async def answer(self) -> None:
-        await self._post("/api/call/answer")
+async def answer(self) -> None:
+    await self._post("/api/call/answer")
 
-    async def speak(self, text: str) -> None:
-        await self._post("/api/call/speak", {"text": text})
 
-    async def hangup(self) -> None:
-        await self._post("/api/call/hangup")
+async def speak(self, text: str) -> None:
+    await self._post("/api/call/speak", {"text": text})
+
+
+async def hangup(self) -> None:
+    await self._post("/api/call/hangup")
 ```
 
 - [ ] **Step 5: Run — passes**; **sweep**; **commit**
@@ -766,15 +786,34 @@ def _settings(**kw: object) -> Settings:
 @pytest.mark.parametrize(
     ("kwargs", "expected_answer", "expected_reason"),
     [
-        (dict(settings=Settings(_env_file=None), runtime_stopped=False, normalized_caller="+37360111222"),
-         False, "disabled_by_config"),
-        (dict(settings=_settings(), runtime_stopped=True, normalized_caller="+37360111222"),
-         False, "stopped_by_operator"),
-        (dict(settings=_settings(phone_answer_blocklist=["+37360111222"]), runtime_stopped=False,
-              normalized_caller="+37360111222"),
-         False, "blocklisted"),
-        (dict(settings=_settings(), runtime_stopped=False, normalized_caller="+37360111222"),
-         True, "answer"),
+        (
+            dict(
+                settings=Settings(_env_file=None),
+                runtime_stopped=False,
+                normalized_caller="+37360111222",
+            ),
+            False,
+            "disabled_by_config",
+        ),
+        (
+            dict(settings=_settings(), runtime_stopped=True, normalized_caller="+37360111222"),
+            False,
+            "stopped_by_operator",
+        ),
+        (
+            dict(
+                settings=_settings(phone_answer_blocklist=["+37360111222"]),
+                runtime_stopped=False,
+                normalized_caller="+37360111222",
+            ),
+            False,
+            "blocklisted",
+        ),
+        (
+            dict(settings=_settings(), runtime_stopped=False, normalized_caller="+37360111222"),
+            True,
+            "answer",
+        ),
     ],
 )
 def test_should_answer_table(kwargs, expected_answer, expected_reason) -> None:
@@ -784,14 +823,19 @@ def test_should_answer_table(kwargs, expected_answer, expected_reason) -> None:
 
 
 def test_not_ringing_is_ignored() -> None:
-    d = should_answer(status=_status("IN_CALL"), settings=_settings(),
-                      runtime_stopped=False, normalized_caller="+37360111222")
+    d = should_answer(
+        status=_status("IN_CALL"),
+        settings=_settings(),
+        runtime_stopped=False,
+        normalized_caller="+37360111222",
+    )
     assert d.answer is False and d.reason == "not_ringing"
 
 
 def test_unknown_caller_still_answered() -> None:
-    d = should_answer(status=_status(), settings=_settings(),
-                      runtime_stopped=False, normalized_caller=None)
+    d = should_answer(
+        status=_status(), settings=_settings(), runtime_stopped=False, normalized_caller=None
+    )
     assert d.answer is True and d.reason == "answer"
 ```
 
@@ -1138,13 +1182,21 @@ async def test_record_assistant_turn_and_delivery(db: AsyncSession) -> None:
     store = SessionStore()
     now = datetime.now(UTC)
     call = await store.open(
-        db, remote_raw="+3736011", remote_address="+3736011", event_id=1,
-        correlation=_corr(db.info["profile_id"]), opened_at=now,
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
     )
     await db.flush()
     turn = await store.record_assistant_turn(
-        db, session_id=call.id, phonegate_transcript_id=7, spoken_text="Здравствуйте",
-        delivery_status=TurnDeliveryStatus.ATTEMPTED, occurred_at=now,
+        db,
+        session_id=call.id,
+        phonegate_transcript_id=7,
+        spoken_text="Здравствуйте",
+        delivery_status=TurnDeliveryStatus.ATTEMPTED,
+        occurred_at=now,
     )
     assert turn.speaker is TurnSpeaker.ASSISTANT
     assert turn.spoken_text == "Здравствуйте"
@@ -1159,8 +1211,12 @@ async def test_set_script_stage_and_mark_auto_answered(db: AsyncSession) -> None
     store = SessionStore()
     now = datetime.now(UTC)
     call = await store.open(
-        db, remote_raw="+3736011", remote_address="+3736011", event_id=1,
-        correlation=_corr(db.info["profile_id"]), opened_at=now,
+        db,
+        remote_raw="+3736011",
+        remote_address="+3736011",
+        event_id=1,
+        correlation=_corr(db.info["profile_id"]),
+        opened_at=now,
     )
     await store.mark_auto_answered(call, now)
     await store.set_script_stage(call, "greeting")
@@ -1205,9 +1261,7 @@ def test_speaker_from_phonegate_tx_is_assistant() -> None:
       occurred_at: datetime,
   ) -> CommunicationTurn:
       count = await session.scalar(
-          select(func.count(CommunicationTurn.id)).where(
-              CommunicationTurn.session_id == session_id
-          )
+          select(func.count(CommunicationTurn.id)).where(CommunicationTurn.session_id == session_id)
       )
       turn = CommunicationTurn(
           session_id=session_id,
@@ -1224,6 +1278,7 @@ def test_speaker_from_phonegate_tx_is_assistant() -> None:
       await session.flush()
       return turn
 
+
   async def set_turn_delivery(
       self, session: AsyncSession, *, turn_id: UUID, status: TurnDeliveryStatus
   ) -> None:
@@ -1232,8 +1287,10 @@ def test_speaker_from_phonegate_tx_is_assistant() -> None:
           turn.delivery_status = status
           await session.flush()
 
+
   async def set_script_stage(self, call: CommunicationSession, stage: str) -> None:
       call.script_stage = stage
+
 
   async def mark_auto_answered(self, call: CommunicationSession, when: datetime) -> None:
       call.auto_answered = True
@@ -1273,7 +1330,9 @@ async def test_last_status_is_exposed_after_run_cycle(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:
     fake = FakePhoneGate()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
         loop = _make_loop(client, profiled_factory, redis)
         assert loop.last_status is None
         await loop.load_cursor()
@@ -1286,7 +1345,9 @@ async def test_tx_transcript_lines_are_not_persisted_by_ingest(
     profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
 ) -> None:
     fake = FakePhoneGate()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
         loop = _make_loop(client, profiled_factory, redis)
         await loop.load_cursor()
         status = await client.device_status()
@@ -1398,7 +1459,9 @@ def _fast_settings() -> Settings:
 
 
 @pytest_asyncio.fixture
-async def factory(sqlite_session_factory: async_sessionmaker[AsyncSession]) -> async_sessionmaker[AsyncSession]:
+async def factory(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> async_sessionmaker[AsyncSession]:
     async with sqlite_session_factory() as s:
         s.add(UserProfile(name="d", is_default=True))
         await s.commit()
@@ -1410,7 +1473,10 @@ async def _open_ringing_session(factory: async_sessionmaker[AsyncSession]) -> "U
         profile = (await s.scalars(select(UserProfile))).one()
         store = SessionStore()
         call = await store.open(
-            s, remote_raw="+37360111222", remote_address="+37360111222", event_id=2,
+            s,
+            remote_raw="+37360111222",
+            remote_address="+37360111222",
+            event_id=2,
             correlation=CorrelationResult(profile.id, None, None, None, None),
             opened_at=datetime.now(UTC),
         )
@@ -1423,16 +1489,20 @@ async def test_happy_path_greeting_listen_closing(factory) -> None:
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
         orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
         stage = await orch.run(session_id)
 
     assert stage == "greeting_completed"
     async with factory() as s:
         call = await s.get(CommunicationSession, session_id)
-        turns = (await s.scalars(
-            select(CommunicationTurn).where(CommunicationTurn.session_id == session_id)
-        )).all()
+        turns = (
+            await s.scalars(
+                select(CommunicationTurn).where(CommunicationTurn.session_id == session_id)
+            )
+        ).all()
     assert call.auto_answered is True
     assert call.script_stage == "greeting_completed"
     assistant = [t for t in turns if t.speaker is TurnSpeaker.ASSISTANT]
@@ -1448,9 +1518,16 @@ async def test_hard_cap_cuts_listening(factory) -> None:
     session_id = await _open_ringing_session(factory)
     settings = _fast_settings()
     object.__setattr__  # (settings is pydantic; build a fresh one instead)
-    settings = Settings(**{**settings.model_dump(), "phone_listen_silence_timeout_seconds": 10.0,
-                           "phone_call_hard_cap_seconds": 0.3})
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
+    settings = Settings(
+        **{
+            **settings.model_dump(),
+            "phone_listen_silence_timeout_seconds": 10.0,
+            "phone_call_hard_cap_seconds": 0.3,
+        }
+    )
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
         orch = CallOrchestrator(client=client, session_factory=factory, settings=settings)
         stage = await orch.run(session_id)
     assert stage == "greeting_completed"  # cap -> closing -> done is still a clean finish
@@ -1461,7 +1538,9 @@ async def test_call_drops_mid_greeting(factory) -> None:
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
         # make the caller hang up after the first block
         real_speak = client.speak
         count = {"n": 0}
@@ -1492,9 +1571,15 @@ async def test_operator_hangup_command(factory) -> None:
     async def command_check() -> str | None:
         return cmds.pop() if cmds else None
 
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings(),
-                                command_check=command_check)
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        orch = CallOrchestrator(
+            client=client,
+            session_factory=factory,
+            settings=_fast_settings(),
+            command_check=command_check,
+        )
         stage = await orch.run(session_id)
     assert stage == "aborted_operator"
     assert fake._call_state == "IDLE"
@@ -1511,15 +1596,23 @@ async def test_stop_command_plays_short_closing(factory) -> None:
         calls["n"] += 1
         return "stop" if calls["n"] >= 2 else None  # trip after the greeting starts
 
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings(),
-                                command_check=command_check)
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        orch = CallOrchestrator(
+            client=client,
+            session_factory=factory,
+            settings=_fast_settings(),
+            command_check=command_check,
+        )
         stage = await orch.run(session_id)
     assert stage == "aborted_operator"
     async with factory() as s:
-        turns = (await s.scalars(
-            select(CommunicationTurn).where(CommunicationTurn.session_id == session_id)
-        )).all()
+        turns = (
+            await s.scalars(
+                select(CommunicationTurn).where(CommunicationTurn.session_id == session_id)
+            )
+        ).all()
     assert any("прервать" in (t.spoken_text or "") for t in turns)  # short/interrupted closing used
 ```
 
@@ -1703,7 +1796,8 @@ class CallOrchestrator:
         """speak one block, record the assistant turn, reconcile delivery.
         Returns 'ok' or 'ended'."""
         res = await speak_block(
-            self._client, text,
+            self._client,
+            text,
             fence_timeout=self._s.phone_speak_fence_timeout_seconds,
             poll=self._s.phone_orchestrator_poll_seconds,
         )
@@ -1727,8 +1821,12 @@ class CallOrchestrator:
         )
         async with self._sf() as db:
             turn = await self._store.record_assistant_turn(
-                db, session_id=self._session_id, phonegate_transcript_id=tx_id,
-                spoken_text=text, delivery_status=initial, occurred_at=datetime.now(UTC),
+                db,
+                session_id=self._session_id,
+                phonegate_transcript_id=tx_id,
+                spoken_text=text,
+                delivery_status=initial,
+                occurred_at=datetime.now(UTC),
             )
             turn_id = turn.id
             await db.commit()
@@ -1815,9 +1913,12 @@ async def test_supervisor_spawns_on_ringing_and_answers(factory) -> None:
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
     redis = FakeAsyncRedis()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        sup = OrchestratorSupervisor(client=client, session_factory=factory, redis=redis,
-                                     settings=_fast_settings())
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        sup = OrchestratorSupervisor(
+            client=client, session_factory=factory, redis=redis, settings=_fast_settings()
+        )
         await sup.tick(await client.device_status(), session_id)
         assert await redis.get(CALL_OWNED_KEY) == str(session_id)
         # let it run to completion
@@ -1834,7 +1935,11 @@ async def test_supervisor_spawns_on_ringing_and_answers(factory) -> None:
 
 @pytest.mark.asyncio
 async def test_supervisor_respects_runtime_stop(factory) -> None:
-    from app.phone.orchestrator import AUTO_ANSWER_STOPPED_KEY, CALL_OWNED_KEY, OrchestratorSupervisor
+    from app.phone.orchestrator import (
+        AUTO_ANSWER_STOPPED_KEY,
+        CALL_OWNED_KEY,
+        OrchestratorSupervisor,
+    )
     from tests.fixtures.fake_redis import FakeAsyncRedis
 
     fake = FakePhoneGate()
@@ -1842,9 +1947,12 @@ async def test_supervisor_respects_runtime_stop(factory) -> None:
     session_id = await _open_ringing_session(factory)
     redis = FakeAsyncRedis()
     await redis.set(AUTO_ANSWER_STOPPED_KEY, "1")
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        sup = OrchestratorSupervisor(client=client, session_factory=factory, redis=redis,
-                                     settings=_fast_settings())
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        sup = OrchestratorSupervisor(
+            client=client, session_factory=factory, redis=redis, settings=_fast_settings()
+        )
         await sup.tick(await client.device_status(), session_id)
         assert await redis.get(CALL_OWNED_KEY) is None
         assert fake._call_state == "RINGING"  # not answered
@@ -1859,9 +1967,12 @@ async def test_supervisor_disabled_by_config_does_not_answer(factory) -> None:
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
     redis = FakeAsyncRedis()
-    async with PhoneGateClient(base_url="http://pg", token="t", transport=fake.transport()) as client:
-        sup = OrchestratorSupervisor(client=client, session_factory=factory, redis=redis,
-                                     settings=Settings(_env_file=None))  # auto-answer OFF
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        sup = OrchestratorSupervisor(
+            client=client, session_factory=factory, redis=redis, settings=Settings(_env_file=None)
+        )  # auto-answer OFF
         await sup.tick(await client.device_status(), session_id)
         assert await redis.get(CALL_OWNED_KEY) is None
         assert fake._call_state == "RINGING"
@@ -1945,18 +2056,26 @@ class OrchestratorSupervisor:
         )
         async with self._sf() as db:
             await record_audit_event(
-                db, actor="phone-agent", action="communication.auto_answer_decision",
-                entity_type="communication_session", entity_id=str(open_session_id),
+                db,
+                actor="phone-agent",
+                action="communication.auto_answer_decision",
+                entity_type="communication_session",
+                entity_id=str(open_session_id),
                 correlation_id=str(open_session_id),
-                details={"answer": decision.answer, "reason": decision.reason,
-                         "caller": mask_phone(status.caller_number)},
+                details={
+                    "answer": decision.answer,
+                    "reason": decision.reason,
+                    "caller": mask_phone(status.caller_number),
+                },
             )
             await db.commit()
         if not decision.answer:
             return
 
         orch = CallOrchestrator(
-            client=self._client, session_factory=self._sf, settings=self._s,
+            client=self._client,
+            session_factory=self._sf,
+            settings=self._s,
             command_check=self._command_check_for(open_session_id),
         )
         self._task = asyncio.create_task(orch.run(open_session_id))
@@ -2033,12 +2152,18 @@ async def profiled_factory(sqlite_session_factory: async_sessionmaker[AsyncSessi
 
 def _settings() -> Settings:
     return Settings(
-        _env_file=None, phone_agent_enabled=True, phonegate_auth_token="tok",
+        _env_file=None,
+        phone_agent_enabled=True,
+        phonegate_auth_token="tok",
         phone_auto_answer_enabled=True,
-        phone_poll_idle_seconds=0.02, phone_poll_active_seconds=0.02,
-        phone_post_connect_wait_seconds=0.01, phone_speak_fence_timeout_seconds=2.0,
-        phone_inter_block_listen_seconds=0.01, phone_listen_silence_timeout_seconds=0.2,
-        phone_call_hard_cap_seconds=5.0, phone_orchestrator_poll_seconds=0.01,
+        phone_poll_idle_seconds=0.02,
+        phone_poll_active_seconds=0.02,
+        phone_post_connect_wait_seconds=0.01,
+        phone_speak_fence_timeout_seconds=2.0,
+        phone_inter_block_listen_seconds=0.01,
+        phone_listen_silence_timeout_seconds=0.2,
+        phone_call_hard_cap_seconds=5.0,
+        phone_orchestrator_poll_seconds=0.01,
     )
 
 
@@ -2055,9 +2180,13 @@ async def test_agent_auto_answers_and_runs_the_script(
             return redis
 
     monkeypatch.setattr(agent_module, "AsyncRedis", _RedisMod)
-    monkeypatch.setattr(agent_module, "PhoneGateClient",
-                        lambda **kw: __import__("app.phone.client", fromlist=["PhoneGateClient"]).PhoneGateClient(
-                            base_url="http://pg", token="t", transport=fake.transport()))
+    monkeypatch.setattr(
+        agent_module,
+        "PhoneGateClient",
+        lambda **kw: __import__("app.phone.client", fromlist=["PhoneGateClient"]).PhoneGateClient(
+            base_url="http://pg", token="t", transport=fake.transport()
+        ),
+    )
     monkeypatch.setattr(agent_module, "async_session_factory", profiled_factory)
     monkeypatch.setattr(agent_module, "get_settings", _settings)
 
@@ -2172,13 +2301,21 @@ async def test_status_auto_answer_block(client, sqlite_session_factory) -> None:
         profile = UserProfile(name="d", is_default=True)
         s.add(profile)
         await s.flush()
-        s.add(CommunicationSession(
-            profile_id=profile.id, channel=CommunicationChannel.CALL, transport="phonegate",
-            direction=CommunicationDirection.INBOUND, remote_address="+37360111222",
-            remote_raw="+37360111222", phonegate_event_id_start=1,
-            started_at=datetime.now(UTC), answered_at=datetime.now(UTC),
-            auto_answered=True, script_stage="listening",
-        ))
+        s.add(
+            CommunicationSession(
+                profile_id=profile.id,
+                channel=CommunicationChannel.CALL,
+                transport="phonegate",
+                direction=CommunicationDirection.INBOUND,
+                remote_address="+37360111222",
+                remote_raw="+37360111222",
+                phonegate_event_id_start=1,
+                started_at=datetime.now(UTC),
+                answered_at=datetime.now(UTC),
+                auto_answered=True,
+                script_stage="listening",
+            )
+        )
         await s.commit()
 
     body = (await client.get("/api/v1/phone/status")).json()
@@ -2448,8 +2585,16 @@ def test_preconditions_return_reasons_when_ssh_fails(monkeypatch) -> None:
         raise FileNotFoundError("ssh")
 
     monkeypatch.setattr("subprocess.run", _boom)
-    rig = A06Rig(ssh_host="x", ssh_port="1", ssh_user="u", a14_serial="", a06_serial="",
-                 a06_number="060", phonegate_url="http://x", phonegate_token="t")
+    rig = A06Rig(
+        ssh_host="x",
+        ssh_port="1",
+        ssh_user="u",
+        a14_serial="",
+        a06_serial="",
+        a06_number="060",
+        phonegate_url="http://x",
+        phonegate_token="t",
+    )
     reasons = rig.check_preconditions()
     assert reasons and any("ssh" in r.lower() for r in reasons)
 ```
@@ -2485,7 +2630,10 @@ class A06Rig:
     def _ssh(self, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["ssh", "-p", self.ssh_port, f"{self.ssh_user}@{self.ssh_host}", cmd],
-            capture_output=True, text=True, timeout=timeout, check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
 
     def _adb(self, serial: str, cmd: str, timeout: int = 25) -> str:
@@ -2505,11 +2653,16 @@ class A06Rig:
             reasons.append(f"A06 {self.a06_serial} not in adb devices")
         if self.phonegate_url and self.phonegate_token:
             try:
-                r = httpx.get(f"{self.phonegate_url}/api/device/status",
-                              headers={"Authorization": f"Bearer {self.phonegate_token}"}, timeout=10)
+                r = httpx.get(
+                    f"{self.phonegate_url}/api/device/status",
+                    headers={"Authorization": f"Bearer {self.phonegate_token}"},
+                    timeout=10,
+                )
                 st = r.json()
                 if not st.get("connected") or st.get("mode") != "Zero-ADB":
-                    reasons.append(f"PhoneGate not ready: connected={st.get('connected')} mode={st.get('mode')}")
+                    reasons.append(
+                        f"PhoneGate not ready: connected={st.get('connected')} mode={st.get('mode')}"
+                    )
             except (httpx.HTTPError, ValueError) as exc:
                 reasons.append(f"PhoneGate status unreachable: {exc}")
         if not self.a14_number:
