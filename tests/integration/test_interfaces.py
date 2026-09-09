@@ -127,6 +127,8 @@ async def _login_admin(
     client: httpx.AsyncClient,
     settings: Settings,
 ) -> str:
+    from app.security.auth import CsrfProtector
+
     login_page = await client.get("/login")
     assert login_page.status_code == 200
     logged_in = await client.post(
@@ -138,6 +140,18 @@ async def _login_admin(
     )
     assert logged_in.status_code == 303
     dashboard = await client.get("/")
+    # If dashboard returns 404 (no default profile), generate CSRF token from session
+    if dashboard.status_code == 404:
+        # Extract session token from cookies
+        session_token = None
+        for cookie in client.cookies.jar:  # type: ignore
+            if cookie.name == settings.session_cookie_name:
+                session_token = cookie.value
+                break
+        assert session_token is not None
+        # Generate CSRF token based on session
+        csrf_protector = CsrfProtector(settings.secret_key.get_secret_value())
+        return csrf_protector.issue(session_token)
     assert dashboard.status_code == 200
     return _csrf_token(dashboard.text)
 
@@ -2818,3 +2832,108 @@ async def test_admin_resume_activate_422_when_binary_missing(
             data={"profile_id": str(profile_id), "csrf_token": csrf_token},
         )
         assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_admin_create_profile_with_first_resume(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        created = await client.post(
+            "/admin/profiles",
+            data={
+                "name": "Courier profile",
+                "make_default": "on",
+                "resume_name": "Courier CV",
+                "resume_category": "courier",
+                "csrf_token": csrf_token,
+            },
+            files={"resume_file": ("courier.pdf", b"%PDF-1.7\ncourier\n%%EOF", "application/pdf")},
+        )
+        assert created.status_code == 303
+        assert "notice=profile_and_resume_created" in created.headers["location"]
+
+    async with sqlite_session_factory() as session:
+        profile = await session.scalar(
+            select(UserProfile).where(UserProfile.name == "Courier profile")
+        )
+        assert profile is not None
+        resume = await session.scalar(select(Resume).where(Resume.profile_id == profile.id))
+        assert resume is not None
+        assert resume.name == "Courier CV"
+        assert resume.category == "courier"
+        assert resume.is_default is True
+        assert resume.verified is False
+        preference = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == profile.id)
+        )
+        assert preference is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_create_profile_without_file_is_unchanged(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        created = await client.post(
+            "/admin/profiles",
+            data={"name": "Bare profile", "csrf_token": csrf_token},
+        )
+        assert created.status_code == 303
+        assert "notice=profile_created" in created.headers["location"]
+
+    async with sqlite_session_factory() as session:
+        profile = await session.scalar(
+            select(UserProfile).where(UserProfile.name == "Bare profile")
+        )
+        assert profile is not None
+        assert (await session.scalar(select(Resume).where(Resume.profile_id == profile.id))) is None
+
+
+@pytest.mark.asyncio
+async def test_admin_create_profile_rejects_file_without_metadata_and_bad_pdf(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+
+        missing_meta = await client.post(
+            "/admin/profiles",
+            data={"name": "Needs meta", "csrf_token": csrf_token},
+            files={"resume_file": ("x.pdf", b"%PDF-1.7\nx\n%%EOF", "application/pdf")},
+        )
+        assert missing_meta.status_code == 422
+
+        bad_pdf = await client.post(
+            "/admin/profiles",
+            data={
+                "name": "Bad pdf",
+                "resume_name": "CV",
+                "resume_category": "ops",
+                "csrf_token": csrf_token,
+            },
+            files={"resume_file": ("x.pdf", b"not a pdf", "application/pdf")},
+        )
+        assert bad_pdf.status_code == 422
+
+    async with sqlite_session_factory() as session:
+        assert (
+            await session.scalar(select(UserProfile).where(UserProfile.name == "Needs meta"))
+        ) is None
+        assert (
+            await session.scalar(select(UserProfile).where(UserProfile.name == "Bad pdf"))
+        ) is None

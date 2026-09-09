@@ -81,7 +81,12 @@ from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeInUseError
 from app.security.auth import CsrfProtector, SessionSigner, verify_password
-from app.security.files import UnsafeResumeError, read_verified_resume, safe_storage_path
+from app.security.files import (
+    UnsafeResumeError,
+    read_verified_resume,
+    safe_storage_path,
+    validate_resume_upload,
+)
 from app.security.ssrf import public_url_shape_is_safe
 from app.settings import get_settings
 
@@ -1508,19 +1513,62 @@ async def create_profile(
     request: Request,
     name: str = Form(...),
     make_default: bool = Form(False),
-    profile_id: UUID | None = Form(None),
+    resume_name: str = Form(""),
+    resume_category: str = Form(""),
+    resume_file: UploadFile | None = File(None),
     csrf_token: str = Form(...),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
+    settings = get_settings()
+    has_resume = resume_file is not None and bool(resume_file.filename)
+    if has_resume and not (resume_name.strip() and resume_category.strip()):
+        raise HTTPException(
+            status_code=422, detail="resume name and category are required with a file"
+        )
+    data = b""
+    if has_resume:
+        assert resume_file is not None
+        data = await resume_file.read(settings.max_resume_bytes + 1)
+        try:
+            validate_resume_upload(
+                resume_file.filename or "resume.pdf",
+                resume_file.content_type or "",
+                data,
+                settings.max_resume_bytes,
+            )
+        except UnsafeResumeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     profile = await ProfileService().create_profile(
         session, UserProfileInput(name=name), make_default=make_default
     )
     await _audit_admin(session, "profile.created", "user_profile", str(profile.id))
+    notice = "profile_created"
+    if has_resume:
+        assert resume_file is not None
+        resume = await ResumeService(settings).upload(
+            session,
+            profile_id=profile.id,
+            name=resume_name.strip(),
+            category=resume_category.strip(),
+            filename=resume_file.filename or "resume.pdf",
+            mime_type=resume_file.content_type or "",
+            data=data,
+            make_default=True,
+        )
+        await _audit_admin(
+            session,
+            "resume.uploaded",
+            "resume",
+            str(resume.id),
+            details={"mime_type": resume.mime_type, "sha256": resume.sha256},
+        )
+        notice = "profile_and_resume_created"
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={profile.id}&notice=profile_created", status_code=303
+        f"/?view=settings&profile_id={profile.id}&notice={notice}", status_code=303
     )
 
 
