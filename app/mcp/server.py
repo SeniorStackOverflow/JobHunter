@@ -471,10 +471,11 @@ async def delete_resume(resume_id: str) -> dict[str, Any]:
     from contextlib import suppress
 
     from app.database.session import async_session_factory
-    from app.profiles.service import ResumeInUseError
+    from app.profiles.service import ResumeDeletion, ResumeInUseError
 
     settings = get_settings()
     resume_service = ResumeService(settings)
+    deletion: ResumeDeletion | None = None
     async with async_session_factory() as session:
         try:
             deletion = await resume_service.delete(session, UUID(resume_id))
@@ -487,14 +488,17 @@ async def delete_resume(resume_id: str) -> dict[str, Any]:
             )
             await session.commit()
         # LookupError / ResumeInUseError are raised by ResumeService.delete before
-        # any transaction marker is written, so this path needs no rollback/reconcile.
+        # any transaction marker is written, so this path needs no rollback/cleanup.
         except (LookupError, ResumeInUseError) as exc:
             raise ValueError(str(exc)) from exc
         except Exception:
             with suppress(Exception):
                 await session.rollback()
+            # The rollback restored the Resume row and its file; drop only the
+            # marker this request wrote (never touch the file).
             with suppress(Exception):
-                await resume_service.reconcile_file_transactions(session)
+                if deletion is not None:
+                    resume_service.abort_pending_delete(deletion)
             raise
     resume_service.finalize_delete(deletion)
     return {"id": resume_id, "deleted": True}

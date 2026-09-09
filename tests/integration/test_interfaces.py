@@ -2620,8 +2620,11 @@ async def test_resume_service_delete_guards_referenced_resumes(
 
 @pytest.mark.asyncio
 async def test_resume_service_delete_removes_unreferenced_resume_and_file(
-    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.profiles import service as resume_service_module
     from app.profiles.service import ResumeService
 
     _application, settings = interface_app
@@ -2659,10 +2662,11 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
     assert deletion.sha256 == hashlib.sha256(b"%PDF-1.4\norphan\n%%EOF").hexdigest()
     assert resume_path.exists()
 
-    # Simulate a process crash after the DB commit but before physical unlink.
-    # Reconcile only sweeps markers older than its grace window, so age the
-    # marker to represent a crash that happened well before this reconcile runs.
-    _age_transaction_markers(settings)
+    # Simulate a process crash after the DB commit but before the physical
+    # unlink: the restarted api process runs reconcile under a fresh nonce, so
+    # the marker delete() wrote is now foreign-owned and swept in full
+    # immediately -- no age gate.
+    monkeypatch.setattr(resume_service_module, "_PROCESS_NONCE", "restarted-api-process")
     async with sqlite_session_factory() as session:
         await service.reconcile_file_transactions(session)
 
@@ -2672,23 +2676,50 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
         assert await session.get(Resume, resume_id) is None
 
 
-def _age_transaction_markers(settings: Settings) -> None:
-    """Backdate every file-transaction marker past the reconcile grace window."""
-    from app.profiles.service import RESUME_TRANSACTION_GRACE_SECONDS
+@pytest.mark.asyncio
+async def test_reconcile_sweeps_foreign_owner_marker_without_aging(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    """A marker owned by a previous, now-dead api process is a crashed
+    predecessor under the single-writer invariant: reconcile rolls it back in
+    full immediately, with no age gate, even when the marker was written a
+    moment ago."""
+    from app.profiles.service import ResumeService
 
+    _application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    service = ResumeService(settings)
+
+    storage_key = "predecessor-orphan.pdf"
+    orphan_file = settings.resume_storage_path / storage_key
+    orphan_file.write_bytes(b"%PDF-1.4\npredecessor\n%%EOF")
     transaction_dir = settings.resume_storage_path / ".transactions"
-    aged = time.time() - RESUME_TRANSACTION_GRACE_SECONDS - 5
-    for marker in transaction_dir.glob("*"):
-        os.utime(marker, (aged, aged))
+    transaction_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = transaction_dir / "upload-predecessor.json"
+    marker.write_text(
+        json.dumps(
+            {"operation": "upload", "owner": "dead-predecessor", "storage_key": storage_key}
+        ),
+        encoding="utf-8",
+    )
+
+    async with sqlite_session_factory() as session:
+        await service.reconcile_file_transactions(session)
+
+    assert not orphan_file.exists()
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio
-async def test_reconcile_skips_fresh_upload_marker_for_uncommitted_resume(
+async def test_reconcile_skips_same_owner_in_flight_upload_marker(
     interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
 ) -> None:
-    """A marker written 'just now' may belong to a concurrent upload that has
-    written its file but not yet committed its Resume row; reconcile triggered by
-    an unrelated failing request must not delete that live file."""
+    """A marker written by THIS live process may belong to an upload that has
+    written its file but not yet committed its Resume row; a reconcile fired by
+    an unrelated failing request in the same process must not delete that live
+    file or its marker -- not even once the marker ages past the grace window
+    (defect-2 guard)."""
+    from app.profiles import service as resume_service_module
     from app.profiles.service import ResumeService
 
     _application, settings = interface_app
@@ -2700,15 +2731,85 @@ async def test_reconcile_skips_fresh_upload_marker_for_uncommitted_resume(
     live_file.write_bytes(b"%PDF-1.4\nin flight\n%%EOF")
     transaction_dir = settings.resume_storage_path / ".transactions"
     transaction_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (transaction_dir / "upload-fresh.json").write_text(
-        json.dumps({"operation": "upload", "storage_key": storage_key}), encoding="utf-8"
+    marker = transaction_dir / "upload-fresh.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "operation": "upload",
+                "owner": resume_service_module._PROCESS_NONCE,
+                "storage_key": storage_key,
+            }
+        ),
+        encoding="utf-8",
     )
+    aged = time.time() - 3600
+    os.utime(marker, (aged, aged))
 
     async with sqlite_session_factory() as session:
         await service.reconcile_file_transactions(session)
 
     assert live_file.exists()
-    assert list(transaction_dir.glob("*.json"))
+    assert marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clears_same_owner_upload_marker_once_row_committed(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    """When this process's upload has committed its Resume row the marker's
+    outcome is settled: reconcile tidies the marker but keeps the file the row
+    points at."""
+    from app.profiles import service as resume_service_module
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    service = ResumeService(settings)
+
+    storage_key = "committed-upload.pdf"
+    committed_file = settings.resume_storage_path / storage_key
+    payload_bytes = b"%PDF-1.4\ncommitted\n%%EOF"
+    committed_file.write_bytes(payload_bytes)
+
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Committed owner", is_default=True)
+        session.add(profile)
+        await session.flush()
+        session.add(
+            Resume(
+                profile_id=profile.id,
+                name="Committed",
+                category="ops",
+                storage_key=storage_key,
+                original_filename="committed.pdf",
+                mime_type="application/pdf",
+                sha256=hashlib.sha256(payload_bytes).hexdigest(),
+                active=True,
+                verified=False,
+                is_default=False,
+            )
+        )
+        await session.commit()
+
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    transaction_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = transaction_dir / "upload-committed.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "operation": "upload",
+                "owner": resume_service_module._PROCESS_NONCE,
+                "storage_key": storage_key,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async with sqlite_session_factory() as session:
+        await service.reconcile_file_transactions(session)
+
+    assert committed_file.exists()
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio
@@ -3131,18 +3232,78 @@ async def test_admin_create_profile_cleans_uploaded_pdf_when_transaction_fails(
         ) is None
         assert (await session.scalar(select(Resume).where(Resume.name == "Rollback CV"))) is None
 
-    # The failing request leaves an orphan file + marker; reconcile's grace period
-    # defers cleanup so it can never race a concurrent upload. A later reconcile
-    # (startup, or another request) sweeps it once the marker ages out.
-    from app.profiles.service import ResumeService
-
+    # abort_pending_upload rolls back this process's own in-flight upload
+    # synchronously in the failing request's except path: the orphan file and
+    # its marker are gone the moment the request returns -- no reconcile, no
+    # marker aging.
     transaction_dir = settings.resume_storage_path / ".transactions"
-    assert list(transaction_dir.glob("*.json"))
-    _age_transaction_markers(settings)
-    async with sqlite_session_factory() as session:
-        await ResumeService(settings).reconcile_file_transactions(session)
     assert not list(settings.resume_storage_path.glob("*.pdf"))
     assert not list(transaction_dir.glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_admin_delete_resume_rolls_back_marker_and_keeps_file_on_failure(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delete request that fails after ResumeService.delete wrote its marker
+    must, in its except path, drop only that marker (abort_pending_delete): the
+    rolled-back Resume row and its file both survive."""
+    application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    pdf = b"%PDF-1.7\nkeep me\n%%EOF"
+    storage_key = "keep-on-delete-failure.pdf"
+    (settings.resume_storage_path / storage_key).write_bytes(pdf)
+
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Delete failure owner", is_default=True)
+        session.add(profile)
+        await session.flush()
+        profile_id = profile.id
+        resume = Resume(
+            profile_id=profile_id,
+            name="Keep me",
+            category="ops",
+            storage_key=storage_key,
+            original_filename="keep.pdf",
+            mime_type="application/pdf",
+            sha256=hashlib.sha256(pdf).hexdigest(),
+            active=True,
+            verified=False,
+            is_default=False,
+        )
+        session.add(resume)
+        await session.commit()
+        resume_id = resume.id
+
+    original_audit = admin_routes._audit_admin
+
+    async def fail_on_delete(
+        session: Any, action: str, entity_type: str, entity_id: str, **kwargs: Any
+    ) -> None:
+        if action == "resume.deleted":
+            raise RuntimeError("forced audit failure after delete marker")
+        await original_audit(session, action, entity_type, entity_id, **kwargs)
+
+    monkeypatch.setattr(admin_routes, "_audit_admin", fail_on_delete)
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        with pytest.raises(RuntimeError, match="forced audit failure after delete marker"):
+            await client.post(
+                f"/admin/resumes/{resume_id}/delete",
+                data={"profile_id": str(profile_id), "csrf_token": csrf_token},
+            )
+
+    assert (settings.resume_storage_path / storage_key).exists()
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, resume_id) is not None
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    assert not list(transaction_dir.glob("delete-*.json"))
 
 
 @pytest.mark.asyncio

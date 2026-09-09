@@ -39,7 +39,7 @@ from app.models.entities import (
 from app.models.enums import RunStatus, ScanType, SourceHealth
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
-from app.profiles.service import ResumeInUseError
+from app.profiles.service import ResumeDeletion, ResumeInUseError
 from app.security.auth import SessionSigner
 from app.settings import get_settings
 
@@ -303,8 +303,11 @@ async def upload_resume(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
+        # Roll back only this request's own in-flight upload (marker + file);
+        # a no-op when upload() failed before writing its marker.
         with contextlib.suppress(Exception):
-            await resume_service.reconcile_file_transactions(session)
+            if resume_service._last_upload_key is not None:
+                resume_service.abort_pending_upload(resume_service._last_upload_key)
         raise
     resume_service.finalize_upload(resume)
     return {"id": resume.id, "sha256": resume.sha256, "verified": resume.verified}
@@ -364,6 +367,7 @@ async def delete_resume_endpoint(
 ) -> dict[str, Any]:
     settings = get_settings()
     resume_service = ResumeService(settings)
+    deletion: ResumeDeletion | None = None
     try:
         deletion = await resume_service.delete(session, resume_id)
         await record_audit_event(
@@ -377,7 +381,7 @@ async def delete_resume_endpoint(
         )
         await session.commit()
     # LookupError / ResumeInUseError are raised by ResumeService.delete before any
-    # transaction marker is written, so these paths need no rollback/reconcile.
+    # transaction marker is written, so these paths need no rollback/cleanup.
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:
@@ -385,8 +389,11 @@ async def delete_resume_endpoint(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
+        # The rollback restored the Resume row and its file; drop only the
+        # marker this request wrote (never touch the file).
         with contextlib.suppress(Exception):
-            await resume_service.reconcile_file_transactions(session)
+            if deletion is not None:
+                resume_service.abort_pending_delete(deletion)
         raise
     resume_service.finalize_delete(deletion)
     return {"id": resume_id, "deleted": True}

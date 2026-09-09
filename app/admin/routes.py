@@ -79,7 +79,7 @@ from app.models.enums import (
 )
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
-from app.profiles.service import ResumeInUseError
+from app.profiles.service import ResumeDeletion, ResumeInUseError
 from app.security.auth import CsrfProtector, SessionSigner, verify_password
 from app.security.files import (
     UnsafeResumeError,
@@ -1572,8 +1572,12 @@ async def create_profile(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
+        # Targeted rollback of this request's own in-flight upload: its Resume
+        # row is gone with the rollback above, so drop the marker and the file
+        # it wrote. A no-op when no marker was written (profile row failed first).
         with contextlib.suppress(Exception):
-            await resume_service.reconcile_file_transactions(session)
+            if has_resume and resume_service._last_upload_key is not None:
+                resume_service.abort_pending_upload(resume_service._last_upload_key)
         raise
     if resume is not None:
         resume_service.finalize_upload(resume)
@@ -1748,8 +1752,11 @@ async def admin_upload_resume(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
+        # Roll back only this request's own in-flight upload (marker + file);
+        # a no-op when upload() failed before writing its marker.
         with contextlib.suppress(Exception):
-            await resume_service.reconcile_file_transactions(session)
+            if resume_service._last_upload_key is not None:
+                resume_service.abort_pending_upload(resume_service._last_upload_key)
         raise
     resume_service.finalize_upload(resume)
     return RedirectResponse(
@@ -1892,6 +1899,7 @@ async def admin_delete_resume(
     _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
     settings = get_settings()
     resume_service = ResumeService(settings)
+    deletion: ResumeDeletion | None = None
     try:
         deletion = await resume_service.delete(session, resume_id)
         await _audit_admin(
@@ -1903,7 +1911,7 @@ async def admin_delete_resume(
         )
         await session.commit()
     # LookupError / ResumeInUseError are raised by ResumeService.delete before any
-    # transaction marker is written, so these paths need no rollback/reconcile.
+    # transaction marker is written, so these paths need no rollback/cleanup.
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:
@@ -1911,8 +1919,11 @@ async def admin_delete_resume(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
+        # The rollback restored the Resume row and its file; drop only the
+        # marker this request wrote (never touch the file).
         with contextlib.suppress(Exception):
-            await resume_service.reconcile_file_transactions(session)
+            if deletion is not None:
+                resume_service.abort_pending_delete(deletion)
         raise
     resume_service.finalize_delete(deletion)
     return RedirectResponse(

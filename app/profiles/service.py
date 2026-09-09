@@ -32,12 +32,22 @@ from app.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
-# A file-transaction marker younger than this may belong to a request that is
-# still running in another worker: it has written the marker and the physical
-# file but has not yet committed (or rolled back) its Resume row. Reconcile skips
-# such markers so it never deletes a live upload's file or strands an in-flight
-# delete. 60s is comfortably longer than any single upload/delete request.
+# Every file-transaction marker records the nonce of the ``api`` process that
+# wrote it (see ``_PROCESS_NONCE``); ``reconcile_file_transactions`` branches on
+# that identity, not on marker age. This grace window now only backstops the two
+# residual cases with no usable owner: the ``.tmp`` sweep (a torn ``_write_marker``
+# write has no readable owner) and the unsupported multi-``api``-replica
+# deployment (a live peer's marker would otherwise look like a dead
+# predecessor's). 60s is comfortably longer than any single upload/delete request.
 RESUME_TRANSACTION_GRACE_SECONDS = 60
+
+# Regenerated on every import, i.e. once per ``api`` process. Written into every
+# transaction marker so a later reconcile can tell "this same live process wrote
+# it" (a request may still be in flight -- leave its file alone) from "a
+# previous, now-dead process wrote it" (a crashed predecessor -- reconcile it
+# immediately). Relies on the single-writer invariant documented on
+# ``reconcile_file_transactions``.
+_PROCESS_NONCE = uuid4().hex
 
 
 @dataclass(frozen=True)
@@ -216,6 +226,12 @@ class ResumeService:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # Set by ``upload`` right before it writes its marker, so a failing
+        # request's ``except`` path can roll back exactly the storage key this
+        # call used -- ``validate_resume_upload`` mints a fresh uuid-prefixed
+        # name the handler cannot recompute. One ``ResumeService`` is built per
+        # request, so this never leaks between requests.
+        self._last_upload_key: str | None = None
 
     def _transaction_dir(self) -> Path:
         # Pure path computation, no side effect: only _write_marker needs the
@@ -230,7 +246,10 @@ class ResumeService:
         self._transaction_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
         marker = self._marker_path(operation, key)
         temporary = marker.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"operation": operation, **payload}), encoding="utf-8")
+        temporary.write_text(
+            json.dumps({"operation": operation, "owner": _PROCESS_NONCE, **payload}),
+            encoding="utf-8",
+        )
         temporary.chmod(0o600)
         temporary.replace(marker)
         return marker
@@ -271,26 +290,41 @@ class ResumeService:
         marker while keeping its file, or keep a marker whose file was already
         written.
 
-        Markers younger than ``RESUME_TRANSACTION_GRACE_SECONDS`` are skipped
-        entirely: they may belong to a request still in flight in another worker
-        that has written the marker and the file but not yet committed (or rolled
-        back) its ``Resume`` row.
+        Single-writer assumption: the ``api`` container is the only writer;
+        ``worker``/``beat`` mount the volume read-only. Running multiple ``api``
+        replicas against one resume volume is unsupported without a
+        process-liveness registry.
+
+        Each marker records the ``owner`` nonce of the ``api`` process that wrote
+        it, and reconcile branches on that identity rather than on marker age:
+
+        * ``owner == _PROCESS_NONCE`` -- this same live process wrote it, so a
+          matching request may still be in flight. Only a marker whose outcome
+          is already settled in the database is tidied, and the physical file is
+          never touched (this is what makes a slow ``upload`` racing a reconcile
+          safe).
+        * a foreign or missing ``owner`` -- a previous, now-dead ``api`` process
+          wrote it (the single-writer invariant makes it a crashed predecessor;
+          a missing ``owner`` is a pre-fix marker, also a predecessor once this
+          build is deployed). It is reconciled in full immediately -- unlink the
+          file when no row references it, then drop the marker -- with no age
+          gate, so a fast container restart recovers the orphan at once.
+
+        ``RESUME_TRANSACTION_GRACE_SECONDS`` no longer gates this ``*.json`` hot
+        path; it is now only a fallback for the ``.tmp`` sweep below and for the
+        unsupported multi-``api``-replica deployment.
         """
         transaction_dir = self.settings.resume_storage_path / self._TRANSACTION_DIR
         if not transaction_dir.is_dir():
             return
         for marker in transaction_dir.glob("*.json"):
             try:
-                age_seconds = time.time() - marker.stat().st_mtime
-            except OSError:
-                # A concurrent finalize_* removed the marker between glob and stat.
-                continue
-            if age_seconds < RESUME_TRANSACTION_GRACE_SECONDS:
-                continue
-            try:
                 payload = json.loads(marker.read_text(encoding="utf-8"))
                 operation = str(payload["operation"])
                 storage_key = str(payload["storage_key"])
+            except FileNotFoundError:
+                # A concurrent finalize_* removed the marker between glob and read.
+                continue
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 logger.error(
                     "resume_transaction_marker_invalid",
@@ -299,10 +333,20 @@ class ResumeService:
                 )
                 continue
 
+            # A marker this live process wrote may still have a request behind
+            # it: only clear it once its DB outcome is settled, and never unlink
+            # its file. A foreign/missing owner is a crashed predecessor -- run
+            # the full rollback now.
+            own_marker = payload.get("owner") == _PROCESS_NONCE
+
             if operation == "upload":
                 persisted = await session.scalar(
                     select(Resume.id).where(Resume.storage_key == storage_key).limit(1)
                 )
+                if own_marker:
+                    if persisted is not None:
+                        self._remove_marker(marker)
+                    continue
                 if persisted is not None or self._unlink_storage_key(storage_key):
                     self._remove_marker(marker)
                 continue
@@ -316,6 +360,10 @@ class ResumeService:
                 persisted = await session.scalar(
                     select(Resume.id).where(Resume.id == resume_id).limit(1)
                 )
+                if own_marker:
+                    if persisted is None:
+                        self._remove_marker(marker)
+                    continue
                 if persisted is not None or self._unlink_storage_key(
                     storage_key, resume_id=resume_id
                 ):
@@ -330,7 +378,10 @@ class ResumeService:
 
         # A crash between ``write_text`` and ``os.replace`` in _write_marker
         # leaves a ``.tmp`` that the ``*.json`` sweep never sees; upload keys are
-        # uuid-prefixed so these would otherwise accumulate unbounded.
+        # uuid-prefixed so these would otherwise accumulate unbounded. A torn
+        # write has no readable owner, so this is the one path still gated on
+        # ``RESUME_TRANSACTION_GRACE_SECONDS`` to avoid racing an in-progress
+        # ``_write_marker``.
         for stale_tmp in transaction_dir.glob("*.tmp"):
             try:
                 age_seconds = time.time() - stale_tmp.stat().st_mtime
@@ -359,6 +410,22 @@ class ResumeService:
         self._remove_marker(marker)
         return True
 
+    def abort_pending_upload(self, storage_key: str) -> None:
+        """Roll back this process's in-flight upload: drop its marker and the file it wrote.
+
+        Safe only for the owning request, whose ``Resume`` row was rolled back.
+        """
+        self._unlink_storage_key(storage_key)
+        self._remove_marker(self._marker_path("upload", storage_key))
+
+    def abort_pending_delete(self, deletion: ResumeDeletion) -> None:
+        """Roll back this process's in-flight delete: drop its marker only.
+
+        The ``Resume`` row (and its file) survived the rollback, so the file is
+        NOT touched.
+        """
+        self._remove_marker(self._marker_path("delete", str(deletion.resume_id)))
+
     async def upload(
         self,
         session: AsyncSession,
@@ -380,6 +447,9 @@ class ResumeService:
         if existing is not None:
             return existing
         self.settings.resume_storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Record the key before the marker exists so a failing request can abort
+        # this exact upload even if _write_marker itself is where it fails.
+        self._last_upload_key = validated.safe_filename
         self._write_marker(
             "upload",
             key=validated.safe_filename,
