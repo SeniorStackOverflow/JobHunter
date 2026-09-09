@@ -50,6 +50,20 @@ class OneTimeDetailFailureFetcher(FixtureSiteFetcher):
         return await super().get(url)
 
 
+class MissingAfterFailureFetcher(FixtureSiteFetcher):
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        super().__init__(client)
+        self.failed = False
+
+    async def get(self, url: str, **_kwargs: object) -> httpx.Response:
+        if httpx.URL(url).path.endswith("/job/courier"):
+            if not self.failed:
+                self.failed = True
+                raise httpx.ReadTimeout("temporary detail timeout")
+            return httpx.Response(404, request=httpx.Request("GET", url))
+        return await super().get(url)
+
+
 class SelectiveAbsenceFetcher(FixtureSiteFetcher):
     def __init__(self, client: httpx.AsyncClient) -> None:
         super().__init__(client)
@@ -363,6 +377,42 @@ async def test_failed_detail_is_retried_from_checkpoint_without_data_loss(
             ).all()
         )
     assert ids == {f"fx-{index:03d}" for index in range(1, 10)} | {"fx-011"}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_pending_reference_retry_resolves_missing_detail(
+    fixture_site_client: httpx.AsyncClient,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    fetcher = MissingAfterFailureFetcher(fixture_site_client)
+    service = ScanService(
+        sqlite_session_factory,
+        build_default_registry(client_factory=lambda _source: fetcher),
+    )
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Missing retry fixture"),
+    )
+
+    interrupted = await run_full_scan(service, source_id)
+    assert interrupted.status == RunStatus.PARTIAL
+    state = interrupted.checkpoint["adapter_state"]
+    assert state["failed_reference_attempts"] == {"fx-002": 1}
+    assert state["failed_references"]["fx-002"]["external_id"] == "fx-002"
+
+    resumed_queued = await service.create_scan(
+        source_id,
+        ScanType.FULL,
+        resume_scan_id=interrupted.id,
+    )
+    resumed = await service.run_scan(resumed_queued.id)
+
+    assert resumed.status == RunStatus.SUCCEEDED
+    assert resumed.checkpoint["adapter_state"]["failed_reference_attempts"] == {}
+    assert resumed.checkpoint["adapter_state"]["failed_references"] == {}
+    assert resumed.diagnostics["resolved_missing_references"] == ["fx-002"]
 
 
 @pytest.mark.integration

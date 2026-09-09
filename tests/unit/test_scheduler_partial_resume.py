@@ -8,6 +8,7 @@ from app.crawlers.pipeline import (
     _completed_scan_status,
     _safe_scan_error_reason,
     scan_has_pending_reference_failures,
+    scan_resume_is_stalled,
 )
 from app.crawlers.schemas import ScanCheckpoint
 from app.models.entities import ScanRun
@@ -44,6 +45,46 @@ def test_pending_reference_failure_forces_partial_completion() -> None:
         checkpoint={"adapter_state": {"failed_reference_attempts": {"120561": 1}}},
     )
     assert _completed_scan_status(run) == RunStatus.PARTIAL
+
+
+def test_legacy_resume_with_no_progress_is_stalled() -> None:
+    run = ScanRun(
+        source_id=uuid4(),
+        scan_type=ScanType.INCREMENTAL,
+        status=RunStatus.PARTIAL,
+        found_jobs=0,
+        parsing_errors=0,
+        network_errors=0,
+        checkpoint={
+            "entrypoint_index": 3,
+            "page_url": None,
+            "completed_entrypoints": ["one", "two", "three"],
+            "adapter_state": {"failed_reference_attempts": {"143175": 1}},
+        },
+        diagnostics={"resume_parent_scan_id": str(uuid4())},
+    )
+    assert scan_resume_is_stalled(run) is True
+
+
+def test_resume_depth_increments_from_parent() -> None:
+    previous_diagnostics = {"resume_depth": 3}
+    previous_depth = previous_diagnostics.get("resume_depth")
+    resume_depth = (
+        previous_depth + 1 if isinstance(previous_depth, int) and previous_depth >= 1 else 1
+    )
+    assert resume_depth == 4
+
+
+def test_resume_with_retry_progress_is_not_stalled() -> None:
+    run = ScanRun(
+        source_id=uuid4(),
+        scan_type=ScanType.INCREMENTAL,
+        status=RunStatus.PARTIAL,
+        found_jobs=1,
+        checkpoint={"adapter_state": {"failed_reference_attempts": {"143175": 1}}},
+        diagnostics={"resume_parent_scan_id": str(uuid4())},
+    )
+    assert scan_resume_is_stalled(run) is False
 
 
 def test_checkpoint_merge_does_not_resurrect_pending_failed_reference() -> None:

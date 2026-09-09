@@ -125,6 +125,32 @@ def scan_is_resume(run: ScanRun) -> bool:
     return isinstance(diagnostics.get("resume_parent_scan_id"), str)
 
 
+def scan_resume_is_stalled(run: ScanRun) -> bool:
+    """Return True when an automatic resume made no observable retry progress."""
+    return (
+        scan_is_resume(run)
+        and run.found_jobs == 0
+        and run.parsing_errors == 0
+        and run.network_errors == 0
+        and scan_has_pending_reference_failures(run)
+    )
+
+
+def _missing_pending_reference(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {404, 410}
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "returned http 404",
+            "returned http 410",
+            "status code 404",
+            "status code 410",
+        )
+    )
+
+
 def _completed_scan_status(run: ScanRun) -> RunStatus:
     if run.parsing_errors > 0 or scan_has_pending_reference_failures(run):
         return RunStatus.PARTIAL
@@ -233,11 +259,18 @@ class ScanService:
                     previous.diagnostics if isinstance(previous.diagnostics, dict) else {}
                 )
                 root_scan_id = previous_diagnostics.get("resume_root_scan_id")
+                previous_depth = previous_diagnostics.get("resume_depth")
+                resume_depth = (
+                    previous_depth + 1
+                    if isinstance(previous_depth, int) and previous_depth >= 1
+                    else 1
+                )
                 diagnostics = {
                     "resume_parent_scan_id": str(previous.id),
                     "resume_root_scan_id": (
                         root_scan_id if isinstance(root_scan_id, str) else str(previous.id)
                     ),
+                    "resume_depth": resume_depth,
                 }
 
             run = ScanRun(
@@ -370,13 +403,29 @@ class ScanService:
                 if run.scan_type == ScanType.FULL
                 else adapter.iterate_incremental_scan(checkpoint)
             )
+
+            async def references_with_pending_retries():
+                for pending in self._pending_reference_retries(checkpoint):
+                    retry_checkpoint = checkpoint.model_copy(deep=True)
+                    if pending.external_id not in retry_checkpoint.yielded_external_ids:
+                        retry_checkpoint.yielded_external_ids.append(pending.external_id)
+                    pending.metadata = {
+                        **pending.metadata,
+                        "pending_reference_retry": True,
+                        "scan_checkpoint": retry_checkpoint.model_dump(mode="json"),
+                    }
+                    yield pending
+                async for discovered in iterator:
+                    yield discovered
+
+            references = references_with_pending_retries()
             # IDs already committed by a resumed scan are metadata-only duplicates. This avoids
             # refetching their detail pages while still allowing later category/locale merges.
             processed_ids: set[str] = set(checkpoint.yielded_external_ids)
             observed_pages: set[str] = set()
             forced_degradation_reason: str | None = None
             try:
-                async for reference in iterator:
+                async for reference in references:
                     if reference.discovery_url and reference.discovery_url not in observed_pages:
                         observed_pages.add(reference.discovery_url)
                         run.scanned_pages += 1
@@ -405,6 +454,22 @@ class ScanService:
                         await self._save_checkpoint(session, run, reference, succeeded=True)
                         await session.commit()
                     except Exception as exc:
+                        if reference.metadata.get(
+                            "pending_reference_retry"
+                        ) is True and _missing_pending_reference(exc):
+                            diagnostics = dict(run.diagnostics)
+                            resolved = list(diagnostics.get("resolved_missing_references", []))
+                            resolved.append(reference.external_id)
+                            diagnostics["resolved_missing_references"] = resolved[-20:]
+                            run.diagnostics = diagnostics
+                            await self._save_checkpoint(
+                                session,
+                                run,
+                                reference,
+                                succeeded=True,
+                            )
+                            await session.commit()
+                            continue
                         run.parsing_errors += 1
                         diagnostics = dict(run.diagnostics)
                         errors = list(diagnostics.get("errors", []))
@@ -566,6 +631,38 @@ class ScanService:
         }
         return checkpoint
 
+    @staticmethod
+    def _pending_reference_retries(checkpoint: ScanCheckpoint) -> list[RawJobReference]:
+        raw_failures = checkpoint.adapter_state.get("failed_reference_attempts", {})
+        failures = raw_failures if isinstance(raw_failures, dict) else {}
+        raw_references = checkpoint.adapter_state.get("failed_references", {})
+        references = raw_references if isinstance(raw_references, dict) else {}
+        pending: list[RawJobReference] = []
+        for external_id, attempts in failures.items():
+            if not isinstance(external_id, str) or not isinstance(attempts, int) or attempts <= 0:
+                continue
+            payload = references.get(external_id)
+            if not isinstance(payload, dict):
+                continue
+            try:
+                reference = RawJobReference.model_validate(payload)
+            except (TypeError, ValueError):
+                continue
+            if reference.external_id == external_id:
+                pending.append(reference)
+        return pending
+
+    @staticmethod
+    def _failed_reference_payload(reference: RawJobReference) -> dict[str, Any]:
+        payload = reference.model_dump(mode="json")
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            metadata.pop("scan_checkpoint", None)
+            metadata.pop("pending_reference_retry", None)
+            payload["metadata"] = metadata
+        return payload
+
     async def _save_checkpoint(
         self,
         session: AsyncSession,
@@ -581,8 +678,11 @@ class ScanService:
             persisted = ScanCheckpoint.model_validate(run.checkpoint or {})
             raw_failures = persisted.adapter_state.get("failed_reference_attempts", {})
             failures = dict(raw_failures) if isinstance(raw_failures, dict) else {}
+            raw_references = persisted.adapter_state.get("failed_references", {})
+            failed_references = dict(raw_references) if isinstance(raw_references, dict) else {}
             if succeeded:
                 failures.pop(reference.external_id, None)
+                failed_references.pop(reference.external_id, None)
             else:
                 checkpoint.yielded_external_ids = [
                     value
@@ -592,10 +692,12 @@ class ScanService:
                 previous = failures.get(reference.external_id, 0)
                 failure_count = (previous if isinstance(previous, int) else 0) + 1
                 failures[reference.external_id] = failure_count
+                failed_references[reference.external_id] = self._failed_reference_payload(reference)
             checkpoint.adapter_state = {
                 **persisted.adapter_state,
                 **checkpoint.adapter_state,
                 "failed_reference_attempts": failures,
+                "failed_references": failed_references,
             }
             run.checkpoint = checkpoint.model_dump(mode="json")
         await session.flush()
@@ -624,12 +726,11 @@ class ScanService:
         # still hold the checkpoint object it received when the scan started, so allowing
         # that stale copy to win here would resurrect a failure that a resumed scan has
         # already retried successfully.
-        if "failed_reference_attempts" in persisted.adapter_state:
-            progressed.adapter_state["failed_reference_attempts"] = persisted.adapter_state[
-                "failed_reference_attempts"
-            ]
-        else:
-            progressed.adapter_state.pop("failed_reference_attempts", None)
+        for key in ("failed_reference_attempts", "failed_references"):
+            if key in persisted.adapter_state:
+                progressed.adapter_state[key] = persisted.adapter_state[key]
+            else:
+                progressed.adapter_state.pop(key, None)
         failures = progressed.adapter_state.get("failed_reference_attempts", {})
         failed_ids = (
             {k for k, v in failures.items() if isinstance(k, str) and isinstance(v, int) and v > 0}

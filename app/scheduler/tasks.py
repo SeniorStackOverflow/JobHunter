@@ -14,7 +14,11 @@ from celery.schedules import crontab
 from redis import Redis
 from sqlalchemy import select
 
-from app.crawlers.pipeline import ScanService, scan_has_pending_reference_failures
+from app.crawlers.pipeline import (
+    ScanService,
+    scan_has_pending_reference_failures,
+    scan_resume_is_stalled,
+)
 from app.crawlers.registry import build_default_registry
 from app.database import async_session_factory
 from app.models.entities import JobSource, ScanRun
@@ -32,6 +36,8 @@ from app.settings import get_settings
 
 logger = structlog.get_logger(__name__)
 _task_event_loop: asyncio.AbstractEventLoop | None = None
+
+MAX_AUTO_RESUME_DEPTH = 5
 
 DEFAULT_SOURCE_SCHEDULES = {
     "incremental": "0 */2 * * *",
@@ -325,6 +331,12 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
             run.status == RunStatus.PARTIAL
             and health == SourceHealth.HEALTHY
             and scan_has_pending_reference_failures(run)
+            and not scan_resume_is_stalled(run)
+            and (
+                not isinstance(run.diagnostics, dict)
+                or not isinstance(run.diagnostics.get("resume_depth"), int)
+                or run.diagnostics["resume_depth"] < MAX_AUTO_RESUME_DEPTH
+            )
         ):
             resumed = _run_async(
                 _scan_service().create_scan(
