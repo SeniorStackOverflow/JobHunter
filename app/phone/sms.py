@@ -1011,37 +1011,42 @@ async def _persist_message(
     profile: UserProfile,
     message: PhoneSmsMessage,
     settings: Settings,
+    existing: CommunicationSession | None = None,
 ) -> tuple[CommunicationSession, bool]:
     occurred_at = _validate_message_timestamp(message)
-    normalized_number = normalize_e164(message.address, region=settings.phone_caller_region)
-    sms_session = CommunicationSession(
-        profile_id=profile.id,
-        channel=CommunicationChannel.SMS,
-        transport="phonegate",
-        direction=CommunicationDirection.INBOUND,
-        remote_address=normalized_number or "",
-        remote_raw=message.address,
-        phonegate_event_id_start=None,
-        transport_external_id=message.id,
-        started_at=occurred_at,
-        ended_at=occurred_at,
-    )
-    try:
-        # Keep the external-ID conflict in its own savepoint. Other integrity
-        # failures must not be mistaken for a duplicate message.
-        async with db.begin_nested():
-            db.add(sms_session)
-            await db.flush()
-    except IntegrityError as exc:
-        if not _is_sms_external_id_conflict(exc):
-            raise
-        existing = await _existing_sms(db, external_id=message.id)
-        if existing is None:
-            raise
+    if existing is not None:
         sms_session = existing
         duplicate = True
     else:
-        duplicate = False
+        normalized_number = normalize_e164(message.address, region=settings.phone_caller_region)
+        sms_session = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.SMS,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address=normalized_number or "",
+            remote_raw=message.address,
+            phonegate_event_id_start=None,
+            transport_external_id=message.id,
+            started_at=occurred_at,
+            ended_at=occurred_at,
+        )
+        try:
+            # The unique constraint is only a race-condition fallback. Ordinary
+            # replay is prefetched so PostgreSQL does not log expected duplicates.
+            async with db.begin_nested():
+                db.add(sms_session)
+                await db.flush()
+        except IntegrityError as exc:
+            if not _is_sms_external_id_conflict(exc):
+                raise
+            raced = await _existing_sms(db, external_id=message.id)
+            if raced is None:
+                raise
+            sms_session = raced
+            duplicate = True
+        else:
+            duplicate = False
     try:
         async with db.begin_nested():
             await _ensure_turn(
@@ -1147,17 +1152,43 @@ async def _ingest_with_client(
         profile = await _profile_for_sms(db)
         if profile is None:
             raise PhoneSmsProfileUnavailable("No local profile is available for SMS import")
-        # End the read-only profile lookup before concurrent SQLite writers
-        # begin. This avoids two read transactions attempting an impossible
-        # lock upgrade; the external-ID constraint still arbitrates the race.
+        incoming_messages = [
+            message for message in page.messages if message.direction == "incoming"
+        ]
+        existing_sms_by_id: dict[str, CommunicationSession] = {}
+        if incoming_messages:
+            external_ids = {message.id for message in incoming_messages}
+            existing_sessions = list(
+                (
+                    await db.scalars(
+                        select(CommunicationSession).where(
+                            CommunicationSession.transport == "phonegate",
+                            CommunicationSession.channel == CommunicationChannel.SMS,
+                            CommunicationSession.transport_external_id.in_(external_ids),
+                        )
+                    )
+                ).all()
+            )
+            existing_sms_by_id = {
+                session.transport_external_id: session
+                for session in existing_sessions
+                if session.transport_external_id is not None
+            }
+        # End the read-only lookup transaction before concurrent SQLite writers
+        # begin. The unique constraint still arbitrates a true race.
         await db.commit()
         for message in page.messages:
             if message.direction != "incoming":
                 result["outgoing_ignored"] += 1
                 continue
             sms_session, duplicate = await _persist_message(
-                db, profile=profile, message=message, settings=settings
+                db,
+                profile=profile,
+                message=message,
+                settings=settings,
+                existing=existing_sms_by_id.get(message.id),
             )
+            existing_sms_by_id[message.id] = sms_session
             if duplicate:
                 result["duplicates"] += 1
             else:

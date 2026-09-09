@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import app.phone.sms as sms_module
 from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
 from app.models.enums import (
     CallFactState,
@@ -180,6 +181,28 @@ async def test_ingest_persists_one_inbound_sms_and_is_idempotent(
     assert turns[0].seq == 1
     assert turns[0].speaker is TurnSpeaker.EMPLOYER
     assert turns[0].phonegate_transcript_id is None
+
+
+@pytest.mark.asyncio
+async def test_reingest_prefetches_existing_sms_without_unique_conflict(
+    sqlite_session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    async with sqlite_session_factory() as db:
+        db.add(profile)
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="prefetched", timestamp=1_720_000_000_000)])
+
+    first = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    def unexpected_conflict(_exc: object) -> bool:
+        raise AssertionError("ordinary SMS replay reached the unique-conflict fallback")
+
+    monkeypatch.setattr(sms_module, "_is_sms_external_id_conflict", unexpected_conflict)
+    second = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    assert first["imported"] == 1
+    assert second["duplicates"] == 1
 
 
 @pytest.mark.asyncio

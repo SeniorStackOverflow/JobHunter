@@ -145,18 +145,22 @@ def test_backup_keeps_dev_postgres_fallback(tmp_path: Path) -> None:
     }
     env.pop("MIGRATOR_DATABASE_URL", None)
 
-    result = subprocess.run(  # noqa: S603 - test controls the temporary script path
-        ["/bin/sh", str(script)],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(  # noqa: S603 - test controls the temporary script path
+            ["/bin/sh", str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
-    assert result.returncode == 0, result.stderr
-    args = args_file.read_text(encoding="utf-8")
-    assert "--host=postgres" in args
-    assert "--username=dev_user" in args
-    assert "--dbname=dev_db" in args
-    assert "dev-password" not in result.stdout + result.stderr
-    assert f"Backup created: {backup_dir}/job-agent-dev_db-" in result.stdout
+        assert result.returncode == 0, result.stderr
+        args = args_file.read_text(encoding="utf-8")
+        assert "--host=postgres" in args
+        assert "--username=dev_user" in args
+        assert "--dbname=dev_db" in args
+        assert "dev-password" not in result.stdout + result.stderr
+        assert f"Backup created: {backup_dir}/job-agent-dev_db-" in result.stdout
+    finally:
+        for dump_file in backup_dir.glob("*.dump"):
+            dump_file.unlink(missing_ok=True)
