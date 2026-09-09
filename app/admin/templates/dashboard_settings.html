@@ -42,18 +42,87 @@
       </form>
     </div>
 
-    <details class="settings-section"><summary><span><strong>Профиль кандидата</strong><small>{{ profile.name }} · {{ profile.contact_email or 'почта не указана' }}</small></span><span>Открыть</span></summary><div class="details-body settings-body">
-      <form method="post" action="/admin/profile"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid"><label class="field">Имя<input type="text" name="name" value="{{ profile.name }}" required></label><label class="field">Email<input type="email" name="contact_email" value="{{ profile.contact_email or '' }}"></label><label class="field">Телефон<input type="text" name="phone" value="{{ profile.phone or '' }}"></label><label class="field">Город<input type="text" name="location" value="{{ profile.location or '' }}"></label><label class="field">Языки<input type="text" name="languages" value="{{ profile.languages|map(attribute='code')|join(', ') }}"></label><label class="field">Навыки<input type="text" name="skills" value="{{ profile.skills|join(', ') }}"></label></div><div class="form-actions"><button class="btn btn-primary">Сохранить профиль</button></div></form>
-      <details class="nested-details"><summary>Создать ещё один профиль</summary><form class="details-body" method="post" action="/admin/profiles"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="field">Название<input type="text" name="name" required></label><label class="switch-row"><span class="switch-copy"><strong>Сделать основным</strong></span><span class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></span></label><button class="btn">Создать профиль</button></form></details>
-    </div></details>
+    <div class="panel">
+      <div class="panel-head">
+        <div><div class="panel-title">Профиль</div><div class="panel-subtitle">{{ profile.name }} · {{ profile.contact_email or 'почта не указана' }}</div></div>
+        <details class="inline-create"><summary class="btn btn-sm">＋ Новый профиль</summary>
+          <form class="details-body" method="post" action="/admin/profiles" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-grid">
+              <label class="field">Название<input type="text" name="name" required></label>
+              <label class="switch-row"><span class="switch-copy"><strong>Сделать основным</strong></span><span class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></span></label>
+            </div>
+            <div class="form-grid">
+              <label class="field">Резюме — название<input type="text" name="resume_name"></label>
+              <label class="field">Резюме — категория<input type="text" name="resume_category"></label>
+              <label class="field full">Резюме — PDF (необязательно)<input type="file" name="resume_file" accept="application/pdf,.pdf"></label>
+            </div>
+            <button class="btn btn-primary">Создать профиль</button>
+          </form>
+        </details>
+      </div>
+      <form method="post" action="/admin/profile" class="panel-pad">
+        <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="form-grid">
+          <label class="field">Имя<input type="text" name="name" value="{{ profile.name }}" required></label>
+          <label class="field">Email<input type="email" name="contact_email" value="{{ profile.contact_email or '' }}"><span class="field-help">Попадёт в подпись письма работодателю</span></label>
+          <label class="field">Телефон<input type="text" name="phone" value="{{ profile.phone or '' }}"><span class="field-help">Попадёт в подпись письма — сюда сможет перезвонить HR</span></label>
+          <label class="field">Город<input type="text" name="location" value="{{ profile.location or '' }}"></label>
+          <label class="field">Языки<input type="text" name="languages" value="{{ profile.languages|map(attribute='code')|join(', ') }}"><span class="field-help">Через запятую</span></label>
+          <label class="field">Навыки<input type="text" name="skills" value="{{ profile.skills|join(', ') }}"><span class="field-help">Через запятую</span></label>
+        </div>
+        <div class="form-actions"><button class="btn btn-primary">Сохранить профиль</button></div>
+      </form>
+      <div class="panel-pad">
+        <div class="panel-subtitle">Резюме этого профиля</div>
+        <div class="compact-list">
+          {% for item in resumes %}
+          <div class="compact-row">
+            <div>
+              <strong>{{ item.name }}{% if item.is_default %} · основное{% endif %}</strong>
+              <span>{{ item.category }} · {{ item.original_filename }}</span>
+            </div>
+            <div class="row-actions">
+              {% if item.verified and item.active %}<span class="badge success">Подтверждено</span>
+              {% elif item.verified and not item.active %}<span class="badge muted">Неактивно</span>
+              {% else %}<span class="badge warning">Проверьте</span>{% endif %}
+              {% if not item.storage_key.startswith('pending/') %}<a class="btn btn-sm" href="/admin/resumes/{{ item.id }}/file?profile_id={{ selected_profile_id }}" target="_blank" rel="noopener">Открыть</a>{% endif %}
+              {% if not item.verified %}<form method="post" action="/admin/resumes/{{ item.id }}/verify"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Подтвердить</button></form>{% endif %}
+              {% if item.active %}<form method="post" action="/admin/resumes/{{ item.id }}/deactivate" data-confirm-title="Деактивировать резюме?" data-confirm="Оно перестанет использоваться для новых откликов. Активировать можно обратно." data-confirm-action="Деактивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Деактивировать</button></form>
+              {% else %}<form method="post" action="/admin/resumes/{{ item.id }}/activate"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Активировать</button></form>{% endif %}
+              {% if not resume_usage.get(item.id) %}<form method="post" action="/admin/resumes/{{ item.id }}/delete" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>{% endif %}
+            </div>
+          </div>
+          {% else %}<div class="empty-state compact">Резюме ещё не загружены.</div>{% endfor %}
+        </div>
+        <form class="compact-add" method="post" action="/admin/resumes" enctype="multipart/form-data">
+          <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="text" name="name" placeholder="Название" required>
+          <input type="text" name="category" placeholder="Категория" required>
+          <input type="file" name="file" accept="application/pdf,.pdf" required>
+          <label class="switch-inline"><input type="checkbox" name="make_default"> основное</label>
+          <button class="btn btn-sm btn-primary">Загрузить</button>
+        </form>
+      </div>
+    </div>
 
-    <details class="settings-section"><summary><span><strong>Резюме</strong><small>{{ resumes|length }} сохранено</small></span><span>Открыть</span></summary><div class="details-body settings-body">
-      <div class="compact-list">{% for item in resumes %}<div class="compact-row"><div><strong>{{ item.name }}{% if item.is_default %} · основное{% endif %}</strong><span>{{ item.category }} · {{ item.original_filename }}</span></div>{% if item.verified and item.active %}<span class="badge success">Подтверждено</span>{% elif not item.verified %}<form method="post" action="/admin/resumes/{{ item.id }}/verify"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Подтвердить</button></form>{% else %}<span class="badge muted">Неактивно</span>{% endif %}</div>{% else %}<div class="empty-state compact">Резюме ещё не загружены.</div>{% endfor %}</div>
-      <details class="nested-details"><summary>Загрузить новое резюме</summary><form class="details-body" method="post" action="/admin/resumes" enctype="multipart/form-data"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid"><label class="field">Название<input type="text" name="name" required></label><label class="field">Категория<input type="text" name="category" required></label><label class="field full">PDF-файл<input type="file" name="file" accept="application/pdf,.pdf" required></label><label class="switch-row full"><span class="switch-copy"><strong>Сделать основным</strong></span><span class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></span></label></div><button class="btn btn-primary">Загрузить PDF</button></form></details>
+    <details class="settings-section"><summary><span><strong>Источники вакансий</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} включённых работают штатно</small></span><span>Открыть</span></summary><div class="details-body settings-body">
+      <div class="compact-list">
+        {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}
+        <div class="compact-row">
+          <div>
+            <strong>{% if source_link %}<a href="{{ source_link }}" rel="noreferrer" target="_blank">{{ item.name }} ↗</a>{% else %}{{ item.name }}{% endif %}</strong>
+            <span>{{ item.adapter_type }}</span>
+          </div>
+          <div class="row-actions">
+            <span class="badge {{ status_tone(item.health_status) }}">{{ status_label(item.health_status) }}</span>
+            <span class="badge {{ 'success' if item.enabled else 'muted' }}">{{ 'Включён' if item.enabled else 'Выключен' }}</span>
+            <form method="post" action="/admin/sources/{{ item.id }}/toggle" data-confirm-title="{{ 'Выключить источник?' if item.enabled else 'Включить источник?' }}" data-confirm="{{ item.name }}: {{ 'новые обходы остановятся, уже собранные вакансии сохранятся.' if item.enabled else 'JobHunter начнёт обход по настроенному расписанию.' }}" data-confirm-action="{{ 'Выключить' if item.enabled else 'Включить' }}" data-confirm-tone="{{ 'danger' if item.enabled else 'default' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm {{ 'btn-danger' if item.enabled else '' }}">{{ 'Выключить' if item.enabled else 'Включить' }}</button></form>
+            {% if item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Обновить сейчас</button></form>{% endif %}
+          </div>
+        </div>
+        {% else %}<div class="empty-state compact">Источники ещё не настроены.</div>{% endfor %}
+      </div>
     </div></details>
-
-    <details class="settings-section"><summary><span><strong>Источники вакансий</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} включённых работают штатно</small></span><span>Открыть</span></summary><div class="details-body settings-body"><div class="source-list">
-      {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}<div class="source-card"><div class="source-main"><h3>{% if source_link %}<a href="{{ source_link }}" rel="noreferrer" target="_blank">{{ item.name }} ↗</a>{% else %}{{ item.name }}{% endif %}</h3><div class="source-meta"><span class="badge {{ status_tone(item.health_status) }}">{{ status_label(item.health_status) }}</span><span class="badge {{ 'success' if item.enabled else 'muted' }}">{{ 'Включён' if item.enabled else 'Выключен' }}</span></div></div><div class="source-actions"><form method="post" action="/admin/sources/{{ item.id }}/toggle" data-confirm-title="{{ 'Выключить источник?' if item.enabled else 'Включить источник?' }}" data-confirm="{{ item.name }}: {{ 'новые обходы остановятся, уже собранные вакансии сохранятся.' if item.enabled else 'JobHunter начнёт обход по настроенному расписанию.' }}" data-confirm-action="{{ 'Выключить' if item.enabled else 'Включить' }}" data-confirm-tone="{{ 'danger' if item.enabled else 'default' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm {{ 'btn-danger' if item.enabled else '' }}">{{ 'Выключить' if item.enabled else 'Включить' }}</button></form>{% if item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Обновить сейчас</button></form>{% endif %}</div></div>{% endfor %}
-    </div></div></details>
   </div>
 </section>

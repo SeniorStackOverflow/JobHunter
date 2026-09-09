@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -2937,3 +2939,96 @@ async def test_admin_create_profile_rejects_file_without_metadata_and_bad_pdf(
         assert (
             await session.scalar(select(UserProfile).where(UserProfile.name == "Bad pdf"))
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_settings_page_renders_unified_profile_block(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="settings-render"
+    )
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        # a second, unreferenced resume on the same profile
+        await client.post(
+            "/admin/resumes",
+            data={
+                "profile_id": str(seeded["profile_id"]),
+                "name": "Spare CV",
+                "category": "ops",
+                "csrf_token": csrf_token,
+            },
+            files={"file": ("spare.pdf", b"%PDF-1.7\nspare\n%%EOF", "application/pdf")},
+        )
+
+        page = await client.get(f"/?view=settings&profile_id={seeded['profile_id']}")
+        assert page.status_code == 200
+        html = page.text
+
+        # one Профиль block, new-profile disclosure carries a file input
+        assert 'action="/admin/profiles"' in html
+        assert 'name="resume_file"' in html
+        # per-row resume actions
+        assert f"/admin/resumes/{seeded['resume_id']}/file?profile_id=" in html
+        assert f"/admin/resumes/{seeded['resume_id']}/deactivate" in html
+        # referenced resume: no delete form
+        assert f"/admin/resumes/{seeded['resume_id']}/delete" not in html
+
+        async with sqlite_session_factory() as session:
+            spare = await session.scalar(select(Resume).where(Resume.name == "Spare CV"))
+            assert spare is not None
+            spare_id = spare.id
+        # unreferenced resume: delete form present
+        assert f"/admin/resumes/{spare_id}/delete" in html
+
+        # no nested <details> inside <details> (settings view has no <details> in
+        # its page shell — only dashboard_settings.html contributes them)
+        import re
+
+        depth = 0
+        max_depth = 0
+        for token in re.findall(r"<details|</details>", html):
+            depth += 1 if token == "<details" else -1
+            max_depth = max(max_depth, depth)
+        assert max_depth <= 1
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_PLAYWRIGHT_TESTS") != "1" or importlib.util.find_spec("playwright") is None,
+    reason="set RUN_PLAYWRIGHT_TESTS=1 and install Playwright to run the settings browser check",
+)
+@pytest.mark.asyncio
+async def test_settings_page_playwright_narrow_view(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    from playwright import async_api as playwright_api
+
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="settings-playwright"
+    )
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        await _login_admin(client, settings)
+        page_html = (await client.get(f"/?view=settings&profile_id={seeded['profile_id']}")).text
+
+    async with playwright_api.async_playwright() as runtime:
+        browser = await runtime.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 844})
+        await page.set_content(page_html, wait_until="domcontentloaded")
+        assert await page.get_by_text("Резюме этого профиля").count() == 1
+        assert await page.locator("input[name='resume_file']").count() == 1
+        assert await page.locator("form[action='/admin/resumes'] input[name='file']").count() == 1
+        no_overflow = await page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        assert no_overflow is True
+        await browser.close()
