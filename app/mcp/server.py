@@ -152,7 +152,14 @@ def _public(obj: Any, *fields: str) -> dict[str, Any]:
     return result
 
 
-async def _audit_write(session: Any, action: str, entity_type: str, entity_id: str) -> None:
+async def _audit_write(
+    session: Any,
+    action: str,
+    entity_type: str,
+    entity_id: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> None:
     await record_audit_event(
         session,
         actor="mcp",
@@ -160,6 +167,7 @@ async def _audit_write(session: Any, action: str, entity_type: str, entity_id: s
         entity_type=entity_type,
         entity_id=entity_id,
         correlation_id=entity_id,
+        details=details,
     )
 
 
@@ -464,19 +472,29 @@ async def delete_resume(resume_id: str) -> dict[str, Any]:
 
     from app.database.session import async_session_factory
     from app.profiles.service import ResumeInUseError
-    from app.security.files import UnsafeResumeError, safe_storage_path
 
     settings = get_settings()
+    resume_service = ResumeService(settings)
     async with async_session_factory() as session:
         try:
-            unlink_key = await ResumeService(settings).delete(session, UUID(resume_id))
+            deletion = await resume_service.delete(session, UUID(resume_id))
+            await _audit_write(
+                session,
+                "resume.deleted",
+                "resume",
+                resume_id,
+                details=deletion.audit_details(),
+            )
+            await session.commit()
         except (LookupError, ResumeInUseError) as exc:
             raise ValueError(str(exc)) from exc
-        await _audit_write(session, "resume.deleted", "resume", resume_id)
-        await session.commit()
-    if unlink_key is not None:
-        with suppress(UnsafeResumeError):
-            safe_storage_path(settings.resume_storage_path, unlink_key).unlink(missing_ok=True)
+        except Exception:
+            with suppress(Exception):
+                await session.rollback()
+            with suppress(Exception):
+                await resume_service.reconcile_file_transactions(session)
+            raise
+    resume_service.finalize_delete(deletion)
     return {"id": resume_id, "deleted": True}
 
 

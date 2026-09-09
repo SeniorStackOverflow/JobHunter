@@ -158,12 +158,20 @@ async def delete(self, session: AsyncSession, resume_id: UUID) -> None:
 resume_ids = [r.id for r in resumes]
 used = set()
 if resume_ids:
-    used |= set((await session.scalars(
-        select(Application.resume_id).where(Application.resume_id.in_(resume_ids))
-    )).all())
-    used |= set((await session.scalars(
-        select(MatchEvaluation.resume_id).where(MatchEvaluation.resume_id.in_(resume_ids))
-    )).all())
+    used |= set(
+        (
+            await session.scalars(
+                select(Application.resume_id).where(Application.resume_id.in_(resume_ids))
+            )
+        ).all()
+    )
+    used |= set(
+        (
+            await session.scalars(
+                select(MatchEvaluation.resume_id).where(MatchEvaluation.resume_id.in_(resume_ids))
+            )
+        ).all()
+    )
 resume_usage = {rid: (rid in used) for rid in resume_ids}
 ```
 

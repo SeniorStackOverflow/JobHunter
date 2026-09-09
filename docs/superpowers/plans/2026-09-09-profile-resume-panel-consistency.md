@@ -106,9 +106,7 @@ def test_letter_signature_appends_phone_and_email_when_present() -> None:
 
     _subject, body, _language, _facts = generate_letter(profile, _job("ru"))
 
-    assert body.endswith(
-        "С уважением,\nКандидат\nТел.: +373 60 000 000\nEmail: cv@example.com"
-    )
+    assert body.endswith("С уважением,\nКандидат\nТел.: +373 60 000 000\nEmail: cv@example.com")
 
 
 def test_letter_signature_omits_blank_contact_lines() -> None:
@@ -662,9 +660,7 @@ async def test_admin_resume_deactivate_activate_delete_lifecycle(
         assert deleted.status_code == 303
         async with sqlite_session_factory() as session:
             assert await session.get(Resume, resume_id) is None
-            actions = set(
-                (await session.scalars(select(AuditEvent.action))).all()
-            )
+            actions = set((await session.scalars(select(AuditEvent.action))).all())
             assert {"resume.deactivated", "resume.activated", "resume.deleted"} <= actions
         assert not (settings.resume_storage_path / "cv.pdf").exists()
 
@@ -766,26 +762,24 @@ In `app/admin/routes.py`, in the `elif view == "settings":` block, after the
 `resumes = list(...)` assignment, add:
 
 ```python
-        resume_ids = [item.id for item in resumes]
-        referenced: set[UUID] = set()
-        if resume_ids:
-            referenced |= set(
-                (
-                    await session.scalars(
-                        select(Application.resume_id).where(Application.resume_id.in_(resume_ids))
-                    )
-                ).all()
+resume_ids = [item.id for item in resumes]
+referenced: set[UUID] = set()
+if resume_ids:
+    referenced |= set(
+        (
+            await session.scalars(
+                select(Application.resume_id).where(Application.resume_id.in_(resume_ids))
             )
-            referenced |= set(
-                (
-                    await session.scalars(
-                        select(MatchEvaluation.resume_id).where(
-                            MatchEvaluation.resume_id.in_(resume_ids)
-                        )
-                    )
-                ).all()
+        ).all()
+    )
+    referenced |= set(
+        (
+            await session.scalars(
+                select(MatchEvaluation.resume_id).where(MatchEvaluation.resume_id.in_(resume_ids))
             )
-        resume_usage = {item_id: (item_id in referenced) for item_id in resume_ids}
+        ).all()
+    )
+resume_usage = {item_id: (item_id in referenced) for item_id in resume_ids}
 ```
 
 Initialise `resume_usage: dict[UUID, bool] = {}` where `resumes: list[Resume] = []`
@@ -990,9 +984,7 @@ async def test_admin_create_profile_without_file_is_unchanged(
             select(UserProfile).where(UserProfile.name == "Bare profile")
         )
         assert profile is not None
-        assert (
-            await session.scalar(select(Resume).where(Resume.profile_id == profile.id))
-        ) is None
+        assert (await session.scalar(select(Resume).where(Resume.profile_id == profile.id))) is None
 
 
 @pytest.mark.asyncio
@@ -1359,9 +1351,7 @@ async def test_settings_page_playwright_narrow_view(
         transport=transport, base_url="https://testserver", follow_redirects=False
     ) as client:
         await _login_admin(client, settings)
-        page_html = (
-            await client.get(f"/?view=settings&profile_id={seeded['profile_id']}")
-        ).text
+        page_html = (await client.get(f"/?view=settings&profile_id={seeded['profile_id']}")).text
 
     async with playwright_api.async_playwright() as runtime:
         browser = await runtime.chromium.launch()
@@ -1437,9 +1427,7 @@ async def test_rest_resume_delete_activate_deactivate(
         await session.commit()
 
     transport = httpx.ASGITransport(app=application)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="https://testserver"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
         upload = await client.post(
             "/api/v1/resumes",
             headers=headers,
@@ -1449,15 +1437,11 @@ async def test_rest_resume_delete_activate_deactivate(
         assert upload.status_code == 200
         resume_id = upload.json()["id"]
 
-        deactivated = await client.post(
-            f"/api/v1/resumes/{resume_id}/deactivate", headers=headers
-        )
+        deactivated = await client.post(f"/api/v1/resumes/{resume_id}/deactivate", headers=headers)
         assert deactivated.status_code == 200
         assert deactivated.json()["active"] is False
 
-        activated = await client.post(
-            f"/api/v1/resumes/{resume_id}/activate", headers=headers
-        )
+        activated = await client.post(f"/api/v1/resumes/{resume_id}/activate", headers=headers)
         assert activated.status_code == 200
         assert activated.json()["active"] is True
 
@@ -1480,9 +1464,7 @@ async def test_rest_resume_delete_conflicts_when_referenced(
         sqlite_session_factory, settings, suffix="rest-delete-conflict"
     )
     transport = httpx.ASGITransport(app=application)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="https://testserver"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
         response = await client.delete(
             f"/api/v1/resumes/{seeded['resume_id']}",
             headers={"Authorization": f"Bearer {API_KEY}"},

@@ -41,7 +41,6 @@ from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeInUseError
 from app.security.auth import SessionSigner
-from app.security.files import UnsafeResumeError, safe_storage_path
 from app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
@@ -279,26 +278,35 @@ async def upload_resume(
     profile = await ProfileService().get_profile(session)
     if profile is None:
         raise ValueError("profile is required before resume upload")
-    resume = await ResumeService(settings).upload(
-        session,
-        profile_id=profile.id,
-        name=name,
-        category=category,
-        filename=file.filename or "resume.pdf",
-        mime_type=file.content_type or "",
-        data=data,
-        make_default=make_default,
-    )
-    await record_audit_event(
-        session,
-        actor=actor,
-        action="resume.uploaded",
-        entity_type="resume",
-        entity_id=str(resume.id),
-        correlation_id=str(resume.id),
-        details={"mime_type": resume.mime_type, "sha256": resume.sha256},
-    )
-    await session.commit()
+    resume_service = ResumeService(settings)
+    try:
+        resume = await resume_service.upload(
+            session,
+            profile_id=profile.id,
+            name=name,
+            category=category,
+            filename=file.filename or "resume.pdf",
+            mime_type=file.content_type or "",
+            data=data,
+            make_default=make_default,
+        )
+        await record_audit_event(
+            session,
+            actor=actor,
+            action="resume.uploaded",
+            entity_type="resume",
+            entity_id=str(resume.id),
+            correlation_id=str(resume.id),
+            details={"mime_type": resume.mime_type, "sha256": resume.sha256},
+        )
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        with contextlib.suppress(Exception):
+            await resume_service.reconcile_file_transactions(session)
+        raise
+    resume_service.finalize_upload(resume)
     return {"id": resume.id, "sha256": resume.sha256, "verified": resume.verified}
 
 
@@ -355,24 +363,30 @@ async def delete_resume_endpoint(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     settings = get_settings()
+    resume_service = ResumeService(settings)
     try:
-        unlink_key = await ResumeService(settings).delete(session, resume_id)
+        deletion = await resume_service.delete(session, resume_id)
+        await record_audit_event(
+            session,
+            actor=actor,
+            action="resume.deleted",
+            entity_type="resume",
+            entity_id=str(resume_id),
+            correlation_id=str(resume_id),
+            details=deletion.audit_details(),
+        )
+        await session.commit()
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await record_audit_event(
-        session,
-        actor=actor,
-        action="resume.deleted",
-        entity_type="resume",
-        entity_id=str(resume_id),
-        correlation_id=str(resume_id),
-    )
-    await session.commit()
-    if unlink_key is not None:
-        with contextlib.suppress(UnsafeResumeError):
-            safe_storage_path(settings.resume_storage_path, unlink_key).unlink(missing_ok=True)
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        with contextlib.suppress(Exception):
+            await resume_service.reconcile_file_transactions(session)
+        raise
+    resume_service.finalize_delete(deletion)
     return {"id": resume_id, "deleted": True}
 
 

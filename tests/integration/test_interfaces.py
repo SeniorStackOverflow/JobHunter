@@ -2649,12 +2649,21 @@ async def test_resume_service_delete_removes_unreferenced_resume_and_file(
         await session.commit()
         resume_id = resume.id
 
+    service = ResumeService(settings)
     async with sqlite_session_factory() as session:
-        unlink_key = await ResumeService(settings).delete(session, resume_id)
+        deletion = await service.delete(session, resume_id)
         await session.commit()
 
-    assert unlink_key == storage_key
+    assert deletion.storage_key == storage_key
+    assert deletion.sha256 == hashlib.sha256(b"%PDF-1.4\norphan\n%%EOF").hexdigest()
+    assert resume_path.exists()
 
+    # Simulate a process crash after the DB commit but before physical unlink.
+    async with sqlite_session_factory() as session:
+        await service.reconcile_file_transactions(session)
+
+    assert not resume_path.exists()
+    assert not list((settings.resume_storage_path / ".transactions").glob("*.json"))
     async with sqlite_session_factory() as session:
         assert await session.get(Resume, resume_id) is None
 
@@ -2823,6 +2832,15 @@ async def test_admin_resume_deactivate_activate_delete_lifecycle(
             assert await session.get(Resume, resume_id) is None
             actions = set((await session.scalars(select(AuditEvent.action))).all())
             assert {"resume.deactivated", "resume.activated", "resume.deleted"} <= actions
+            deleted_audit = await session.scalar(
+                select(AuditEvent).where(AuditEvent.action == "resume.deleted")
+            )
+            assert deleted_audit is not None
+            assert (
+                deleted_audit.sanitized_details["sha256"]
+                == hashlib.sha256(b"%PDF-1.7\ncv\n%%EOF").hexdigest()
+            )
+            assert deleted_audit.sanitized_details["original_filename"] == "cv.pdf"
         assert not (settings.resume_storage_path / "cv.pdf").exists()
 
 
@@ -2990,6 +3008,60 @@ async def test_admin_create_profile_rejects_file_without_metadata_and_bad_pdf(
         assert (
             await session.scalar(select(UserProfile).where(UserProfile.name == "Bad pdf"))
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_admin_create_profile_cleans_uploaded_pdf_when_transaction_fails(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application, settings = interface_app
+    original_audit = admin_routes._audit_admin
+
+    async def fail_after_upload(
+        session: Any,
+        action: str,
+        entity_type: str,
+        entity_id: str,
+        **kwargs: Any,
+    ) -> None:
+        if action == "resume.uploaded":
+            raise RuntimeError("forced audit failure after file write")
+        await original_audit(session, action, entity_type, entity_id, **kwargs)
+
+    monkeypatch.setattr(admin_routes, "_audit_admin", fail_after_upload)
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+        with pytest.raises(RuntimeError, match="forced audit failure"):
+            await client.post(
+                "/admin/profiles",
+                data={
+                    "name": "Rollback profile",
+                    "resume_name": "Rollback CV",
+                    "resume_category": "ops",
+                    "csrf_token": csrf_token,
+                },
+                files={
+                    "resume_file": (
+                        "rollback.pdf",
+                        b"%PDF-1.7\nrollback\n%%EOF",
+                        "application/pdf",
+                    )
+                },
+            )
+
+    async with sqlite_session_factory() as session:
+        assert (
+            await session.scalar(select(UserProfile).where(UserProfile.name == "Rollback profile"))
+        ) is None
+        assert (await session.scalar(select(Resume).where(Resume.name == "Rollback CV"))) is None
+    assert not list(settings.resume_storage_path.glob("*.pdf"))
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    assert not transaction_dir.exists() or not list(transaction_dir.glob("*.json"))
 
 
 @pytest.mark.asyncio

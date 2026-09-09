@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -404,7 +405,7 @@ class ScanService:
                 else adapter.iterate_incremental_scan(checkpoint)
             )
 
-            async def references_with_pending_retries():
+            async def references_with_pending_retries() -> AsyncIterator[RawJobReference]:
                 for pending in self._pending_reference_retries(checkpoint):
                     retry_checkpoint = checkpoint.model_copy(deep=True)
                     if pending.external_id not in retry_checkpoint.yielded_external_ids:

@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -24,12 +25,24 @@ from app.settings import get_settings
 
 configure_logging()
 settings = get_settings()
+logger = structlog.get_logger(__name__)
 mcp_asgi = streamable_http_app()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.resume_storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        from app.database.session import async_session_factory
+        from app.profiles import ResumeService
+
+        async with async_session_factory() as session:
+            await ResumeService(settings).reconcile_file_transactions(session)
+    except Exception as exc:
+        logger.warning(
+            "resume_file_reconciliation_failed",
+            error_type=type(exc).__name__,
+        )
     async with mcp_asgi.router.lifespan_context(mcp_asgi):
         yield
 

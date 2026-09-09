@@ -586,6 +586,21 @@ class MatchingService:
                 resume_fit=resume_fit,
                 resume_category=resume_category,
             )
+        if resume is not None:
+            current_resume = await session.scalar(
+                select(Resume)
+                .where(Resume.id == resume.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            if (
+                current_resume is None
+                or current_resume.sha256 != resume.sha256
+                or not current_resume.active
+                or not current_resume.verified
+            ):
+                raise ValueError("resume changed during analysis")
+            resume = current_resume
         current_job = await session.scalar(
             select(SourceJob)
             .where(SourceJob.id == source_job_id)

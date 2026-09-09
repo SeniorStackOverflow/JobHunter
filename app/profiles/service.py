@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
+import structlog
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,8 +26,42 @@ from app.profiles.schemas import (
     ResumeMetadataInput,
     UserProfileInput,
 )
-from app.security.files import safe_storage_path, validate_resume_upload
+from app.security.files import UnsafeResumeError, safe_storage_path, validate_resume_upload
 from app.settings import Settings
+
+logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ResumeDeletion:
+    resume_id: UUID
+    profile_id: UUID
+    storage_key: str | None
+    original_filename: str
+    sha256: str
+    name: str
+    category: str
+
+    @classmethod
+    def from_resume(cls, resume: Resume) -> ResumeDeletion:
+        return cls(
+            resume_id=resume.id,
+            profile_id=resume.profile_id,
+            storage_key=None if resume.storage_key.startswith("pending/") else resume.storage_key,
+            original_filename=resume.original_filename,
+            sha256=resume.sha256,
+            name=resume.name,
+            category=resume.category,
+        )
+
+    def audit_details(self) -> dict[str, str]:
+        return {
+            "profile_id": str(self.profile_id),
+            "sha256": self.sha256,
+            "original_filename": self.original_filename,
+            "name": self.name,
+            "category": self.category,
+        }
 
 
 class ResumeInUseError(RuntimeError):
@@ -166,8 +204,110 @@ class ProfileService:
 
 
 class ResumeService:
+    _TRANSACTION_DIR = ".transactions"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+    def _transaction_dir(self) -> Path:
+        path = self.settings.resume_storage_path / self._TRANSACTION_DIR
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path
+
+    def _marker_path(self, operation: str, key: str) -> Path:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return self._transaction_dir() / f"{operation}-{digest}.json"
+
+    def _write_marker(self, operation: str, *, key: str, payload: dict[str, str]) -> Path:
+        marker = self._marker_path(operation, key)
+        temporary = marker.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"operation": operation, **payload}), encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(marker)
+        return marker
+
+    @staticmethod
+    def _remove_marker(marker: Path) -> None:
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "resume_transaction_marker_cleanup_failed",
+                marker=marker.name,
+                error_type=type(exc).__name__,
+            )
+
+    def _unlink_storage_key(self, storage_key: str, *, resume_id: UUID | None = None) -> bool:
+        try:
+            safe_storage_path(self.settings.resume_storage_path, storage_key).unlink(
+                missing_ok=True
+            )
+        except (UnsafeResumeError, OSError) as exc:
+            logger.error(
+                "resume_file_cleanup_failed",
+                resume_id=str(resume_id) if resume_id else None,
+                error_type=type(exc).__name__,
+            )
+            return False
+        return True
+
+    async def reconcile_file_transactions(self, session: AsyncSession) -> None:
+        transaction_dir = self.settings.resume_storage_path / self._TRANSACTION_DIR
+        if not transaction_dir.is_dir():
+            return
+        for marker in transaction_dir.glob("*.json"):
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                operation = str(payload["operation"])
+                storage_key = str(payload["storage_key"])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.error(
+                    "resume_transaction_marker_invalid",
+                    marker=marker.name,
+                    error_type=type(exc).__name__,
+                )
+                continue
+
+            if operation == "upload":
+                persisted = await session.scalar(
+                    select(Resume.id).where(Resume.storage_key == storage_key).limit(1)
+                )
+                if persisted is not None or self._unlink_storage_key(storage_key):
+                    self._remove_marker(marker)
+                continue
+
+            if operation == "delete":
+                try:
+                    resume_id = UUID(str(payload["resume_id"]))
+                except (KeyError, ValueError):
+                    logger.error("resume_transaction_marker_invalid", marker=marker.name)
+                    continue
+                persisted = await session.scalar(
+                    select(Resume.id).where(Resume.id == resume_id).limit(1)
+                )
+                if persisted is not None or self._unlink_storage_key(
+                    storage_key, resume_id=resume_id
+                ):
+                    self._remove_marker(marker)
+                continue
+
+            logger.error(
+                "resume_transaction_marker_invalid",
+                marker=marker.name,
+                operation=operation,
+            )
+
+    def finalize_upload(self, resume: Resume) -> None:
+        self._remove_marker(self._marker_path("upload", resume.storage_key))
+
+    def finalize_delete(self, deletion: ResumeDeletion) -> bool:
+        if deletion.storage_key is None:
+            return True
+        marker = self._marker_path("delete", str(deletion.resume_id))
+        if not self._unlink_storage_key(deletion.storage_key, resume_id=deletion.resume_id):
+            return False
+        self._remove_marker(marker)
+        return True
 
     async def upload(
         self,
@@ -190,6 +330,11 @@ class ResumeService:
         if existing is not None:
             return existing
         self.settings.resume_storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._write_marker(
+            "upload",
+            key=validated.safe_filename,
+            payload={"storage_key": validated.safe_filename},
+        )
         destination = safe_storage_path(self.settings.resume_storage_path, validated.safe_filename)
         with destination.open("xb") as handle:
             handle.write(validated.data)
@@ -260,8 +405,13 @@ class ResumeService:
         await session.flush()
         return resume
 
-    async def delete(self, session: AsyncSession, resume_id: UUID) -> str | None:
-        resume = await session.get(Resume, resume_id)
+    async def delete(self, session: AsyncSession, resume_id: UUID) -> ResumeDeletion:
+        resume = await session.scalar(
+            select(Resume)
+            .where(Resume.id == resume_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
         if resume is None:
             raise LookupError(f"resume {resume_id} does not exist")
         application_refs = await session.scalar(
@@ -274,10 +424,16 @@ class ResumeService:
         )
         if application_refs or evaluation_refs:
             raise ResumeInUseError("resume is referenced and can only be deactivated")
-        storage_key = resume.storage_key
+        deletion = ResumeDeletion.from_resume(resume)
+        if deletion.storage_key is not None:
+            self._write_marker(
+                "delete",
+                key=str(resume_id),
+                payload={"resume_id": str(resume_id), "storage_key": deletion.storage_key},
+            )
         await session.delete(resume)
         await session.flush()
-        return None if storage_key.startswith("pending/") else storage_key
+        return deletion
 
     async def select_for_category(
         self, session: AsyncSession, profile_id: UUID, category: str | None

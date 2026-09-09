@@ -84,7 +84,6 @@ from app.security.auth import CsrfProtector, SessionSigner, verify_password
 from app.security.files import (
     UnsafeResumeError,
     read_verified_resume,
-    safe_storage_path,
     validate_resume_upload,
 )
 from app.security.ssrf import public_url_shape_is_safe
@@ -1541,32 +1540,43 @@ async def create_profile(
         except UnsafeResumeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    profile = await ProfileService().create_profile(
-        session, UserProfileInput(name=name), make_default=make_default
-    )
-    await _audit_admin(session, "profile.created", "user_profile", str(profile.id))
-    notice = "profile_created"
-    if has_resume:
-        assert resume_file is not None
-        resume = await ResumeService(settings).upload(
-            session,
-            profile_id=profile.id,
-            name=resume_name.strip(),
-            category=resume_category.strip(),
-            filename=resume_file.filename or "resume.pdf",
-            mime_type=resume_file.content_type or "",
-            data=data,
-            make_default=True,
+    resume_service = ResumeService(settings)
+    resume: Resume | None = None
+    try:
+        profile = await ProfileService().create_profile(
+            session, UserProfileInput(name=name), make_default=make_default
         )
-        await _audit_admin(
-            session,
-            "resume.uploaded",
-            "resume",
-            str(resume.id),
-            details={"mime_type": resume.mime_type, "sha256": resume.sha256},
-        )
-        notice = "profile_and_resume_created"
-    await session.commit()
+        await _audit_admin(session, "profile.created", "user_profile", str(profile.id))
+        notice = "profile_created"
+        if has_resume:
+            assert resume_file is not None
+            resume = await resume_service.upload(
+                session,
+                profile_id=profile.id,
+                name=resume_name.strip(),
+                category=resume_category.strip(),
+                filename=resume_file.filename or "resume.pdf",
+                mime_type=resume_file.content_type or "",
+                data=data,
+                make_default=True,
+            )
+            await _audit_admin(
+                session,
+                "resume.uploaded",
+                "resume",
+                str(resume.id),
+                details={"mime_type": resume.mime_type, "sha256": resume.sha256},
+            )
+            notice = "profile_and_resume_created"
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        with contextlib.suppress(Exception):
+            await resume_service.reconcile_file_transactions(session)
+        raise
+    if resume is not None:
+        resume_service.finalize_upload(resume)
     return RedirectResponse(
         f"/?view=settings&profile_id={profile.id}&notice={notice}", status_code=303
     )
@@ -1715,24 +1725,33 @@ async def admin_upload_resume(
     profile = await ProfileService().get_profile(session, profile_id)
     if profile is None:
         raise ValueError("profile is required before resume upload")
-    resume = await ResumeService(settings).upload(
-        session,
-        profile_id=profile.id,
-        name=name,
-        category=category,
-        filename=file.filename or "resume.pdf",
-        mime_type=file.content_type or "",
-        data=data,
-        make_default=make_default,
-    )
-    await _audit_admin(
-        session,
-        "resume.uploaded",
-        "resume",
-        str(resume.id),
-        details={"mime_type": resume.mime_type, "sha256": resume.sha256},
-    )
-    await session.commit()
+    resume_service = ResumeService(settings)
+    try:
+        resume = await resume_service.upload(
+            session,
+            profile_id=profile.id,
+            name=name,
+            category=category,
+            filename=file.filename or "resume.pdf",
+            mime_type=file.content_type or "",
+            data=data,
+            make_default=make_default,
+        )
+        await _audit_admin(
+            session,
+            "resume.uploaded",
+            "resume",
+            str(resume.id),
+            details={"mime_type": resume.mime_type, "sha256": resume.sha256},
+        )
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        with contextlib.suppress(Exception):
+            await resume_service.reconcile_file_transactions(session)
+        raise
+    resume_service.finalize_upload(resume)
     return RedirectResponse(
         f"/?view=settings&profile_id={profile.id}&notice=resume_uploaded", status_code=303
     )
@@ -1872,15 +1891,28 @@ async def admin_delete_resume(
     require_csrf(request, csrf_token)
     _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
     settings = get_settings()
+    resume_service = ResumeService(settings)
     try:
-        unlink_key = await ResumeService(settings).delete(session, resume_id)
+        deletion = await resume_service.delete(session, resume_id)
+        await _audit_admin(
+            session,
+            "resume.deleted",
+            "resume",
+            str(resume_id),
+            details=deletion.audit_details(),
+        )
+        await session.commit()
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await _audit_admin(session, "resume.deleted", "resume", str(resume_id))
-    await session.commit()
-    if unlink_key is not None:
-        with contextlib.suppress(UnsafeResumeError):
-            safe_storage_path(settings.resume_storage_path, unlink_key).unlink(missing_ok=True)
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        with contextlib.suppress(Exception):
+            await resume_service.reconcile_file_transactions(session)
+        raise
+    resume_service.finalize_delete(deletion)
     return RedirectResponse(
         f"/?view=settings&profile_id={selected_profile.id}&notice=resume_deleted",
         status_code=303,
