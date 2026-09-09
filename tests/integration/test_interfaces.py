@@ -2104,6 +2104,56 @@ def _tool_payload(response: httpx.Response) -> dict[str, Any]:
     return json.loads(result["content"][0]["text"])
 
 
+@pytest.mark.asyncio
+async def test_mcp_delete_resume_removes_unreferenced_and_guards_referenced(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+    from app.mcp import server as mcp_server
+
+    _application, settings = interface_app
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="mcp-delete-resume"
+    )
+    with pytest.raises(ValueError):
+        await mcp_server.delete_resume(resume_id=str(seeded["resume_id"]))
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, seeded["resume_id"]) is not None
+
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="MCP resume owner")
+        session.add(profile)
+        await session.flush()
+        settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+        (settings.resume_storage_path / "mcp-orphan.pdf").write_bytes(b"%PDF-1.4\nmcp\n%%EOF")
+        orphan = Resume(
+            profile_id=profile.id,
+            name="MCP orphan",
+            category="ops",
+            storage_key="mcp-orphan.pdf",
+            original_filename="mcp.pdf",
+            mime_type="application/pdf",
+            sha256=hashlib.sha256(b"%PDF-1.4\nmcp\n%%EOF").hexdigest(),
+            active=True,
+            verified=False,
+            is_default=False,
+        )
+        session.add(orphan)
+        await session.commit()
+        orphan_id = orphan.id
+
+    result = await mcp_server.delete_resume(resume_id=str(orphan_id))
+    assert result == {"id": str(orphan_id), "deleted": True}
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, orphan_id) is None
+    assert not (settings.resume_storage_path / "mcp-orphan.pdf").exists()
+
+
 async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
     sqlite_session_factory: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -2285,6 +2335,7 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "upload_resume_metadata",
             "activate_resume",
             "deactivate_resume",
+            "delete_resume",
             "list_sources",
             "get_source",
             "add_source",

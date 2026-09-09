@@ -458,6 +458,29 @@ async def deactivate_resume(resume_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def delete_resume(resume_id: str) -> dict[str, Any]:
+    """Delete a resume that no application or evaluation uses; the file is removed too."""
+    from contextlib import suppress
+
+    from app.database.session import async_session_factory
+    from app.profiles.service import ResumeInUseError
+    from app.security.files import UnsafeResumeError, safe_storage_path
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        try:
+            unlink_key = await ResumeService(settings).delete(session, UUID(resume_id))
+        except (LookupError, ResumeInUseError) as exc:
+            raise ValueError(str(exc)) from exc
+        await _audit_write(session, "resume.deleted", "resume", resume_id)
+        await session.commit()
+    if unlink_key is not None:
+        with suppress(UnsafeResumeError):
+            safe_storage_path(settings.resume_storage_path, unlink_key).unlink(missing_ok=True)
+    return {"id": resume_id, "deleted": True}
+
+
+@mcp.tool()
 async def list_sources() -> list[dict[str, Any]]:
     """List source configuration summaries without credentials."""
     from app.database.session import async_session_factory
