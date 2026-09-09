@@ -4,11 +4,18 @@ from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
-from app.models.entities import JobPreference, Resume, SourceJob, UserProfile
+from app.models.entities import (
+    Application,
+    JobPreference,
+    MatchEvaluation,
+    Resume,
+    SourceJob,
+    UserProfile,
+)
 from app.profiles.schemas import (
     JobPreferenceInput,
     JobPreferenceUpdateInput,
@@ -17,6 +24,10 @@ from app.profiles.schemas import (
 )
 from app.security.files import safe_storage_path, validate_resume_upload
 from app.settings import Settings
+
+
+class ResumeInUseError(RuntimeError):
+    """A resume referenced by an application or evaluation cannot be deleted."""
 
 
 def choose_resume_for_job(resumes: list[Resume], job: SourceJob) -> Resume | None:
@@ -248,6 +259,25 @@ class ResumeService:
         resume.is_default = False
         await session.flush()
         return resume
+
+    async def delete(self, session: AsyncSession, resume_id: UUID) -> str | None:
+        resume = await session.get(Resume, resume_id)
+        if resume is None:
+            raise LookupError(f"resume {resume_id} does not exist")
+        application_refs = await session.scalar(
+            select(func.count()).select_from(Application).where(Application.resume_id == resume_id)
+        )
+        evaluation_refs = await session.scalar(
+            select(func.count())
+            .select_from(MatchEvaluation)
+            .where(MatchEvaluation.resume_id == resume_id)
+        )
+        if application_refs or evaluation_refs:
+            raise ResumeInUseError("resume is referenced and can only be deactivated")
+        storage_key = resume.storage_key
+        await session.delete(resume)
+        await session.flush()
+        return None if storage_key.startswith("pending/") else storage_key
 
     async def select_for_category(
         self, session: AsyncSession, profile_id: UUID, category: str | None

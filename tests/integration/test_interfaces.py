@@ -2528,3 +2528,64 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "partial",
             "succeeded",
         }
+
+
+@pytest.mark.asyncio
+async def test_resume_service_delete_guards_referenced_resumes(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    from app.profiles.service import ResumeInUseError, ResumeService
+
+    _application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="resume-delete-guard"
+    )
+
+    async with sqlite_session_factory() as session:
+        with pytest.raises(ResumeInUseError):
+            await ResumeService(settings).delete(session, seeded["resume_id"])
+
+    async with sqlite_session_factory() as session:
+        still_there = await session.get(Resume, seeded["resume_id"])
+        assert still_there is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_service_delete_removes_unreferenced_resume_and_file(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    storage_key = "orphan-resume.pdf"
+    resume_path = settings.resume_storage_path / storage_key
+    resume_path.write_bytes(b"%PDF-1.4\norphan\n%%EOF")
+
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Orphan owner", is_default=True)
+        session.add(profile)
+        await session.flush()
+        resume = Resume(
+            profile_id=profile.id,
+            name="Orphan",
+            category="ops",
+            storage_key=storage_key,
+            original_filename="orphan.pdf",
+            mime_type="application/pdf",
+            sha256=hashlib.sha256(b"%PDF-1.4\norphan\n%%EOF").hexdigest(),
+            active=True,
+            verified=False,
+            is_default=False,
+        )
+        session.add(resume)
+        await session.commit()
+        resume_id = resume.id
+
+    async with sqlite_session_factory() as session:
+        unlink_key = await ResumeService(settings).delete(session, resume_id)
+        await session.commit()
+
+    assert unlink_key == storage_key
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, resume_id) is None
