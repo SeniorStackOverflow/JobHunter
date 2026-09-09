@@ -3032,3 +3032,61 @@ async def test_settings_page_playwright_narrow_view(
         )
         assert no_overflow is True
         await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_rest_resume_delete_activate_deactivate(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="REST resume owner", is_default=True)
+        session.add(profile)
+        await session.flush()
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+        upload = await client.post(
+            "/api/v1/resumes",
+            headers=headers,
+            data={"name": "REST CV", "category": "ops"},
+            files={"file": ("rest.pdf", b"%PDF-1.7\nrest\n%%EOF", "application/pdf")},
+        )
+        assert upload.status_code == 200
+        resume_id = upload.json()["id"]
+
+        deactivated = await client.post(f"/api/v1/resumes/{resume_id}/deactivate", headers=headers)
+        assert deactivated.status_code == 200
+        assert deactivated.json()["active"] is False
+
+        activated = await client.post(f"/api/v1/resumes/{resume_id}/activate", headers=headers)
+        assert activated.status_code == 200
+        assert activated.json()["active"] is True
+
+        deleted = await client.delete(f"/api/v1/resumes/{resume_id}", headers=headers)
+        assert deleted.status_code == 200
+        assert deleted.json() == {"id": resume_id, "deleted": True}
+
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, UUID(resume_id)) is None
+        actions = set((await session.scalars(select(AuditEvent.action))).all())
+        assert {"resume.deactivated", "resume.activated", "resume.deleted"} <= actions
+
+
+@pytest.mark.asyncio
+async def test_rest_resume_delete_conflicts_when_referenced(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="rest-delete-conflict"
+    )
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+        response = await client.delete(
+            f"/api/v1/resumes/{seeded['resume_id']}",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        assert response.status_code == 409

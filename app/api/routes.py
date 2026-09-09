@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # FastAPI's declarative dependency/form parameters intentionally call Depends/File.
 # ruff: noqa: B008
+import contextlib
 from typing import Any
 from uuid import UUID
 
@@ -38,7 +39,9 @@ from app.models.entities import (
 from app.models.enums import RunStatus, ScanType, SourceHealth
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
+from app.profiles.service import ResumeInUseError
 from app.security.auth import SessionSigner
+from app.security.files import UnsafeResumeError, safe_storage_path
 from app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
@@ -297,6 +300,75 @@ async def upload_resume(
     )
     await session.commit()
     return {"id": resume.id, "sha256": resume.sha256, "verified": resume.verified}
+
+
+@router.post("/resumes/{resume_id}/deactivate")
+async def deactivate_resume_endpoint(
+    resume_id: UUID,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    item = await ResumeService(get_settings()).deactivate(session, resume_id)
+    await record_audit_event(
+        session,
+        actor=actor,
+        action="resume.deactivated",
+        entity_type="resume",
+        entity_id=str(item.id),
+        correlation_id=str(item.id),
+    )
+    await session.commit()
+    return {"id": item.id, "active": item.active}
+
+
+@router.post("/resumes/{resume_id}/activate")
+async def activate_resume_endpoint(
+    resume_id: UUID,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        item = await ResumeService(get_settings()).activate(session, resume_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        actor=actor,
+        action="resume.activated",
+        entity_type="resume",
+        entity_id=str(item.id),
+        correlation_id=str(item.id),
+    )
+    await session.commit()
+    return {"id": item.id, "active": item.active}
+
+
+@router.delete("/resumes/{resume_id}")
+async def delete_resume_endpoint(
+    resume_id: UUID,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        unlink_key = await ResumeService(settings).delete(session, resume_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ResumeInUseError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        actor=actor,
+        action="resume.deleted",
+        entity_type="resume",
+        entity_id=str(resume_id),
+        correlation_id=str(resume_id),
+    )
+    await session.commit()
+    if unlink_key is not None:
+        with contextlib.suppress(UnsafeResumeError):
+            safe_storage_path(settings.resume_storage_path, unlink_key).unlink(missing_ok=True)
+    return {"id": resume_id, "deleted": True}
 
 
 @router.get("/sources", dependencies=[Depends(require_api_actor)])
