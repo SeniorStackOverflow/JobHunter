@@ -132,6 +132,10 @@ services:
       - resumes:/data/resumes
       - phone_evidence:/data/phone_evidence
     shm_size: 1gb
+    # Bound the whole worker process tree (Celery + Playwright + Chromium).
+    mem_reservation: ${JOBHUNTER_CRAWLER_MEMORY_RESERVATION:-850m}
+    mem_limit: ${JOBHUNTER_CRAWLER_MEMORY_LIMIT:-1150m}
+    memswap_limit: ${JOBHUNTER_CRAWLER_MEMORY_SWAP_LIMIT:-1300m}
     healthcheck:
       <<: *app-healthcheck
       test:

@@ -54,6 +54,7 @@ class StealthPlaywrightBrowser:
         headless: bool = True,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         proxy_server: str | None = None,
+        max_navigations_per_page: int = 50,
     ) -> None:
         self.allowed_domains = tuple(item.casefold() for item in allowed_domains)
         self.timeout_ms = int(timeout_seconds * 1000)
@@ -62,6 +63,10 @@ class StealthPlaywrightBrowser:
         self.headless = headless
         self.max_response_bytes = max_response_bytes
         self.proxy_server = proxy_server or os.getenv("JOBHUNTER_BROWSER_PROXY")
+        if max_navigations_per_page < 1:
+            raise ValueError("max_navigations_per_page must be positive")
+        self.max_navigations_per_page = max_navigations_per_page
+        self._page_navigation_count = 0
         self._limiter = AsyncRateLimiter(
             requests_per_minute,
             minimum_interval_seconds=minimum_interval_seconds,
@@ -118,15 +123,31 @@ class StealthPlaywrightBrowser:
                 service_workers="block",
             )
             await stealth.apply_stealth_async(self._context)
-            self._page = await self._context.new_page()
-            self._page.set_default_timeout(self.timeout_ms)
-            self._page.set_default_navigation_timeout(self.timeout_ms)
-            await self._page.route("**/*", self._guard_route)
+            self._page = await self._new_page()
         except Exception as exc:
             await self.aclose()
             raise BrowserFallbackUnavailable(
                 f"persistent stealth browser failed to start: {type(exc).__name__}"
             ) from exc
+
+    async def _new_page(self) -> Any:
+        if self._context is None:
+            raise BrowserFallbackUnavailable("browser context is not available")
+        page = await self._context.new_page()
+        page.set_default_timeout(self.timeout_ms)
+        page.set_default_navigation_timeout(self.timeout_ms)
+        await page.route("**/*", self._guard_route)
+        self._page_navigation_count = 0
+        return page
+
+    async def _rotate_page_if_needed(self) -> None:
+        if self._page is None or self._page_navigation_count < self.max_navigations_per_page:
+            return
+        previous = self._page
+        self._page = None
+        with suppress(Exception):
+            await previous.close()
+        self._page = await self._new_page()
 
     async def _guard_route(self, route: Any) -> None:
         request = route.request
@@ -151,10 +172,12 @@ class StealthPlaywrightBrowser:
     async def get(self, url: str) -> httpx.Response:
         target = await self._validated_url(url)
         await self.start()
-        assert self._page is not None
-        page = self._page
         async with self._lock:
             await self._limiter.wait()
+            await self._rotate_page_if_needed()
+            assert self._page is not None
+            page = self._page
+            self._page_navigation_count += 1
             loop = asyncio.get_running_loop()
             challenge_result: asyncio.Future[Any] = loop.create_future()
 
@@ -306,6 +329,7 @@ class StealthPlaywrightBrowser:
         context, self._context = self._context, None
         browser, self._browser = self._browser, None
         playwright, self._playwright = self._playwright, None
+        self._page_navigation_count = 0
         if page is not None:
             with suppress(Exception):
                 await page.close()

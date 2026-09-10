@@ -117,6 +117,9 @@ class Settings(BaseSettings):
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
     crawler_user_agent: str = "job-agent/0.1 (+operator contact configured by deployment)"
+    crawler_min_mem_available_mb: int = Field(default=700, ge=128, le=16_384)
+    crawler_memory_retry_seconds: int = Field(default=900, ge=60, le=86_400)
+    crawler_browser_resume_backoff_seconds: int = Field(default=900, ge=60, le=86_400)
     outbound_request_timeout_seconds: float = 20.0
     max_redirects: int = 5
     log_level: str = "INFO"

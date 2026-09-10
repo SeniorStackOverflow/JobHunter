@@ -893,6 +893,12 @@ class ScanService:
         existing.last_checked_at = now
         existing.confirmed_absence_count = 0
         existing.raw_metadata = {**existing.raw_metadata, **raw_metadata}
+        # Rabota.md routinely bumps source clocks without changing vacancy content.
+        # Keep source metadata fresh without creating JobSnapshot/rematch churn.
+        if normalized.updated_at is not None:
+            existing.source_updated_at = normalized.updated_at
+        if existing.published_at is None and normalized.published_at is not None:
+            existing.published_at = normalized.published_at
         if normalized.status == JobStatus.ACTIVE and existing.status != JobStatus.ACTIVE:
             existing.status = JobStatus.ACTIVE
         if not changed:
@@ -914,7 +920,7 @@ class ScanService:
             # Category and locale describe where the publication was discovered.
             # They are merged above and must not turn a material vacancy update
             # into a false positive when entrypoint order changes.
-            if field in {"category", "page_locale"}:
+            if field in {"category", "page_locale", "published_at", "source_updated_at"}:
                 continue
             if field not in value_map:
                 continue

@@ -165,7 +165,8 @@ class RabotaMdConfig(BaseModel):
     max_redirects: int = Field(default=3, ge=0, le=10)
     max_pages_per_entrypoint: int = Field(default=100, ge=1, le=1_000)
     incremental_max_pages_per_entrypoint: int = Field(default=20, ge=1, le=1_000)
-    incremental_known_detail_refresh_hours: int = Field(default=24, ge=1, le=168)
+    incremental_known_detail_refresh_hours: int = Field(default=72, ge=1, le=168)
+    browser_max_navigations_per_page: int = Field(default=50, ge=5, le=500)
     known_unchanged_stop_threshold: int = Field(default=100, ge=1, le=100_000)
     max_discovered_entrypoints: int = Field(default=10_000, ge=1, le=100_000)
     incremental_category_slugs: list[str] = Field(default_factory=_default_incremental_categories)
@@ -268,7 +269,7 @@ class RabotaMdAdapter:
                 )
                 raw_config.setdefault(
                     "incremental_known_detail_refresh_hours",
-                    incremental.get("known_detail_refresh_hours", 24),
+                    incremental.get("known_detail_refresh_hours", 72),
                 )
             parsed_config = RabotaMdConfig.model_validate(raw_config)
         elif isinstance(config, RabotaMdConfig):
@@ -298,6 +299,7 @@ class RabotaMdAdapter:
                 requests_per_minute=self.config.requests_per_minute,
                 minimum_interval_seconds=self.config.minimum_interval_seconds,
                 timeout_seconds=self.config.timeout_seconds,
+                max_navigations_per_page=self.config.browser_max_navigations_per_page,
             )
         else:
             self._http = SecureHttpClient(
@@ -594,13 +596,10 @@ class RabotaMdAdapter:
         hash_payload = {
             "external_job_id": job_id,
             "canonical_url": canonical_url,
-            "localized_urls": localized_urls,
             "title": title,
             "company": company,
             "employer_url": employer_url,
-            "category": category,
             "subcategory": subcategory,
-            "categories_seen": categories_seen,
             "description": description,
             "requirements": requirements,
             "responsibilities": responsibilities,
@@ -616,10 +615,6 @@ class RabotaMdAdapter:
             "workplace_type": workplace_type,
             "contacts": [*public_emails, *public_phones, application_url],
             "internal_application_available": internal_application_available,
-            "listing_updated_hint": raw_job.reference.updated_hint,
-            "page_locale": page_locale,
-            "published_at": published_at.isoformat() if published_at else None,
-            "updated_at": updated_at.isoformat() if updated_at else None,
             "status": status.value,
         }
         content_hash = self._hash_json(hash_payload)
@@ -739,6 +734,28 @@ class RabotaMdAdapter:
             normalized_job=normalized,
         )
 
+    @staticmethod
+    def _checkpoint_snapshot_for_reference(state: ScanCheckpoint) -> dict[str, Any]:
+        # known_* maps contain one entry per source job and are immutable during a scan.
+        # Copying them into every yielded reference creates hundreds of megabytes of
+        # short-lived allocations. The persisted checkpoint already owns those maps.
+        transient_keys = {
+            "known_external_ids",
+            "known_updated_hints",
+            "known_last_checked_at",
+        }
+        adapter_state = {
+            key: value for key, value in state.adapter_state.items() if key not in transient_keys
+        }
+        return ScanCheckpoint(
+            entrypoint_index=state.entrypoint_index,
+            page_url=state.page_url,
+            cursor=state.cursor,
+            yielded_external_ids=list(state.yielded_external_ids),
+            completed_entrypoints=list(state.completed_entrypoints),
+            adapter_state=adapter_state,
+        ).model_dump(mode="json")
+
     async def _iterate_scan(
         self,
         checkpoint: ScanCheckpoint | None,
@@ -828,7 +845,9 @@ class RabotaMdAdapter:
                         # carries checkpoint progress to the common pipeline.
                         yielded = existing.model_copy(deep=True)
                         yielded.metadata["known_unchanged"] = hint_unchanged
-                        yielded.metadata["scan_checkpoint"] = state.model_dump(mode="json")
+                        yielded.metadata["scan_checkpoint"] = (
+                            self._checkpoint_snapshot_for_reference(state)
+                        )
                         yielded.metadata["duplicate_reference"] = True
                         # The common pipeline keeps SourceJob unique while merging every
                         # category/locale occurrence without fetching details twice.
@@ -850,7 +869,9 @@ class RabotaMdAdapter:
                         # short-lived item crossing the adapter/pipeline boundary.
                         yielded = reference.model_copy(deep=True)
                         yielded.metadata["known_unchanged"] = hint_unchanged
-                        yielded.metadata["scan_checkpoint"] = state.model_dump(mode="json")
+                        yielded.metadata["scan_checkpoint"] = (
+                            self._checkpoint_snapshot_for_reference(state)
+                        )
                         # Later locale/category occurrences merge into the cached reference;
                         # callers must receive an immutable view of this occurrence.
                         yield yielded

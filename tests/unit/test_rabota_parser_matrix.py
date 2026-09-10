@@ -81,6 +81,8 @@ async def normalize(
     *,
     job_id: str = "9001",
     locale: str = "ru",
+    category: str = "others",
+    updated_hint: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Any:
     url = f"{BASE}/{locale}/locuri-de-munca/operator/{job_id}"
@@ -88,7 +90,8 @@ async def normalize(
         external_id=job_id,
         url=url,
         locale=locale,
-        category="others",
+        category=category,
+        updated_hint=updated_hint,
         metadata=metadata or {},
     )
     raw = RawJobData(
@@ -542,6 +545,26 @@ async def test_content_hash_is_deterministic_and_changes_with_contact(
     assert first.content_hash == repeated.content_hash
     assert first.content_hash != changed.content_hash
     assert first.source_fingerprint == changed.source_fingerprint
+
+
+@pytest.mark.asyncio
+async def test_content_hash_ignores_source_clock_and_discovery_metadata(
+    adapter: RabotaMdAdapter,
+) -> None:
+    marker = '"@type": "JobPosting",'
+    first_html = job_html(
+        body_extra='<div class="vacancy-updated-at">10 сентября 2026</div>'
+    ).replace(marker, marker + ' "datePosted": "2026-09-10 16:00:03",', 1)
+    second_html = job_html(
+        body_extra='<div class="vacancy-updated-at">11 сентября 2026</div>'
+    ).replace(marker, marker + ' "datePosted": "2026-09-11 17:05:04",', 1)
+
+    first = await normalize(adapter, first_html, category="others", updated_hint="10 сентября")
+    second = await normalize(adapter, second_html, category="operating", updated_hint="11 сентября")
+
+    assert first.published_at != second.published_at
+    assert first.updated_at != second.updated_at
+    assert first.content_hash == second.content_hash
 
 
 def test_listing_reference_filters_private_cross_domain_and_inactive_links(

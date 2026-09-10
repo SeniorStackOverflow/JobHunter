@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Never, cast
 from uuid import UUID
 
@@ -284,6 +285,57 @@ def _set_source_health_metric(source_id: UUID, current: SourceHealth | None) -> 
         SOURCE_HEALTH.labels(str(source_id), state).set(1 if state == current.value else 0)
 
 
+def _mem_available_mb(meminfo_path: Path = Path("/proc/meminfo")) -> int | None:
+    try:
+        for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) // 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _browser_partial_resume_delay_seconds(run: ScanRun, base_seconds: int) -> int:
+    diagnostics = run.diagnostics if isinstance(run.diagnostics, dict) else {}
+    errors = diagnostics.get("errors")
+    if not isinstance(errors, list):
+        return 60
+    browser_failure = any(
+        isinstance(item, dict)
+        and isinstance(item.get("reason"), str)
+        and item["reason"].startswith("browser_")
+        for item in errors
+    )
+    if not browser_failure:
+        return 60
+    depth = diagnostics.get("resume_depth")
+    resume_depth = depth if isinstance(depth, int) and depth >= 1 else 0
+    delay = base_seconds
+    for _ in range(resume_depth):
+        delay *= 2
+    return min(delay, 3600)
+
+
+def _retry_low_memory(
+    task: Task, available_mb: int, threshold_mb: int, retry_seconds: int
+) -> Never:
+    logger.warning(
+        "scan_deferred_low_memory",
+        mem_available_mb=available_mb,
+        threshold_mb=threshold_mb,
+        retry_seconds=retry_seconds,
+    )
+    raise task.retry(
+        exc=RuntimeError(
+            f"crawler deferred: MemAvailable {available_mb} MiB below {threshold_mb} MiB"
+        ),
+        countdown=retry_seconds,
+        max_retries=24,
+    )
+
+
 def _retry_busy(task: Task, operation: str) -> Never:
     raise task.retry(
         exc=RuntimeError(f"{operation} is already running"),
@@ -301,6 +353,15 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
     parsed_scan_id = _parse_uuid(scan_id, name="scan_id")
     bind_log_context(scan_id=scan_id, correlation_id=scan_id)
     source_id, scan_type = _run_async(_scan_identity(parsed_scan_id))
+    settings = get_settings()
+    available_mb = _mem_available_mb()
+    if available_mb is not None and available_mb < settings.crawler_min_mem_available_mb:
+        _retry_low_memory(
+            self,
+            available_mb,
+            settings.crawler_min_mem_available_mb,
+            settings.crawler_memory_retry_seconds,
+        )
     client = _redis_client()
     try:
         key = lock_key("source-operation", str(source_id))
@@ -353,10 +414,13 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
             )
             if reservation is not None:
                 try:
+                    resume_delay = _browser_partial_resume_delay_seconds(
+                        run, settings.crawler_browser_resume_backoff_seconds
+                    )
                     run_scan_task.apply_async(
                         args=[str(resumed.id)],
                         queue="crawling",
-                        countdown=60,
+                        countdown=resume_delay,
                     )
                     resume_scan_id = str(resumed.id)
                     logger.info(
