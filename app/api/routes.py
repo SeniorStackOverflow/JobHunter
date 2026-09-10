@@ -299,16 +299,25 @@ async def upload_resume(
             correlation_id=str(resume.id),
             details={"mime_type": resume.mime_type, "sha256": resume.sha256},
         )
-        await session.commit()
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
-        # Roll back only this request's own in-flight upload (marker + file);
-        # a no-op when upload() failed before writing its marker.
         with contextlib.suppress(Exception):
             if resume_service._last_upload_key is not None:
                 resume_service.abort_pending_upload(resume_service._last_upload_key)
         raise
+    try:
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        outcome = "unknown"
+        if resume_service._last_upload_key is not None:
+            outcome = await resume_service.resolve_upload_commit_outcome(
+                resume_service._last_upload_key
+            )
+        if outcome != "committed":
+            raise
     resume_service.finalize_upload(resume)
     return {"id": resume.id, "sha256": resume.sha256, "verified": resume.verified}
 
@@ -379,9 +388,6 @@ async def delete_resume_endpoint(
             correlation_id=str(resume_id),
             details=deletion.audit_details(),
         )
-        await session.commit()
-    # LookupError / ResumeInUseError are raised by ResumeService.delete before any
-    # transaction marker is written, so these paths need no rollback/cleanup.
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:
@@ -389,12 +395,20 @@ async def delete_resume_endpoint(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
-        # The rollback restored the Resume row and its file; drop only the
-        # marker this request wrote (never touch the file).
         with contextlib.suppress(Exception):
             if deletion is not None:
                 resume_service.abort_pending_delete(deletion)
         raise
+    try:
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        outcome = "unknown"
+        if deletion is not None:
+            outcome = await resume_service.resolve_delete_commit_outcome(deletion)
+        if outcome != "committed":
+            raise
     resume_service.finalize_delete(deletion)
     return {"id": resume_id, "deleted": True}
 

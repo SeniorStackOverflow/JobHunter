@@ -486,20 +486,25 @@ async def delete_resume(resume_id: str) -> dict[str, Any]:
                 resume_id,
                 details=deletion.audit_details(),
             )
-            await session.commit()
-        # LookupError / ResumeInUseError are raised by ResumeService.delete before
-        # any transaction marker is written, so this path needs no rollback/cleanup.
         except (LookupError, ResumeInUseError) as exc:
             raise ValueError(str(exc)) from exc
         except Exception:
             with suppress(Exception):
                 await session.rollback()
-            # The rollback restored the Resume row and its file; drop only the
-            # marker this request wrote (never touch the file).
             with suppress(Exception):
                 if deletion is not None:
                     resume_service.abort_pending_delete(deletion)
             raise
+        try:
+            await session.commit()
+        except Exception:
+            with suppress(Exception):
+                await session.rollback()
+            outcome = "unknown"
+            if deletion is not None:
+                outcome = await resume_service.resolve_delete_commit_outcome(deletion)
+            if outcome != "committed":
+                raise
     resume_service.finalize_delete(deletion)
     return {"id": resume_id, "deleted": True}
 

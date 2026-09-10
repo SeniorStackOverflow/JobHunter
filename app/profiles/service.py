@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import structlog
@@ -337,7 +337,9 @@ class ResumeService:
             # it: only clear it once its DB outcome is settled, and never unlink
             # its file. A foreign/missing owner is a crashed predecessor -- run
             # the full rollback now.
-            own_marker = payload.get("owner") == _PROCESS_NONCE
+            own_marker = (
+                payload.get("owner") == _PROCESS_NONCE and payload.get("outcome") != "unknown"
+            )
 
             if operation == "upload":
                 persisted = await session.scalar(
@@ -425,6 +427,109 @@ class ResumeService:
         NOT touched.
         """
         self._remove_marker(self._marker_path("delete", str(deletion.resume_id)))
+
+    async def resolve_upload_commit_outcome(
+        self, storage_key: str
+    ) -> Literal["committed", "rolled_back", "unknown"]:
+        """Resolve an upload after ``commit()`` raised with an unknown outcome.
+
+        The original session is no longer authoritative: PostgreSQL may have
+        committed before the client lost the acknowledgement. Mark the file
+        transaction as outcome-unknown, then inspect the database through a
+        fresh independent session. If verification itself is unavailable the
+        marker and file are deliberately left intact for a later reconcile.
+        """
+        marker = self._marker_path("upload", storage_key)
+        try:
+            self._write_marker(
+                "upload",
+                key=storage_key,
+                payload={"storage_key": storage_key, "outcome": "unknown"},
+            )
+        except OSError as exc:
+            logger.error(
+                "resume_commit_outcome_marker_failed",
+                operation="upload",
+                error_type=type(exc).__name__,
+            )
+
+        try:
+            import app.database.session as database_session
+
+            async with database_session.async_session_factory() as verification_session:
+                persisted = await verification_session.scalar(
+                    select(Resume.id).where(Resume.storage_key == storage_key).limit(1)
+                )
+        except Exception as exc:
+            logger.error(
+                "resume_commit_outcome_unresolved",
+                operation="upload",
+                error_type=type(exc).__name__,
+            )
+            return "unknown"
+
+        if persisted is not None:
+            self._remove_marker(marker)
+            return "committed"
+        if self._unlink_storage_key(storage_key):
+            self._remove_marker(marker)
+        return "rolled_back"
+
+    async def resolve_delete_commit_outcome(
+        self, deletion: ResumeDeletion
+    ) -> Literal["committed", "rolled_back", "unknown"]:
+        """Resolve a delete after ``commit()`` raised with an unknown outcome.
+
+        Presence of the resume row in a fresh session means the transaction did
+        not commit, so keep the file and drop only the marker. Absence means the
+        delete committed, so finish the physical unlink. On verification failure
+        leave the marker untouched for later crash/restart reconciliation.
+        """
+        marker = self._marker_path("delete", str(deletion.resume_id))
+        if deletion.storage_key is not None:
+            try:
+                self._write_marker(
+                    "delete",
+                    key=str(deletion.resume_id),
+                    payload={
+                        "resume_id": str(deletion.resume_id),
+                        "storage_key": deletion.storage_key,
+                        "outcome": "unknown",
+                    },
+                )
+            except OSError as exc:
+                logger.error(
+                    "resume_commit_outcome_marker_failed",
+                    operation="delete",
+                    resume_id=str(deletion.resume_id),
+                    error_type=type(exc).__name__,
+                )
+
+        try:
+            import app.database.session as database_session
+
+            async with database_session.async_session_factory() as verification_session:
+                persisted = await verification_session.scalar(
+                    select(Resume.id).where(Resume.id == deletion.resume_id).limit(1)
+                )
+        except Exception as exc:
+            logger.error(
+                "resume_commit_outcome_unresolved",
+                operation="delete",
+                resume_id=str(deletion.resume_id),
+                error_type=type(exc).__name__,
+            )
+            return "unknown"
+
+        if persisted is not None:
+            if deletion.storage_key is not None:
+                self._remove_marker(marker)
+            return "rolled_back"
+        if deletion.storage_key is not None and self._unlink_storage_key(
+            deletion.storage_key, resume_id=deletion.resume_id
+        ):
+            self._remove_marker(marker)
+        return "committed"
 
     async def upload(
         self,

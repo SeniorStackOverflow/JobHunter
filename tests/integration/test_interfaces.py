@@ -3444,6 +3444,120 @@ async def test_rest_resume_delete_activate_deactivate(
         assert {"resume.deactivated", "resume.activated", "resume.deleted"} <= actions
 
 
+class _CommitThenRaiseSession:
+    """Proxy that commits durably, then simulates losing the COMMIT acknowledgement."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def commit(self) -> None:
+        await self._inner.commit()
+        raise RuntimeError("commit acknowledgement lost")
+
+
+@pytest.mark.asyncio
+async def test_rest_resume_upload_recovers_when_commit_ack_is_lost(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+
+    application, settings = interface_app
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    async with sqlite_session_factory() as session:
+        session.add(UserProfile(name="Ambiguous upload owner", is_default=True))
+        await session.commit()
+
+    async def ambiguous_session() -> AsyncIterator[Any]:
+        async with sqlite_session_factory() as inner:
+            yield _CommitThenRaiseSession(inner)
+
+    application.dependency_overrides[get_session] = ambiguous_session
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+        response = await client.post(
+            "/api/v1/resumes",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            data={"name": "Ambiguous CV", "category": "ops"},
+            files={
+                "file": (
+                    "ambiguous.pdf",
+                    b"%PDF-1.7\nambiguous upload\n%%EOF",
+                    "application/pdf",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    resume_id = UUID(response.json()["id"])
+    async with sqlite_session_factory() as session:
+        resume = await session.get(Resume, resume_id)
+        assert resume is not None
+        storage_key = resume.storage_key
+    assert (settings.resume_storage_path / storage_key).is_file()
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    assert not list(transaction_dir.glob("upload-*.json"))
+
+
+@pytest.mark.asyncio
+async def test_rest_resume_delete_recovers_when_commit_ack_is_lost(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+
+    application, settings = interface_app
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    pdf = b"%PDF-1.7\nambiguous delete\n%%EOF"
+    storage_key = "ambiguous-delete.pdf"
+    (settings.resume_storage_path / storage_key).write_bytes(pdf)
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Ambiguous delete owner", is_default=True)
+        session.add(profile)
+        await session.flush()
+        resume = Resume(
+            profile_id=profile.id,
+            name="Ambiguous delete CV",
+            category="ops",
+            storage_key=storage_key,
+            original_filename="ambiguous-delete.pdf",
+            mime_type="application/pdf",
+            sha256=hashlib.sha256(pdf).hexdigest(),
+            active=True,
+            verified=False,
+            is_default=False,
+        )
+        session.add(resume)
+        await session.commit()
+        resume_id = resume.id
+
+    async def ambiguous_session() -> AsyncIterator[Any]:
+        async with sqlite_session_factory() as inner:
+            yield _CommitThenRaiseSession(inner)
+
+    application.dependency_overrides[get_session] = ambiguous_session
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+        response = await client.delete(
+            f"/api/v1/resumes/{resume_id}",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"id": str(resume_id), "deleted": True}
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, resume_id) is None
+    assert not (settings.resume_storage_path / storage_key).exists()
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    assert not list(transaction_dir.glob("delete-*.json"))
+
+
 @pytest.mark.asyncio
 async def test_rest_resume_delete_conflicts_when_referenced(
     interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any

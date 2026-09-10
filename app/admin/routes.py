@@ -1568,17 +1568,25 @@ async def create_profile(
                 details={"mime_type": resume.mime_type, "sha256": resume.sha256},
             )
             notice = "profile_and_resume_created"
-        await session.commit()
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
-        # Targeted rollback of this request's own in-flight upload: its Resume
-        # row is gone with the rollback above, so drop the marker and the file
-        # it wrote. A no-op when no marker was written (profile row failed first).
         with contextlib.suppress(Exception):
             if has_resume and resume_service._last_upload_key is not None:
                 resume_service.abort_pending_upload(resume_service._last_upload_key)
         raise
+    try:
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        outcome = "unknown"
+        if has_resume and resume_service._last_upload_key is not None:
+            outcome = await resume_service.resolve_upload_commit_outcome(
+                resume_service._last_upload_key
+            )
+        if outcome != "committed":
+            raise
     if resume is not None:
         resume_service.finalize_upload(resume)
     return RedirectResponse(
@@ -1748,16 +1756,25 @@ async def admin_upload_resume(
             str(resume.id),
             details={"mime_type": resume.mime_type, "sha256": resume.sha256},
         )
-        await session.commit()
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
-        # Roll back only this request's own in-flight upload (marker + file);
-        # a no-op when upload() failed before writing its marker.
         with contextlib.suppress(Exception):
             if resume_service._last_upload_key is not None:
                 resume_service.abort_pending_upload(resume_service._last_upload_key)
         raise
+    try:
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        outcome = "unknown"
+        if resume_service._last_upload_key is not None:
+            outcome = await resume_service.resolve_upload_commit_outcome(
+                resume_service._last_upload_key
+            )
+        if outcome != "committed":
+            raise
     resume_service.finalize_upload(resume)
     return RedirectResponse(
         f"/?view=settings&profile_id={profile.id}&notice=resume_uploaded", status_code=303
@@ -1909,9 +1926,6 @@ async def admin_delete_resume(
             str(resume_id),
             details=deletion.audit_details(),
         )
-        await session.commit()
-    # LookupError / ResumeInUseError are raised by ResumeService.delete before any
-    # transaction marker is written, so these paths need no rollback/cleanup.
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResumeInUseError as exc:
@@ -1919,12 +1933,20 @@ async def admin_delete_resume(
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
-        # The rollback restored the Resume row and its file; drop only the
-        # marker this request wrote (never touch the file).
         with contextlib.suppress(Exception):
             if deletion is not None:
                 resume_service.abort_pending_delete(deletion)
         raise
+    try:
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        outcome = "unknown"
+        if deletion is not None:
+            outcome = await resume_service.resolve_delete_commit_outcome(deletion)
+        if outcome != "committed":
+            raise
     resume_service.finalize_delete(deletion)
     return RedirectResponse(
         f"/?view=settings&profile_id={selected_profile.id}&notice=resume_deleted",
