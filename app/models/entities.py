@@ -99,6 +99,7 @@ class Resume(UUIDPrimaryKeyMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

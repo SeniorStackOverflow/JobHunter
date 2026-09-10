@@ -631,6 +631,8 @@ class ResumeService:
         path = safe_storage_path(self.settings.resume_storage_path, resume.storage_key)
         if not path.is_file():
             raise ValueError("resume binary has not been uploaded")
+        if resume.archived:
+            raise ValueError("archived resume must be restored first")
         resume.active = True
         await session.flush()
         return resume
@@ -641,6 +643,31 @@ class ResumeService:
             raise LookupError(f"resume {resume_id} does not exist")
         resume.active = False
         resume.is_default = False
+        await session.flush()
+        return resume
+
+    async def archive(self, session: AsyncSession, resume_id: UUID) -> Resume:
+        """Soft-hide a resume that is referenced and therefore cannot be deleted.
+
+        The row and its foreign-key references stay intact (history unbroken) and
+        the file is kept, but the resume drops out of the settings list, is not
+        selectable for applications, and cannot be activated until restored.
+        """
+        resume = await session.get(Resume, resume_id)
+        if resume is None:
+            raise LookupError(f"resume {resume_id} does not exist")
+        resume.archived = True
+        resume.active = False
+        resume.is_default = False
+        await session.flush()
+        return resume
+
+    async def restore(self, session: AsyncSession, resume_id: UUID) -> Resume:
+        """Un-archive a resume; it stays inactive and must be activated separately."""
+        resume = await session.get(Resume, resume_id)
+        if resume is None:
+            raise LookupError(f"resume {resume_id} does not exist")
+        resume.archived = False
         await session.flush()
         return resume
 
@@ -693,6 +720,7 @@ class ResumeService:
                         Resume.profile_id == profile_id,
                         Resume.active.is_(True),
                         Resume.verified.is_(True),
+                        Resume.archived.is_(False),
                     )
                 )
             ).all()
@@ -713,6 +741,7 @@ class ResumeService:
                         Resume.profile_id == profile_id,
                         Resume.active.is_(True),
                         Resume.verified.is_(True),
+                        Resume.archived.is_(False),
                     )
                 )
             ).all()

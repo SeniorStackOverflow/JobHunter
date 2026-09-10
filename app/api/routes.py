@@ -363,6 +363,50 @@ async def activate_resume_endpoint(
     return {"id": item.id, "active": item.active}
 
 
+@router.post("/resumes/{resume_id}/archive")
+async def archive_resume_endpoint(
+    resume_id: UUID,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        item = await ResumeService(get_settings()).archive(session, resume_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        actor=actor,
+        action="resume.archived",
+        entity_type="resume",
+        entity_id=str(item.id),
+        correlation_id=str(item.id),
+    )
+    await session.commit()
+    return {"id": item.id, "archived": item.archived}
+
+
+@router.post("/resumes/{resume_id}/restore")
+async def restore_resume_endpoint(
+    resume_id: UUID,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        item = await ResumeService(get_settings()).restore(session, resume_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        actor=actor,
+        action="resume.restored",
+        entity_type="resume",
+        entity_id=str(item.id),
+        correlation_id=str(item.id),
+    )
+    await session.commit()
+    return {"id": item.id, "archived": item.archived}
+
+
 @router.delete("/resumes/{resume_id}")
 async def delete_resume_endpoint(
     resume_id: UUID,

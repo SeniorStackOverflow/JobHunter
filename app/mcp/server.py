@@ -466,6 +466,30 @@ async def deactivate_resume(resume_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def archive_resume(resume_id: str) -> dict[str, Any]:
+    """Archive a referenced resume that cannot be deleted; it drops out of the list."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        item = await ResumeService(get_settings()).archive(session, UUID(resume_id))
+        await _audit_write(session, "resume.archived", "resume", str(item.id))
+        await session.commit()
+        return {"id": str(item.id), "archived": item.archived}
+
+
+@mcp.tool()
+async def restore_resume(resume_id: str) -> dict[str, Any]:
+    """Restore an archived resume; it returns to the list, still inactive."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        item = await ResumeService(get_settings()).restore(session, UUID(resume_id))
+        await _audit_write(session, "resume.restored", "resume", str(item.id))
+        await session.commit()
+        return {"id": str(item.id), "archived": item.archived}
+
+
+@mcp.tool()
 async def delete_resume(resume_id: str) -> dict[str, Any]:
     """Delete a resume that no application or evaluation uses; the file is removed too."""
     from contextlib import suppress

@@ -190,8 +190,10 @@ _AUDIT_ACTION_LABELS = {
     "profile.created": "Профиль создан",
     "profile.updated": "Профиль обновлён",
     "resume.activated": "Резюме снова активно",
+    "resume.archived": "Резюме заархивировано",
     "resume.deactivated": "Резюме деактивировано",
     "resume.deleted": "Резюме удалено",
+    "resume.restored": "Резюме восстановлено",
     "resume.uploaded": "Резюме загружено",
     "resume.verified": "Резюме подтверждено",
     "source.disabled": "Источник выключен",
@@ -233,6 +235,11 @@ _FEEDBACK_NOTICES = {
         "Оно больше не используется для новых откликов; активировать можно обратно.",
     ),
     "resume_activated": ("Резюме активно", "Оно снова доступно для подготовки откликов."),
+    "resume_archived": (
+        "Резюме заархивировано",
+        "Оно скрыто из списка; строка и история сохранены. Можно восстановить.",
+    ),
+    "resume_restored": ("Резюме восстановлено", "Оно снова в списке, неактивно."),
     "resume_deleted": ("Резюме удалено", "Файл и запись удалены безвозвратно."),
     "profile_and_resume_created": (
         "Профиль и резюме созданы",
@@ -958,7 +965,7 @@ async def dashboard(
     match_jobs: dict[UUID, SourceJob] = {}
     scans: list[ScanRun] = []
     resumes: list[Resume] = []
-    resume_usage: dict[UUID, bool] = {}
+    resume_usage: dict[UUID, int] = {}
     audits: list[AuditEvent] = []
     active_alerts: list[Alert] = []
     historical_alerts: list[Alert] = []
@@ -1261,25 +1268,17 @@ async def dashboard(
             ).all()
         )
         resume_ids = [item.id for item in resumes]
-        referenced: set[UUID | None] = set()
-        if resume_ids:
-            referenced |= set(
-                (
-                    await session.scalars(
-                        select(Application.resume_id).where(Application.resume_id.in_(resume_ids))
-                    )
-                ).all()
+        resume_usage = dict.fromkeys(resume_ids, 0)
+        # One grouped-count query per referencing table (no N+1); sum per resume.
+        for column in (Application.resume_id, MatchEvaluation.resume_id):
+            if not resume_ids:
+                break
+            usage_rows = await session.execute(
+                select(column, func.count()).where(column.in_(resume_ids)).group_by(column)
             )
-            referenced |= set(
-                (
-                    await session.scalars(
-                        select(MatchEvaluation.resume_id).where(
-                            MatchEvaluation.resume_id.in_(resume_ids)
-                        )
-                    )
-                ).all()
-            )
-        resume_usage = {item_id: (item_id in referenced) for item_id in resume_ids}
+            for reference_id, reference_count in usage_rows.all():
+                if reference_id is not None:
+                    resume_usage[reference_id] += int(reference_count)
     elif view == "calls":
         from app.admin.phone_routes import build_calls_context
 
@@ -1889,6 +1888,46 @@ async def admin_activate_resume(
     await session.commit()
     return RedirectResponse(
         f"/?view=settings&profile_id={selected_profile.id}&notice=resume_activated",
+        status_code=303,
+    )
+
+
+@router.post("/admin/resumes/{resume_id}/archive")
+async def admin_archive_resume(
+    resume_id: UUID,
+    request: Request,
+    profile_id: UUID | None = Form(None),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
+    await ResumeService(get_settings()).archive(session, resume_id)
+    await _audit_admin(session, "resume.archived", "resume", str(resume_id))
+    await session.commit()
+    return RedirectResponse(
+        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_archived",
+        status_code=303,
+    )
+
+
+@router.post("/admin/resumes/{resume_id}/restore")
+async def admin_restore_resume(
+    resume_id: UUID,
+    request: Request,
+    profile_id: UUID | None = Form(None),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    _resume, selected_profile = await _owned_resume(session, resume_id, profile_id)
+    await ResumeService(get_settings()).restore(session, resume_id)
+    await _audit_admin(session, "resume.restored", "resume", str(resume_id))
+    await session.commit()
+    return RedirectResponse(
+        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_restored",
         status_code=303,
     )
 

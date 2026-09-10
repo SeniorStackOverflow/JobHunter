@@ -2336,6 +2336,8 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "upload_resume_metadata",
             "activate_resume",
             "deactivate_resume",
+            "archive_resume",
+            "restore_resume",
             "delete_resume",
             "list_sources",
             "get_source",
@@ -3692,3 +3694,262 @@ async def test_rest_resume_delete_conflicts_when_referenced(
         assert response.status_code == 409
     async with sqlite_session_factory() as session:
         assert await session.get(Resume, seeded["resume_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_service_archive_then_restore_transitions(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="resume-archive-service"
+    )
+    service = ResumeService(settings)
+
+    async with sqlite_session_factory() as session:
+        archived = await service.archive(session, seeded["resume_id"])
+        assert archived.archived is True
+        assert archived.active is False
+        assert archived.is_default is False
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        restored = await service.restore(session, seeded["resume_id"])
+        assert restored.archived is False
+        assert restored.active is False
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        with pytest.raises(LookupError):
+            await service.archive(session, uuid4())
+        with pytest.raises(LookupError):
+            await service.restore(session, uuid4())
+
+
+@pytest.mark.asyncio
+async def test_resume_service_activate_rejects_archived_resume(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="resume-archive-activate"
+    )
+    service = ResumeService(settings)
+    async with sqlite_session_factory() as session:
+        await service.archive(session, seeded["resume_id"])
+        await session.commit()
+    async with sqlite_session_factory() as session:
+        with pytest.raises(ValueError, match="restored first"):
+            await service.activate(session, seeded["resume_id"])
+
+
+@pytest.mark.asyncio
+async def test_resume_service_select_excludes_archived_resume(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="resume-archive-select"
+    )
+    service = ResumeService(settings)
+    async with sqlite_session_factory() as session:
+        job = await session.get(SourceJob, seeded["source_job_id"])
+        assert job is not None
+        assert await service.select_for_job(session, seeded["profile_id"], job) is not None
+        assert (
+            await service.select_for_category(session, seeded["profile_id"], "technology")
+            is not None
+        )
+        # Flip only ``archived`` (leave active/verified True) to prove the new
+        # defensive filter, not the ``active`` filter, is doing the exclusion.
+        row = await session.get(Resume, seeded["resume_id"])
+        assert row is not None
+        row.archived = True
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        job = await session.get(SourceJob, seeded["source_job_id"])
+        assert job is not None
+        assert await service.select_for_job(session, seeded["profile_id"], job) is None
+        assert (
+            await service.select_for_category(session, seeded["profile_id"], "technology") is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_resume_archive_and_restore_lifecycle(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="admin-archive"
+    )
+    resume_id = seeded["resume_id"]
+    profile_id = str(seeded["profile_id"])
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+
+        no_csrf = await client.post(f"/admin/resumes/{resume_id}/archive", data={})
+        assert no_csrf.status_code == 422
+        bad_csrf = await client.post(
+            f"/admin/resumes/{resume_id}/archive",
+            data={"profile_id": profile_id, "csrf_token": "not-the-real-token"},
+        )
+        assert bad_csrf.status_code == 403
+
+        archived = await client.post(
+            f"/admin/resumes/{resume_id}/archive",
+            data={"profile_id": profile_id, "csrf_token": csrf_token},
+        )
+        assert archived.status_code == 303
+        assert "notice=resume_archived" in archived.headers["location"]
+        async with sqlite_session_factory() as session:
+            row = await session.get(Resume, resume_id)
+            assert row is not None
+            assert row.archived is True and row.active is False and row.is_default is False
+
+        blocked = await client.post(
+            f"/admin/resumes/{resume_id}/activate",
+            data={"profile_id": profile_id, "csrf_token": csrf_token},
+        )
+        assert blocked.status_code == 422
+
+        restored = await client.post(
+            f"/admin/resumes/{resume_id}/restore",
+            data={"profile_id": profile_id, "csrf_token": csrf_token},
+        )
+        assert restored.status_code == 303
+        assert "notice=resume_restored" in restored.headers["location"]
+        async with sqlite_session_factory() as session:
+            row = await session.get(Resume, resume_id)
+            assert row is not None and row.archived is False and row.active is False
+
+        missing = await client.post(
+            f"/admin/resumes/{uuid4()}/archive",
+            data={"profile_id": profile_id, "csrf_token": csrf_token},
+        )
+        assert missing.status_code == 404
+
+    async with sqlite_session_factory() as session:
+        actions = set((await session.scalars(select(AuditEvent.action))).all())
+        assert {"resume.archived", "resume.restored"} <= actions
+
+
+@pytest.mark.asyncio
+async def test_rest_resume_archive_and_restore(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    seeded = await _seed_review_application(sqlite_session_factory, settings, suffix="rest-archive")
+    resume_id = str(seeded["resume_id"])
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+        archived = await client.post(f"/api/v1/resumes/{resume_id}/archive", headers=headers)
+        assert archived.status_code == 200
+        body = archived.json()
+        assert body["id"] == resume_id and body["archived"] is True
+
+        restored = await client.post(f"/api/v1/resumes/{resume_id}/restore", headers=headers)
+        assert restored.status_code == 200
+        body = restored.json()
+        assert body["id"] == resume_id and body["archived"] is False
+
+        not_found = await client.post(f"/api/v1/resumes/{uuid4()}/archive", headers=headers)
+        assert not_found.status_code == 404
+
+    async with sqlite_session_factory() as session:
+        actions = set((await session.scalars(select(AuditEvent.action))).all())
+        assert {"resume.archived", "resume.restored"} <= actions
+
+
+@pytest.mark.asyncio
+async def test_mcp_archive_and_restore_resume(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+    from app.mcp import server as mcp_server
+
+    _application, settings = interface_app
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+
+    seeded = await _seed_review_application(sqlite_session_factory, settings, suffix="mcp-archive")
+    resume_id = str(seeded["resume_id"])
+
+    assert await mcp_server.archive_resume(resume_id=resume_id) == {
+        "id": resume_id,
+        "archived": True,
+    }
+    async with sqlite_session_factory() as session:
+        row = await session.get(Resume, seeded["resume_id"])
+        assert row is not None and row.archived is True and row.active is False
+
+    assert await mcp_server.restore_resume(resume_id=resume_id) == {
+        "id": resume_id,
+        "archived": False,
+    }
+    async with sqlite_session_factory() as session:
+        row = await session.get(Resume, seeded["resume_id"])
+        assert row is not None and row.archived is False
+
+
+@pytest.mark.asyncio
+async def test_settings_page_archived_resume_section(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    import re
+
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="settings-archive"
+    )
+    resume_id = seeded["resume_id"]
+    profile_id = seeded["profile_id"]
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", follow_redirects=False
+    ) as client:
+        csrf_token = await _login_admin(client, settings)
+
+        html = (await client.get(f"/?view=settings&profile_id={profile_id}")).text
+        # referenced + not archived: an archive form, no delete form, no archived section
+        assert f'action="/admin/resumes/{resume_id}/archive"' in html
+        assert f'action="/admin/resumes/{resume_id}/delete"' not in html
+        assert "Архивные" not in html
+
+        archived = await client.post(
+            f"/admin/resumes/{resume_id}/archive",
+            data={"profile_id": str(profile_id), "csrf_token": csrf_token},
+        )
+        assert archived.status_code == 303
+
+        html = (await client.get(f"/?view=settings&profile_id={profile_id}")).text
+        assert "Архивные (1)" in html
+        assert f'action="/admin/resumes/{resume_id}/restore"' in html
+        # the archived row lives inside the disclosure, after its heading
+        assert html.index("Архивные (1)") < html.index(
+            f'action="/admin/resumes/{resume_id}/restore"'
+        )
+        # no archive/delete form for it any more (archived + still referenced)
+        assert f'action="/admin/resumes/{resume_id}/archive"' not in html
+        assert f'action="/admin/resumes/{resume_id}/delete"' not in html
+
+        depth = max_depth = 0
+        for token in re.findall(r"<details|</details>", html):
+            depth += 1 if token == "<details" else -1
+            max_depth = max(max_depth, depth)
+        assert max_depth <= 1

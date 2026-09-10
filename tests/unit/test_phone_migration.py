@@ -40,6 +40,20 @@ async def test_phase_2a_columns_present_after_metadata_create(sqlite_engine: Asy
 
 
 @pytest.mark.asyncio
+async def test_resume_archived_column_present_after_metadata_create(
+    sqlite_engine: AsyncEngine,
+) -> None:
+    def _columns(sync_conn: object, table: str) -> dict[str, dict]:
+        return {column["name"]: column for column in inspect(sync_conn).get_columns(table)}
+
+    async with sqlite_engine.connect() as conn:
+        resumes = await conn.run_sync(_columns, "resumes")
+
+    assert "archived" in resumes
+    assert resumes["archived"]["nullable"] is False
+
+
+@pytest.mark.asyncio
 async def test_phase_2b_columns_present_after_metadata_create(sqlite_engine: AsyncEngine) -> None:
     def _cols(sync_conn: object, table: str) -> set[str]:
         return {c["name"] for c in inspect(sync_conn).get_columns(table)}

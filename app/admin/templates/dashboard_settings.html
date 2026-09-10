@@ -75,8 +75,10 @@
       </form>
       <div class="panel-pad">
         <div class="panel-subtitle">Резюме этого профиля</div>
+        {% set active_resumes = resumes | rejectattr('archived') | list %}
+        {% set archived_resumes = resumes | selectattr('archived') | list %}
         <div class="compact-list">
-          {% for item in resumes %}
+          {% for item in active_resumes %}
           <div class="compact-row">
             <div>
               <strong>{{ item.name }}{% if item.is_default %} · основное{% endif %}</strong>
@@ -90,7 +92,8 @@
               {% if not item.verified %}<form method="post" action="/admin/resumes/{{ item.id }}/verify"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Подтвердить</button></form>{% endif %}
               {% if item.active %}<form method="post" action="/admin/resumes/{{ item.id }}/deactivate" data-confirm-title="Деактивировать резюме?" data-confirm="Оно перестанет использоваться для новых откликов. Активировать можно обратно." data-confirm-action="Деактивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Деактивировать</button></form>
               {% else %}<form method="post" action="/admin/resumes/{{ item.id }}/activate"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Активировать</button></form>{% endif %}
-              {% if not resume_usage.get(item.id) %}<form method="post" action="/admin/resumes/{{ item.id }}/delete" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>{% endif %}
+              {% if resume_usage.get(item.id, 0) == 0 %}<form method="post" action="/admin/resumes/{{ item.id }}/delete" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>
+              {% else %}<form method="post" action="/admin/resumes/{{ item.id }}/archive" data-confirm-title="Заархивировать резюме?" data-confirm="Используется в {{ resume_usage[item.id] }} записях — будет скрыто из списка, строка и история сохранятся. Восстановить можно." data-confirm-action="Заархивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Архивировать</button></form>{% endif %}
             </div>
           </div>
           {% else %}<div class="empty-state compact">Резюме ещё не загружены.</div>{% endfor %}
@@ -103,6 +106,26 @@
           <label class="switch-inline"><input type="checkbox" name="make_default"> основное</label>
           <button class="btn btn-sm btn-primary">Загрузить</button>
         </form>
+        {% if archived_resumes %}
+        <details class="settings-section"><summary><span><strong>Архивные ({{ archived_resumes | length }})</strong><small>Скрыты из списка; строки и история сохранены</small></span><span>Открыть</span></summary><div class="details-body settings-body">
+          <div class="compact-list">
+            {% for item in archived_resumes %}
+            <div class="compact-row">
+              <div>
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.category }} · {{ item.original_filename }}</span>
+              </div>
+              <div class="row-actions">
+                <span class="badge muted">В архиве</span>
+                {% if not item.storage_key.startswith('pending/') %}<a class="btn btn-sm" href="/admin/resumes/{{ item.id }}/file?profile_id={{ selected_profile_id }}" target="_blank" rel="noopener">Открыть</a>{% endif %}
+                <form method="post" action="/admin/resumes/{{ item.id }}/restore"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Восстановить</button></form>
+                {% if resume_usage.get(item.id, 0) == 0 %}<form method="post" action="/admin/resumes/{{ item.id }}/delete" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>{% endif %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div></details>
+        {% endif %}
       </div>
     </div>
 

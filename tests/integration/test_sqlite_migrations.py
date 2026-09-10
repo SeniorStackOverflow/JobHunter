@@ -12,7 +12,7 @@ from sqlalchemy import inspect
 from sqlalchemy.engine import create_engine
 from sqlalchemy.orm import Session
 
-from app.models.entities import CommunicationSession, UserProfile
+from app.models.entities import CommunicationSession, Resume, UserProfile
 from app.models.enums import CommunicationChannel, CommunicationDirection
 from app.settings import get_settings
 
@@ -31,7 +31,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision == ("b7c8d9e0f1a2",)
+        assert revision == ("645593917157",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -39,6 +39,9 @@ def test_fresh_sqlite_database_migrations_round_trip(
         assert {"public_emails", "public_phones", "matching_content_hash"} <= {
             column["name"] for column in database.get_columns("source_jobs")
         }
+        resume_columns = {column["name"]: column for column in database.get_columns("resumes")}
+        assert "archived" in resume_columns
+        assert resume_columns["archived"]["nullable"] is False
         assert "requires_rematch" in {
             column["name"] for column in database.get_columns("job_snapshots")
         }
@@ -116,6 +119,18 @@ def test_fresh_sqlite_database_migrations_round_trip(
             profile = UserProfile(name="Migration profile", is_default=True)
             session.add(profile)
             session.flush()
+            resume = Resume(
+                profile_id=profile.id,
+                name="Migration resume",
+                category="ops",
+                storage_key="migration-resume.pdf",
+                original_filename="migration-resume.pdf",
+                mime_type="application/pdf",
+                sha256="0" * 64,
+            )
+            session.add(resume)
+            session.flush()
+            assert resume.archived is False
             started_at = datetime.now(UTC)
             session.add(
                 CommunicationSession(
@@ -173,4 +188,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("b7c8d9e0f1a2",)
+    assert revision == ("645593917157",)
