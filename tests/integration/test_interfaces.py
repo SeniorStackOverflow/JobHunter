@@ -2813,12 +2813,14 @@ async def test_reconcile_clears_same_owner_upload_marker_once_row_committed(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_sweeps_stale_tmp_marker_files(
+async def test_reconcile_sweeps_every_tmp_marker_file(
     interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
 ) -> None:
-    """A crash between write_text and os.replace leaves an orphan '.tmp'; reconcile
-    removes it once older than the grace window but keeps a fresh one."""
-    from app.profiles.service import RESUME_TRANSACTION_GRACE_SECONDS, ResumeService
+    """``_write_marker`` is synchronous and atomic w.r.t. the single ``api``
+    event loop, so any '.tmp' a reconcile observes is from a crashed
+    ``_write_marker``, never one in progress. Reconcile unlinks them all, with no
+    wall-clock age gate (defect-2/defect-4)."""
+    from app.profiles.service import ResumeService
 
     _application, settings = interface_app
     settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
@@ -2826,18 +2828,133 @@ async def test_reconcile_sweeps_stale_tmp_marker_files(
     transaction_dir = settings.resume_storage_path / ".transactions"
     transaction_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    stale_tmp = transaction_dir / "upload-stale.tmp"
-    stale_tmp.write_text("{}", encoding="utf-8")
-    aged = time.time() - RESUME_TRANSACTION_GRACE_SECONDS - 5
-    os.utime(stale_tmp, (aged, aged))
+    aged_tmp = transaction_dir / "upload-aged.tmp"
+    aged_tmp.write_text("{}", encoding="utf-8")
+    aged = time.time() - 3600
+    os.utime(aged_tmp, (aged, aged))
     fresh_tmp = transaction_dir / "upload-fresh.tmp"
     fresh_tmp.write_text("{}", encoding="utf-8")
 
     async with sqlite_session_factory() as session:
         await service.reconcile_file_transactions(session)
 
-    assert not stale_tmp.exists()
-    assert fresh_tmp.exists()
+    assert not aged_tmp.exists()
+    assert not fresh_tmp.exists()
+
+
+@pytest.mark.asyncio
+async def test_periodic_resume_reconcile_loops_on_its_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``api``-process background task runs one reconcile sweep per interval
+    and survives a failing iteration instead of dying (FIX 1)."""
+    import asyncio
+    import contextlib as _contextlib
+
+    import app.main as app_main
+
+    calls = 0
+
+    async def fake_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("transient reconcile failure")
+
+    monkeypatch.setattr(app_main, "_run_resume_reconcile_once", fake_once)
+
+    task = asyncio.create_task(app_main._periodic_resume_reconcile(0.01))
+    try:
+        for _ in range(200):
+            if calls >= 4:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with _contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert calls >= 4  # kept looping past the interval AND past a raised iteration
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_resume_delete_drops_its_marker_when_flush_fails(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+) -> None:
+    """``delete()`` writes its delete marker before ``session.delete``/``flush``.
+    If flush raises the row was not deleted, so ``delete()`` must drop its own
+    marker (never the file) before re-raising -- the caller's ``except`` path has
+    no ``deletion`` local to clean up with (FIX 3)."""
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    settings.resume_storage_path.mkdir(parents=True, exist_ok=True)
+    pdf = b"%PDF-1.7\nflush failure\n%%EOF"
+    storage_key = "flush-failure-resume.pdf"
+    resume_path = settings.resume_storage_path / storage_key
+    resume_path.write_bytes(pdf)
+
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Flush failure owner", is_default=True)
+        session.add(profile)
+        await session.flush()
+        resume = Resume(
+            profile_id=profile.id,
+            name="Flush failure",
+            category="ops",
+            storage_key=storage_key,
+            original_filename="flush.pdf",
+            mime_type="application/pdf",
+            sha256=hashlib.sha256(pdf).hexdigest(),
+            active=True,
+            verified=False,
+            is_default=False,
+        )
+        session.add(resume)
+        await session.commit()
+        resume_id = resume.id
+
+    class _FlushFailsSession:
+        """Proxy that forwards everything but fails ``flush``."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        async def flush(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("forced flush failure")
+
+    service = ResumeService(settings)
+    async with sqlite_session_factory() as session:
+        with pytest.raises(RuntimeError, match="forced flush failure"):
+            await service.delete(_FlushFailsSession(session), resume_id)
+
+    transaction_dir = settings.resume_storage_path / ".transactions"
+    assert not list(transaction_dir.glob("delete-*.json"))
+    assert resume_path.exists()
+    async with sqlite_session_factory() as session:
+        assert await session.get(Resume, resume_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_resolve_last_upload_commit_outcome_defaults_rolled_back(
+    interface_app: tuple[FastAPI, Settings],
+) -> None:
+    """A request that never reached ``upload`` has no ``_last_upload_key``: the
+    public helpers a handler now calls unconditionally must be safe no-ops
+    (FIX 5)."""
+    from app.profiles.service import ResumeService
+
+    _application, settings = interface_app
+    service = ResumeService(settings)
+
+    assert service._last_upload_key is None
+    service.abort_last_pending_upload()  # no-op, must not raise
+    assert await service.resolve_last_upload_commit_outcome() == "rolled_back"
 
 
 @pytest.mark.asyncio

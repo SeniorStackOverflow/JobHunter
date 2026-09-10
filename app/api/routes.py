@@ -303,19 +303,14 @@ async def upload_resume(
         with contextlib.suppress(Exception):
             await session.rollback()
         with contextlib.suppress(Exception):
-            if resume_service._last_upload_key is not None:
-                resume_service.abort_pending_upload(resume_service._last_upload_key)
+            resume_service.abort_last_pending_upload()
         raise
     try:
         await session.commit()
     except Exception:
         with contextlib.suppress(Exception):
             await session.rollback()
-        outcome = "unknown"
-        if resume_service._last_upload_key is not None:
-            outcome = await resume_service.resolve_upload_commit_outcome(
-                resume_service._last_upload_key
-            )
+        outcome = await resume_service.resolve_last_upload_commit_outcome()
         if outcome != "committed":
             raise
     resume_service.finalize_upload(resume)

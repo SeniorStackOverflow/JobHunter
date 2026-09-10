@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -32,21 +31,21 @@ from app.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
-# Every file-transaction marker records the nonce of the ``api`` process that
-# wrote it (see ``_PROCESS_NONCE``); ``reconcile_file_transactions`` branches on
-# that identity, not on marker age. This grace window now only backstops the two
-# residual cases with no usable owner: the ``.tmp`` sweep (a torn ``_write_marker``
-# write has no readable owner) and the unsupported multi-``api``-replica
-# deployment (a live peer's marker would otherwise look like a dead
-# predecessor's). 60s is comfortably longer than any single upload/delete request.
-RESUME_TRANSACTION_GRACE_SECONDS = 60
+# Interval between background reconcile sweeps inside the long-lived ``api``
+# process (see ``app.main``). The startup sweep only clears orphans from a
+# previous process; this bounds how long a marker stranded by a double fault (a
+# request whose own ``except`` path also failed) survives -- such a marker is
+# same-owner, so reconcile only tidies it once its DB outcome is settled.
+RESUME_TRANSACTION_RECONCILE_INTERVAL_SECONDS = 900
 
 # Regenerated on every import, i.e. once per ``api`` process. Written into every
 # transaction marker so a later reconcile can tell "this same live process wrote
 # it" (a request may still be in flight -- leave its file alone) from "a
 # previous, now-dead process wrote it" (a crashed predecessor -- reconcile it
 # immediately). Relies on the single-writer invariant documented on
-# ``reconcile_file_transactions``.
+# ``reconcile_file_transactions``: running more than one ``api`` process against
+# a single resume volume is unsupported -- a live peer's fresh marker is
+# indistinguishable from a dead predecessor's and its file would be deleted.
 _PROCESS_NONCE = uuid4().hex
 
 
@@ -291,9 +290,11 @@ class ResumeService:
         written.
 
         Single-writer assumption: the ``api`` container is the only writer;
-        ``worker``/``beat`` mount the volume read-only. Running multiple ``api``
-        replicas against one resume volume is unsupported without a
-        process-liveness registry.
+        ``worker``/``beat`` mount the volume read-only. Running more than one
+        ``api`` process against a single resume volume is unsupported -- a live
+        peer's fresh marker is indistinguishable from a dead predecessor's and
+        its file would be deleted. There is no wall-clock age fallback anywhere
+        in this protocol.
 
         Each marker records the ``owner`` nonce of the ``api`` process that wrote
         it, and reconcile branches on that identity rather than on marker age:
@@ -309,10 +310,6 @@ class ResumeService:
           build is deployed). It is reconciled in full immediately -- unlink the
           file when no row references it, then drop the marker -- with no age
           gate, so a fast container restart recovers the orphan at once.
-
-        ``RESUME_TRANSACTION_GRACE_SECONDS`` no longer gates this ``*.json`` hot
-        path; it is now only a fallback for the ``.tmp`` sweep below and for the
-        unsupported multi-``api``-replica deployment.
         """
         transaction_dir = self.settings.resume_storage_path / self._TRANSACTION_DIR
         if not transaction_dir.is_dir():
@@ -378,19 +375,15 @@ class ResumeService:
                 operation=operation,
             )
 
-        # A crash between ``write_text`` and ``os.replace`` in _write_marker
+        # A crash between ``write_text`` and ``os.replace`` in ``_write_marker``
         # leaves a ``.tmp`` that the ``*.json`` sweep never sees; upload keys are
-        # uuid-prefixed so these would otherwise accumulate unbounded. A torn
-        # write has no readable owner, so this is the one path still gated on
-        # ``RESUME_TRANSACTION_GRACE_SECONDS`` to avoid racing an in-progress
-        # ``_write_marker``.
+        # uuid-prefixed so these would otherwise accumulate unbounded.
+        # ``_write_marker`` is fully synchronous -- no ``await`` between
+        # ``write_text`` and ``os.replace`` -- so within the single ``api`` event
+        # loop a concurrent reconcile can never observe a ``.tmp`` mid-write; any
+        # ``.tmp`` seen here is from a crashed ``_write_marker``. Unlink them all,
+        # best effort, with no age gate.
         for stale_tmp in transaction_dir.glob("*.tmp"):
-            try:
-                age_seconds = time.time() - stale_tmp.stat().st_mtime
-            except OSError:
-                continue
-            if age_seconds < RESUME_TRANSACTION_GRACE_SECONDS:
-                continue
             try:
                 stale_tmp.unlink(missing_ok=True)
             except OSError as exc:
@@ -419,6 +412,15 @@ class ResumeService:
         """
         self._unlink_storage_key(storage_key)
         self._remove_marker(self._marker_path("upload", storage_key))
+
+    def abort_last_pending_upload(self) -> None:
+        """Roll back the upload this service last started, if any (handler ``except`` path).
+
+        A no-op when this request never reached ``upload`` (``_last_upload_key``
+        stays ``None``), so handlers can call it unconditionally.
+        """
+        if self._last_upload_key is not None:
+            self.abort_pending_upload(self._last_upload_key)
 
     def abort_pending_delete(self, deletion: ResumeDeletion) -> None:
         """Roll back this process's in-flight delete: drop its marker only.
@@ -473,6 +475,18 @@ class ResumeService:
             return "committed"
         if self._unlink_storage_key(storage_key):
             self._remove_marker(marker)
+        return "rolled_back"
+
+    async def resolve_last_upload_commit_outcome(
+        self,
+    ) -> Literal["committed", "rolled_back", "unknown"]:
+        """Resolve the last upload this service started after ``commit()`` raised.
+
+        Returns ``"rolled_back"`` when this request never reached ``upload``
+        (nothing was written), so handlers can call it unconditionally.
+        """
+        if self._last_upload_key is not None:
+            return await self.resolve_upload_commit_outcome(self._last_upload_key)
         return "rolled_back"
 
     async def resolve_delete_commit_outcome(
@@ -656,8 +670,17 @@ class ResumeService:
                 key=str(resume_id),
                 payload={"resume_id": str(resume_id), "storage_key": deletion.storage_key},
             )
-        await session.delete(resume)
-        await session.flush()
+        try:
+            await session.delete(resume)
+            await session.flush()
+        except Exception:
+            # The row was not deleted, so leave the file alone -- but drop this
+            # delete's marker before re-raising. The caller's ``deletion`` local
+            # is never assigned when ``delete`` raises, so its ``except`` path
+            # cannot call ``abort_pending_delete`` to clean up after us.
+            if deletion.storage_key is not None:
+                self._remove_marker(self._marker_path("delete", str(resume_id)))
+            raise
         return deletion
 
     async def select_for_category(

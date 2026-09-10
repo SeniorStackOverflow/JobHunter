@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -29,6 +31,36 @@ logger = structlog.get_logger(__name__)
 mcp_asgi = streamable_http_app()
 
 
+async def _run_resume_reconcile_once() -> None:
+    """One resume file-transaction reconcile sweep against a fresh session."""
+    from app.database.session import async_session_factory
+    from app.profiles import ResumeService
+
+    async with async_session_factory() as session:
+        await ResumeService(settings).reconcile_file_transactions(session)
+
+
+async def _periodic_resume_reconcile(interval_seconds: float) -> None:
+    """Re-run the reconcile every ``interval_seconds`` for the life of the api process.
+
+    The startup sweep only clears orphans left by a previous process. A marker a
+    request strands when its own ``except`` path also fails (a double fault) is
+    same-owner, so reconcile skips it until the next restart -- on a long-lived
+    process that can be a very long time. This loop bounds that. Every iteration
+    is isolated: a failure is logged and the loop keeps going, never dies.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await _run_resume_reconcile_once()
+        except Exception as exc:
+            logger.warning(
+                "resume_file_reconciliation_periodic_failed",
+                message="periodic resume file transaction reconcile failed",
+                error_type=type(exc).__name__,
+            )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.resume_storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -36,6 +68,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # instead of silently disabling reconcile forever.
     from app.database.session import async_session_factory
     from app.profiles import ResumeService
+    from app.profiles.service import RESUME_TRANSACTION_RECONCILE_INTERVAL_SECONDS
 
     try:
         async with async_session_factory() as session:
@@ -46,8 +79,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             message="startup resume file transaction reconcile failed",
             error_type=type(exc).__name__,
         )
-    async with mcp_asgi.router.lifespan_context(mcp_asgi):
-        yield
+    reconcile_task = asyncio.create_task(
+        _periodic_resume_reconcile(RESUME_TRANSACTION_RECONCILE_INTERVAL_SECONDS)
+    )
+    try:
+        async with mcp_asgi.router.lifespan_context(mcp_asgi):
+            yield
+    finally:
+        reconcile_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reconcile_task
 
 
 app = FastAPI(
