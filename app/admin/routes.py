@@ -1270,15 +1270,14 @@ async def dashboard(
         resume_ids = [item.id for item in resumes]
         resume_usage = dict.fromkeys(resume_ids, 0)
         # One grouped-count query per referencing table (no N+1); sum per resume.
-        for column in (Application.resume_id, MatchEvaluation.resume_id):
-            if not resume_ids:
-                break
-            usage_rows = await session.execute(
-                select(column, func.count()).where(column.in_(resume_ids)).group_by(column)
-            )
-            for reference_id, reference_count in usage_rows.all():
-                if reference_id is not None:
-                    resume_usage[reference_id] += int(reference_count)
+        if resume_ids:
+            for column in (Application.resume_id, MatchEvaluation.resume_id):
+                usage_rows = await session.execute(
+                    select(column, func.count()).where(column.in_(resume_ids)).group_by(column)
+                )
+                for reference_id, reference_count in usage_rows.all():
+                    if reference_id is not None:
+                        resume_usage[reference_id] += int(reference_count)
     elif view == "calls":
         from app.admin.phone_routes import build_calls_context
 

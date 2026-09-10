@@ -258,6 +258,7 @@ async def list_resumes(session: AsyncSession = Depends(get_session)) -> list[dic
             "active",
             "verified",
             "is_default",
+            "archived",
             "created_at",
         )
         for item in values

@@ -415,6 +415,7 @@ async def list_resumes(profile_id: str | None = None) -> list[dict[str, Any]]:
                 "active",
                 "verified",
                 "is_default",
+                "archived",
                 "created_at",
             )
             for item in values
