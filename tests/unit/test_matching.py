@@ -1445,11 +1445,14 @@ async def test_llmrouter_exhausted_structured_pool_falls_back_to_prompt_json() -
         bodies.append(body)
         if "response_format" in body:
             return httpx.Response(
-                429, request=request, headers={"Retry-After": "59"},
+                429,
+                request=request,
+                headers={"Retry-After": "59"},
                 json={"error": {"type": "all_providers_exhausted", "retry_after_seconds": 59}},
             )
         return httpx.Response(
-            200, request=request,
+            200,
+            request=request,
             json={
                 "choices": [
                     {"finish_reason": "stop", "message": {"content": expected.model_dump_json()}}
@@ -1459,9 +1462,12 @@ async def test_llmrouter_exhausted_structured_pool_falls_back_to_prompt_json() -
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         provider = LLMRouterProvider(
-            model="jobhunter", api_key="router-key",
-            base_url="http://router.example.test", client=client,
-            max_attempts=1, retry_delay_seconds=0,
+            model="jobhunter",
+            api_key="router-key",
+            base_url="http://router.example.test",
+            client=client,
+            max_attempts=1,
+            retry_delay_seconds=0,
         )
         result = await provider.evaluate(make_request())
 

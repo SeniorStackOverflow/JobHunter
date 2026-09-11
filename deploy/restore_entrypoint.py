@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backup_entrypoint import parse_migrator_database_url  # noqa: E402
+from backup_entrypoint import parse_migrator_database_url
 
 RESTORE_EXECUTABLE = "/usr/local/bin/job-agent-restore"
 
@@ -30,7 +30,7 @@ def main() -> int:
     except ValueError as exc:
         print(f"Restore configuration error: {exc}", file=sys.stderr)
         return 64
-    os.execve(
+    os.execve(  # noqa: S606 - fixed root-owned executable, no shell or user path
         RESTORE_EXECUTABLE, [RESTORE_EXECUTABLE], environment
     )
     return 70
