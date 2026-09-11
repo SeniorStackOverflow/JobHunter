@@ -79,6 +79,13 @@ def test_celery_beat_and_worker_safety_configuration() -> None:
         "job_agent.scheduler.send_auto_approved_applications",
         "job_agent.scheduler.retry_temporary_failures",
         "job_agent.scheduler.generate_daily_report",
+        "job_agent.scheduler.train_learning_models",
+        "job_agent.scheduler.record_learning_shadow",
+        "job_agent.scheduler.finalize_pending_calls",
+        "job_agent.scheduler.deliver_phone_notifications",
+        "job_agent.scheduler.prune_phone_evidence",
+        "job_agent.scheduler.ingest_phonegate_sms",
+        "job_agent.scheduler.reconcile_phone_sms",
     }
     assert {entry["task"] for entry in schedule.values()} == expected_periodic_tasks
     assert celery_app.conf.accept_content == ["json"]
