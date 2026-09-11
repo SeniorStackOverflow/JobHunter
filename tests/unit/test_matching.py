@@ -1308,12 +1308,17 @@ async def test_llmrouter_provider_retries_and_validates_structured_json() -> Non
             max_attempts=2,
             retry_delay_seconds=0,
         )
-        result = await provider.evaluate(make_request())
+        result, logical_request_id, telemetry = await provider.evaluate_with_telemetry(
+            make_request()
+        )
 
     assert result == expected
+    assert logical_request_id
     assert len(requests) == 2
     assert requests[0].headers["authorization"] == "Bearer router-key"
     assert requests[0].headers["x-llmrouter-prefer"] == "quality"
+    assert requests[0].headers["x-llmrouter-trace"] == "attempts"
+    assert [item["http_status"] for item in telemetry] == [429, 200]
     body = json.loads(requests[0].content)
     assert body["model"] == "smart"
     assert body["response_format"]["type"] == "json_schema"
@@ -1347,6 +1352,8 @@ async def test_llmrouter_exhausted_429_does_not_retry_without_schema() -> None:
             await provider.evaluate(make_request())
     assert exc.value.provider == "llmrouter"
     assert exc.value.retry_after_seconds == 300
+    assert exc.value.logical_request_id
+    assert [item["http_status"] for item in exc.value.telemetry] == [429, 429]
     assert len(bodies) == 2
     assert all("response_format" in body for body in bodies)
 

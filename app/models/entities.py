@@ -524,6 +524,38 @@ class LearningShadowOutcome(UUIDPrimaryKeyMixin, Base):
     )
 
 
+class ExternalCallEvent(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "external_call_events"
+    __table_args__ = (
+        Index("ix_external_call_events_occurred_subsystem", "occurred_at", "subsystem"),
+        Index("ix_external_call_events_logical_request", "logical_request_id"),
+    )
+
+    subsystem: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    upstream_service: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(64))
+    resource: Mapped[str | None] = mapped_column(String(255))
+    logical_request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String(64))
+    entity_id: Mapped[str | None] = mapped_column(String(255))
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, index=True)
+    provider_error_code: Mapped[str | None] = mapped_column(String(128), index=True)
+    exception_type: Mapped[str | None] = mapped_column(String(128), index=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    retry_after_seconds: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    recovered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_final_attempt: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
 class EmailDelivery(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "email_deliveries"
 

@@ -46,6 +46,7 @@ from app.models.enums import (
 )
 from app.profiles.service import ProfileService, choose_resume_for_job
 from app.settings import Settings, get_settings
+from app.telemetry import record_external_call_attempts
 from app.time_utils import local_day_bounds
 
 _MAX_JOB_FIELD_CHARS = 50_000
@@ -507,6 +508,50 @@ class MatchingService:
         self.provider = provider or _provider_from_settings(settings)
         self.prefilter = prefilter or DeterministicPrefilter()
 
+    async def evaluate_with_telemetry(
+        self,
+        job: SourceJob,
+        preference: JobPreference,
+        profile: UserProfile,
+        *,
+        resume_fit: int,
+        resume_category: str | None = None,
+        resume_summary: str | None = None,
+    ) -> tuple[MatchResult, str | None, list[dict[str, Any]]]:
+        deterministic = self.prefilter.evaluate(
+            job,
+            preference,
+            profile,
+            resume_fit=resume_fit,
+        )
+        if not deterministic.eligible_for_ai:
+            return deterministic.to_match_result(), None, []
+        request = build_match_request(
+            job,
+            profile,
+            preference,
+            prefilter=deterministic,
+            resume_category=resume_category,
+            resume_summary=resume_summary,
+        )
+        if isinstance(self.provider, LLMRouterProvider):
+            llm_result, logical_request_id, telemetry = await self.provider.evaluate_with_telemetry(
+                request
+            )
+        else:
+            llm_result = await self.provider.evaluate(request)
+            logical_request_id = None
+            telemetry = []
+        return (
+            reconcile_match_result(
+                deterministic,
+                llm_result,
+                minimum_auto_send_score=preference.minimum_auto_send_score,
+            ),
+            logical_request_id,
+            telemetry,
+        )
+
     async def evaluate(
         self,
         job: SourceJob,
@@ -517,28 +562,15 @@ class MatchingService:
         resume_category: str | None = None,
         resume_summary: str | None = None,
     ) -> MatchResult:
-        deterministic = self.prefilter.evaluate(
+        result, _logical_request_id, _telemetry = await self.evaluate_with_telemetry(
             job,
             preference,
             profile,
             resume_fit=resume_fit,
-        )
-        if not deterministic.eligible_for_ai:
-            return deterministic.to_match_result()
-        request = build_match_request(
-            job,
-            profile,
-            preference,
-            prefilter=deterministic,
             resume_category=resume_category,
             resume_summary=resume_summary,
         )
-        llm_result = await self.provider.evaluate(request)
-        return reconcile_match_result(
-            deterministic,
-            llm_result,
-            minimum_auto_send_score=preference.minimum_auto_send_score,
-        )
+        return result
 
     async def analyze(
         self,
@@ -564,6 +596,8 @@ class MatchingService:
         resume = await _select_resume(session, profile.id, job)
         resume_category = resume.category if resume is not None else None
         resume_fit = _estimate_resume_fit(job, profile, resume_category)
+        telemetry_request_id: str | None = None
+        telemetry_attempts: list[dict[str, Any]] = []
         minimum_catchup_active = await _minimum_catchup_active(session, preference, profile.id)
         if minimum_catchup_active:
             deterministic = self.prefilter.evaluate(job, preference, profile, resume_fit=resume_fit)
@@ -579,7 +613,7 @@ class MatchingService:
             else:
                 result = deterministic.to_match_result()
         else:
-            result = await self.evaluate(
+            result, telemetry_request_id, telemetry_attempts = await self.evaluate_with_telemetry(
                 job,
                 preference,
                 profile,
@@ -645,6 +679,22 @@ class MatchingService:
         )
         session.add(evaluation)
         await session.flush()
+        if telemetry_request_id and telemetry_attempts:
+            has_failure = any(item.get("outcome") != "success" for item in telemetry_attempts)
+            has_success = any(item.get("outcome") == "success" for item in telemetry_attempts)
+            await record_external_call_attempts(
+                session,
+                attempts=telemetry_attempts,
+                subsystem="matching",
+                operation="llm_match",
+                upstream_service="llmrouter",
+                logical_request_id=telemetry_request_id,
+                correlation_id=telemetry_request_id,
+                entity_type="source_job",
+                entity_id=job.id,
+                recovered=has_failure and has_success,
+                metadata={"profile_id": str(profile.id)},
+            )
         return evaluation
 
 
@@ -795,6 +845,20 @@ async def process_unprocessed_jobs() -> int:
                     async with session.begin_nested():
                         await service.analyze(session, source_job_id, profile.id)
                 except LLMProviderUnavailable as exc:
+                    if exc.logical_request_id and exc.telemetry:
+                        await record_external_call_attempts(
+                            session,
+                            attempts=exc.telemetry,
+                            subsystem="matching",
+                            operation="llm_match",
+                            upstream_service="llmrouter",
+                            logical_request_id=exc.logical_request_id,
+                            correlation_id=exc.logical_request_id,
+                            entity_type="source_job",
+                            entity_id=source_job_id,
+                            recovered=False,
+                            metadata={"profile_id": str(profile.id), "final": "unavailable"},
+                        )
                     ttl = await _set_matching_provider_backoff(settings, exc.retry_after_seconds)
                     logger.warning(
                         "job_matching_provider_backoff",

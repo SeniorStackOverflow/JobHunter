@@ -8,6 +8,7 @@ from app.models.entities import (
     CanonicalJob,
     EmailDelivery,
     EmployerContact,
+    ExternalCallEvent,
     JobPreference,
     JobSource,
     MatchEvaluation,
@@ -195,6 +196,57 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             )
         )
         await session.flush()
+        session.add_all(
+            [
+                ExternalCallEvent(
+                    subsystem="matching",
+                    operation="llm_match",
+                    upstream_service="llmrouter",
+                    provider="google",
+                    resource="gemini-test",
+                    logical_request_id="req-1",
+                    correlation_id="req-1",
+                    entity_type="source_job",
+                    entity_id=str(jobs[0].id),
+                    attempt_no=1,
+                    outcome="error",
+                    http_status=429,
+                    provider_error_code="RESOURCE_EXHAUSTED",
+                    exception_type=None,
+                    retryable=True,
+                    retry_after_seconds=60,
+                    latency_ms=12,
+                    recovered=True,
+                    is_final_attempt=False,
+                    event_metadata={},
+                    occurred_at=now,
+                ),
+                ExternalCallEvent(
+                    subsystem="matching",
+                    operation="llm_match",
+                    upstream_service="llmrouter",
+                    provider="cerebras",
+                    resource="gpt-oss-120b",
+                    logical_request_id="req-1",
+                    correlation_id="req-1",
+                    entity_type="source_job",
+                    entity_id=str(jobs[0].id),
+                    attempt_no=2,
+                    outcome="success",
+                    http_status=200,
+                    provider_error_code=None,
+                    exception_type=None,
+                    retryable=False,
+                    retry_after_seconds=None,
+                    latency_ms=8,
+                    recovered=True,
+                    is_final_attempt=True,
+                    event_metadata={},
+                    occurred_at=now + timedelta(milliseconds=1),
+                ),
+            ]
+        )
+        await session.flush()
 
         report = await _generate(session)
 
@@ -217,6 +269,12 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         assert report.summary["pending_review_backlog"] == 0
         assert report.summary["data_integrity"] == {"status": "ok", "issues": []}
         assert report.summary["timezone"] == "Europe/Chisinau"
+        assert report.summary["external_calls"]["failed_attempts"] == 1
+        assert report.summary["external_calls"]["affected_requests"] == 1
+        assert report.summary["external_calls"]["recovered_requests"] == 1
+        assert report.summary["external_calls"]["final_failed_requests"] == 0
+        assert report.summary["external_calls"]["http_errors_by_status"] == {"429": 1}
+        assert report.summary["external_calls"]["errors_by_provider"] == {"google": 1}
         assert report.summary["period_start"].endswith(("+02:00", "+03:00"))
         assert report.summary["daily_limit"] == 20
         assert report.summary["daily_minimum"] == 2

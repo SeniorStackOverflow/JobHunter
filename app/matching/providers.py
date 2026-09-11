@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 from openai import (
@@ -110,9 +112,18 @@ class LLMProvider(Protocol):
 
 
 class LLMProviderUnavailable(RuntimeError):
-    def __init__(self, provider: str, retry_after_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        provider: str,
+        retry_after_seconds: int = 60,
+        *,
+        telemetry: list[dict[str, Any]] | None = None,
+        logical_request_id: str | None = None,
+    ) -> None:
         self.provider = provider
         self.retry_after_seconds = max(1, int(retry_after_seconds))
+        self.telemetry = list(telemetry or [])
+        self.logical_request_id = logical_request_id
         super().__init__(f"{provider} unavailable; retry after {self.retry_after_seconds}s")
 
 
@@ -419,27 +430,74 @@ class LLMRouterProvider:
         return body
 
     async def evaluate(self, request: MatchRequest) -> MatchResult:
+        result, _logical_request_id, _telemetry = await self.evaluate_with_telemetry(request)
+        return result
+
+    async def evaluate_with_telemetry(
+        self, request: MatchRequest
+    ) -> tuple[MatchResult, str, list[dict[str, Any]]]:
+        logical_request_id = str(uuid4())
         if self._client is not None:
-            return await self._evaluate_with_client(self._client, request)
+            return await self._evaluate_with_client(
+                self._client, request, logical_request_id=logical_request_id
+            )
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds,
             follow_redirects=False,
         ) as client:
-            return await self._evaluate_with_client(client, request)
+            return await self._evaluate_with_client(
+                client, request, logical_request_id=logical_request_id
+            )
+
+    @staticmethod
+    def _router_attempts(payload: Any) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        telemetry = payload.get("_llmrouter")
+        if not isinstance(telemetry, dict):
+            return []
+        attempts = telemetry.get("attempts")
+        if not isinstance(attempts, list):
+            return []
+        return [dict(item) for item in attempts if isinstance(item, dict)]
+
+    def _outer_attempt(
+        self,
+        *,
+        outcome: str,
+        http_status: int | None,
+        provider_error_code: str | None = None,
+        exception_type: str | None = None,
+        retryable: bool = False,
+        retry_after_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "occurred_at": datetime.now(UTC).isoformat(),
+            "provider": "llmrouter",
+            "model": self.model_name,
+            "outcome": outcome,
+            "http_status": http_status,
+            "provider_error_code": provider_error_code,
+            "exception_type": exception_type,
+            "retryable": retryable,
+            "retry_after_seconds": retry_after_seconds,
+            "latency_ms": None,
+        }
 
     async def _evaluate_with_client(
         self,
         client: httpx.AsyncClient,
         request: MatchRequest,
-    ) -> MatchResult:
+        *,
+        logical_request_id: str,
+    ) -> tuple[MatchResult, str, list[dict[str, Any]]]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "X-LLMRouter-Prefer": self.prefer,
+            "X-LLMRouter-Trace": "attempts",
         }
+        telemetry: list[dict[str, Any]] = []
         last_failure = "unknown"
-        # Prefer strict provider-side JSON Schema. If the structured-capable pool is
-        # exhausted, downgrade once to prompt-enforced JSON; the parsed result still
-        # passes strict MatchResult validation before it can affect policy or storage.
         structured = True
         while True:
             switch_to_unstructured = False
@@ -452,16 +510,44 @@ class LLMRouterProvider:
                         headers=headers,
                         json=self._body(request, structured=structured),
                     )
+                    try:
+                        response_payload: Any = response.json()
+                    except json.JSONDecodeError:
+                        response_payload = None
+                    traced = self._router_attempts(response_payload)
+                    if traced:
+                        telemetry.extend(traced)
+                    else:
+                        error_payload = (
+                            response_payload.get("error")
+                            if isinstance(response_payload, dict)
+                            else None
+                        )
+                        error_code = None
+                        if isinstance(error_payload, dict):
+                            raw_code = (
+                                error_payload.get("type")
+                                or error_payload.get("code")
+                                or error_payload.get("status")
+                            )
+                            if raw_code is not None:
+                                error_code = str(raw_code)[:128]
+                        telemetry.append(
+                            self._outer_attempt(
+                                outcome="success" if response.status_code < 400 else "error",
+                                http_status=response.status_code,
+                                provider_error_code=error_code,
+                                retryable=(
+                                    response.status_code == 429 or response.status_code >= 500
+                                ),
+                            )
+                        )
                     if response.status_code >= 400:
                         last_failure = f"http_{response.status_code}"
                         if response.status_code == 400 and structured:
-                            try:
-                                error_payload = response.json()
-                            except json.JSONDecodeError:
-                                error_payload = {}
                             error = (
-                                error_payload.get("error")
-                                if isinstance(error_payload, dict)
+                                response_payload.get("error")
+                                if isinstance(response_payload, dict)
                                 else None
                             )
                             if (
@@ -477,11 +563,11 @@ class LLMRouterProvider:
                                 retry_after_seconds = max(0.0, float(raw_retry_after))
                             except ValueError:
                                 retry_after_seconds = 0.0
-                            try:
-                                payload = response.json()
-                            except json.JSONDecodeError:
-                                payload = {}
-                            error = payload.get("error") if isinstance(payload, dict) else None
+                            error = (
+                                response_payload.get("error")
+                                if isinstance(response_payload, dict)
+                                else None
+                            )
                             if (
                                 isinstance(error, dict)
                                 and error.get("type") == "all_providers_exhausted"
@@ -500,12 +586,23 @@ class LLMRouterProvider:
                                 raise LLMProviderUnavailable(
                                     "llmrouter",
                                     max(1, int(max(retry_after_seconds, payload_retry))),
+                                    telemetry=telemetry,
+                                    logical_request_id=logical_request_id,
                                 )
                             retry_after_seconds = min(60.0, retry_after_seconds)
                         if not retryable:
-                            raise LLMProviderUnavailable("llmrouter", 300)
+                            raise LLMProviderUnavailable(
+                                "llmrouter",
+                                300,
+                                telemetry=telemetry,
+                                logical_request_id=logical_request_id,
+                            )
                     else:
-                        return _llmrouter_result(response.json())
+                        return (
+                            _llmrouter_result(response_payload),
+                            logical_request_id,
+                            telemetry,
+                        )
                 except InvalidLLMResponse as exc:
                     last_failure = exc.code
                 except ValidationError as exc:
@@ -514,6 +611,16 @@ class LLMRouterProvider:
                     last_failure = "response_json_invalid"
                 except httpx.RequestError as exc:
                     last_failure = type(exc).__name__
+                    telemetry.append(
+                        self._outer_attempt(
+                            outcome=(
+                                "timeout" if isinstance(exc, httpx.TimeoutException) else "error"
+                            ),
+                            http_status=None,
+                            exception_type=type(exc).__name__,
+                            retryable=True,
+                        )
+                    )
                 if retryable and attempt + 1 < self.max_attempts:
                     delay = max(self.retry_delay_seconds * (2**attempt), retry_after_seconds)
                     if delay:
@@ -522,8 +629,17 @@ class LLMRouterProvider:
                 structured = False
                 continue
             if last_failure.startswith("http_"):
-                raise LLMProviderUnavailable("llmrouter", 300)
-            return _safe_fallback("llmrouter", last_failure)
+                raise LLMProviderUnavailable(
+                    "llmrouter",
+                    300,
+                    telemetry=telemetry,
+                    logical_request_id=logical_request_id,
+                )
+            return (
+                _safe_fallback("llmrouter", last_failure),
+                logical_request_id,
+                telemetry,
+            )
 
 
 def _gemini_result(payload: Any) -> MatchResult:

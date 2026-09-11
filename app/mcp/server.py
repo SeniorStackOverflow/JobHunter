@@ -1036,12 +1036,36 @@ async def get_job(job_id: str) -> dict[str, Any]:
 async def analyze_job(job_id: str, profile_id: str | None = None) -> dict[str, Any]:
     """Run deterministic filters and the configured validated matcher for one source job."""
     from app.database.session import async_session_factory
+    from app.matching.providers import LLMProviderUnavailable
     from app.matching.service import MatchingService
+    from app.telemetry import record_external_call_attempts
 
     async with async_session_factory() as session:
-        evaluation = await MatchingService(get_settings()).analyze(
-            session, UUID(job_id), UUID(profile_id) if profile_id else None
-        )
+        try:
+            evaluation = await MatchingService(get_settings()).analyze(
+                session, UUID(job_id), UUID(profile_id) if profile_id else None
+            )
+        except LLMProviderUnavailable as exc:
+            if exc.logical_request_id and exc.telemetry:
+                await record_external_call_attempts(
+                    session,
+                    attempts=exc.telemetry,
+                    subsystem="matching",
+                    operation="llm_match",
+                    upstream_service="llmrouter",
+                    logical_request_id=exc.logical_request_id,
+                    correlation_id=exc.logical_request_id,
+                    entity_type="source_job",
+                    entity_id=job_id,
+                    recovered=False,
+                    metadata={
+                        "profile_id": profile_id,
+                        "final": "unavailable",
+                        "origin": "mcp",
+                    },
+                )
+                await session.commit()
+            raise
         await _audit_write(session, "job.analyzed", "source_job", job_id)
         await session.commit()
         return _public(
