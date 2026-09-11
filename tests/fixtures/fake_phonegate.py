@@ -22,6 +22,9 @@ class FakePhoneGate:
         self._boot_id = uuid.uuid4().hex
         self._call_state = "IDLE"
         self._caller = ""
+        self._call_id = ""
+        self._call_direction = ""
+        self._call_origin = ""
         self._connected = True
         self._mode = "Zero-ADB"
         self._daemon_version = "0.2.30"
@@ -78,10 +81,28 @@ class FakePhoneGate:
             "duration": "00:00",
             "caller_number": self._caller,
             "caller_name": "",
+            "call_id": self._call_id,
+            "direction": self._call_direction,
+            "origin": self._call_origin,
         }
 
-    def ring(self, caller: str) -> None:
+    def _current_call(self) -> dict[str, Any] | None:
+        if self._call_state == "IDLE":
+            return None
+        return {
+            "call_id": self._call_id,
+            "direction": self._call_direction,
+            "origin": self._call_origin,
+        }
+
+    def ring(self, caller: str, *, origin: str = "network") -> None:
+        """Simulate a call reaching RINGING. ``origin`` defaults to "network"
+        (a genuine inbound call); pass "mcp"/"web"/"api"/"manual" to simulate
+        a call PhoneGate itself dialed out, which the ingest loop must skip."""
         self._call_state, self._caller = "RINGING", caller
+        self._call_id = uuid.uuid4().hex
+        self._call_direction = "incoming" if origin == "network" else "outgoing"
+        self._call_origin = origin
         self._emit("call_state", self._call_state_data())
         self._emit("incoming_call", self._call_state_data())
 
@@ -116,6 +137,7 @@ class FakePhoneGate:
     def hangup(self) -> None:
         self._call_state, self._caller = "IDLE", ""
         self._emit("call_state", self._call_state_data())
+        self._call_id = self._call_direction = self._call_origin = ""
 
     def emit_raw(self, event_type: str, data: dict[str, Any]) -> int:
         """Append an event with an arbitrary type/data shape (for resilience tests)."""
@@ -233,6 +255,7 @@ class FakePhoneGate:
             "transcript_count": len(self._transcripts),
             "latest_event_id": self._next_event_id - 1,
             "boot_id": self._boot_id,
+            "current_call": self._current_call(),
         }
         if self._tx_auto_advance and self._tx_stage != 0:
             self.advance_tx()

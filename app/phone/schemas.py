@@ -15,6 +15,20 @@ class RxAudioStats(_Lenient):
     dropped_frames: int = 0
 
 
+class CurrentCall(_Lenient):
+    """Call-lifecycle identity for the call PhoneGate is currently tracking.
+
+    ``origin`` is the provenance PhoneGate assigns at dial/ring time:
+    ``"network"`` for a genuine inbound call, or ``"mcp"``/``"web"``/``"api"``/
+    ``"jobhunter"``/``"manual"`` for one PhoneGate itself originated. Only
+    ``"network"`` calls are real employer interactions.
+    """
+
+    call_id: str = ""
+    direction: str = ""
+    origin: str = ""
+
+
 class DeviceStatus(_Lenient):
     connected: bool = False
     mode: str = ""
@@ -31,6 +45,8 @@ class DeviceStatus(_Lenient):
     # Absent on older PhoneGate builds — the ingest loop then falls back to the
     # event-id heuristic for restart detection.
     boot_id: str = ""
+    # None while idle; set for the call PhoneGate is currently tracking.
+    current_call: CurrentCall | None = None
 
     @property
     def is_daemon_mode(self) -> bool:

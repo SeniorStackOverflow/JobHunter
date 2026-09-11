@@ -44,6 +44,12 @@ EVENTS_STATE_KEY = "job-agent:phone:events:state"
 # chance of suppressing a real call that collides after a Redis generation loss.
 _INCOMING_CALL_DEDUP_WINDOW = timedelta(minutes=5)
 
+# PhoneGate tags every call with its provenance. Only "network" is a genuine
+# inbound call from the telephone network; "mcp", "web", "api", "jobhunter" and
+# "manual" are all calls PhoneGate itself dialed out (tests, ops, tooling) and
+# must never surface as a JobHunter communication session.
+_NETWORK_CALL_ORIGIN = "network"
+
 
 class IngestLoop:
     def __init__(
@@ -212,7 +218,14 @@ class IngestLoop:
                 self._open_session_id = None
                 # A2 + finding #3: open a session on any active call state
                 # (RINGING or an already-answered IN_CALL) with no open session.
-                if status.call_state in {"RINGING", "IN_CALL"}:
+                origin = status.current_call.origin if status.current_call else ""
+                if status.call_state in {"RINGING", "IN_CALL"} and origin != _NETWORK_CALL_ORIGIN:
+                    logger.info(
+                        "phone_reconcile_skipped_non_network_origin",
+                        origin=origin,
+                        call_state=status.call_state,
+                    )
+                elif status.call_state in {"RINGING", "IN_CALL"}:
                     correlation = await self._correlation.resolve(session, status.caller_number)
                     if correlation is not None:
                         normalized_address = (
@@ -457,6 +470,15 @@ class IngestLoop:
             )
         )
         if already is not None:
+            return
+
+        origin = str(event.data.get("origin") or "")
+        if origin != _NETWORK_CALL_ORIGIN:
+            logger.info(
+                "phone_call_skipped_non_network_origin",
+                origin=origin,
+                direction=str(event.data.get("direction") or ""),
+            )
             return
 
         raw = str(event.data.get("caller_number") or "")

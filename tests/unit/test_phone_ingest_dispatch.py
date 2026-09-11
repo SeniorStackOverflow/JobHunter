@@ -647,6 +647,7 @@ async def test_reset_branch_uses_fresh_device_status(
                 boot_id="new-boot",
                 caller_number="+37360111222",
                 latest_event_id=2,
+                current_call={"call_id": "c1", "direction": "incoming", "origin": "network"},
             )
 
         async def _events(*, after_id: int, limit: int = 250) -> EventsPage:
@@ -655,7 +656,13 @@ async def test_reset_branch_uses_fresh_device_status(
                     events=[
                         PhoneEvent(id=1, type="call_state", data={"state": "RINGING"}),
                         PhoneEvent(
-                            id=2, type="incoming_call", data={"caller_number": "+37360111222"}
+                            id=2,
+                            type="incoming_call",
+                            data={
+                                "caller_number": "+37360111222",
+                                "direction": "incoming",
+                                "origin": "network",
+                            },
                         ),
                     ],
                     latest_id=2,
@@ -1022,6 +1029,106 @@ async def test_last_status_is_exposed_after_run_cycle(
         await loop.run_cycle()
         assert loop.last_status is not None
         assert loop.last_status.call_state == "IDLE"
+
+
+async def test_outgoing_mcp_call_does_not_open_a_session(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """A call PhoneGate itself dialed via MCP must never surface as a
+    JobHunter communication session, even though it goes through the exact
+    same RINGING -> IN_CALL -> IDLE event stream as a real inbound call."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        cursor = await loop.load_cursor()
+        if cursor is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222", origin="mcp")
+        fake.answer()
+        fake.transcript(speaker="rx", text="test tone")
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+        turns = (await session.scalars(select(CommunicationTurn))).all()
+    assert calls == []
+    assert turns == []
+
+
+@pytest.mark.parametrize("origin", ["web", "api", "jobhunter", "manual", "unknown", ""])
+async def test_outgoing_calls_of_every_non_network_origin_are_skipped(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis, origin: str
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        cursor = await loop.load_cursor()
+        if cursor is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222", origin=origin)
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+    assert calls == []
+
+
+async def test_network_origin_call_still_opens_a_session(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """Explicit origin="network" (the default) is unaffected by the filter."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        cursor = await loop.load_cursor()
+        if cursor is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222", origin="network")
+        fake.hangup()
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+    assert len(calls) == 1
+
+
+async def test_reconcile_skips_outgoing_call_already_in_progress(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    """A02/finding: the agent restarts mid-call while PhoneGate is mid-dial on
+    an MCP-originated call. reconcile() must not adopt it as a session."""
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        await loop.load_cursor()
+
+        fake.ring("+37360111222", origin="mcp")
+        status = await client.device_status()
+        assert status.call_state == "RINGING"
+        assert status.current_call is not None
+        assert status.current_call.origin == "mcp"
+
+        await loop.reconcile(status)
+
+    async with profiled_factory() as session:
+        calls = (await session.scalars(select(CommunicationSession))).all()
+    assert calls == []
 
 
 async def test_tx_transcript_lines_are_not_persisted_by_ingest(
