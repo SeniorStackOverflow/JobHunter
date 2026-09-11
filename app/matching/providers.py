@@ -437,9 +437,9 @@ class LLMRouterProvider:
             "X-LLMRouter-Prefer": self.prefer,
         }
         last_failure = "unknown"
-        # Prefer strict provider-side JSON Schema. Only a direct 400 rejection of
-        # response_format may downgrade to prompt-enforced JSON. Provider exhaustion
-        # stays retryable so weak unstructured backends cannot create schema noise.
+        # Prefer strict provider-side JSON Schema. If the structured-capable pool is
+        # exhausted, downgrade once to prompt-enforced JSON; the parsed result still
+        # passes strict MatchResult validation before it can affect policy or storage.
         structured = True
         while True:
             switch_to_unstructured = False
@@ -494,6 +494,9 @@ class LLMRouterProvider:
                                         payload_retry = 0.0
                                 else:
                                     payload_retry = 0.0
+                                if structured:
+                                    switch_to_unstructured = True
+                                    break
                                 raise LLMProviderUnavailable(
                                     "llmrouter",
                                     max(1, int(max(retry_after_seconds, payload_retry))),

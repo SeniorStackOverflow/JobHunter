@@ -1436,37 +1436,37 @@ async def test_llmrouter_falls_back_when_backend_rejects_json_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llmrouter_exhausted_structured_pool_stays_structured_and_retries_later() -> None:
+async def test_llmrouter_exhausted_structured_pool_falls_back_to_prompt_json() -> None:
+    expected = make_result()
     bodies: list[dict[str, Any]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         bodies.append(body)
+        if "response_format" in body:
+            return httpx.Response(
+                429, request=request, headers={"Retry-After": "59"},
+                json={"error": {"type": "all_providers_exhausted", "retry_after_seconds": 59}},
+            )
         return httpx.Response(
-            429,
-            request=request,
-            headers={"Retry-After": "5"},
+            200, request=request,
             json={
-                "error": {
-                    "type": "all_providers_exhausted",
-                    "retry_after_seconds": 5,
-                }
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": expected.model_dump_json()}}
+                ]
             },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         provider = LLMRouterProvider(
-            model="jobhunter",
-            api_key="router-key",
-            base_url="http://router.example.test",
-            client=client,
-            max_attempts=1,
-            retry_delay_seconds=0,
+            model="jobhunter", api_key="router-key",
+            base_url="http://router.example.test", client=client,
+            max_attempts=1, retry_delay_seconds=0,
         )
-        with pytest.raises(LLMProviderUnavailable) as exc:
-            await provider.evaluate(make_request())
+        result = await provider.evaluate(make_request())
 
-    assert exc.value.provider == "llmrouter"
-    assert exc.value.retry_after_seconds == 5
-    assert len(bodies) == 1
+    assert result == expected
+    assert len(bodies) == 2
     assert "response_format" in bodies[0]
+    assert "response_format" not in bodies[1]
+    assert "JSON Schema" in bodies[1]["messages"][0]["content"]
