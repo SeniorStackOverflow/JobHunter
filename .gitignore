@@ -22,6 +22,7 @@ playwright-report/
 
 # Local secrets
 .admin-password
+.env.bak*
 
 # Local backup/editor artifacts
 *.pre-*
