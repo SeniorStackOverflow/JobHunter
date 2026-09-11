@@ -260,14 +260,24 @@ services:
       - no-new-privileges:true
 
   restore:
+    image: jobhunter-backup-prod:${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+    build:
+      context: .
+      dockerfile: deploy/backup.Dockerfile
+      args:
+        APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
+    env_file:
+      - path: /etc/jobhunter/migrator.env
+        required: true
     environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
-      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+      POSTGRES_HOST: ""
+      POSTGRES_PORT: ""
+      POSTGRES_DB: ""
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
       BACKUP_DIR: /backups
       BACKUP_FILE: ${BACKUP_FILE:-}
       RESTORE_CONFIRM: ${RESTORE_CONFIRM:-}
+    entrypoint: ["python3", "/usr/local/bin/job-agent-restore-entrypoint"]
     security_opt:
       - no-new-privileges:true

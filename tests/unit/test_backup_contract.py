@@ -164,3 +164,79 @@ def test_backup_keeps_dev_postgres_fallback(tmp_path: Path) -> None:
     finally:
         for dump_file in backup_dir.glob("*.dump"):
             dump_file.unlink(missing_ok=True)
+
+
+def _load_restore_entrypoint() -> ModuleType:
+    path = ROOT / "deploy/restore_entrypoint.py"
+    assert path.exists(), "production restore URL parser is missing"
+    spec = importlib.util.spec_from_file_location("restore_entrypoint", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_production_restore_uses_root_only_migrator_env() -> None:
+    compose = yaml.safe_load((ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8"))
+    restore = compose["services"]["restore"]
+
+    assert restore["env_file"] == [{"path": "/etc/jobhunter/migrator.env", "required": True}]
+    assert restore["environment"]["POSTGRES_HOST"] == ""
+    assert restore["environment"]["POSTGRES_PORT"] == ""
+    assert restore["environment"]["POSTGRES_DB"] == ""
+    assert restore["environment"]["POSTGRES_USER"] == ""
+    assert restore["environment"]["POSTGRES_PASSWORD"] == ""
+    assert restore["entrypoint"] == ["python3", "/usr/local/bin/job-agent-restore-entrypoint"]
+    assert restore["image"].startswith("jobhunter-backup-prod:")
+
+
+def test_restore_entrypoint_uses_migrator_role_without_leaking_secret(monkeypatch) -> None:
+    module = _load_restore_entrypoint()
+    secret = "restore-secret-that-must-not-leak"
+    monkeypatch.setattr(
+        module.os,
+        "environ",
+        {
+            "MIGRATOR_DATABASE_URL": (
+                f"postgresql+asyncpg://jobhunter_migrator:{secret}@postgres:5432/job_agent"
+            ),
+            "POSTGRES_USER": "job_agent",
+            "POSTGRES_PASSWORD": "stale-bootstrap-secret",
+        },
+    )
+    captured: dict[str, object] = {}
+
+    def fake_execve(path: str, argv: list[str], environment: dict[str, str]) -> None:
+        captured.update(path=path, argv=argv, environment=environment)
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(module.os, "execve", fake_execve)
+
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        module.main()
+
+    assert captured["path"] == module.RESTORE_EXECUTABLE
+    assert captured["argv"] == [module.RESTORE_EXECUTABLE]
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert environment["POSTGRES_USER"] == "jobhunter_migrator"
+    assert environment["POSTGRES_PASSWORD"] == secret
+    assert environment["POSTGRES_DB"] == "job_agent"
+    assert "MIGRATOR_DATABASE_URL" not in environment
+    assert secret not in " ".join(captured["argv"])
+
+
+def test_restore_entrypoint_drops_database_url_from_child_environment() -> None:
+    module = _load_restore_entrypoint()
+    environment = module.build_restore_environment(
+        {
+            "DATABASE_URL": "postgresql+asyncpg://wrong:wrong@wrong/wrong",
+            "MIGRATOR_DATABASE_URL": (
+                "postgresql+asyncpg://jobhunter_migrator:secret@postgres:5432/job_agent"
+            ),
+        }
+    )
+
+    assert "DATABASE_URL" not in environment
+    assert "MIGRATOR_DATABASE_URL" not in environment
+    assert environment["POSTGRES_USER"] == "jobhunter_migrator"
