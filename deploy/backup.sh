@@ -18,13 +18,14 @@ case "$BACKUP_DIR" in
 esac
 
 install -d -m 0700 "$BACKUP_DIR"
-backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-backup_name="job-agent-${database_name}-${backup_timestamp}.dump"
-temporary_file="${BACKUP_DIR}/.${backup_name}.partial"
+backup_name="job-agent-${database_name}-current.dump"
+temporary_file="${BACKUP_DIR}/.${backup_name}.$$.partial"
+temporary_checksum="${temporary_file}.sha256"
 final_file="${BACKUP_DIR}/${backup_name}"
+final_checksum="${final_file}.sha256"
 
 cleanup() {
-    rm -f -- "$temporary_file"
+    rm -f -- "$temporary_file" "$temporary_checksum"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -42,9 +43,19 @@ pg_dump \
 
 pg_restore --list "$temporary_file" >/dev/null
 chmod 0600 "$temporary_file"
-mv -- "$temporary_file" "$final_file"
+checksum="$(sha256sum "$temporary_file" | awk '{print $1}')"
+printf '%s  %s\n' "$checksum" "$backup_name" > "$temporary_checksum"
+chmod 0600 "$temporary_checksum"
+mv -f -- "$temporary_file" "$final_file"
+mv -f -- "$temporary_checksum" "$final_checksum"
 trap - EXIT HUP INT TERM
 
-sha256sum "$final_file" > "${final_file}.sha256"
-chmod 0600 "${final_file}.sha256"
+for stale_file in "$BACKUP_DIR"/"job-agent-${database_name}-"*.dump "$BACKUP_DIR"/"job-agent-${database_name}-"*.dump.sha256; do
+    [ -e "$stale_file" ] || continue
+    case "$stale_file" in
+        "$final_file"|"$final_checksum") continue ;;
+    esac
+    rm -f -- "$stale_file"
+done
+
 echo "Backup created: $final_file"

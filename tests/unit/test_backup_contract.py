@@ -160,7 +160,9 @@ def test_backup_keeps_dev_postgres_fallback(tmp_path: Path) -> None:
         assert "--username=dev_user" in args
         assert "--dbname=dev_db" in args
         assert "dev-password" not in result.stdout + result.stderr
-        assert f"Backup created: {backup_dir}/job-agent-dev_db-" in result.stdout
+        assert f"Backup created: {backup_dir}/job-agent-dev_db-current.dump" in result.stdout
+        assert (backup_dir / "job-agent-dev_db-current.dump").exists()
+        assert (backup_dir / "job-agent-dev_db-current.dump.sha256").exists()
     finally:
         for dump_file in backup_dir.glob("*.dump"):
             dump_file.unlink(missing_ok=True)
