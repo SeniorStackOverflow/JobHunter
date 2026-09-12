@@ -41,7 +41,7 @@ class MatchResult(BaseModel):
     @model_validator(mode="after")
     def enforce_scam_block(self) -> MatchResult:
         if self.scam_indicators and self.decision is not MatchDecision.BLOCK:
-            raise ValueError("scam indicators require the block decision")
+            self.decision = MatchDecision.BLOCK
         return self
 
 

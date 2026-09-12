@@ -272,14 +272,14 @@ def test_match_result_rejects_extra_fields_and_invalid_scores() -> None:
         MatchResult.model_validate({**payload, "decision": "invented"})
 
 
-def test_match_result_requires_block_for_scam_indicators() -> None:
-    with pytest.raises(ValidationError):
-        make_result(scam_indicators=["upfront_payment"])
-    result = make_result(
+def test_match_result_normalizes_scam_indicators_to_block() -> None:
+    result = make_result(scam_indicators=["upfront_payment"])
+    assert result.decision is MatchDecision.BLOCK
+    explicit = make_result(
         scam_indicators=["upfront_payment"],
         decision=MatchDecision.BLOCK,
     )
-    assert result.decision is MatchDecision.BLOCK
+    assert explicit.decision is MatchDecision.BLOCK
 
 
 @pytest.mark.asyncio
