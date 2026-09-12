@@ -78,6 +78,7 @@ _PUBLIC_EMAIL_RE = re.compile(
 )
 _SOURCE_SERVICE_EMAILS = {"rabota@rabota.md", "support@rabota.md"}
 _SOURCE_SERVICE_PHONES = {"+37322921058", "+37322921095", "+37369619917"}
+_CONTENT_HASH_VERSION = 3
 _INTERNAL_ACTION_PARTS = (
     "/ajax/",
     "/auth/",
@@ -166,6 +167,8 @@ class RabotaMdConfig(BaseModel):
     max_pages_per_entrypoint: int = Field(default=100, ge=1, le=1_000)
     incremental_max_pages_per_entrypoint: int = Field(default=20, ge=1, le=1_000)
     incremental_known_detail_refresh_hours: int = Field(default=72, ge=1, le=168)
+    incremental_refresh_jitter_hours: int = Field(default=12, ge=0, le=72)
+    incremental_detail_refresh_budget: int = Field(default=50, ge=1, le=1_000)
     browser_max_navigations_per_page: int = Field(default=50, ge=5, le=500)
     known_unchanged_stop_threshold: int = Field(default=100, ge=1, le=100_000)
     max_discovered_entrypoints: int = Field(default=10_000, ge=1, le=100_000)
@@ -270,6 +273,14 @@ class RabotaMdAdapter:
                 raw_config.setdefault(
                     "incremental_known_detail_refresh_hours",
                     incremental.get("known_detail_refresh_hours", 72),
+                )
+                raw_config.setdefault(
+                    "incremental_refresh_jitter_hours",
+                    incremental.get("refresh_jitter_hours", 12),
+                )
+                raw_config.setdefault(
+                    "incremental_detail_refresh_budget",
+                    incremental.get("detail_refresh_budget", 50),
                 )
             parsed_config = RabotaMdConfig.model_validate(raw_config)
         elif isinstance(config, RabotaMdConfig):
@@ -614,7 +625,6 @@ class RabotaMdAdapter:
             "no_experience": no_experience,
             "workplace_type": workplace_type,
             "contacts": [*public_emails, *public_phones, application_url],
-            "internal_application_available": internal_application_available,
             "status": status.value,
         }
         content_hash = self._hash_json(hash_payload)
@@ -669,6 +679,7 @@ class RabotaMdAdapter:
                 "discovery_url": raw_job.reference.discovery_url,
                 "region": raw_job.reference.region,
                 "internal_application_available": internal_application_available,
+                "content_hash_version": _CONTENT_HASH_VERSION,
                 "listing_updated_hint": raw_job.reference.updated_hint,
                 "public_emails": public_emails,
                 "public_phones": public_phones,
@@ -773,26 +784,53 @@ class RabotaMdAdapter:
         known_checks_raw = state.adapter_state.get("known_last_checked_at", {})
         known_checks = known_checks_raw if isinstance(known_checks_raw, dict) else {}
 
-        def known_unchanged(reference: RawJobReference) -> bool:
+        scan_started_at = datetime.now(UTC)
+        refresh_selected_ids: set[str] = set()
+        refresh_deferred_ids: set[str] = set()
+
+        def refresh_age_limit(reference: RawJobReference) -> timedelta:
+            base_seconds = self.config.incremental_known_detail_refresh_hours * 3600
+            jitter_seconds = self.config.incremental_refresh_jitter_hours * 3600
+            if jitter_seconds <= 0:
+                return timedelta(seconds=base_seconds)
+            digest = hashlib.sha256(reference.external_id.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:8], "big")
+            offset = bucket % (2 * jitter_seconds + 1) - jitter_seconds
+            return timedelta(seconds=max(3600, base_seconds + offset))
+
+        def reference_state(reference: RawJobReference) -> tuple[bool, bool, bool]:
             if reference.external_id not in known_ids:
-                return False
+                return False, False, False
             if reference.updated_hint:
-                return known_hints.get(reference.external_id) == reference.updated_hint
+                return (
+                    known_hints.get(reference.external_id) == reference.updated_hint,
+                    False,
+                    False,
+                )
             raw_checked = known_checks.get(reference.external_id)
             if not isinstance(raw_checked, str):
-                return False
+                return False, False, False
             try:
                 checked_at = datetime.fromisoformat(raw_checked.replace("Z", "+00:00"))
             except ValueError:
-                return False
+                return False, False, False
             if checked_at.tzinfo is None:
                 checked_at = checked_at.replace(tzinfo=UTC)
-            age = datetime.now(UTC) - checked_at.astimezone(UTC)
-            return (
-                timedelta(0)
-                <= age
-                <= timedelta(hours=self.config.incremental_known_detail_refresh_hours)
-            )
+            age = scan_started_at - checked_at.astimezone(UTC)
+            if age < timedelta(0):
+                return False, False, False
+            refresh_due = age > refresh_age_limit(reference)
+            if not refresh_due:
+                return True, False, False
+            if reference.external_id in refresh_selected_ids:
+                return False, True, False
+            if reference.external_id in refresh_deferred_ids:
+                return True, True, True
+            if len(refresh_selected_ids) < self.config.incremental_detail_refresh_budget:
+                refresh_selected_ids.add(reference.external_id)
+                return False, True, False
+            refresh_deferred_ids.add(reference.external_id)
+            return True, True, True
 
         entrypoints = await self._scan_entrypoints(incremental=incremental)
         max_pages = (
@@ -836,7 +874,7 @@ class RabotaMdAdapter:
                 for reference in references:
                     existing = self._references_by_id.get(reference.external_id)
                     if existing is not None:
-                        hint_unchanged = known_unchanged(reference)
+                        hint_unchanged, refresh_due, refresh_deferred = reference_state(reference)
                         unchanged_run = unchanged_run + 1 if hint_unchanged else 0
                         self._merge_reference(existing, reference)
                         # Never attach the growing checkpoint snapshot to the cached reference.
@@ -845,6 +883,10 @@ class RabotaMdAdapter:
                         # carries checkpoint progress to the common pipeline.
                         yielded = existing.model_copy(deep=True)
                         yielded.metadata["known_unchanged"] = hint_unchanged
+                        if refresh_due:
+                            yielded.metadata["detail_refresh_due"] = True
+                        if refresh_deferred:
+                            yielded.metadata["detail_refresh_deferred"] = True
                         yielded.metadata["scan_checkpoint"] = (
                             self._checkpoint_snapshot_for_reference(state)
                         )
@@ -860,7 +902,7 @@ class RabotaMdAdapter:
                             break
                         continue
                     self._references_by_id[reference.external_id] = reference
-                    hint_unchanged = known_unchanged(reference)
+                    hint_unchanged, refresh_due, refresh_deferred = reference_state(reference)
                     unchanged_run = unchanged_run + 1 if hint_unchanged else 0
                     if reference.external_id not in seen_ids:
                         seen_ids.add(reference.external_id)
@@ -869,6 +911,10 @@ class RabotaMdAdapter:
                         # short-lived item crossing the adapter/pipeline boundary.
                         yielded = reference.model_copy(deep=True)
                         yielded.metadata["known_unchanged"] = hint_unchanged
+                        if refresh_due:
+                            yielded.metadata["detail_refresh_due"] = True
+                        if refresh_deferred:
+                            yielded.metadata["detail_refresh_deferred"] = True
                         yielded.metadata["scan_checkpoint"] = (
                             self._checkpoint_snapshot_for_reference(state)
                         )

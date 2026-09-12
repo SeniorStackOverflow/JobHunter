@@ -93,6 +93,18 @@ def _degradation_reason(exc: Exception) -> str | None:
     return None
 
 
+def _hash_version_migration_only(
+    previous_version: object,
+    next_version: object,
+    changed_fields: list[str],
+) -> bool:
+    return (
+        next_version is not None
+        and previous_version != next_version
+        and set(changed_fields) <= {"content_hash"}
+    )
+
+
 def _safe_scan_error_reason(exc: Exception) -> str | None:
     message = str(exc).casefold()
     if "aws waf challenge did not resolve" in message:
@@ -425,6 +437,10 @@ class ScanService:
             processed_ids: set[str] = set(checkpoint.yielded_external_ids)
             observed_pages: set[str] = set()
             forced_degradation_reason: str | None = None
+            detail_fetches = 0
+            refresh_due = 0
+            refresh_deferred = 0
+            hash_version_migrations = 0
             try:
                 async for reference in references:
                     if reference.discovery_url and reference.discovery_url not in observed_pages:
@@ -436,6 +452,10 @@ class ScanService:
                         continue
                     processed_ids.add(reference.external_id)
                     run.found_jobs += 1
+                    if reference.metadata.get("detail_refresh_due") is True:
+                        refresh_due += 1
+                    if reference.metadata.get("detail_refresh_deferred") is True:
+                        refresh_deferred += 1
                     if reference.metadata.get("known_unchanged") is True:
                         await self._merge_reference_metadata(session, source.id, reference)
                         run.unchanged_jobs += 1
@@ -443,6 +463,7 @@ class ScanService:
                         await session.commit()
                         continue
                     try:
+                        detail_fetches += 1
                         raw = await adapter.fetch_job_details(reference)
                         normalized = await adapter.normalize_job(raw)
                         outcome = await self._upsert_job(session, source, normalized, reference)
@@ -452,6 +473,8 @@ class ScanService:
                             run.updated_jobs += 1
                         else:
                             run.unchanged_jobs += 1
+                            if outcome == "hash_migrated":
+                                hash_version_migrations += 1
                         await self._save_checkpoint(session, run, reference, succeeded=True)
                         await session.commit()
                     except Exception as exc:
@@ -535,6 +558,15 @@ class ScanService:
             # Capture completed-entrypoint progress after a clean iterator shutdown as well.
             # Per-reference metadata remains authoritative for adapters using checkpoint copies.
             run.checkpoint = self._merge_checkpoint_progress(run.checkpoint, checkpoint)
+            if run.scan_type == ScanType.INCREMENTAL:
+                diagnostics = dict(run.diagnostics)
+                diagnostics["incremental_refresh"] = {
+                    "detail_fetches": detail_fetches,
+                    "refresh_due": refresh_due,
+                    "refresh_deferred": refresh_deferred,
+                    "hash_version_migrations": hash_version_migrations,
+                }
+                run.diagnostics = diagnostics
             degraded_reason = forced_degradation_reason or await self._detect_degradation(
                 session,
                 run,
@@ -831,6 +863,13 @@ class ScanService:
             | ({reference.category} if reference.category else set())
         )
         raw_metadata = dict(normalized.raw_metadata)
+        previous_raw_metadata = (
+            dict(existing.raw_metadata)
+            if existing is not None and isinstance(existing.raw_metadata, dict)
+            else {}
+        )
+        previous_hash_version = previous_raw_metadata.get("content_hash_version")
+        next_hash_version = raw_metadata.get("content_hash_version")
         if reference.updated_hint:
             raw_metadata["listing_updated_hint"] = reference.updated_hint
         if existing is None:
@@ -929,6 +968,13 @@ class ScanService:
                 changed_fields.append(field)
                 setattr(existing, field, new_value)
         existing.matching_content_hash = compute_source_matching_hash(existing)
+        if _hash_version_migration_only(
+            previous_hash_version, next_hash_version, changed_fields
+        ):
+            if existing.canonical_job_id is not None:
+                await self._refresh_canonical_status(session, {existing.canonical_job_id})
+            await session.flush()
+            return "hash_migrated"
         session.add(
             JobSnapshot(
                 source_job_id=existing.id,
@@ -1161,7 +1207,7 @@ class ScanService:
                 job.status = JobStatus.ACTIVE
                 job.last_seen_at = datetime.now(UTC)
                 if result.changed and result.normalized_job is not None:
-                    await self._upsert_job(
+                    outcome = await self._upsert_job(
                         session,
                         source,
                         result.normalized_job,
@@ -1172,7 +1218,8 @@ class ScanService:
                             category=job.category,
                         ),
                     )
-                    counters["updated"] += 1
+                    if outcome == "updated":
+                        counters["updated"] += 1
             await self._refresh_canonical_status(
                 session,
                 {

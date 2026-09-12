@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncGenerator, AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -196,7 +196,7 @@ async def test_full_scan_uses_top_level_categories_and_paginates() -> None:
     # retain all category/locale occurrences without refetching details.
     assert len(references) >= len(by_id)
     assert f"{BASE}/ru/vacancies/category/it/2" in fetcher.requested
-    assert by_id["1004"].category == "it"
+    assert by_id["2001"].category == "it"
     assert by_id["1001"].metadata["localized_urls"] == {
         "ru": f"{BASE}/ru/locuri-de-munca/python-razrabotchik/1001",
         "ro": f"{BASE}/ro/locuri-de-munca/dezvoltator-python/1001",
@@ -322,6 +322,45 @@ async def test_incremental_recent_known_job_without_listing_hint_skips_detail() 
     references = await collect(adapter.iterate_incremental_scan(checkpoint))
 
     assert references[0].metadata["known_unchanged"] is True
+
+
+@pytest.mark.asyncio
+async def test_incremental_detail_refresh_budget_defers_overdue_known_jobs() -> None:
+    no_hint_routes = routes()
+    no_hint_routes[f"{BASE}/ru/vacancies/category/it"] = re.sub(
+        r'<time class="vacancy-date"[^>]*></time>',
+        "",
+        fixture("category_it_ru_page1.html"),
+    )
+    adapter = RabotaMdAdapter(
+        adapter_config(
+            locale_priority=["ru"],
+            incremental_category_slugs=["it"],
+            incremental_max_pages_per_entrypoint=1,
+            incremental_known_detail_refresh_hours=72,
+            incremental_refresh_jitter_hours=0,
+            incremental_detail_refresh_budget=1,
+            known_unchanged_stop_threshold=1000,
+        ),
+        http_fetcher=FixtureFetcher(no_hint_routes),
+    )
+    stale = (datetime.now(UTC) - timedelta(hours=100)).isoformat()
+    checkpoint = ScanCheckpoint(
+        adapter_state={
+            "known_external_ids": ["1001", "2001"],
+            "known_last_checked_at": {"1001": stale, "2001": stale},
+        }
+    )
+
+    references = await collect(adapter.iterate_incremental_scan(checkpoint))
+    by_id = {item.external_id: item for item in references}
+
+    assert by_id["1001"].metadata["detail_refresh_due"] is True
+    assert by_id["1001"].metadata["known_unchanged"] is False
+    assert by_id["1001"].metadata.get("detail_refresh_deferred") is not True
+    assert by_id["2001"].metadata["detail_refresh_due"] is True
+    assert by_id["2001"].metadata["detail_refresh_deferred"] is True
+    assert by_id["2001"].metadata["known_unchanged"] is True
 
 
 @pytest.mark.asyncio

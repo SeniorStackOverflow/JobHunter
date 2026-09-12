@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.crawlers.pipeline import _hash_version_migration_only
 from app.matching.source_version import (
     changes_require_rematch,
     compute_source_matching_hash,
@@ -65,3 +66,10 @@ def test_matching_hash_changes_for_decision_relevant_fields(
 def test_unknown_snapshot_shape_fails_closed() -> None:
     assert changes_require_rematch(None)
     assert changes_require_rematch({"description": "changed"})
+
+
+def test_content_hash_version_migration_is_not_a_source_update() -> None:
+    assert _hash_version_migration_only(2, 3, ["content_hash"])
+    assert _hash_version_migration_only(None, 3, ["content_hash"])
+    assert not _hash_version_migration_only(3, 3, ["content_hash"])
+    assert not _hash_version_migration_only(2, 3, ["description", "content_hash"])

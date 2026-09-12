@@ -548,6 +548,23 @@ async def test_content_hash_is_deterministic_and_changes_with_contact(
 
 
 @pytest.mark.asyncio
+async def test_content_hash_ignores_internal_apply_ui_and_is_versioned(
+    adapter: RabotaMdAdapter,
+) -> None:
+    without_apply = await normalize(adapter, job_html())
+    with_apply = await normalize(
+        adapter,
+        job_html(body_extra='<button data-caid="123">Отправить CV</button>'),
+    )
+
+    assert without_apply.raw_metadata["internal_application_available"] is False
+    assert with_apply.raw_metadata["internal_application_available"] is True
+    assert without_apply.raw_metadata["content_hash_version"] == 3
+    assert with_apply.raw_metadata["content_hash_version"] == 3
+    assert without_apply.content_hash == with_apply.content_hash
+
+
+@pytest.mark.asyncio
 async def test_content_hash_ignores_source_clock_and_discovery_metadata(
     adapter: RabotaMdAdapter,
 ) -> None:

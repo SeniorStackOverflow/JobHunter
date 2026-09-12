@@ -49,7 +49,9 @@ async def seed_defaults(include_fixture: bool) -> None:
                             "schedule": "0 * * * *",
                             "category_slugs": ["others"],
                             "known_unchanged_stop_threshold": 100,
-                            "known_detail_refresh_hours": 24,
+                            "known_detail_refresh_hours": 72,
+                            "refresh_jitter_hours": 12,
+                            "detail_refresh_budget": 50,
                             "max_pages_per_entrypoint": 20,
                         },
                         "active_job_recheck": {
@@ -119,8 +121,10 @@ def validate_source_config(path: Path) -> dict[str, Any]:
             ),
             "incremental_category_slugs": incremental.get("category_slugs", ["others"]),
             "incremental_known_detail_refresh_hours": incremental.get(
-                "known_detail_refresh_hours", 24
+                "known_detail_refresh_hours", 72
             ),
+            "incremental_refresh_jitter_hours": incremental.get("refresh_jitter_hours", 12),
+            "incremental_detail_refresh_budget": incremental.get("detail_refresh_budget", 50),
         }
         parsed = RabotaMdConfig.model_validate(values)
     elif adapter_type in {"generic_api", "rss", "sitemap"}:

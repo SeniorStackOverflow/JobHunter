@@ -14,7 +14,9 @@ source:
     schedule: "0 * * * *"
     category_slugs: [others]
     known_unchanged_stop_threshold: 100
-    known_detail_refresh_hours: 24
+    known_detail_refresh_hours: 72
+    refresh_jitter_hours: 12
+    detail_refresh_budget: 50
     max_pages_per_entrypoint: 20
   active_job_recheck:
     schedule: "0 2 * * *"
