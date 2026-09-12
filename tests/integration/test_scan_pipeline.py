@@ -270,6 +270,42 @@ async def test_resumed_success_is_not_a_fresh_count_baseline(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_degradation_baseline_ignores_single_large_success_outlier(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    generic_source_configuration: dict[str, Any],
+) -> None:
+    service = ScanService(sqlite_session_factory, build_default_registry())
+    source_id = await persist_source(
+        sqlite_session_factory,
+        make_source(generic_source_configuration, name="Robust degradation baseline fixture"),
+    )
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        counts = [2_169, 306, 287, 293, 283]
+        for index, count in enumerate(counts):
+            session.add(
+                ScanRun(
+                    source_id=source_id,
+                    scan_type=ScanType.INCREMENTAL,
+                    status=RunStatus.SUCCEEDED,
+                    found_jobs=count,
+                    finished_at=now - timedelta(minutes=index + 1),
+                )
+            )
+        current = ScanRun(
+            source_id=source_id,
+            scan_type=ScanType.INCREMENTAL,
+            status=RunStatus.RUNNING,
+            found_jobs=278,
+        )
+        session.add(current)
+        await session.flush()
+
+        assert await service._detect_degradation(session, current) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_degradation_baseline_does_not_compare_full_and_incremental_scans(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
     generic_source_configuration: dict[str, Any],

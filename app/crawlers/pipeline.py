@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from statistics import median
 from typing import Any
 from uuid import UUID
 
@@ -1027,9 +1028,14 @@ class ScanService:
         # A resume continues a previous logical traversal. Its found_jobs counter only
         # describes this segment, so zero/small counts are not source-wide health signals.
         # Resumed successes are likewise not valid count baselines for fresh scans.
-        previous = next(
-            (candidate for candidate in previous_candidates if not scan_is_resume(candidate)),
-            None,
+        fresh_previous = [
+            candidate for candidate in previous_candidates if not scan_is_resume(candidate)
+        ]
+        baseline_candidates = fresh_previous[:5]
+        previous_baseline = (
+            median(candidate.found_jobs for candidate in baseline_candidates)
+            if baseline_candidates
+            else None
         )
         if not is_resume and run.found_jobs == 0:
             return "source returned zero jobs; automatic actions were paused for review"
@@ -1038,9 +1044,9 @@ class ScanService:
         if (
             not is_resume
             and not scan_has_pending_reference_failures(run)
-            and previous is not None
-            and previous.found_jobs >= 20
-            and run.found_jobs < previous.found_jobs * 0.2
+            and previous_baseline is not None
+            and previous_baseline >= 20
+            and run.found_jobs < previous_baseline * 0.2
         ):
             return "source result count dropped by more than 80%"
         total_attempts = run.new_jobs + run.updated_jobs + run.unchanged_jobs + run.parsing_errors
