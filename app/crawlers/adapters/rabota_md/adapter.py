@@ -14,8 +14,15 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from selectolax.parser import HTMLParser
 
+from app.crawlers.adapters.rabota_md.errors import (
+    RabotaMdAccessDenied,
+    RabotaMdDegradedError,
+    RabotaMdError,
+    RabotaMdParseError,
+    RabotaMdTemporaryError,
+)
 from app.crawlers.browser import BrowserNavigationError, StealthPlaywrightBrowser
-from app.crawlers.http import HttpFetcher, SecureHttpClient
+from app.crawlers.http import HttpFetcher
 from app.crawlers.schemas import (
     AccessPolicyResult,
     JobRecheckResult,
@@ -129,26 +136,6 @@ def _default_incremental_categories() -> list[str]:
     return ["others"]
 
 
-class RabotaMdError(RuntimeError):
-    """Base error raised by the Rabota.md adapter."""
-
-
-class RabotaMdAccessDenied(RabotaMdError):
-    """The requested operation is not permitted by the configured access policy."""
-
-
-class RabotaMdTemporaryError(RabotaMdError):
-    """A retryable source or network error."""
-
-
-class RabotaMdDegradedError(RabotaMdError):
-    """The source appears blocked or structurally degraded."""
-
-
-class RabotaMdParseError(RabotaMdError):
-    """A public page could not be parsed safely."""
-
-
 class RabotaMdConfig(BaseModel):
     """Runtime configuration for the dedicated public Rabota.md adapter."""
 
@@ -160,6 +147,8 @@ class RabotaMdConfig(BaseModel):
     policy_review_reference: str | None = None
     locale_priority: list[Literal["ru", "ro"]] = Field(default_factory=_default_locales)
     use_stealth_browser: bool = True
+    transport: Literal["waf_http", "stealth_browser"] | None = None
+    fallback_transport: Literal["stealth_browser", "none"] = "stealth_browser"
     requests_per_minute: int = Field(default=50, ge=1, le=60)
     minimum_interval_seconds: float = Field(default=1.2, ge=1.0)
     timeout_seconds: float = Field(default=30.0, gt=0, le=120)
@@ -209,6 +198,22 @@ class RabotaMdConfig(BaseModel):
                 "policy_review_reference is required when live policy review is acknowledged"
             )
         return self
+
+    @model_validator(mode="after")
+    def transport_legacy_consistency(self) -> RabotaMdConfig:
+        fields = self.model_fields_set
+        if "transport" in fields and "use_stealth_browser" in fields:
+            legacy = "stealth_browser" if self.use_stealth_browser else "waf_http"
+            if self.transport != legacy:
+                raise ValueError(
+                    "transport conflicts with legacy use_stealth_browser; set only transport"
+                )
+        return self
+
+    def resolved_transport(self) -> Literal["waf_http", "stealth_browser"]:
+        if self.transport is not None:
+            return self.transport
+        return "stealth_browser" if self.use_stealth_browser else "waf_http"
 
     @field_validator("user_agent")
     @classmethod
@@ -299,7 +304,7 @@ class RabotaMdAdapter:
         self._owns_http = injected_fetcher is None
         if injected_fetcher is not None:
             self._http = injected_fetcher
-        elif self.config.use_stealth_browser:
+        elif self.config.resolved_transport() == "stealth_browser":
             self._http = StealthPlaywrightBrowser(
                 allowed_domains=(
                     "rabota.md",
@@ -313,13 +318,16 @@ class RabotaMdAdapter:
                 max_navigations_per_page=self.config.browser_max_navigations_per_page,
             )
         else:
-            self._http = SecureHttpClient(
-                allowed_domains=("rabota.md",),
+            from app.crawlers.adapters.rabota_md.transport import build_waf_fetcher
+
+            self._http = build_waf_fetcher(
+                base_url=self.config.base_url,
                 user_agent=self.config.user_agent,
                 requests_per_minute=self.config.requests_per_minute,
                 minimum_interval_seconds=self.config.minimum_interval_seconds,
                 timeout_seconds=self.config.timeout_seconds,
                 max_redirects=self.config.max_redirects,
+                fallback_transport=self.config.fallback_transport,
                 resolver=resolver,
             )
         self._access_result: AccessPolicyResult | None = None

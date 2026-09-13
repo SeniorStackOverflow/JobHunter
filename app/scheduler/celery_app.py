@@ -113,6 +113,11 @@ celery_app.conf.update(
             "schedule": crontab(minute=40, hour=3),
             "options": {"queue": "phone"},
         },
+        "rabota-md-waf-canary": {
+            "task": "job_agent.scheduler.rabota_md_waf_canary",
+            "schedule": crontab(minute=22, hour=4),
+            "options": {"queue": "maintenance", "expires": 3600},
+        },
         "ingest-phonegate-sms": {
             "task": "job_agent.scheduler.ingest_phonegate_sms",
             "schedule": _sms_poll_interval,
@@ -138,6 +143,7 @@ celery_app.conf.update(
         "job_agent.scheduler.finalize_pending_calls": {"queue": "phone"},
         "job_agent.scheduler.deliver_phone_notifications": {"queue": "phone"},
         "job_agent.scheduler.prune_phone_evidence": {"queue": "phone"},
+        "job_agent.scheduler.rabota_md_waf_canary": {"queue": "maintenance"},
         "job_agent.scheduler.ingest_phonegate_sms": {"queue": "phone"},
         "job_agent.scheduler.reconcile_phone_sms": {"queue": "phone"},
     },

@@ -53,6 +53,29 @@ EMAIL_DELIVERIES = Counter(
     "Email delivery outcomes.",
     ("provider", "state"),
 )
+RABOTA_WAF_TOKEN_REFRESH = Counter(
+    "job_agent_rabota_md_waf_token_refresh_total",
+    "aws-waf-token refreshes by backend outcome.",
+    ("outcome",),
+)
+RABOTA_WAF_CHALLENGE = Counter(
+    "job_agent_rabota_md_waf_challenge_total",
+    "AWS WAF 202 challenge responses observed by the HTTP transport.",
+)
+RABOTA_TRANSPORT_FALLBACK = Counter(
+    "job_agent_rabota_md_transport_fallback_total",
+    "In-scan switches from waf_http to the stealth browser.",
+    ("reason",),
+)
+WAF_SOLVER_SOLVE_DURATION = Histogram(
+    "job_agent_waf_solver_solve_duration_seconds",
+    "Pure-Python AWS WAF solve duration.",
+)
+WAF_SOLVER_CANARY = Counter(
+    "job_agent_waf_solver_canary_total",
+    "Daily WAF solver canary outcomes.",
+    ("outcome",),
+)
 
 
 def metrics_response() -> Response:
@@ -66,9 +89,14 @@ __all__ = [
     "EMAIL_DELIVERIES",
     "HTTP_REQUESTS",
     "HTTP_REQUEST_DURATION",
+    "RABOTA_TRANSPORT_FALLBACK",
+    "RABOTA_WAF_CHALLENGE",
+    "RABOTA_WAF_TOKEN_REFRESH",
     "SCAN_ERRORS",
     "SCAN_JOBS",
     "SCAN_RUNS",
     "SOURCE_HEALTH",
+    "WAF_SOLVER_CANARY",
+    "WAF_SOLVER_SOLVE_DURATION",
     "metrics_response",
 ]

@@ -767,6 +767,7 @@ __all__ = [
     "prepare_pending_applications_task",
     "process_unprocessed_jobs_task",
     "prune_phone_evidence_task",
+    "rabota_md_waf_canary_task",
     "recheck_source_task",
     "reconcile_phone_sms_task",
     "record_learning_shadow_task",
@@ -776,3 +777,47 @@ __all__ = [
     "start_scan_task",
     "train_learning_models_task",
 ]
+
+
+@celery_app.task(name="job_agent.scheduler.rabota_md_waf_canary")
+def rabota_md_waf_canary_task() -> dict[str, str]:
+    """Daily canary: solve one live AWS WAF challenge and approve the script hash.
+
+    The pure-Python solver fails closed on an unknown challenge.js version
+    (WafScriptVersionUnknown). This task solves a real challenge once a day and
+    pins the observed script hash in the watchdog, so a silent AWS rotation is
+    detected and re-approved by an explicit successful solve, never implicitly.
+    """
+    return _run_async(_rabota_md_waf_canary())
+
+
+async def _rabota_md_waf_canary() -> dict[str, str]:
+    from redis.asyncio import Redis as AsyncRedis
+
+    from app.crawlers.adapters.rabota_md.transport import WAF_SOLVER_USER_AGENT
+    from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
+    from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
+    from app.observability.metrics import WAF_SOLVER_CANARY
+
+    redis = AsyncRedis.from_url(get_settings().redis_url)
+    try:
+        watchdog = ScriptWatchdog(redis)
+        solver = AwsWafSolver(script_hash_checker=lambda _digest: True)
+        try:
+            token = await solver.solve("https://www.rabota.md", WAF_SOLVER_USER_AGENT)
+        except Exception as exc:
+            WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            logger.warning("rabota_md_waf_canary_failed", error_type=type(exc).__name__)
+            return {"outcome": "failure", "error_type": type(exc).__name__}
+        script_hash = solver.last_script_hash
+        if script_hash:
+            await watchdog.approve(script_hash)
+        WAF_SOLVER_CANARY.labels(outcome="success").inc()
+        logger.info("rabota_md_waf_canary_ok", script_hash=script_hash)
+        return {
+            "outcome": "success",
+            "script_hash": script_hash or "",
+            "token_length": str(len(token)),
+        }
+    finally:
+        await redis.aclose()

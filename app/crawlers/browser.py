@@ -312,6 +312,22 @@ class StealthPlaywrightBrowser:
         async with self._lock:
             await self._page.wait_for_timeout(milliseconds)
 
+    async def find_cookie(
+        self, name: str, *, domain_suffix: str | None = None
+    ) -> dict[str, Any] | None:
+        """Return a cookie from the persistent context (used by the WAF token minter)."""
+        await self.start()
+        assert self._context is not None
+        async with self._lock:
+            for cookie in await self._context.cookies():
+                if cookie.get("name") != name:
+                    continue
+                domain = str(cookie.get("domain") or "")
+                if domain_suffix is not None and not domain.endswith(domain_suffix):
+                    continue
+                return dict(cookie)
+        return None
+
     async def screenshot(self, path: str, *, full_page: bool = True) -> None:
         await self.start()
         assert self._page is not None

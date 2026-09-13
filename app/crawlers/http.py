@@ -96,20 +96,28 @@ class SecureHttpClient:
             host_header = f"{host_header}:{port}"
         return target, host_header
 
-    async def _bounded_get(self, validated: ValidatedURL) -> httpx.Response:
+    async def _bounded_request(
+        self,
+        method: str,
+        validated: ValidatedURL,
+        *,
+        content: bytes | str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
         request_url = validated.url
-        headers: dict[str, str] | None = None
+        extra_headers = dict(headers) if headers else None
         extensions: dict[str, str] | None = None
         if self._pin_resolved_addresses:
             request_url, host_header = self._pinned_target(validated)
-            headers = {"Host": host_header}
+            extra_headers = {**(extra_headers or {}), "Host": host_header}
             if urlsplit(validated.url).scheme == "https":
                 extensions = {"sni_hostname": validated.hostname}
 
         request = self._client.build_request(
-            "GET",
+            method,
             request_url,
-            headers=headers,
+            content=content,
+            headers=extra_headers,
             extensions=extensions,
         )
         response = await self._client.send(request, stream=True)
@@ -134,7 +142,7 @@ class SecureHttpClient:
                 response.status_code,
                 headers=safe_headers,
                 content=b"".join(chunks),
-                request=httpx.Request("GET", validated.url),
+                request=httpx.Request(method, validated.url),
                 extensions={
                     key: value
                     for key, value in response.extensions.items()
@@ -144,13 +152,46 @@ class SecureHttpClient:
         finally:
             await response.aclose()
 
-    async def get(self, url: str) -> httpx.Response:
+    async def get(self, url: str, *, headers: dict[str, str] | None = None) -> httpx.Response:
         validated = await validate_outbound_url(url, self.allowed_domains, self._resolver)
         current = validated.url
         for _ in range(self._max_redirects + 1):
             await self._limiter.wait()
-            response = await self._bounded_get(validated)
+            response = await self._bounded_request("GET", validated, headers=headers)
             if response.status_code not in {301, 302, 303, 307, 308}:
+                return response
+            location = response.headers.get("location")
+            if not location:
+                return response
+            validated = await validate_redirect(
+                current,
+                location,
+                self.allowed_domains,
+                self._resolver,
+            )
+            current = validated.url
+        raise httpx.TooManyRedirects("source exceeded redirect limit", request=response.request)
+
+    async def post_bounded(
+        self,
+        url: str,
+        *,
+        content: bytes | str,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        """Bounded POST inside the domain allowlist (same SSRF/redirect/size guards).
+
+        Deliberately narrow: only the Rabota.md AJAX pagination contract uses it.
+        Redirects are followed only when they preserve the method (307/308).
+        """
+        validated = await validate_outbound_url(url, self.allowed_domains, self._resolver)
+        current = validated.url
+        for _ in range(self._max_redirects + 1):
+            await self._limiter.wait()
+            response = await self._bounded_request(
+                "POST", validated, content=content, headers=headers
+            )
+            if response.status_code not in {307, 308}:
                 return response
             location = response.headers.get("location")
             if not location:
