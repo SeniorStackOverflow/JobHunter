@@ -1,7 +1,7 @@
 # Rabota.md HTTP (waf_http) — основной транспорт без Chromium, stealth-browser как fallback
 
 Дизайн-документ. Дата разведки: 2026-09-03. Spike: 2026-09-12 (успешен).
-Статус: spike пройден, архитектура пересмотрена в пользу primary waf_http, реализация не начата.
+Статус: spike пройден, архитектура пересмотрена в пользу primary waf_http; implementation spec уточнён 2026-09-12, реализация не начата.
 
 ## Цель
 
@@ -31,7 +31,7 @@ Solver [Switch3301/Aws-Waf-Solver](https://github.com/Switch3301/Aws-Waf-Solver)
    (`httpx`, `cryptography`, `structlog` уже в pyproject; scrypt — stdlib).
 3. **`pyscrypt` использовать нельзя**: 314 мс/итерацию (HashcashScrypt d=8 → 297 с).
    `hashlib.scrypt` (OpenSSL) — 0.42 мс/итерацию, бит-в-бит паритет проверен.
-   PoW-bюджет 30 с перекрывает любую разумную difficulty.
+   PoW-бюджет 30 с перекрывает любую разумную difficulty.
 4. **Переносимость токена подтверждена повторно**: токен принимается plain `httpx`
    с UA `job-agent/0.1`; 3 конкурентных solve дают 3 валидных токена.
 5. **AJAX-пагинация POST** работает с токеном и браузерным набором заголовков:
@@ -76,7 +76,7 @@ User-Agent `job-agent/0.1` либо браузерным UA. Выводы:
 ```text
 RabotaMdAdapter (без изменений: entrypoints, пагинация, нормализация, статусы)
         |
-        |  get(url) / post_html_fragment(url)   — seam уже существует
+        |  RabotaMdFetcher: get(url) / post_html_fragment(url)
         v
 +---------------------------+     деградация primary      +---------------------------+
 |      FallbackFetcher      | --------------------------> | StealthPlaywrightBrowser  |
@@ -87,7 +87,7 @@ RabotaMdAdapter (без изменений: entrypoints, пагинация, н�
               v
 +------------------+      202 challenge / 403       +----------------------+
 |  WafHttpClient   | -----------------------------> |   WafTokenProvider   |
-| (httpx + cookie) | <----------------------------- |  get / invalidate    |
+| (httpx + cookie) | <----------------------------- |  get/publish/invalidate |
 +------------------+   aws-waf-token (single-flight)+----------------------+
                                                              |
              +-------------------+  +-------------------+  +------------------+
@@ -109,19 +109,83 @@ Spike инвертировал решение: **primary = `waf_http`, fallback 
 **до** исключения:
 
 - `get(url)` / `post_html_fragment(url)` сначала идут через `WafHttpClient`;
-- сигналы переключения: повторный 202 challenge после refresh, `403` на POST после
-  retry, таймаут PoW-бюджета, `WafSolverError` (незнакомый challenge/captcha-страница);
-- на сигнале тот же запрос повторяется через `StealthPlaywrightBrowser`; ответ
+- request-level browser fallback разрешён только для повторного
+  `202 + x-amzn-waf-action: challenge` после успешного token refresh и для подтверждённой
+  поломки AJAX POST-контракта (`403` при уже каноническом наборе заголовков);
+- `403` не ретраится вслепую теми же заголовками: сначала проверяется, что запрос действительно
+  использовал канонический AJAX header set; если нет — это bug/config error, если да — допускается
+  один request-level browser fallback;
+- `429` **не является сигналом browser fallback**: соблюдается `Retry-After`/backoff, чтобы
+  браузер не превращался в способ обхода server-side rate limit;
+- на fallback-сигнале тот же запрос повторяется через `StealthPlaywrightBrowser`; ответ
   возвращается адаптеру как обычно — parsing общий, checkpoint и итератор не затронуты;
+- если browser fallback успешно прошёл WAF и получил новый `aws-waf-token`, токен
+  обязательно публикуется обратно в `WafTokenProvider`/Redis и синхронизируется с cookie
+  jar `WafHttpClient`; следующий запрос снова идёт через HTTP, а не закрепляет scan на браузере;
 - факт переключения пишется в метрику `rabota_md_transport_fallback_total` и
   structured log (без токена); за scan допускается ограниченное число переключений
   (предлагается 20), дальше — `RabotaMdDegradedError` наружу (реальная деградация);
 - если `playwright` extra недоступен (`BrowserFallbackUnavailable`), fallback-ветка
   пропускается, и primary-ошибка пробрасывается как сейчас.
 
-### WafHttpClient
 
-Реализация существующего seam `HttpFetcher` поверх `SecureHttpClient`:
+#### WAF error taxonomy и state machine
+
+Ошибки WAF разделяются явно; общий `WafSolverError` не используется как универсальный
+сигнал «попробовать браузер», чтобы CAPTCHA/block случайно не попали в fallback-ветку:
+
+```text
+WafChallengeRequired
+    -> invalidate/refresh token -> HTTP retry once
+
+WafUnsupportedChallenge / WafScriptVersionUnknown / WafPowTimeout
+    -> pure-Python solver unavailable
+    -> StealthBrowserTokenMinter разрешён
+
+WafCaptchaRequired
+    -> FAIL CLOSED + alert
+    -> browser fallback/minter запрещён
+
+WafBlocked
+    -> FAIL CLOSED + alert
+    -> browser fallback/minter запрещён
+
+WafRateLimited
+    -> Retry-After/backoff
+    -> browser fallback запрещён
+
+WafPostContractError
+    -> один request-level browser fallback, только если canonical AJAX headers уже были применены
+```
+
+Две роли Chromium не должны запускаться подряд без необходимости. Нормальная цепочка:
+
+```text
+HTTP request
+    -> 202 challenge
+    -> WafTokenProvider.refresh()
+        -> PurePythonSolver
+        -> unsupported script/challenge -> StealthBrowserTokenMinter
+    -> publish token -> sync HTTP cookie jar
+    -> retry original HTTP request once
+    -> если request всё ещё не обслуживается и ошибка допускает request fallback
+       -> FallbackFetcher делает этот один запрос через browser
+       -> если browser получил свежий token, publish/sync его
+    -> следующий запрос снова начинается с HTTP
+```
+
+`StealthBrowserTokenMinter` и request-level browser fallback — разные операции. Успешный
+browser mint не является основанием сразу повторять тот же запрос браузером: сначала
+обязателен HTTP retry с новым токеном.
+
+### Transport contract и WafHttpClient
+
+Текущий общий `HttpFetcher` формально содержит только `get()`, тогда как Rabota.md уже
+использует `post_html_fragment()` через `getattr()`. Перед реализацией вводится отдельный
+`RabotaMdFetcher` protocol с `get()`, `post_html_fragment()` и `aclose()`. Общий
+`HttpFetcher` не расширяется AJAX-спецификой Rabota.md.
+
+`WafHttpClient` реализует `RabotaMdFetcher` поверх безопасных примитивов `SecureHttpClient`:
 
 - один persistent cookie jar с `aws-waf-token`; токен подставляется только в запросы к
   `*.rabota.md`;
@@ -132,38 +196,66 @@ Spike инвертировал решение: **primary = `waf_http`, fallback 
 - `post_html_fragment(url)` — POST с фиксированным браузерным набором заголовков из
   п. 6 разведки (Referer вычисляется из URL страницы 1 категории); контракт ответа
   (`success=true`, строковый `data.content`) совпадает с браузерной реализацией, поэтому
-  код адаптера не меняется;
+  parsing адаптера не меняется;
+- `SecureHttpClient` получает внутренний bounded request primitive для строго разрешённых
+  `GET`/`POST`, чтобы не дублировать SSRF, redirect и response-size guards в WAF-клиенте;
+  наружу generic arbitrary-method API не экспортируется;
 - rate limit, allowlist доменов, SSRF-валидация URL и redirect-проверки — те же, что у
   `SecureHttpClient` (50 rpm, интервал ≥ 1.2 с, только `rabota.md`/`www.rabota.md`);
+- текущий `SecureHttpClient` при DNS/IP pinning намеренно отключает keep-alive, поэтому
+  ожидаемый выигрыш `waf_http` основан прежде всего на отсутствии Chromium/DOM/JS, а не
+  на обещаниях connection pooling;
 - `token.awswaf.com`/`captcha.awswaf.com` в allowlist нужны только solver'у
   (см. ниже), не crawl-трафику.
 
 ### WafTokenProvider
 
-Протокол `async get_token() -> str` / `async invalidate()`. Хранилище — Redis
-(`redis.asyncio`, уже используется в проекте): ключ `crawler:rabota_md:waf_token` с TTL
-из `expires` cookie минус защитный запас (12 часов). Обновление — single-flight через
-Redis lock, чтобы параллельные ветки scan не минтили токен одновременно. Токен —
-чувствительное значение: не логируется, не попадает в audit/observability, не коммитится.
+Протокол минимум `async get_token() -> str`, `async refresh_token() -> str`,
+`async publish_token(token, expires)` и `async invalidate()`. Хранилище — Redis
+(`redis.asyncio`, уже используется в проекте): ключ `crawler:rabota_md:waf_token`, lock-key
+`crawler:rabota_md:waf_token:refresh_lock`. TTL вычисляется консервативно как
+`min(cookie_expiry - safety_margin, configured_max_ttl)`; cookie expiry не считается
+гарантией реального AWS immunity window.
+
+Single-flight refresh имеет фиксированную семантику:
+
+1. прочитать token; если он годен — вернуть его без lock;
+2. если token отсутствует/invalid — попытаться взять Redis lock с обязательным TTL;
+3. **после получения lock перечитать token**: другой worker мог уже завершить refresh;
+4. только если token всё ещё отсутствует/invalid — выполнить mint и `publish_token`;
+5. при crash lock сам истекает по TTL; вечный lock запрещён.
+
+Токен — чувствительное значение: не логируется, не попадает в audit/observability и не
+коммитится.
 
 Backends (в порядке приоритета):
 
-1. **`PurePythonSolver`** — основной, результаты spike'а. Вендорится из
-   [Aws-Waf-Solver](https://github.com/Switch3301/Aws-Waf-Solver) (MIT, с атрибуцией) в
+1. **`PurePythonSolver`** — основной, результаты spike'а. Upstream для воспроизводимости
+   жёстко pin'ится на `Switch3301/Aws-Waf-Solver@fed489c54fe2eb10a6dfac5b4d4c5dfcb06b8808`
+   (MIT, с атрибуцией); не брать свежий `main/master` во время реализации. Вендорятся в
    `app/crawlers/adapters/rabota_md/waf/`: `solver.py`, `crypto.py`, `signal.py`,
-   `metrics.py`, `webgl.json`. Обязательные правки при вендоринге (проверены spike'ом):
+   `metrics.py`, `webgl.json`. Важно: подтверждённый plain-`httpx` spike был отдельным
+   портом `/tmp/waf-solvers/test_httpx_port.py`, который переиспользует helper'ы upstream,
+   но **не** является неизменённым upstream `solve()`. Реализация должна перенести именно
+   проверенную транспортную схему spike'а, а не копировать свежий upstream вслепую.
+   Обязательные правки при вендоринге (проверены spike'ом):
    - `rnet` → `httpx` (impersonation не нужна);
    - `pyscrypt` → `hashlib.scrypt` (750× быстрее, паритет подтверждён);
-   - бюджет времени на PoW (30 с) — превышение = `WafSolverError` → fallback-цепочка;
-   - `x-amzn-waf-action: captcha`/`block`/незнакомый action — немедленный стоп,
-     никаких попыток решать (граница проекта);
+   - бюджет времени на PoW (30 с) — превышение = `WafPowTimeout`; browser token minter
+     разрешён, request-level fallback решается отдельно по state machine выше;
+   - `x-amzn-waf-action: captcha` → `WafCaptchaRequired`, `block` → `WafBlocked`: оба
+     случая fail-closed, без browser fallback/minter; неизвестная версия challenge/script
+     → `WafUnsupportedChallenge`/`WafScriptVersionUnknown` и может использовать только
+     разрешённый browser token minter;
    - сетевые вызовы solver'а (challenge page, `challenge.js`, token endpoint) проходят
      тот же rate limiter; allowlist solver'а = `*.rabota.md` + `*.token.awswaf.com`.
 2. **`StealthBrowserTokenMinter`** — fallback backend. Поднимает существующий
    `StealthPlaywrightBrowser` на одну навигацию `/ru/vacancies`, ждёт разрешения
    challenge (механика уже реализована в `StealthPlaywrightBrowser.get`), забирает cookie
    `aws-waf-token` из контекста (нужен небольшой метод чтения cookies в `browser.py`) и
-   закрывает браузер. Запускается по сигналу invalidate, если solver недоступен.
+   закрывает браузер. Успешно полученный токен публикуется в общий provider, чтобы
+   последующий crawl немедленно вернулся на HTTP. Запускается по сигналу invalidate,
+   если solver недоступен.
 3. **`EnvTokenProvider`** — аварийный ручной канал: токен из переменной окружения/
    secret-файла, выпущенный оператором из обычного браузера. Позволяет пережить поломку
    обоих backend'ов без деплоя.
@@ -174,21 +266,26 @@ Pure-Python solver реимплементирует протокол конкр�
 скрипта AWS ломает его мгновенно и потенциально молча. Смягчение:
 
 - `sha256(challenge.js)` хранится в Redis (стартовый пин — см. spike п. 9);
-- новая версия скрипта не идёт в scan, пока не пройден canary-прогон (одиночный solve
-  вне расписания, задача 1 раз/день) и не выставлен сигнал `solver_canary_ok`;
+- **неизвестный hash `challenge.js` fail-closed для pure-Python solver**: production scan
+  не пробует новую версию «на удачу», а поднимает `WafScriptVersionUnknown`; pure solver
+  становится unavailable, после чего разрешён только `StealthBrowserTokenMinter`. Это не
+  разрешает request-level browser fallback для `captcha`/`block`;
+- новая версия скрипта допускается в solver только после отдельного canary-прогона
+  (одиночный solve вне scan, задача 1 раз/день) и сигнала `solver_canary_ok`;
 - при failed canary solver исключается из цепочки, токен минтит браузер, оператору —
   алерт: ротация скрипта превращается в алерт, а не в молча сломанный источник.
 
 ### Изменения в адаптере и конфиге
 
-`RabotaMdAdapter` уже принимает `HttpFetcher` и содержит весь parsing — его код не
-меняется. Меняется только выбор транспорта по конфигу (`RabotaMdConfig`):
+`RabotaMdAdapter` уже изолирует parsing от транспорта, но перед реализацией его
+transport type уточняется до `RabotaMdFetcher`. Parsing/entrypoints/checkpoint semantics
+не меняются; меняется выбор транспорта по конфигу (`RabotaMdConfig`):
 
 ```yaml
 source:
   id: rabota_md
   adapter: rabota_md
-  transport: waf_http               # waf_http | stealth_browser
+  transport: waf_http                   # waf_http | stealth_browser
   fallback_transport: stealth_browser   # stealth_browser | none
   # ... остальные ключи без изменений
 ```
@@ -197,17 +294,21 @@ source:
 - `fallback_transport: stealth_browser` — in-scan fallback + аварийный минтер;
   `none` — строгий режим без браузера (когда playwright extra удалён из образа);
 - `transport: stealth_browser` — текущее поведение, без изменений (откат конфигом);
-- устаревший флаг `use_stealth_browser` маппится: `true` → `stealth_browser`,
-  `false` → `waf_http` без fallback; сохраняется для обратной совместимости конфигов.
+- устаревший флаг `use_stealth_browser` учитывается **только если `transport` отсутствует**:
+  `true` → `stealth_browser`, `false` → `waf_http` без fallback;
+- если одновременно заданы новый `transport` и legacy `use_stealth_browser` и они
+  противоречат друг другу, конфигурация fail-fast отклоняется вместо тихого выбора.
 
 ### Границы доверия и безопасность
 
-- Те же fail-closed правила: 403/429/5xx и challenge после retry и fallback —
-  degraded/temporary ошибки, никогда «пустая выдача»; массовые переходы статусов при
-  деградации отключены.
+- Те же fail-closed правила: повторный challenge после refresh/fallback, `403` после
+  проверки POST-контракта и `5xx` становятся degraded/temporary ошибками, никогда
+  «пустой выдачей»; `429` отдельно соблюдает `Retry-After`/backoff и **не** включает
+  browser fallback; массовые переходы статусов при деградации отключены.
 - Токен не расширяет права: он лишь воспроизводит сессию обычного посетителя публичных
   страниц. Allowlist публичных путей (`_allowed_public_path`) остаётся без изменений,
-  внутренние endpoints (`/ajax/`, `/cabinet/`, …) по-прежнему запрещены.
+  внутренние endpoints (`/ajax/`, `/cabinet/`, …) по-прежнему запрещены, кроме уже
+  существующего строго ограниченного same-site pagination POST-контракта адаптера.
 - Политика доступа не меняется: `policy_review_acknowledged` + `policy_review_reference`
   обязательны, живой трафик — умеренной интенсивности с теми же лимитами.
 - HTML по-прежнему недоверенный ввод; parsing на selectolax и все нормализационные
@@ -231,15 +332,20 @@ source:
 
 ## План миграции (пересмотрен после spike: primary-first)
 
-1. **Фаза 1 — реализация:** вендор solver'а в `app/crawlers/adapters/rabota_md/waf/`
-   (правки выше), `WafTokenProvider` (Redis store, single-flight, цепочка backends),
-   `WafHttpClient`, `FallbackFetcher`, ScriptWatchdog + canary-задача, ключи `transport`/
-   `fallback_transport` в конфиге. Unit-тесты на существующих fixtures через injected
-   fetcher; live smoke ограниченного числа вакансий без откликов.
+1. **Фаза 1 — transport foundation:** сначала `RabotaMdFetcher` protocol и bounded
+   `GET`/`POST` primitive в `SecureHttpClient`, затем `WafHttpClient` с fake token provider
+   и тестами `202/403/429/AJAX`. После стабилизации интерфейса — `WafTokenProvider`
+   (Redis store, refresh/publish/invalidate, single-flight с double-read после lock), затем
+   vendored solver строго от pinned commit `fed489c54fe2...` и проверенного `httpx` spike-port,
+   `StealthBrowserTokenMinter`, `FallbackFetcher`, ScriptWatchdog + canary-задача и ключи
+   `transport`/`fallback_transport` в конфиге. Unit-тесты на существующих fixtures через
+   injected fetcher; live smoke ограниченного числа вакансий без откликов.
 2. **Фаза 2 — включение primary:** `transport: waf_http` + `fallback_transport:
    stealth_browser` на проде после стандартного deployment gate. Браузер остаётся в
-   образе и страхует каждый scan. Наблюдение ≥ 2 недель: success rate solver'а ≥ 99%,
-   доля fallback-переключений → 0, ни одного необъяснимого 202/403 шторма.
+   образе и страхует каждый scan. Наблюдение ≥ 2 недель: **≥99% crawl-request'ов
+   обслуживаются без Chromium**, fallback остаётся редким, нет необъяснимого 202/403
+   шторма; success rate solver'а отслеживается как вторичная метрика вместе с частотой
+   token refresh, потому что при многосуточном токене solver в норме вызывается редко.
 3. **Фаза 3 — решение об удалении браузера:** вынос минтинга из приложения
    (`EnvTokenProvider` + ops-процедура) либо сохранение минимального browser-extra как
    fallback. Только после этого `playwright`/`playwright-stealth` исключаются из
@@ -248,9 +354,17 @@ source:
 ## Проверки
 
 - unit: parity parsing одних и тех же fixture HTML обоими транспортами; обновление токена
-  по 202 (детект по статусу+заголовку); 403 на POST до retry-политики; single-flight
-  refresh; переключение FallbackFetcher на браузер при повторном challenge; отказ при
-  `captcha`-action; отсутствие токена в логах; scrypt через `hashlib.scrypt`.
+  по 202 (детект по статусу+заголовку); `403` на POST с неканоническими headers считается
+  bug/config error без бессмысленного retry, а `403` при канонических headers допускает один
+  request-level browser fallback; `429` соблюдает backoff и не вызывает browser fallback;
+  single-flight refresh перечитывает token после lock; browser fallback после
+  успешного WAF-прохождения публикует токен обратно в Redis/HTTP cookie jar; переключение
+  `FallbackFetcher` на браузер при повторном challenge; неизвестный `challenge.js` hash
+  блокирует pure-Python solver до canary; `captcha`/`block` не могут попасть ни в browser
+  minter, ни в request-level fallback; `StealthBrowserTokenMinter` после успеха приводит к
+  HTTP retry до любого request-level fallback; конфликт нового transport-конфига с
+  legacy-флагом fail-fast; отсутствие токена в логах; scrypt через
+  `hashlib.scrypt`.
 - integration: live smoke `waf_http` — listing, 2+ страницы AJAX-пагинации, detail,
   recheck; сверка `content_hash` с browser-транспортом на пересекающихся ID
   (спайк-сценарии уже отработаны в `/tmp/waf-solvers`, переносятся в `tests/realcall`).
@@ -260,6 +374,18 @@ source:
   `rabota_md_waf_challenge_total`, `rabota_md_transport_fallback_total`,
   `waf_solver_attempts_total`, `waf_solver_success_total`,
   `waf_solver_solve_duration_seconds`, `waf_solver_script_version`,
-  доля degraded по транспортам.
-- деплой: только через стандартный production gate AGENTS.md (локальная валидация,
-  e2e, явная авторизация оператора).
+  `rabota_md_http_without_browser_ratio`, частота token refresh и доля degraded по
+  транспортам.
+- implementation scope: изменения выполняются **только в DEV checkout** `/home/andrei/JobHunter`.
+  Во время реализации нельзя редактировать `/srv/jobhunter-prod`, pull/build/restart/migrate/deploy
+  PROD или менять production secrets. PROD mutation требует отдельной явной авторизации оператора
+  после завершения всех gate-проверок.
+- обязательные project checks перед handoff: `ruff check .`, `ruff format --check .`,
+  `mypy app fixture_site`, `pytest`. Обычный `pytest` не должен включать live crawling.
+- live Rabota smoke остаётся строго opt-in через существующий gate
+  `ENABLE_LIVE_RABOTA_SMOKE_TEST=true`; live-тест не включается автоматически и не заменяет
+  non-production validation.
+- browser/cookie/WAF integration-sensitive path перед PROD должен пройти end-to-end в DEV/non-PROD
+  **3 раза подряд** с чистым browser context согласно `AGENTS.md`.
+- после тестов исполнитель должен остановиться, перечислить изменённые файлы, результаты проверок,
+  rollout/rollback plan и ждать отдельной авторизации на PROD; никакого самовольного deploy.
