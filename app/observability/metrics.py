@@ -67,9 +67,31 @@ RABOTA_TRANSPORT_FALLBACK = Counter(
     "In-scan switches from waf_http to the stealth browser.",
     ("reason",),
 )
+WAF_SOLVER_ATTEMPTS = Counter(
+    "job_agent_waf_solver_attempts_total",
+    "Pure-Python AWS WAF solver attempts.",
+)
+WAF_SOLVER_SUCCESS = Counter(
+    "job_agent_waf_solver_success_total",
+    "Successful pure-Python AWS WAF solves.",
+)
 WAF_SOLVER_SOLVE_DURATION = Histogram(
     "job_agent_waf_solver_solve_duration_seconds",
     "Pure-Python AWS WAF solve duration.",
+)
+WAF_SOLVER_SCRIPT_VERSION = Gauge(
+    "job_agent_waf_solver_script_version",
+    "Observed challenge.js version by sha256 (1 for versions observed by this process).",
+    ("sha256",),
+)
+RABOTA_TRANSPORT_REQUESTS = Counter(
+    "job_agent_rabota_md_transport_requests_total",
+    "Successful Rabota.md logical requests by serving transport.",
+    ("transport",),
+)
+RABOTA_HTTP_WITHOUT_BROWSER_RATIO = Gauge(
+    "job_agent_rabota_md_http_without_browser_ratio",
+    "Per-fetcher ratio of successful logical requests served without Chromium.",
 )
 WAF_SOLVER_CANARY = Counter(
     "job_agent_waf_solver_canary_total",
@@ -89,14 +111,19 @@ __all__ = [
     "EMAIL_DELIVERIES",
     "HTTP_REQUESTS",
     "HTTP_REQUEST_DURATION",
+    "RABOTA_HTTP_WITHOUT_BROWSER_RATIO",
     "RABOTA_TRANSPORT_FALLBACK",
+    "RABOTA_TRANSPORT_REQUESTS",
     "RABOTA_WAF_CHALLENGE",
     "RABOTA_WAF_TOKEN_REFRESH",
     "SCAN_ERRORS",
     "SCAN_JOBS",
     "SCAN_RUNS",
     "SOURCE_HEALTH",
+    "WAF_SOLVER_ATTEMPTS",
     "WAF_SOLVER_CANARY",
+    "WAF_SOLVER_SCRIPT_VERSION",
     "WAF_SOLVER_SOLVE_DURATION",
+    "WAF_SOLVER_SUCCESS",
     "metrics_response",
 ]

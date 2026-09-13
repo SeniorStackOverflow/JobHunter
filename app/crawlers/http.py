@@ -56,6 +56,7 @@ class SecureHttpClient:
         transport: httpx.AsyncBaseTransport | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         pin_resolved_addresses: bool | None = None,
+        rate_limiter: AsyncRateLimiter | None = None,
     ) -> None:
         if max_response_bytes < 1:
             raise ValueError("max_response_bytes must be positive")
@@ -66,7 +67,9 @@ class SecureHttpClient:
         self._pin_resolved_addresses = (
             transport is None if pin_resolved_addresses is None else pin_resolved_addresses
         )
-        self._limiter = AsyncRateLimiter(requests_per_minute, minimum_interval_seconds)
+        self._limiter = rate_limiter or AsyncRateLimiter(
+            requests_per_minute, minimum_interval_seconds
+        )
         self._client = httpx.AsyncClient(
             timeout=timeout_seconds,
             follow_redirects=False,

@@ -21,8 +21,8 @@ crawling Rabota.md. Транспорт `waf_http` работает на plain HT
 
 ## Spike 2026-09-12: что проверено live
 
-Solver [Switch3301/Aws-Waf-Solver](https://github.com/Switch3301/Aws-Waf-Solver) (MIT,
-~490 строк Python) доработан и прогнан против rabota.md. Результаты:
+Solver [Switch3301/Aws-Waf-Solver](https://github.com/Switch3301/Aws-Waf-Solver)
+(~490 строк Python; pinned tree не содержит LICENSE, см. `waf/UPSTREAM.md`) доработан и прогнан против rabota.md. Результаты:
 
 1. **3/3 последовательных solve**, каждый подтверждён GET: категория `it` → `200`,
    101 уникальный ID вакансии; detail → `200`, `.vacancy-content` + JSON-LD `JobPosting`.
@@ -92,7 +92,7 @@ RabotaMdAdapter (без изменений: entrypoints, пагинация, н�
                                                              |
              +-------------------+  +-------------------+  +------------------+
              | PurePythonSolver  |  | StealthBrowser    |  | EnvTokenProvider |
-             | (vendored, MIT)  |  | TokenMinter       |  | (аварийный, ops) |
+             | (vendored, provenance tracked) |  | TokenMinter       |  | (аварийный, ops) |
              +-------------------+  +-------------------+  +------------------+
 ```
 
@@ -232,7 +232,7 @@ Backends (в порядке приоритета):
 
 1. **`PurePythonSolver`** — основной, результаты spike'а. Upstream для воспроизводимости
    жёстко pin'ится на `Switch3301/Aws-Waf-Solver@fed489c54fe2eb10a6dfac5b4d4c5dfcb06b8808`
-   (MIT, с атрибуцией); не брать свежий `main/master` во время реализации. Вендорятся в
+   (provenance в `waf/UPSTREAM.md`; license review обязателен до PROD/distribution); не брать свежий `main/master` во время реализации. Вендорятся в
    `app/crawlers/adapters/rabota_md/waf/`: `solver.py`, `crypto.py`, `signal.py`,
    `metrics.py`, `webgl.json`. Важно: подтверждённый plain-`httpx` spike был отдельным
    портом `/tmp/waf-solvers/test_httpx_port.py`, который переиспользует helper'ы upstream,

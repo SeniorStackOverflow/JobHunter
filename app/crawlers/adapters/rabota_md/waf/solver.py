@@ -1,7 +1,7 @@
 """Pure-Python AWS WAF challenge solver (no browser, no TLS impersonation).
 
 Protocol reimplementation vendored from
-https://github.com/Switch3301/Aws-Waf-Solver (declared MIT,
+https://github.com/Switch3301/Aws-Waf-Solver (pinned source; see waf/UPSTREAM.md,
 commit fed489c54fe2eb10a6dfac5b4d4c5dfcb06b8808). The transport was ported from
 ``rnet`` to plain ``httpx`` and ``pyscrypt`` to stdlib ``hashlib.scrypt``; the
 ported scheme is exactly what was verified live against rabota.md on
@@ -36,6 +36,8 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
 )
 from app.crawlers.adapters.rabota_md.waf.metrics import build_metrics
 from app.crawlers.adapters.rabota_md.waf.signals import build_signal
+from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
+from app.security.ssrf import Resolver
 
 RE_CHAL_SAME = re.compile(r"(/__challenge_[A-Za-z0-9]+/[a-f0-9]+/[a-f0-9]+)")
 RE_CHAL_EXT = re.compile(
@@ -66,7 +68,7 @@ BRANDS = {
 
 # The solver only ever talks to the target site and the AWS WAF token endpoints.
 _ALLOWED_HOSTS = ("rabota.md", "www.rabota.md")
-_ALLOWED_HOST_SUFFIXES = (".token.awswaf.com",)
+_ALLOWED_HOST_SUFFIXES = (".token.awswaf.com", ".sdk.awswaf.com")
 
 
 def _parse_ua(ua: str) -> tuple[str, str]:
@@ -190,18 +192,42 @@ class AwsWafSolver:
         timeout_seconds: float = 30.0,
         pow_budget_seconds: float = 30.0,
         script_hash_checker: Callable[[str], bool] | None = None,
-        client: httpx.AsyncClient | None = None,
+        client: SecureHttpClient | httpx.AsyncClient | None = None,
+        requests_per_minute: int = 50,
+        minimum_interval_seconds: float = 1.2,
+        max_redirects: int = 3,
+        resolver: Resolver | None = None,
+        rate_limiter: AsyncRateLimiter | None = None,
     ) -> None:
         self._timeout = timeout_seconds
         self._pow_budget = pow_budget_seconds
         self._script_hash_checker = script_hash_checker
         self._client = client
+        self._requests_per_minute = requests_per_minute
+        self._minimum_interval_seconds = minimum_interval_seconds
+        self._max_redirects = max_redirects
+        self._resolver = resolver
+        self._rate_limiter = rate_limiter
         self.last_script_hash: str | None = None
 
     async def solve(self, site: str, user_agent: str) -> str:
         site = site.rstrip("/")
         _require_allowed_url(site)
-        client = self._client or httpx.AsyncClient(timeout=self._timeout, follow_redirects=True)
+        client = self._client or SecureHttpClient(
+            allowed_domains=(
+                "rabota.md",
+                "www.rabota.md",
+                "token.awswaf.com",
+                "sdk.awswaf.com",
+            ),
+            user_agent=user_agent,
+            requests_per_minute=self._requests_per_minute,
+            minimum_interval_seconds=self._minimum_interval_seconds,
+            timeout_seconds=self._timeout,
+            max_redirects=self._max_redirects,
+            resolver=self._resolver,
+            rate_limiter=self._rate_limiter,
+        )
         try:
             return await self._solve_with_client(client, site, user_agent)
         finally:
@@ -209,7 +235,7 @@ class AwsWafSolver:
                 await client.aclose()
 
     async def _solve_with_client(
-        self, client: httpx.AsyncClient, site: str, user_agent: str
+        self, client: SecureHttpClient | httpx.AsyncClient, site: str, user_agent: str
     ) -> str:
         domain = site.split("//")[1].split("/")[0]
         challenge_url, same_origin, goku_props = await self._discover(client, site, user_agent)
@@ -225,8 +251,8 @@ class AwsWafSolver:
             encrypted = encrypt(encoded)
 
             inputs_started = time.time()
-            inputs_response = await client.get(
-                f"{challenge_url}/inputs?client=browser", headers=headers
+            inputs_response = await self._get(
+                client, f"{challenge_url}/inputs?client=browser", headers=headers
             )
             self._reject_waf_response(inputs_response)
             inputs_latency = round((time.time() - inputs_started) * 1000, 1)
@@ -258,7 +284,8 @@ class AwsWafSolver:
                 )
                 content_type = "text/plain;charset=UTF-8"
 
-            verify_response = await client.post(
+            verify_response = await self._post(
+                client,
                 f"{challenge_url}/{endpoint}",
                 content=body,
                 headers={**headers, "content-type": content_type},
@@ -276,9 +303,9 @@ class AwsWafSolver:
         return token
 
     async def _discover(
-        self, client: httpx.AsyncClient, site: str, user_agent: str
+        self, client: SecureHttpClient | httpx.AsyncClient, site: str, user_agent: str
     ) -> tuple[str, bool, dict[str, Any] | None]:
-        response = await client.get(site, headers=_nav_headers(user_agent))
+        response = await self._get(client, site, headers=_nav_headers(user_agent))
         self._reject_waf_response(response)
         html = response.text
 
@@ -298,7 +325,7 @@ class AwsWafSolver:
                 raise WafUnsupportedChallenge("challenge.js URL not found on the 202 page")
             script_url = script_match.group(1)
             _require_allowed_url(script_url)
-            script_response = await client.get(script_url, headers=_nav_headers(user_agent))
+            script_response = await self._get(client, script_url, headers=_nav_headers(user_agent))
             self._reject_waf_response(script_response)
             digest = hashlib.sha256(script_response.content).hexdigest()
             self.last_script_hash = digest
@@ -310,6 +337,47 @@ class AwsWafSolver:
         if goku_match:
             goku_props = json.loads(goku_match.group(1))
         return challenge_url, same_origin, goku_props
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float:
+        raw = response.headers.get("retry-after", "")
+        try:
+            return max(0.0, min(float(raw), 30.0)) if raw else 5.0
+        except ValueError:
+            return 5.0
+
+    async def _get(
+        self,
+        client: SecureHttpClient | httpx.AsyncClient,
+        url: str,
+        *,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        response = await client.get(url, headers=headers)
+        if response.status_code == 429:
+            await asyncio.sleep(self._retry_after_seconds(response))
+            response = await client.get(url, headers=headers)
+        return response
+
+    async def _post(
+        self,
+        client: SecureHttpClient | httpx.AsyncClient,
+        url: str,
+        *,
+        content: str,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        if isinstance(client, SecureHttpClient):
+            response = await client.post_bounded(url, content=content, headers=headers)
+        else:
+            response = await client.post(url, content=content, headers=headers)
+        if response.status_code == 429:
+            await asyncio.sleep(self._retry_after_seconds(response))
+            if isinstance(client, SecureHttpClient):
+                response = await client.post_bounded(url, content=content, headers=headers)
+            else:
+                response = await client.post(url, content=content, headers=headers)
+        return response
 
     @staticmethod
     def _reject_waf_response(response: httpx.Response) -> None:

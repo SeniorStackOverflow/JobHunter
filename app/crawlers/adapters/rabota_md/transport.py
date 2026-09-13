@@ -23,7 +23,7 @@ from app.crawlers.adapters.rabota_md.waf.token_provider import (
 )
 from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
 from app.crawlers.browser import StealthPlaywrightBrowser
-from app.crawlers.http import SecureHttpClient
+from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
 from app.security.ssrf import Resolver
 from app.settings import get_settings
 
@@ -44,11 +44,22 @@ def build_waf_fetcher(
     timeout_seconds: float,
     max_redirects: int,
     fallback_transport: str,
+    browser_max_navigations_per_page: int = 50,
     resolver: Resolver | None = None,
 ) -> RabotaMdFetcher:
     redis = AsyncRedis.from_url(get_settings().redis_url)
     watchdog = ScriptWatchdog(redis)
-    solver = AwsWafSolver(script_hash_checker=watchdog.is_approved)
+    limiter = AsyncRateLimiter(
+        requests_per_minute, minimum_interval_seconds=minimum_interval_seconds
+    )
+    solver = AwsWafSolver(
+        script_hash_checker=watchdog.is_approved,
+        requests_per_minute=requests_per_minute,
+        minimum_interval_seconds=minimum_interval_seconds,
+        max_redirects=max_redirects,
+        resolver=resolver,
+        rate_limiter=limiter,
+    )
 
     browser: StealthPlaywrightBrowser | None = None
     backends: list[WafTokenBackend] = [
@@ -65,6 +76,7 @@ def build_waf_fetcher(
             requests_per_minute=requests_per_minute,
             minimum_interval_seconds=minimum_interval_seconds,
             timeout_seconds=timeout_seconds,
+            max_navigations_per_page=browser_max_navigations_per_page,
         )
         backends.append(StealthBrowserTokenMinterBackend(browser, f"{base_url}/ru/vacancies"))
     backends.append(EnvTokenBackend())
@@ -78,6 +90,7 @@ def build_waf_fetcher(
         timeout_seconds=timeout_seconds,
         max_redirects=max_redirects,
         resolver=resolver,
+        rate_limiter=limiter,
     )
     waf_client = WafHttpClient(secure, provider)
     if browser is None:

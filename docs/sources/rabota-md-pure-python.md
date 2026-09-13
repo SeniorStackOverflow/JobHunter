@@ -32,9 +32,11 @@ Playwright и playwright-stealth.
 
 ## Итог spike 2026-09-12: выбран и проверен подход B
 
-Вместо собственной разработки с нуля был найден и доведён до рабочего состояния готовый
-open-source solver [Switch3301/Aws-Waf-Solver](https://github.com/Switch3301/Aws-Waf-Solver)
-(MIT, ~490 строк Python) — реимплементация протокола (подход B). Проверено live:
+Вместо собственной разработки с нуля был найден и доведён до рабочего состояния публичный
+solver [Switch3301/Aws-Waf-Solver](https://github.com/Switch3301/Aws-Waf-Solver)
+(~490 строк Python) — реимплементация протокола (подход B). Pinned tree не содержит
+`LICENSE`; provenance и обязательный license review перед PROD/distribution зафиксированы в
+`app/crawlers/adapters/rabota_md/waf/UPSTREAM.md`. Проверено live:
 
 - 3/3 последовательных solve с валидным crawl-ответом (категория 101 ID, detail с
   JSON-LD), 3 конкурентных solve, AJAX-пагинация POST — все критерии spike выполнены;

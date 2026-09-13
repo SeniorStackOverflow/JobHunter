@@ -3,7 +3,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.crawlers.adapters.rabota_md.errors import RabotaMdDegradedError
+from app.crawlers.adapters.rabota_md.errors import (
+    RabotaMdDegradedError,
+    RabotaMdTemporaryError,
+)
 from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
 from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBlocked,
@@ -11,6 +14,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafChallengeRequired,
     WafPostContractError,
     WafRateLimited,
+    WafSolveFailed,
 )
 from app.crawlers.adapters.rabota_md.waf.http_client import (
     WafHttpClient,
@@ -33,6 +37,7 @@ async def fake_resolver(hostname: str, port: int) -> tuple[str, ...]:
 class FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
+        self.closed = False
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
@@ -45,6 +50,9 @@ class FakeRedis:
 
     async def delete(self, key: str) -> None:
         self.store.pop(key, None)
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class RotatingBackend:
@@ -74,6 +82,18 @@ def make_transport(
 def make_provider(redis: FakeRedis | None = None) -> tuple[WafTokenProvider, RotatingBackend]:
     backend = RotatingBackend()
     return WafTokenProvider(redis or FakeRedis(), [backend]), backend  # type: ignore[arg-type]
+
+
+async def test_client_close_closes_token_provider_redis() -> None:
+    redis = FakeRedis()
+    provider, _ = make_provider(redis)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="ok")
+
+    client = make_transport(handler, provider)
+    await client.aclose()
+    assert redis.closed
 
 
 async def test_get_plain_200() -> None:
@@ -119,14 +139,19 @@ async def test_get_persistent_challenge_raises() -> None:
         await client.get(f"{BASE}/ru/vacancies")
 
 
-async def test_get_429_is_rate_limited_not_fallback() -> None:
+async def test_get_429_retries_after_backoff_then_rate_limits() -> None:
+    calls = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429)
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, headers={"retry-after": "0"})
 
     provider, _ = make_provider()
     client = make_transport(handler, provider)
     with pytest.raises(WafRateLimited):
         await client.get(f"{BASE}/ru/vacancies")
+    assert calls == 2
 
 
 async def test_get_captcha_fail_closed() -> None:
@@ -209,13 +234,16 @@ class StubPrimary:
 
 
 class StubBrowser:
-    def __init__(self, cookie: dict | None = None) -> None:
+    def __init__(self, cookie: dict | None = None, waf_action: str | None = None) -> None:
         self.cookie = cookie
+        self.waf_action = waf_action
         self.calls = 0
+        self.close_calls = 0
 
     async def get(self, url: str) -> httpx.Response:
         self.calls += 1
-        return httpx.Response(200, text="browser")
+        headers = {"x-amzn-waf-action": self.waf_action} if self.waf_action else {}
+        return httpx.Response(202 if self.waf_action else 200, text="browser", headers=headers)
 
     async def post_html_fragment(self, url: str) -> httpx.Response:
         return await self.get(url)
@@ -224,17 +252,18 @@ class StubBrowser:
         return self.cookie
 
     async def aclose(self) -> None:
-        pass
+        self.close_calls += 1
 
 
 def make_fallback(
     primary_error: Exception | None,
     cookie: dict | None = None,
+    waf_action: str | None = None,
 ) -> tuple[FallbackFetcher, StubPrimary, StubBrowser, FakeRedis]:
     redis = FakeRedis()
     provider = WafTokenProvider(redis, [RotatingBackend()])  # type: ignore[arg-type]
     primary = StubPrimary(primary_error)
-    browser = StubBrowser(cookie)
+    browser = StubBrowser(cookie, waf_action)
     return FallbackFetcher(primary, browser, provider), primary, browser, redis  # type: ignore[arg-type]
 
 
@@ -245,16 +274,39 @@ async def test_fallback_on_persistent_challenge() -> None:
     response = await fetcher.get(f"{BASE}/ru/vacancies")
     assert response.text == "browser"
     assert browser.calls == 1
+    assert browser.close_calls == 1
     # browser token republished so the next request returns to HTTP
     assert await fetcher._tokens.get_token() == "browser-token"
 
 
-async def test_fallback_never_on_fail_closed() -> None:
-    for error in (WafRateLimited("429"), WafCaptchaRequired("captcha"), WafBlocked("block")):
+async def test_browser_fallback_captcha_is_fail_closed() -> None:
+    fetcher, _, browser, _ = make_fallback(WafChallengeRequired("202"), waf_action="captcha")
+    with pytest.raises(RabotaMdDegradedError, match="CAPTCHA"):
+        await fetcher.get(f"{BASE}/ru/vacancies")
+    assert browser.calls == 1
+    assert browser.close_calls == 1
+
+
+async def test_fallback_never_on_access_fail_closed() -> None:
+    for error in (WafCaptchaRequired("captcha"), WafBlocked("block")):
         fetcher, _, browser, _ = make_fallback(error)
         with pytest.raises(RabotaMdDegradedError):
             await fetcher.get(f"{BASE}/ru/vacancies")
         assert browser.calls == 0
+
+
+async def test_fallback_429_is_temporary_and_never_uses_browser() -> None:
+    fetcher, _, browser, _ = make_fallback(WafRateLimited("429"))
+    with pytest.raises(RabotaMdTemporaryError):
+        await fetcher.get(f"{BASE}/ru/vacancies")
+    assert browser.calls == 0
+
+
+async def test_exhausted_token_backends_do_not_trigger_second_browser_attempt() -> None:
+    fetcher, _, browser, _ = make_fallback(WafSolveFailed("backends exhausted"))
+    with pytest.raises(RabotaMdDegradedError, match="token refresh exhausted"):
+        await fetcher.get(f"{BASE}/ru/vacancies")
+    assert browser.calls == 0
 
 
 async def test_fallback_without_browser_degrades() -> None:

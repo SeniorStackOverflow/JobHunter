@@ -8,6 +8,7 @@ must never be inspected (spike finding 2026-09-12, doc п. 7).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from urllib.parse import urlsplit, urlunsplit
 
@@ -30,9 +31,11 @@ _TOKEN_COOKIE = "aws-waf-token"  # noqa: S105 - cookie name, not a secret
 
 def _ajax_headers(referer: str) -> dict[str, str]:
     """Canonical browser header set required by the pagination POST (recon п. 6)."""
+    parsed = urlsplit(referer)
+    origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     return {
         "x-requested-with": "XMLHttpRequest",
-        "origin": "https://www.rabota.md",
+        "origin": origin,
         "referer": referer,
         "accept": "application/json, text/javascript, */*; q=0.01",
         "sec-fetch-dest": "empty",
@@ -93,6 +96,7 @@ class WafHttpClient:
         self, method: str, url: str, extra_headers: dict[str, str] | None = None
     ) -> httpx.Response:
         response = await self._send(method, url, extra_headers)
+        response = await self._retry_rate_limit(method, url, extra_headers, response)
         if not self._is_challenge(response):
             self._reject_terminal_waf(response)
             return response
@@ -100,6 +104,7 @@ class WafHttpClient:
         await self._tokens.invalidate()
         await self._tokens.refresh_token()
         response = await self._send(method, url, extra_headers)
+        response = await self._retry_rate_limit(method, url, extra_headers, response)
         if self._is_challenge(response):
             raise WafChallengeRequired(f"AWS WAF challenge persists after token refresh: {url}")
         self._reject_terminal_waf(response)
@@ -113,6 +118,23 @@ class WafHttpClient:
         if method == "POST":
             return await self._client.post_bounded(url, content="", headers=headers)
         return await self._client.get(url, headers=headers)
+
+    async def _retry_rate_limit(
+        self,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str] | None,
+        response: httpx.Response,
+    ) -> httpx.Response:
+        if response.status_code != 429:
+            return response
+        raw = response.headers.get("retry-after", "")
+        try:
+            delay = max(0.0, min(float(raw), 30.0)) if raw else 5.0
+        except ValueError:
+            delay = 5.0
+        await asyncio.sleep(delay)
+        return await self._send(method, url, extra_headers)
 
     @staticmethod
     def _is_challenge(response: httpx.Response) -> bool:
@@ -138,3 +160,4 @@ class WafHttpClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        await self._tokens.aclose()

@@ -15,7 +15,10 @@ from collections.abc import Awaitable, Callable
 import httpx
 import structlog
 
-from app.crawlers.adapters.rabota_md.errors import RabotaMdDegradedError
+from app.crawlers.adapters.rabota_md.errors import (
+    RabotaMdDegradedError,
+    RabotaMdTemporaryError,
+)
 from app.crawlers.adapters.rabota_md.fetcher import RabotaMdFetcher
 from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBlocked,
@@ -30,18 +33,23 @@ from app.crawlers.adapters.rabota_md.waf.token_provider import (
     WafTokenProvider,
 )
 from app.crawlers.browser import (
+    AWS_WAF_ACTION_HEADER,
     BrowserFallbackUnavailable,
     BrowserNavigationError,
     StealthPlaywrightBrowser,
 )
-from app.observability.metrics import RABOTA_TRANSPORT_FALLBACK
+from app.observability.metrics import (
+    RABOTA_HTTP_WITHOUT_BROWSER_RATIO,
+    RABOTA_TRANSPORT_FALLBACK,
+    RABOTA_TRANSPORT_REQUESTS,
+)
 
 log = structlog.get_logger()
 
 # Errors that allow one request-level browser fallback for the same request.
-_FALLBACK_ALLOWED = (WafChallengeRequired, WafPostContractError, WafSolveFailed)
-# Fail-closed errors: never fall back, never retry through the browser.
-_FAIL_CLOSED = (WafRateLimited, WafCaptchaRequired, WafBlocked)
+_FALLBACK_ALLOWED = (WafChallengeRequired, WafPostContractError)
+# Fail-closed access errors: never fall back, never retry through the browser.
+_FAIL_CLOSED = (WafCaptchaRequired, WafBlocked)
 
 DEFAULT_MAX_SWITCHES_PER_SCAN = 20
 
@@ -60,6 +68,8 @@ class FallbackFetcher:
         self._tokens = token_provider
         self._max_switches = max_switches_per_scan
         self._switches = 0
+        self._logical_requests = 0
+        self._http_requests = 0
 
     async def get(self, url: str) -> httpx.Response:
         return await self._with_fallback(url, lambda fetcher: fetcher.get(url))
@@ -73,11 +83,23 @@ class FallbackFetcher:
         call: Callable[[RabotaMdFetcher], Awaitable[httpx.Response]],
     ) -> httpx.Response:
         try:
-            return await call(self._primary)
+            response = await call(self._primary)
+            self._record_transport("http")
+            return response
+        except WafRateLimited as exc:
+            # Bounded Retry-After handling already happened in the HTTP layer.
+            # Do not switch identity/transport for a server-side rate limit.
+            raise RabotaMdTemporaryError(
+                f"Rabota.md remained rate-limited after backoff for {url}"
+            ) from exc
         except _FAIL_CLOSED as exc:
             raise RabotaMdDegradedError(
                 f"Rabota.md WAF fail-closed ({type(exc).__name__}) for {url}"
             ) from exc
+        except WafSolveFailed as exc:
+            # Token backends (including the browser minter) are already exhausted.
+            # A second request-level browser attempt would violate the state machine.
+            raise RabotaMdDegradedError(f"Rabota.md WAF token refresh exhausted for {url}") from exc
         except _FALLBACK_ALLOWED as exc:
             if self._fallback is None:
                 raise RabotaMdDegradedError(
@@ -98,20 +120,41 @@ class FallbackFetcher:
     ) -> httpx.Response:
         assert self._fallback is not None
         try:
-            response = await call(self._fallback)
-        except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
-            raise RabotaMdDegradedError(
-                f"Rabota.md browser fallback failed ({type(exc).__name__}) for {url}"
-            ) from exc
-        self._switches += 1
-        RABOTA_TRANSPORT_FALLBACK.labels(reason=type(cause).__name__).inc()
-        log.info(
-            "rabota_md_transport_fallback",
-            reason=type(cause).__name__,
-            switches=self._switches,
-        )
-        await self._republish_browser_token()
-        return response
+            try:
+                response = await call(self._fallback)
+                action = response.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
+                if action == "captcha":
+                    raise RabotaMdDegradedError(
+                        "Rabota.md browser fallback encountered CAPTCHA; fail-closed"
+                    )
+                if action == "block":
+                    raise RabotaMdDegradedError(
+                        "Rabota.md browser fallback encountered a WAF block"
+                    )
+            except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
+                raise RabotaMdDegradedError(
+                    f"Rabota.md browser fallback failed ({type(exc).__name__}) for {url}"
+                ) from exc
+            self._switches += 1
+            RABOTA_TRANSPORT_FALLBACK.labels(reason=type(cause).__name__).inc()
+            log.info(
+                "rabota_md_transport_fallback",
+                reason=type(cause).__name__,
+                switches=self._switches,
+            )
+            await self._republish_browser_token()
+            self._record_transport("browser")
+            return response
+        finally:
+            # Browser fallback is emergency work, not a second hot crawler transport.
+            await self._fallback.aclose()
+
+    def _record_transport(self, transport: str) -> None:
+        self._logical_requests += 1
+        if transport == "http":
+            self._http_requests += 1
+        RABOTA_TRANSPORT_REQUESTS.labels(transport=transport).inc()
+        RABOTA_HTTP_WITHOUT_BROWSER_RATIO.set(self._http_requests / self._logical_requests)
 
     async def _republish_browser_token(self) -> None:
         assert self._fallback is not None
@@ -128,4 +171,3 @@ class FallbackFetcher:
         await self._primary.aclose()
         if self._fallback is not None:
             await self._fallback.aclose()
-        await self._tokens.aclose()

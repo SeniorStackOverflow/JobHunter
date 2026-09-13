@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.crawlers.adapters.rabota_md.adapter import RabotaMdConfig
 from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
 from app.crawlers.adapters.rabota_md.transport import build_waf_fetcher
 from app.crawlers.adapters.rabota_md.waf.http_client import WafHttpClient
-from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
+from app.crawlers.adapters.rabota_md.waf.watchdog import (
+    DEFAULT_APPROVED_SCRIPT_HASH,
+    ScriptWatchdog,
+)
+from app.scheduler.tasks import _rabota_md_uses_waf_http
 
 
 class FakeRedis:
@@ -18,6 +24,15 @@ class FakeRedis:
 
     async def set(self, key: str, value: str) -> None:
         self.store[key] = value
+
+
+def test_waf_canary_only_runs_for_waf_http_sources() -> None:
+    waf_source = SimpleNamespace(configuration={"source": {"transport": "waf_http"}})
+    browser_source = SimpleNamespace(configuration={"source": {"transport": "stealth_browser"}})
+    legacy_http = SimpleNamespace(configuration={"source": {"use_stealth_browser": False}})
+    assert _rabota_md_uses_waf_http(waf_source)  # type: ignore[arg-type]
+    assert not _rabota_md_uses_waf_http(browser_source)  # type: ignore[arg-type]
+    assert _rabota_md_uses_waf_http(legacy_http)  # type: ignore[arg-type]
 
 
 def test_transport_conflicts_with_legacy_flag() -> None:
@@ -43,11 +58,12 @@ async def test_watchdog_fail_closed_before_load() -> None:
     assert not watchdog.is_approved("abc")
 
 
-async def test_watchdog_bootstrap_accepts_first_hash() -> None:
+async def test_watchdog_empty_redis_uses_verified_bootstrap_pin() -> None:
     watchdog = ScriptWatchdog(FakeRedis())  # type: ignore[arg-type]
     await watchdog.load()
-    assert await watchdog.pinned_hash() is None
-    assert watchdog.is_approved("first-observed")
+    assert await watchdog.pinned_hash() == DEFAULT_APPROVED_SCRIPT_HASH
+    assert watchdog.is_approved(DEFAULT_APPROVED_SCRIPT_HASH)
+    assert not watchdog.is_approved("first-observed")
 
 
 async def test_watchdog_approve_and_reject_unknown() -> None:

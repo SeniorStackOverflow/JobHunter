@@ -1,6 +1,6 @@
 """AWS WAF challenge payload encryption.
 
-Vendored from https://github.com/Switch3301/Aws-Waf-Solver (declared MIT,
+Vendored from https://github.com/Switch3301/Aws-Waf-Solver (pinned source; see waf/UPSTREAM.md,
 commit fed489c54fe2eb10a6dfac5b4d4c5dfcb06b8808), verified live against
 rabota.md on 2026-09-12. The static AES key is extracted from the public
 challenge.js and simply reproduces what any browser does.

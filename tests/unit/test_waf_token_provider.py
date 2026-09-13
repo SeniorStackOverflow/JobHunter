@@ -3,16 +3,19 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from app.crawlers.adapters.rabota_md.waf.errors import (
     WafCaptchaRequired,
+    WafRateLimited,
     WafSolveFailed,
     WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.token_provider import (
     EnvTokenBackend,
     MintedWafToken,
+    StealthBrowserTokenMinterBackend,
     WafTokenProvider,
 )
 
@@ -58,6 +61,33 @@ def make_provider(
     redis: FakeRedis, backends: list[StubBackend], **kwargs: object
 ) -> WafTokenProvider:
     return WafTokenProvider(redis, backends, **kwargs)  # type: ignore[arg-type]
+
+
+class StubTokenBrowser:
+    def __init__(self, action: str) -> None:
+        self.action = action
+        self.closed = False
+
+    async def get(self, url: str) -> httpx.Response:
+        return httpx.Response(
+            202,
+            headers={"x-amzn-waf-action": self.action},
+            request=httpx.Request("GET", url),
+        )
+
+    async def find_cookie(self, name: str, *, domain_suffix: str | None = None) -> dict | None:
+        return None
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_browser_token_minter_captcha_is_fail_closed() -> None:
+    browser = StubTokenBrowser("captcha")
+    backend = StealthBrowserTokenMinterBackend(browser, "https://www.rabota.md/ru/vacancies")  # type: ignore[arg-type]
+    with pytest.raises(WafCaptchaRequired):
+        await backend.mint()
+    assert browser.closed
 
 
 async def test_get_token_empty() -> None:
@@ -115,6 +145,16 @@ async def test_refresh_falls_back_to_next_backend() -> None:
     provider = make_provider(redis, [first, second])
     assert await provider.refresh_token() == "browser-minted"
     assert first.calls == 1 and second.calls == 1
+
+
+async def test_refresh_rate_limit_stops_backend_chain() -> None:
+    redis = FakeRedis()
+    first = StubBackend(error=WafRateLimited("429"))
+    second = StubBackend(MintedWafToken("must-not-mint"))
+    provider = make_provider(redis, [first, second])
+    with pytest.raises(WafRateLimited):
+        await provider.refresh_token()
+    assert second.calls == 0
 
 
 async def test_refresh_captcha_stops_chain() -> None:

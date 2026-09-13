@@ -791,6 +791,28 @@ def rabota_md_waf_canary_task() -> dict[str, str]:
     return _run_async(_rabota_md_waf_canary())
 
 
+async def _rabota_md_waf_canary_source() -> JobSource | None:
+    async with async_session_factory() as session:
+        source = await session.scalar(
+            select(JobSource)
+            .where(
+                JobSource.adapter_type == "rabota_md",
+                JobSource.enabled.is_(True),
+            )
+            .limit(1)
+        )
+        return source
+
+
+def _rabota_md_uses_waf_http(source: JobSource) -> bool:
+    configured = source.configuration.get("source", source.configuration)
+    raw = configured if isinstance(configured, dict) else {}
+    transport = raw.get("transport")
+    if transport is None:
+        transport = "stealth_browser" if raw.get("use_stealth_browser", True) else "waf_http"
+    return transport == "waf_http"
+
+
 async def _rabota_md_waf_canary() -> dict[str, str]:
     from redis.asyncio import Redis as AsyncRedis
 
@@ -799,24 +821,32 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
     from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
     from app.observability.metrics import WAF_SOLVER_CANARY
 
+    source = await _rabota_md_waf_canary_source()
+    if source is None or not _rabota_md_uses_waf_http(source):
+        WAF_SOLVER_CANARY.labels(outcome="skipped").inc()
+        return {"outcome": "skipped", "reason": "waf_http_not_enabled"}
+
     redis = AsyncRedis.from_url(get_settings().redis_url)
     try:
         watchdog = ScriptWatchdog(redis)
         solver = AwsWafSolver(script_hash_checker=lambda _digest: True)
         try:
-            token = await solver.solve("https://www.rabota.md", WAF_SOLVER_USER_AGENT)
+            token = await solver.solve(source.base_url, WAF_SOLVER_USER_AGENT)
         except Exception as exc:
             WAF_SOLVER_CANARY.labels(outcome="failure").inc()
             logger.warning("rabota_md_waf_canary_failed", error_type=type(exc).__name__)
             return {"outcome": "failure", "error_type": type(exc).__name__}
         script_hash = solver.last_script_hash
-        if script_hash:
-            await watchdog.approve(script_hash)
+        if not script_hash:
+            WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            logger.warning("rabota_md_waf_canary_failed", error_type="MissingScriptHash")
+            return {"outcome": "failure", "error_type": "MissingScriptHash"}
+        await watchdog.approve(script_hash)
         WAF_SOLVER_CANARY.labels(outcome="success").inc()
         logger.info("rabota_md_waf_canary_ok", script_hash=script_hash)
         return {
             "outcome": "success",
-            "script_hash": script_hash or "",
+            "script_hash": script_hash,
             "token_length": str(len(token)),
         }
     finally:

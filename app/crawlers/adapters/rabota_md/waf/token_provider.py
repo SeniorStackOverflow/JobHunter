@@ -21,16 +21,23 @@ import redis.asyncio as aioredis
 from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBlocked,
     WafCaptchaRequired,
+    WafRateLimited,
     WafSolveFailed,
 )
 from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
 from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
 from app.crawlers.browser import (
+    AWS_WAF_ACTION_HEADER,
     BrowserFallbackUnavailable,
     BrowserNavigationError,
     StealthPlaywrightBrowser,
 )
-from app.observability.metrics import WAF_SOLVER_SOLVE_DURATION
+from app.observability.metrics import (
+    WAF_SOLVER_ATTEMPTS,
+    WAF_SOLVER_SCRIPT_VERSION,
+    WAF_SOLVER_SOLVE_DURATION,
+    WAF_SOLVER_SUCCESS,
+)
 
 DEFAULT_TOKEN_KEY = "crawler:rabota_md:waf_token"  # noqa: S105 - Redis key name, not a secret
 DEFAULT_LOCK_KEY = f"{DEFAULT_TOKEN_KEY}:refresh_lock"
@@ -115,6 +122,10 @@ class WafTokenProvider:
                 # Fail-closed by policy: no other backend may retry these.
                 RABOTA_WAF_TOKEN_REFRESH.labels(outcome="fail_closed").inc()
                 raise
+            except WafRateLimited:
+                # A 429 is never a reason to switch identities/transports.
+                RABOTA_WAF_TOKEN_REFRESH.labels(outcome="rate_limited").inc()
+                raise
             except Exception as exc:
                 errors.append(f"{type(exc).__name__}")
                 continue
@@ -176,17 +187,14 @@ class PurePythonSolverBackend:
         if self._watchdog is not None:
             await self._watchdog.load()
         started = time.monotonic()
+        WAF_SOLVER_ATTEMPTS.inc()
         try:
             token = await self._solver.solve(self._site, self._user_agent)
         finally:
             WAF_SOLVER_SOLVE_DURATION.observe(time.monotonic() - started)
-        if (
-            self._watchdog is not None
-            and self._solver.last_script_hash is not None
-            and await self._watchdog.pinned_hash() is None
-        ):
-            # Bootstrap: pin the first ever observed script version after a success.
-            await self._watchdog.approve(self._solver.last_script_hash)
+        WAF_SOLVER_SUCCESS.inc()
+        if self._solver.last_script_hash is not None:
+            WAF_SOLVER_SCRIPT_VERSION.labels(sha256=self._solver.last_script_hash).set(1)
         return MintedWafToken(value=token)
 
 
@@ -199,15 +207,26 @@ class StealthBrowserTokenMinterBackend:
 
     async def mint(self) -> MintedWafToken:
         try:
-            # A plain navigation already resolves the AWS WAF challenge.
-            await self._browser.get(self._entry_url)
-            cookie = await self._browser.find_cookie("aws-waf-token", domain_suffix="rabota.md")
-        except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
-            raise WafSolveFailed(f"browser token minter failed: {type(exc).__name__}") from exc
-        if cookie is None:
-            raise WafSolveFailed("browser token minter found no aws-waf-token cookie")
-        expires_at: datetime | None = None
-        raw_expires = cookie.get("expires")
-        if isinstance(raw_expires, (int, float)) and raw_expires > 0:
-            expires_at = datetime.fromtimestamp(raw_expires, tz=UTC)
-        return MintedWafToken(value=str(cookie["value"]), expires_at=expires_at)
+            try:
+                # A plain navigation already resolves the AWS WAF challenge.
+                response = await self._browser.get(self._entry_url)
+                action = response.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
+                if action == "captcha":
+                    raise WafCaptchaRequired(
+                        "browser token minter encountered CAPTCHA; fail-closed by policy"
+                    )
+                if action == "block":
+                    raise WafBlocked("browser token minter encountered WAF block")
+                cookie = await self._browser.find_cookie("aws-waf-token", domain_suffix="rabota.md")
+            except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
+                raise WafSolveFailed(f"browser token minter failed: {type(exc).__name__}") from exc
+            if cookie is None:
+                raise WafSolveFailed("browser token minter found no aws-waf-token cookie")
+            expires_at: datetime | None = None
+            raw_expires = cookie.get("expires")
+            if isinstance(raw_expires, (int, float)) and raw_expires > 0:
+                expires_at = datetime.fromtimestamp(raw_expires, tz=UTC)
+            return MintedWafToken(value=str(cookie["value"]), expires_at=expires_at)
+        finally:
+            # Token minting is intentionally short-lived; do not keep Chromium hot.
+            await self._browser.aclose()

@@ -328,6 +328,7 @@ class RabotaMdAdapter:
                 timeout_seconds=self.config.timeout_seconds,
                 max_redirects=self.config.max_redirects,
                 fallback_transport=self.config.fallback_transport,
+                browser_max_navigations_per_page=self.config.browser_max_navigations_per_page,
                 resolver=resolver,
             )
         self._access_result: AccessPolicyResult | None = None
