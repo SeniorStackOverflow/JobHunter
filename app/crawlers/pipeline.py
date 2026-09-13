@@ -969,9 +969,7 @@ class ScanService:
                 changed_fields.append(field)
                 setattr(existing, field, new_value)
         existing.matching_content_hash = compute_source_matching_hash(existing)
-        if _hash_version_migration_only(
-            previous_hash_version, next_hash_version, changed_fields
-        ):
+        if _hash_version_migration_only(previous_hash_version, next_hash_version, changed_fields):
             if existing.canonical_job_id is not None:
                 await self._refresh_canonical_status(session, {existing.canonical_job_id})
             await session.flush()

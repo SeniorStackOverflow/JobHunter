@@ -1602,11 +1602,7 @@ async def get_daily_report() -> dict[str, Any]:
                 "diagnostics": scan.diagnostics,
             }
             for scan in scans
-            if (
-                scan.status == RunStatus.FAILED
-                or scan.parsing_errors
-                or scan.network_errors
-            )
+            if (scan.status == RunStatus.FAILED or scan.parsing_errors or scan.network_errors)
         ]
 
         summary = dict(item.summary)
