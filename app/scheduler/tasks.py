@@ -781,12 +781,11 @@ __all__ = [
 
 @celery_app.task(name="job_agent.scheduler.rabota_md_waf_canary")
 def rabota_md_waf_canary_task() -> dict[str, str]:
-    """Daily canary: solve one live AWS WAF challenge and approve the script hash.
+    """Daily canary: prove that the live AWS WAF protocol is still compatible.
 
-    The pure-Python solver fails closed on an unknown challenge.js version
-    (WafScriptVersionUnknown). This task solves a real challenge once a day and
-    pins the observed script hash in the watchdog, so a silent AWS rotation is
-    detected and re-approved by an explicit successful solve, never implicitly.
+    ``challenge.js`` bytes are dynamic, so their SHA-256 is observability only.
+    A successful live token solve writes a short-lived Redis compatibility marker;
+    normal crawls use the pure solver only while that marker is fresh.
     """
     return _run_async(_rabota_md_waf_canary())
 
@@ -819,7 +818,7 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
     from app.crawlers.adapters.rabota_md.transport import WAF_SOLVER_USER_AGENT
     from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
     from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
-    from app.observability.metrics import WAF_SOLVER_CANARY
+    from app.observability.metrics import WAF_SOLVER_CANARY, WAF_SOLVER_COMPATIBILITY
 
     source = await _rabota_md_waf_canary_source()
     if source is None or not _rabota_md_uses_waf_http(source):
@@ -834,15 +833,18 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
             token = await solver.solve(source.base_url, WAF_SOLVER_USER_AGENT)
         except Exception as exc:
             WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            WAF_SOLVER_COMPATIBILITY.set(0)
             logger.warning("rabota_md_waf_canary_failed", error_type=type(exc).__name__)
             return {"outcome": "failure", "error_type": type(exc).__name__}
         script_hash = solver.last_script_hash
         if not script_hash:
             WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            WAF_SOLVER_COMPATIBILITY.set(0)
             logger.warning("rabota_md_waf_canary_failed", error_type="MissingScriptHash")
             return {"outcome": "failure", "error_type": "MissingScriptHash"}
-        await watchdog.approve(script_hash)
+        await watchdog.record_canary_success(script_hash)
         WAF_SOLVER_CANARY.labels(outcome="success").inc()
+        WAF_SOLVER_COMPATIBILITY.set(1)
         logger.info("rabota_md_waf_canary_ok", script_hash=script_hash)
         return {
             "outcome": "success",

@@ -53,7 +53,7 @@ def build_waf_fetcher(
         requests_per_minute, minimum_interval_seconds=minimum_interval_seconds
     )
     solver = AwsWafSolver(
-        script_hash_checker=watchdog.is_approved,
+        script_hash_checker=watchdog.allows_script,
         requests_per_minute=requests_per_minute,
         minimum_interval_seconds=minimum_interval_seconds,
         max_redirects=max_redirects,

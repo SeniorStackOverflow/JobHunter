@@ -262,18 +262,19 @@ Backends (в порядке приоритета):
 
 ### ScriptWatchdog и canary
 
-Pure-Python solver реимплементирует протокол конкретной версии `challenge.js` — ротация
-скрипта AWS ломает его мгновенно и потенциально молча. Смягчение:
+Live E2E показал, что AWS генерирует разные байты `challenge.js` между совместимыми
+solve, поэтому exact SHA нельзя использовать как version allowlist. Защита строится иначе:
 
-- `sha256(challenge.js)` хранится в Redis (стартовый пин — см. spike п. 9);
-- **неизвестный hash `challenge.js` fail-closed для pure-Python solver**: production scan
-  не пробует новую версию «на удачу», а поднимает `WafScriptVersionUnknown`; pure solver
-  становится unavailable, после чего разрешён только `StealthBrowserTokenMinter`. Это не
-  разрешает request-level browser fallback для `captcha`/`block`;
-- новая версия скрипта допускается в solver только после отдельного canary-прогона
-  (одиночный solve вне scan, задача 1 раз/день) и сигнала `solver_canary_ok`;
-- при failed canary solver исключается из цепочки, токен минтит браузер, оператору —
-  алерт: ротация скрипта превращается в алерт, а не в молча сломанный источник.
+- ежедневный live canary выполняет настоящий solve вне scan; успех пишет в Redis
+  `solver_canary_ok` с TTL 30 часов;
+- marker содержит versioned protocol fingerprint. После изменения protocol assumptions
+  старый marker больше не разрешает pure solver;
+- SHA текущего `challenge.js` сохраняется только в логах/canary payload для диагностики и
+  никогда не является gate;
+- без свежего canary marker pure solver fail-closed и токен минтит
+  `StealthBrowserTokenMinter`; `captcha`/`block` по-прежнему не допускают browser bypass;
+- сам solver остаётся структурным guard: разрешённые URL, response taxonomy, challenge type,
+  inputs/verify/token contract проверяются и при несовместимости завершаются fail-closed.
 
 ### Изменения в адаптере и конфиге
 
@@ -359,8 +360,8 @@ source:
   request-level browser fallback; `429` соблюдает backoff и не вызывает browser fallback;
   single-flight refresh перечитывает token после lock; browser fallback после
   успешного WAF-прохождения публикует токен обратно в Redis/HTTP cookie jar; переключение
-  `FallbackFetcher` на браузер при повторном challenge; неизвестный `challenge.js` hash
-  блокирует pure-Python solver до canary; `captcha`/`block` не могут попасть ни в browser
+  `FallbackFetcher` на браузер при повторном challenge; missing/expired compatibility canary
+  блокирует pure-Python solver; `captcha`/`block` не могут попасть ни в browser
   minter, ни в request-level fallback; `StealthBrowserTokenMinter` после успеха приводит к
   HTTP retry до любого request-level fallback; конфликт нового transport-конфига с
   legacy-флагом fail-fast; отсутствие токена в логах; scrypt через
@@ -368,12 +369,12 @@ source:
 - integration: live smoke `waf_http` — listing, 2+ страницы AJAX-пагинации, detail,
   recheck; сверка `content_hash` с browser-транспортом на пересекающихся ID
   (спайк-сценарии уже отработаны в `/tmp/waf-solvers`, переносятся в `tests/realcall`).
-- canary: ежедневный solve вне scan с алертом при failure; смена content-hash скрипта без
-  успешного canary блокирует solver в scan.
+- canary: ежедневный solve вне scan с алертом при failure; failed/expired compatibility canary блокирует solver в scan;
+  динамический script SHA остаётся observability-only.
 - observability: метрики `rabota_md_waf_token_refresh_total`,
   `rabota_md_waf_challenge_total`, `rabota_md_transport_fallback_total`,
   `waf_solver_attempts_total`, `waf_solver_success_total`,
-  `waf_solver_solve_duration_seconds`, `waf_solver_script_version`,
+  `waf_solver_solve_duration_seconds`, `waf_solver_compatibility`,
   `rabota_md_http_without_browser_ratio`, частота token refresh и доля degraded по
   транспортам.
 - implementation scope: изменения выполняются **только в DEV checkout** `/home/andrei/JobHunter`.

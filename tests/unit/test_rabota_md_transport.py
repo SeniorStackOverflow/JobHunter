@@ -9,7 +9,8 @@ from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
 from app.crawlers.adapters.rabota_md.transport import build_waf_fetcher
 from app.crawlers.adapters.rabota_md.waf.http_client import WafHttpClient
 from app.crawlers.adapters.rabota_md.waf.watchdog import (
-    DEFAULT_APPROVED_SCRIPT_HASH,
+    CANARY_TTL_SECONDS,
+    PROTOCOL_FINGERPRINT,
     ScriptWatchdog,
 )
 from app.scheduler.tasks import _rabota_md_uses_waf_http
@@ -18,12 +19,19 @@ from app.scheduler.tasks import _rabota_md_uses_waf_http
 class FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
+        self.set_px: dict[str, int | None] = {}
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(
+        self, key: str, value: str, nx: bool = False, px: int | None = None
+    ) -> bool | None:
+        if nx and key in self.store:
+            return None
         self.store[key] = value
+        self.set_px[key] = px
+        return True
 
 
 def test_waf_canary_only_runs_for_waf_http_sources() -> None:
@@ -55,26 +63,39 @@ def test_resolved_transport_legacy_mapping() -> None:
 
 async def test_watchdog_fail_closed_before_load() -> None:
     watchdog = ScriptWatchdog(FakeRedis())  # type: ignore[arg-type]
-    assert not watchdog.is_approved("abc")
+    assert not watchdog.allows_script("abc")
 
 
-async def test_watchdog_empty_redis_uses_verified_bootstrap_pin() -> None:
+async def test_watchdog_empty_redis_is_fail_closed() -> None:
     watchdog = ScriptWatchdog(FakeRedis())  # type: ignore[arg-type]
     await watchdog.load()
-    assert await watchdog.pinned_hash() == DEFAULT_APPROVED_SCRIPT_HASH
-    assert watchdog.is_approved(DEFAULT_APPROVED_SCRIPT_HASH)
-    assert not watchdog.is_approved("first-observed")
+    assert not await watchdog.is_compatible()
+    assert not watchdog.allows_script("dynamic-script-hash")
 
 
-async def test_watchdog_approve_and_reject_unknown() -> None:
+async def test_watchdog_fresh_canary_allows_different_dynamic_hashes() -> None:
     redis = FakeRedis()
     watchdog = ScriptWatchdog(redis)  # type: ignore[arg-type]
-    await watchdog.approve("hash-a")
+    await watchdog.record_canary_success("canary-hash-a")
 
     reloaded = ScriptWatchdog(redis)  # type: ignore[arg-type]
     await reloaded.load()
-    assert reloaded.is_approved("hash-a")
-    assert not reloaded.is_approved("hash-b")
+    assert await reloaded.is_compatible()
+    assert await reloaded.canary_script_hash() == "canary-hash-a"
+    assert reloaded.allows_script("different-live-hash-b")
+    assert reloaded.allows_script("different-live-hash-c")
+    assert redis.set_px["crawler:rabota_md:waf_solver_canary_ok"] == CANARY_TTL_SECONDS * 1000
+
+
+async def test_watchdog_rejects_marker_for_other_protocol_fingerprint() -> None:
+    redis = FakeRedis()
+    watchdog = ScriptWatchdog(redis)  # type: ignore[arg-type]
+    await watchdog.record_canary_success("hash-a")
+
+    incompatible = ScriptWatchdog(redis, protocol_fingerprint=PROTOCOL_FINGERPRINT + ":v2")  # type: ignore[arg-type]
+    await incompatible.load()
+    assert not await incompatible.is_compatible()
+    assert not incompatible.allows_script("hash-a")
 
 
 def test_build_waf_fetcher_without_fallback() -> None:

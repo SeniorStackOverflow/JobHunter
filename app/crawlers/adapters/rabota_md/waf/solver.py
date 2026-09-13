@@ -330,7 +330,9 @@ class AwsWafSolver:
             digest = hashlib.sha256(script_response.content).hexdigest()
             self.last_script_hash = digest
             if not self._script_hash_checker(digest):
-                raise WafScriptVersionUnknown(f"unapproved challenge.js sha256={digest}")
+                raise WafScriptVersionUnknown(
+                    f"no fresh WAF compatibility canary for challenge.js sha256={digest}"
+                )
 
         goku_props: dict[str, Any] | None = None
         goku_match = RE_GOKU.search(html)

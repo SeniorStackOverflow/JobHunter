@@ -14,7 +14,7 @@ class WafUnsupportedChallenge(WafError):
 
 
 class WafScriptVersionUnknown(WafError):
-    """challenge.js content hash differs from the canary-approved pinned version."""
+    """Pure solver is gated because no fresh compatibility canary authorizes it."""
 
 
 class WafPowTimeout(WafError):

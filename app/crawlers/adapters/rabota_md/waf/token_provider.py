@@ -34,7 +34,7 @@ from app.crawlers.browser import (
 )
 from app.observability.metrics import (
     WAF_SOLVER_ATTEMPTS,
-    WAF_SOLVER_SCRIPT_VERSION,
+    WAF_SOLVER_COMPATIBILITY,
     WAF_SOLVER_SOLVE_DURATION,
     WAF_SOLVER_SUCCESS,
 )
@@ -186,6 +186,7 @@ class PurePythonSolverBackend:
     async def mint(self) -> MintedWafToken:
         if self._watchdog is not None:
             await self._watchdog.load()
+            WAF_SOLVER_COMPATIBILITY.set(1 if self._watchdog.compatible else 0)
         started = time.monotonic()
         WAF_SOLVER_ATTEMPTS.inc()
         try:
@@ -193,8 +194,6 @@ class PurePythonSolverBackend:
         finally:
             WAF_SOLVER_SOLVE_DURATION.observe(time.monotonic() - started)
         WAF_SOLVER_SUCCESS.inc()
-        if self._solver.last_script_hash is not None:
-            WAF_SOLVER_SCRIPT_VERSION.labels(sha256=self._solver.last_script_hash).set(1)
         return MintedWafToken(value=token)
 
 

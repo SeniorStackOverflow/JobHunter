@@ -107,10 +107,10 @@ canary + fallback-цепочкой `pure_python → stealth_browser → env` —
 |                                                               |
 |  ChallengeFetcher   -- GET целевого URL -> 202-страница       |
 |    - парсинг gokuProps + script URL                           |
-|    - кеш challenge.js по content-hash                         |
+|    - challenge.js SHA только для observability               |
 |                                                               |
-|  ScriptWatchdog     -- сверка content-hash с pinned версией   |
-|    - новая версия -> canary-прогон ДО использования в scan    |
+|  ScriptWatchdog     -- свежий protocol canary marker в Redis  |
+|    - marker TTL 30ч; protocol fingerprint versioned           |
 |                                                               |
 |  JsRuntime (quickjs|mini_racer)                               |
 |    + BrowserEnv shim-bundle (профиль "Chrome/Linux desktop")  |
@@ -130,12 +130,11 @@ canary + fallback-цепочкой `pure_python → stealth_browser → env` —
   `invalidate`) и встраивается **первым** backend'ом цепочки
   `pure_python → stealth_browser → env` (актуальный порядок — в
   [rabota-md-http.md](rabota-md-http.md)).
-- `ScriptWatchdog` пингует версию: `sha256(challenge.js)` хранится в Redis; новая версия
-  не идёт в scan, пока не пройден canary-прогон (одиночный solve вне расписания) и не
-  снят сигнал `solver_canary_ok`. Так ротация скрипта AWS превращается в алерт, а не в
-  молча сломанный источник.
+- `ScriptWatchdog` использует не exact SHA, а short-lived `solver_canary_ok` в Redis
+  (TTL 30 ч) с versioned protocol fingerprint. SHA динамического `challenge.js` — только
+  диагностика; live E2E подтвердил, что он меняется между совместимыми solve.
 - Все сетевые вызовы solver'а (challenge page, challenge.js, token endpoint) проходят тот
-  же rate limiter и доменный allowlist; `token.awswaf.com`/`captcha.awswaf.com`
+  же rate limiter и доменный allowlist; `token.awswaf.com`/`sdk.awswaf.com`
   добавляются в allowlist только для solver'а, не для crawl-трафика.
 
 ## Жёсткие границы
@@ -180,7 +179,7 @@ canary + fallback-цепочкой `pure_python → stealth_browser → env` —
    solve подряд с валидным crawl-ответом. Только после этого — интеграция.
 2. **Интеграция:** backend `pure_python` в `WafTokenProvider`, ScriptWatchdog, canary-задача
    (1 solve/день вне scan), метрики `waf_solver_attempts_total`,
-   `waf_solver_success_total`, `waf_solver_script_version`.
+   `waf_solver_success_total`, `waf_solver_compatibility`.
 3. **Эксплуатация параллельно:** `pure_python` первым в цепочке, fallback на
    `stealth_browser` минтер. Наблюдение ≥ 4 недель: success rate ≥ 99%, ни одного
    необъяснимого `403/202` шторма.
@@ -193,8 +192,8 @@ canary + fallback-цепочкой `pure_python → stealth_browser → env` —
 - unit: fixtures записанной challenge-страницы и скрипта; парсинг `gokuProps`;
   корректность shim-ответов canvas/webgl; отказ при `captcha`-action; отсутствие токена
   в логах и метриках.
-- canary: ежедневный solve вне scan с алертом при failure; смена content-hash скрипта без
-  успешного canary блокирует использование solver'а в scan.
+- canary: ежедневный solve вне scan с алертом при failure; failed/expired protocol canary блокирует использование solver'а в scan;
+  script SHA остаётся только диагностикой.
 - integration: полный live smoke источника на `waf_http` с токеном от `pure_python`
   backend'а; сверка `content_hash` выдачи с browser-транспортом.
 - деплой: стандартный production gate AGENTS.md; отдельный `policy_review_reference` на

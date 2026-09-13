@@ -79,10 +79,9 @@ WAF_SOLVER_SOLVE_DURATION = Histogram(
     "job_agent_waf_solver_solve_duration_seconds",
     "Pure-Python AWS WAF solve duration.",
 )
-WAF_SOLVER_SCRIPT_VERSION = Gauge(
-    "job_agent_waf_solver_script_version",
-    "Observed challenge.js version by sha256 (1 for versions observed by this process).",
-    ("sha256",),
+WAF_SOLVER_COMPATIBILITY = Gauge(
+    "job_agent_waf_solver_compatibility",
+    "Whether a fresh live WAF protocol compatibility canary is present (1=yes).",
 )
 RABOTA_TRANSPORT_REQUESTS = Counter(
     "job_agent_rabota_md_transport_requests_total",
@@ -122,7 +121,7 @@ __all__ = [
     "SOURCE_HEALTH",
     "WAF_SOLVER_ATTEMPTS",
     "WAF_SOLVER_CANARY",
-    "WAF_SOLVER_SCRIPT_VERSION",
+    "WAF_SOLVER_COMPATIBILITY",
     "WAF_SOLVER_SOLVE_DURATION",
     "WAF_SOLVER_SUCCESS",
     "metrics_response",
