@@ -7,15 +7,19 @@ from uuid import UUID
 import structlog
 from pydantic import ValidationError
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
 from app.database.base import utcnow
-from app.models.entities import CommunicationSession, PhoneDeviceSnapshot
-from app.models.enums import CommunicationChannel, CommunicationOutcome
+from app.models.entities import (
+    CommunicationSession,
+    CommunicationTurn,
+    PhoneDeviceSnapshot,
+)
+from app.models.enums import CommunicationChannel, CommunicationOutcome, TurnSpeaker
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
@@ -170,6 +174,12 @@ class IngestLoop:
             return len(seen) > 1
         return self._is_reset(page)
 
+    def _call_external_id(self, call_id: object) -> str | None:
+        raw = str(call_id or "").strip()
+        if not raw:
+            return None
+        return f"{self._generation}:{raw}"
+
     @property
     def open_session_id(self) -> UUID | None:
         """Public read of the currently open session ID."""
@@ -246,6 +256,9 @@ class IngestLoop:
                             needs_review=True,
                             generation=self._generation,
                             answered_at=answered,
+                            transport_external_id=self._call_external_id(
+                                status.current_call.call_id if status.current_call else None
+                            ),
                             diagnostics={
                                 "note": f"reconcile_opened_from_{status.call_state.lower()}",
                                 "daemon_version": status.daemon_version,
@@ -293,6 +306,14 @@ class IngestLoop:
                 # so stamp answered_at here or the call closes as MISSED.
                 if status.call_state == "IN_CALL":
                     await self._store.touch_answered(open_row, utcnow())
+                if (
+                    open_row.transport_external_id is None
+                    and status.current_call is not None
+                    and status.current_call.call_id
+                ):
+                    open_row.transport_external_id = self._call_external_id(
+                        status.current_call.call_id
+                    )
                 open_row.diagnostics = {
                     **open_row.diagnostics,
                     "reconciled_at": utcnow().isoformat(),
@@ -457,6 +478,8 @@ class IngestLoop:
             await self._on_call_state(session, event, status)
         elif event.type == "transcript":
             await self._on_transcript(session, event, status)
+        elif event.type == "call_lifecycle":
+            await self._on_call_lifecycle(session, event)
 
     async def _on_incoming_call(
         self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
@@ -514,6 +537,7 @@ class IngestLoop:
             opened_at=utcnow(),
             generation=self._generation,
             needs_review=correlation.ambiguous,
+            transport_external_id=self._call_external_id(event.data.get("call_id")),
             diagnostics={
                 "daemon_version": status.daemon_version,
                 "sim_operator": str(
@@ -567,6 +591,9 @@ class IngestLoop:
         open_row = await self._open_session_this_generation(session)
         if open_row is None:
             return
+        call_id = str(event.data.get("call_id") or "").strip()
+        if open_row.transport_external_id is None and call_id:
+            open_row.transport_external_id = self._call_external_id(call_id)
         if state == "RINGING":
             await self._store.touch_ringing(open_row, utcnow())
         elif state == "IN_CALL":
@@ -585,6 +612,70 @@ class IngestLoop:
                 rx_stats=status.rx_audio_stats.model_dump(),
             )
             self._open_session_id = None
+
+    async def _on_call_lifecycle(self, session: AsyncSession, event: PhoneEvent) -> None:
+        call_id = str(event.data.get("call_id") or "").strip()
+        if not call_id:
+            return
+        external_id = self._call_external_id(call_id)
+        call = await session.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.channel == CommunicationChannel.CALL,
+                CommunicationSession.transport == "phonegate",
+                CommunicationSession.transport_external_id.in_(
+                    [value for value in (external_id, call_id) if value]
+                ),
+            )
+        )
+        if call is None:
+            logger.info("phone_lifecycle_unmatched", call_id=call_id[:16])
+            return
+
+        end_reason = str(event.data.get("end_reason") or "") or None
+        raw_delta = event.data.get("peer_hangup_ms_after_last_tts")
+        delta_ms = int(raw_delta) if isinstance(raw_delta, (int, float)) else None
+        rx_bytes = max(0, int(event.data.get("rx_audio_bytes") or 0))
+        rx_duration_ms = max(0, int(event.data.get("rx_audio_duration_ms") or 0))
+        diagnostics = {
+            **call.diagnostics,
+            "phonegate_end_reason": end_reason,
+            "last_tts_ended_at_ms": event.data.get("last_tts_ended_at"),
+            "peer_hangup_ms_after_last_tts": delta_ms,
+            "rx_audio_bytes": rx_bytes,
+            "rx_audio_duration_ms": rx_duration_ms,
+            "phonegate_audio_evidence_path": event.data.get("audio_evidence_path"),
+            "phonegate_audio_evidence_sha256": event.data.get("audio_evidence_sha256"),
+        }
+        employer_turns = int(
+            await session.scalar(
+                select(func.count(CommunicationTurn.id)).where(
+                    CommunicationTurn.session_id == call.id,
+                    CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
+                )
+            )
+            or 0
+        )
+        phase = str(call.diagnostics.get("remote_end_phase") or "")
+        prompt_phase = phase in {
+            "intro_tts", "wait_first_rx", "retry_tts",
+            "wait_first_rx_retry", "details_tts",
+        }
+        quick_after_tts = (
+            delta_ms is not None
+            and delta_ms <= self._settings.phone_prompt_rejection_window_ms
+        )
+        existing_disposition = str(call.diagnostics.get("call_disposition") or "")
+        if existing_disposition == "no_employer_response_while_connected":
+            diagnostics["call_disposition"] = existing_disposition
+        elif (
+            end_reason == "remote_or_network_hangup"
+            and employer_turns == 0
+            and (quick_after_tts or prompt_phase)
+        ):
+            diagnostics["call_disposition"] = "probable_prompt_rejection"
+        elif end_reason == "remote_or_network_hangup" and employer_turns == 0:
+            diagnostics["call_disposition"] = "remote_hangup_no_employer_transcript"
+        call.diagnostics = diagnostics
 
     async def _on_transcript(
         self, session: AsyncSession, event: PhoneEvent, status: DeviceStatus
@@ -654,6 +745,9 @@ class IngestLoop:
                 # still reports IN_CALL, record the answer so this does not close
                 # as MISSED (e.g. a call that spanned a PhoneGate restart).
                 answered_at=utcnow() if status.call_state == "IN_CALL" else None,
+                transport_external_id=self._call_external_id(
+                    status.current_call.call_id if status.current_call else None
+                ),
                 diagnostics={
                     "note": "transcript_before_session_start",
                     "daemon_version": status.daemon_version,

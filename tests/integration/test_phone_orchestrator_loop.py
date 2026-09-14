@@ -74,6 +74,9 @@ def _settings(**overrides: object) -> Settings:
         "phone_speak_fence_timeout_seconds": 2.0,
         "phone_tx_idle_timeout_seconds": 2.0,
         "phone_inter_block_listen_seconds": 0.01,
+        "phone_first_response_timeout_seconds": 0.08,
+        "phone_first_response_retry_timeout_seconds": 0.08,
+        "phone_prompt_rejection_window_ms": 3000,
         "phone_listen_silence_timeout_seconds": 0.2,
         "phone_call_hard_cap_seconds": 5.0,
         "phone_orchestrator_poll_seconds": 0.01,
@@ -196,16 +199,17 @@ async def test_agent_captures_evidence_clip_during_listening(
         await asyncio.sleep(0.05)
         fake.ring("+37360111222")
 
-        # Wait until the orchestrator is actually in LISTENING, then inject one
-        # important caller line so it is polled (and captured) mid-LISTENING.
+        # The new flow listens immediately after the disclosure. Inject the
+        # important caller line there; evidence capture must work before the
+        # later general LISTENING stage too.
         session_id = None
         for _ in range(400):
             await asyncio.sleep(0.01)
             session_id = session_id or await _open_session_id()
-            if session_id is not None and await _stage(session_id) == "listening":
+            if session_id is not None and await _stage(session_id) == "waiting_first_response":
                 break
         else:  # pragma: no cover - only hit on a hang
-            pytest.fail("orchestrator never reached LISTENING")
+            pytest.fail("orchestrator never reached waiting_first_response")
 
         rx_id = fake.transcript(speaker="rx", text="в четверг в 14:00 на Индустриальной 12")
         assert rx_id > 0

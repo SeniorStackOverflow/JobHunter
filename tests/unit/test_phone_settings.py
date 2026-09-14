@@ -164,7 +164,10 @@ def test_phase_2a_defaults() -> None:
     assert s.phone_speak_fence_timeout_seconds == 5.0
     assert s.phone_tx_idle_timeout_seconds == 30.0
     assert s.phone_inter_block_listen_seconds == 0.25
-    assert s.phone_listen_silence_timeout_seconds == 20.0
+    assert s.phone_first_response_timeout_seconds == 4.5
+    assert s.phone_first_response_retry_timeout_seconds == 4.5
+    assert s.phone_prompt_rejection_window_ms == 3000
+    assert s.phone_listen_silence_timeout_seconds == 5.0
     assert s.phone_call_hard_cap_seconds == 180.0
     assert s.phone_orchestrator_poll_seconds == 0.15
 

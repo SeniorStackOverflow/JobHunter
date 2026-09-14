@@ -662,6 +662,40 @@ A future true-barge-in implementation requires PhoneGate transport work, includi
 
 The greeting should be composed from separate cached blocks, not one long generated TTS sentence.
 
+### Production correction: caller turn-taking (2026-09-14)
+
+Production evidence showed that answered employer calls were ending during the second scripted TTS block or within roughly 0–1.4 seconds after it. A controlled PhoneGate A/B test showed RX working before and after TTS, so JobHunter must treat caller experience as the primary hypothesis rather than assuming an RX failure.
+
+The deterministic Phase-2 opening therefore uses this state flow:
+
+```text
+ANSWER
+  ↓
+post-connect recovery (1.5 s)
+  ↓
+short disclosure + one simple question
+  ↓
+WAIT_FIRST_RESPONSE (real transcript/status polling, 4.5 s)
+  ├─ employer RX → continue
+  ├─ remote end → REMOTE_ENDED
+  └─ timeout → one short retry, then another 4.5 s RX window
+        ├─ employer RX → continue
+        ├─ remote end → REMOTE_ENDED
+        └─ timeout while still connected → no-response review + polite close
+  ↓
+optional short details prompt only for a terse/non-critical first reply
+  ↓
+LISTENING (5 s silence timeout, reset by new RX)
+  ↓
+closing / SMS confirmation path
+```
+
+A blind `sleep()` is not a listening opportunity. JobHunter must poll both call state and transcript during the first-response windows. The old `phone_inter_block_listen_seconds` setting remains for configuration compatibility but is not the turn-taking mechanism.
+
+Normal remote termination is not a technical `aborted_error`. The orchestrator records `remote_ended` plus `remote_end_phase`; PhoneGate lifecycle evidence (`end_reason`, `peer_hangup_ms_after_last_tts`, raw RX duration/bytes and evidence path) is correlated to the JobHunter session by generation-scoped PhoneGate `call_id`.
+
+A call with zero employer turns can be classified as `probable_prompt_rejection` only when the remote-side lifecycle evidence supports it (quick post-TTS end or a prompt-phase end). A call that remained connected through both RX windows but produced no employer transcript stays `needs_review`, because ASR/observability failure is still plausible.
+
 ---
 
 ## 9. Phrase bank

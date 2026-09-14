@@ -70,6 +70,9 @@ def _settings(evidence_dir: Path) -> Settings:
         phone_speak_fence_timeout_seconds=2.0,
         phone_tx_idle_timeout_seconds=2.0,
         phone_inter_block_listen_seconds=0.01,
+        phone_first_response_timeout_seconds=0.08,
+        phone_first_response_retry_timeout_seconds=0.08,
+        phone_prompt_rejection_window_ms=3000,
         phone_listen_silence_timeout_seconds=0.5,
         phone_call_hard_cap_seconds=5.0,
         phone_orchestrator_poll_seconds=0.01,
@@ -128,7 +131,9 @@ async def test_evidence_capture_then_finalize_links_and_summarizes(
         )
         task = asyncio.create_task(orchestrator.run(session_id))
         try:
-            await _wait_for_stage(phone_e2e_factory, session_id, "listening")
+            await _wait_for_stage(
+                phone_e2e_factory, session_id, "waiting_first_response"
+            )
             transcript_id = fake.transcript(
                 speaker="rx", text="в четверг в 14:00 на Индустриальной 12"
             )

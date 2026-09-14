@@ -1152,3 +1152,47 @@ async def test_tx_transcript_lines_are_not_persisted_by_ingest(
     async with profiled_factory() as session:
         turns = (await session.scalars(select(CommunicationTurn))).all()
     assert [t.text for t in turns] == ["по вакансии грузчика"]
+
+
+async def test_call_lifecycle_persists_remote_hangup_evidence_and_disposition(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        if await loop.load_cursor() is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        call_id = fake._call_id
+        fake.answer()
+        fake.hangup()
+        fake.emit_raw(
+            "call_lifecycle",
+            {
+                "call_id": call_id,
+                "state": "ended",
+                "outcome": "completed",
+                "end_reason": "remote_or_network_hangup",
+                "last_tts_ended_at": 1_000_000,
+                "peer_hangup_ms_after_last_tts": 840,
+                "rx_audio_bytes": 25_280,
+                "rx_audio_duration_ms": 790,
+                "audio_evidence_path": "/srv/phonegate/data/call_evidence/test.wav",
+                "audio_evidence_sha256": "a" * 64,
+            },
+        )
+        await _drain(loop)
+
+    async with profiled_factory() as session:
+        call = (await session.scalars(select(CommunicationSession))).one()
+    assert call.transport_external_id == f"0:{call_id}"
+    assert call.diagnostics["phonegate_end_reason"] == "remote_or_network_hangup"
+    assert call.diagnostics["peer_hangup_ms_after_last_tts"] == 840
+    assert call.diagnostics["rx_audio_bytes"] == 25_280
+    assert call.diagnostics["rx_audio_duration_ms"] == 790
+    assert call.diagnostics["call_disposition"] == "probable_prompt_rejection"
+    assert call.diagnostics["phonegate_audio_evidence_sha256"] == "a" * 64

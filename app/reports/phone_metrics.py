@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime
+from statistics import median
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from app.models.enums import (
     PhoneSummaryState,
     PhoneVerificationStatus,
     TurnDeliveryStatus,
+    TurnSpeaker,
 )
 
 _MAX_ANALYSIS_CALLS = 20
@@ -137,8 +139,56 @@ async def daily_phone_metrics(
         error_codes[f"summary:{code or 'failed'}"] += 1
 
     calls_with_transcript = {turn.session_id for turn in turns if turn.text.strip()}
+    assistant_turns = [
+        turn for turn in turns if turn.speaker == TurnSpeaker.ASSISTANT and turn.text.strip()
+    ]
+    employer_turns = [
+        turn for turn in turns if turn.speaker == TurnSpeaker.EMPLOYER and turn.text.strip()
+    ]
+    calls_with_assistant = {turn.session_id for turn in assistant_turns}
+    calls_with_employer = {turn.session_id for turn in employer_turns}
+    assistant_only_calls = calls_with_assistant - calls_with_employer
     audio_turns = [turn for turn in turns if turn.audio_evidence_path]
     calls_with_audio = {turn.session_id for turn in audio_turns}
+    calls_with_raw_rx_audio: set[UUID] = set()
+    remote_hangup_call_ids: set[UUID] = set()
+    remote_hangup_deltas: list[int] = []
+    remote_hangups_without_delta = 0
+    remote_hangups_during_tts = 0
+    probable_prompt_rejections = 0
+    for call in calls:
+        diagnostics = call.diagnostics if isinstance(call.diagnostics, dict) else {}
+        try:
+            rx_bytes = int(diagnostics.get("rx_audio_bytes") or 0)
+        except (TypeError, ValueError):
+            rx_bytes = 0
+        if rx_bytes > 0:
+            calls_with_raw_rx_audio.add(call.id)
+        if diagnostics.get("phonegate_end_reason") != "remote_or_network_hangup":
+            continue
+        remote_hangup_call_ids.add(call.id)
+        raw_delta = diagnostics.get("peer_hangup_ms_after_last_tts")
+        if isinstance(raw_delta, (int, float)) and raw_delta >= 0:
+            remote_hangup_deltas.append(int(raw_delta))
+        else:
+            remote_hangups_without_delta += 1
+        phase = str(diagnostics.get("remote_end_phase") or "")
+        tts_phase = phase in {"intro_tts", "retry_tts", "details_tts"}
+        if tts_phase:
+            remote_hangups_during_tts += 1
+        prompt_phase = tts_phase or phase in {
+            "wait_first_rx", "wait_first_rx_retry",
+        }
+        if (
+            call.id not in calls_with_employer
+            and diagnostics.get("call_disposition") != "no_employer_response_while_connected"
+            and (
+                diagnostics.get("call_disposition") == "probable_prompt_rejection"
+                or prompt_phase
+            )
+        ):
+            probable_prompt_rejections += 1
+    calls_with_any_rx_audio = calls_with_audio | calls_with_raw_rx_audio
 
     linked_by_call: dict[UUID, list[InterviewAppointment]] = defaultdict(list)
     for appointment in linked_appointments:
@@ -181,9 +231,33 @@ async def daily_phone_metrics(
                     for turn in visible_turns
                 ],
                 "transcript_truncated": len(call_turns) > len(visible_turns),
-                "audio_evidence_available": any(
-                    turn.audio_evidence_path for turn in call_turns
+                "assistant_transcript_turns": sum(
+                    turn.speaker == TurnSpeaker.ASSISTANT and bool(turn.text.strip())
+                    for turn in call_turns
                 ),
+                "employer_transcript_turns": sum(
+                    turn.speaker == TurnSpeaker.EMPLOYER and bool(turn.text.strip())
+                    for turn in call_turns
+                ),
+                "audio_evidence_available": (
+                    any(turn.audio_evidence_path for turn in call_turns)
+                    or call.id in calls_with_raw_rx_audio
+                ),
+                "lifecycle": {
+                    "end_reason": (call.diagnostics or {}).get("phonegate_end_reason"),
+                    "peer_hangup_ms_after_last_tts": (call.diagnostics or {}).get(
+                        "peer_hangup_ms_after_last_tts"
+                    ),
+                    "rx_audio_bytes": (call.diagnostics or {}).get("rx_audio_bytes", 0),
+                    "rx_audio_duration_ms": (call.diagnostics or {}).get(
+                        "rx_audio_duration_ms", 0
+                    ),
+                    "audio_evidence_path": (call.diagnostics or {}).get(
+                        "phonegate_audio_evidence_path"
+                    ),
+                    "disposition": (call.diagnostics or {}).get("call_disposition"),
+                    "remote_end_phase": (call.diagnostics or {}).get("remote_end_phase"),
+                },
                 "interviews": [
                     {
                         "status": _value(item.status),
@@ -227,8 +301,31 @@ async def daily_phone_metrics(
         "evidence": {
             "transcript_turns": len(turns),
             "calls_with_transcript": len(calls_with_transcript),
+            "assistant_transcript_turns": len(assistant_turns),
+            "employer_transcript_turns": len(employer_turns),
+            "calls_with_employer_transcript": len(calls_with_employer),
+            "assistant_only_calls": len(assistant_only_calls),
             "audio_evidence_turns": len(audio_turns),
             "calls_with_audio_evidence": len(calls_with_audio),
+            "calls_with_rx_audio": len(calls_with_any_rx_audio),
+            "calls_with_rx_audio_but_no_employer_asr": len(
+                calls_with_any_rx_audio - calls_with_employer
+            ),
+        },
+        "hangups": {
+            "remote_or_network_hangups": len(remote_hangup_call_ids),
+            "remote_hangups_without_post_tts_delta": remote_hangups_without_delta,
+            "remote_hangups_during_tts": remote_hangups_during_tts,
+            "remote_hangups_within_1s_after_tts": sum(
+                value <= 1000 for value in remote_hangup_deltas
+            ),
+            "remote_hangups_within_3s_after_tts": sum(
+                value <= 3000 for value in remote_hangup_deltas
+            ),
+            "median_hangup_after_tts_ms": (
+                round(median(remote_hangup_deltas)) if remote_hangup_deltas else None
+            ),
+            "probable_prompt_rejections": probable_prompt_rejections,
         },
         "analysis_items": analysis_items,
         "analysis_items_truncated": max(0, len(calls) - len(analysis_items)),

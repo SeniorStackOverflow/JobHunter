@@ -23,7 +23,11 @@ from app.phone.client import PhoneGateClient
 from app.phone.correlation import CorrelationResult
 from app.phone.evidence import EvidenceCapturer
 from app.phone.orchestrator import CallOrchestrator
-from app.phone.script import SCRIPT_CLOSING_SMS, SCRIPT_GREETING
+from app.phone.script import (
+    SCRIPT_CLOSING_SMS,
+    SCRIPT_FIRST_RESPONSE_RETRY,
+    SCRIPT_GREETING,
+)
 from app.phone.sessions import SessionStore
 from app.settings.config import Settings
 from tests.fixtures.fake_phonegate import FakePhoneGate
@@ -47,6 +51,9 @@ def _fast_settings(**overrides: object) -> Settings:
         "phone_speak_fence_timeout_seconds": 2.0,
         "phone_tx_idle_timeout_seconds": 2.0,
         "phone_inter_block_listen_seconds": 0.01,
+        "phone_first_response_timeout_seconds": 0.03,
+        "phone_first_response_retry_timeout_seconds": 0.03,
+        "phone_prompt_rejection_window_ms": 3000,
         "phone_listen_silence_timeout_seconds": 0.2,
         "phone_call_hard_cap_seconds": 5.0,
         "phone_orchestrator_poll_seconds": 0.01,
@@ -132,9 +139,55 @@ async def test_happy_path_greeting_listen_closing(
     assert call.script_stage == "greeting_completed"
 
     assistant = await _assistant_turns(factory, session_id)
-    assert len(assistant) == len(SCRIPT_GREETING) + 1  # greeting blocks + one closing
+    assert [turn.spoken_text for turn in assistant[:2]] == [
+        SCRIPT_GREETING[0],
+        SCRIPT_FIRST_RESPONSE_RETRY,
+    ]
+    assert len(assistant) == 3  # greeting + one silence retry + closing
     assert all(t.delivery_status is TurnDeliveryStatus.DELIVERED for t in assistant)
     assert fake._call_state == "IDLE"  # hung up
+
+
+@pytest.mark.asyncio
+async def test_first_response_window_does_not_fire_retry_before_timeout(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+    settings = _fast_settings(
+        phone_first_response_timeout_seconds=0.30,
+        phone_first_response_retry_timeout_seconds=0.03,
+    )
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(
+            client=client, session_factory=file_factory, settings=settings
+        )
+        task = asyncio.create_task(orch.run(session_id))
+        try:
+            for _ in range(300):
+                async with file_factory() as db:
+                    call = await db.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "waiting_first_response":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("never reached first-response window")
+
+            turns = await _assistant_turns(file_factory, session_id)
+            assert [turn.spoken_text for turn in turns] == [SCRIPT_GREETING[0]]
+            await asyncio.sleep(0.05)
+            turns = await _assistant_turns(file_factory, session_id)
+            assert [turn.spoken_text for turn in turns] == [SCRIPT_GREETING[0]]
+
+            fake.transcript(speaker="rx", text="Да, звоню по поводу работы")
+            assert await asyncio.wait_for(task, timeout=5.0) == "greeting_completed"
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
 
 @pytest.mark.asyncio
@@ -154,11 +207,11 @@ async def test_critical_rx_marker_uses_sms_closing(
             for _ in range(300):
                 async with file_factory() as db:
                     call = await db.get(CommunicationSession, session_id)
-                if call is not None and call.script_stage == "listening":
+                if call is not None and call.script_stage == "waiting_first_response":
                     break
                 await asyncio.sleep(0.01)
             else:
-                pytest.fail("never reached LISTENING")
+                pytest.fail("never reached first-response window")
             fake.transcript(speaker="rx", text="Собеседование завтра в 10")
             stage = await asyncio.wait_for(task, timeout=5.0)
         finally:
@@ -192,10 +245,10 @@ async def test_unexpected_evidence_error_does_not_abort_call(
                 await asyncio.sleep(0.01)
                 async with file_factory() as db:
                     call = await db.get(CommunicationSession, session_id)
-                if call is not None and call.script_stage == "listening":
+                if call is not None and call.script_stage == "waiting_first_response":
                     break
             else:
-                pytest.fail("orchestrator never reached LISTENING")
+                pytest.fail("orchestrator never reached first-response window")
             fake.transcript(speaker="rx", text="важная реплика работодателя")
             stage = await task
         finally:
@@ -280,11 +333,21 @@ async def test_listening_extends_on_new_rx_activity(
             for _ in range(300):
                 async with file_factory() as s:
                     call = await s.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "waiting_first_response":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("never reached first-response window")
+            fake.transcript(speaker="rx", text="Да, звоню по работе")
+
+            for _ in range(300):
+                async with file_factory() as s:
+                    call = await s.get(CommunicationSession, session_id)
                 if call is not None and call.script_stage == "listening":
                     break
                 await asyncio.sleep(0.01)
             else:
-                pytest.fail("never reached LISTENING")
+                pytest.fail("never reached LISTENING after first RX")
 
             # Let some silence accumulate, then inject an RX line before the
             # original 0.3s deadline would have fired.
@@ -337,12 +400,13 @@ async def test_call_drops_mid_greeting(factory: async_sessionmaker[AsyncSession]
         orch = CallOrchestrator(client=client, session_factory=factory, settings=_fast_settings())
         stage = await orch.run(session_id)
 
-    assert stage == "aborted_error"
+    assert stage == "remote_ended"
     async with factory() as s:
         call = await s.get(CommunicationSession, session_id)
     assert call is not None
-    assert call.script_stage == "aborted_error"
-    assert call.needs_review is True
+    assert call.script_stage == "remote_ended"
+    assert call.needs_review is False
+    assert call.diagnostics.get("remote_end_phase") == "intro_tts"
 
 
 @pytest.mark.asyncio
@@ -652,8 +716,8 @@ async def test_mute_command_during_listening_records_diagnostic(
 
     async def command_check() -> str | None:
         calls["n"] += 1
-        # Call 1 = the pre-answer check, calls 2-3 = the 2 greeting blocks;
-        # call 6+ is safely inside LISTENING.
+        # Call 1 = pre-answer. The new dialogue checks commands continuously while
+        # waiting for real RX, so a later call safely lands in that/listening path.
         return "mute" if calls["n"] >= 6 else None
 
     async with _pg(fake) as client:
@@ -671,7 +735,8 @@ async def test_mute_command_during_listening_records_diagnostic(
     assert call is not None
     assert call.diagnostics.get("mute_requested") is True
     assistant = await _assistant_turns(factory, session_id)
-    assert len(assistant) == len(SCRIPT_GREETING) + 1  # every block still spoken, none skipped
+    assert assistant[0].spoken_text == SCRIPT_GREETING[0]
+    assert assistant[-1].spoken_text is not None
 
 
 @pytest.mark.asyncio

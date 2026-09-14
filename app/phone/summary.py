@@ -734,6 +734,48 @@ async def _finalize_claimed_call(
                 call.summary_state = PhoneSummaryState.SKIPPED
                 call.processing_started_at = None
                 call.claim_token = None
+                if not confirmations:
+                    if not settings.phone_summary_llm_enabled:
+                        call.verification_status = PhoneVerificationStatus.NOT_APPLICABLE
+                    else:
+                        diagnostics = call.diagnostics if isinstance(call.diagnostics, dict) else {}
+                        disposition = str(diagnostics.get("call_disposition") or "")
+                        phase = str(diagnostics.get("remote_end_phase") or "")
+                        raw_delta = diagnostics.get("peer_hangup_ms_after_last_tts")
+                        quick = (
+                            isinstance(raw_delta, (int, float))
+                            and 0 <= raw_delta <= settings.phone_prompt_rejection_window_ms
+                        )
+                        prompt_phase = phase in {
+                            "intro_tts", "wait_first_rx", "retry_tts",
+                            "wait_first_rx_retry", "details_tts",
+                        }
+                        probable_rejection = (
+                            diagnostics.get("phonegate_end_reason")
+                            == "remote_or_network_hangup"
+                            and disposition != "no_employer_response_while_connected"
+                            and (quick or prompt_phase)
+                        )
+                        if probable_rejection:
+                            call.verification_status = PhoneVerificationStatus.NOT_APPLICABLE
+                            call.diagnostics = {
+                                **diagnostics,
+                                "call_disposition": "probable_prompt_rejection",
+                            }
+                            call.summary = {
+                                **call.summary,
+                                "post_call_disposition": "probable_prompt_rejection",
+                            }
+                        else:
+                            call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
+                            call.needs_review = True
+                            call.summary = {
+                                **call.summary,
+                                "post_call_disposition": (
+                                    disposition or "no_employer_transcript_unexplained"
+                                ),
+                            }
+                            refresh_telegram_notification(call)
                 await db.commit()
         return "skipped"
 

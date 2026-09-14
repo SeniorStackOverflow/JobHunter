@@ -121,6 +121,7 @@ class SessionStore:
         diagnostics: dict[str, Any] | None = None,
         generation: int = 0,
         answered_at: datetime | None = None,
+        transport_external_id: str | None = None,
     ) -> CommunicationSession:
         # A4: merge diagnostics dict (if provided) with note handling
         call_diagnostics: dict[str, Any] = {}
@@ -141,6 +142,7 @@ class SessionStore:
             remote_address=remote_address,
             remote_raw=remote_raw,
             phonegate_event_id_start=event_id,
+            transport_external_id=transport_external_id,
             phonegate_generation=generation,
             started_at=opened_at,
             ringing_at=opened_at,

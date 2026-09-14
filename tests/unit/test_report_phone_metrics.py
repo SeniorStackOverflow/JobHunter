@@ -59,6 +59,13 @@ async def test_daily_phone_metrics_counts_calls_errors_interviews_and_evidence(
             summary_state=PhoneSummaryState.FAILED,
             verification_status=PhoneVerificationStatus.NEEDS_REVIEW,
             summary={"model_meta": {"last_error": "verification_timeout"}},
+            diagnostics={
+                "phonegate_end_reason": "remote_or_network_hangup",
+                "peer_hangup_ms_after_last_tts": 800,
+                "rx_audio_bytes": 6400,
+                "rx_audio_duration_ms": 200,
+                "call_disposition": "probable_prompt_rejection",
+            },
         )
         session.add_all([completed, failed_summary])
         await session.flush()
@@ -125,8 +132,23 @@ async def test_daily_phone_metrics_counts_calls_errors_interviews_and_evidence(
     assert metrics["evidence"] == {
         "transcript_turns": 2,
         "calls_with_transcript": 2,
+        "assistant_transcript_turns": 1,
+        "employer_transcript_turns": 1,
+        "calls_with_employer_transcript": 1,
+        "assistant_only_calls": 1,
         "audio_evidence_turns": 1,
         "calls_with_audio_evidence": 1,
+        "calls_with_rx_audio": 2,
+        "calls_with_rx_audio_but_no_employer_asr": 1,
+    }
+    assert metrics["hangups"] == {
+        "remote_or_network_hangups": 1,
+        "remote_hangups_without_post_tts_delta": 0,
+        "remote_hangups_during_tts": 0,
+        "remote_hangups_within_1s_after_tts": 1,
+        "remote_hangups_within_3s_after_tts": 1,
+        "median_hangup_after_tts_ms": 800,
+        "probable_prompt_rejections": 1,
     }
     assert len(metrics["analysis_items"]) == 2
     first = metrics["analysis_items"][0]

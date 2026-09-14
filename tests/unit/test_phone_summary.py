@@ -11,6 +11,7 @@ from app.models.enums import (
     CommunicationDirection,
     CommunicationOutcome,
     PhoneSummaryState,
+    PhoneVerificationStatus,
     TurnSpeaker,
 )
 from app.phone import summary as summary_module
@@ -228,3 +229,112 @@ async def test_summarize_strips_markdown_fence():
         ),
     )
     assert (await p.summarize(_CTX)).summary_text == "ок"
+
+
+@pytest.mark.asyncio
+async def test_no_employer_turns_prompt_rejection_is_not_manual_review(
+    sqlite_session_factory, tmp_path, monkeypatch
+) -> None:
+    settings = summary_module.Settings(
+        _env_file=None,
+        phone_evidence_dir=tmp_path,
+        phone_summary_llm_enabled=True,
+        phone_summary_llm_model="summary-model",
+        phone_summary_llm_api_key=SecretStr("router-key"),
+        telegram_enabled=False,
+    )
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="default", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            remote_raw="+37360111222",
+            started_at=now,
+            answered_at=now,
+            ended_at=now,
+            outcome=CommunicationOutcome.COMPLETED,
+            auto_answered=True,
+            summary_state=PhoneSummaryState.PENDING,
+            diagnostics={
+                "phonegate_end_reason": "remote_or_network_hangup",
+                "peer_hangup_ms_after_last_tts": 840,
+            },
+        )
+        db.add(call)
+        await db.commit()
+        call_id = call.id
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(summary_module, "get_settings", lambda: settings)
+
+    result = await summary_module.finalize_pending_calls()
+    assert result["picked"] == 1
+    assert result["skipped"] == 1
+    async with sqlite_session_factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+    assert call is not None
+    assert call.summary_state is PhoneSummaryState.SKIPPED
+    assert call.verification_status is PhoneVerificationStatus.NOT_APPLICABLE
+    assert call.needs_review is False
+    assert call.summary["post_call_disposition"] == "probable_prompt_rejection"
+
+
+@pytest.mark.asyncio
+async def test_no_employer_turns_unexplained_stays_needs_review(
+    sqlite_session_factory, tmp_path, monkeypatch
+) -> None:
+    settings = summary_module.Settings(
+        _env_file=None,
+        phone_evidence_dir=tmp_path,
+        phone_summary_llm_enabled=True,
+        phone_summary_llm_model="summary-model",
+        phone_summary_llm_api_key=SecretStr("router-key"),
+        telegram_enabled=False,
+    )
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as db:
+        profile = UserProfile(name="default", is_default=True)
+        db.add(profile)
+        await db.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            remote_address="+37360111222",
+            remote_raw="+37360111222",
+            started_at=now,
+            answered_at=now,
+            ended_at=now,
+            outcome=CommunicationOutcome.COMPLETED,
+            auto_answered=True,
+            summary_state=PhoneSummaryState.PENDING,
+            diagnostics={
+                "phonegate_end_reason": "remote_or_network_hangup",
+                "peer_hangup_ms_after_last_tts": 9000,
+                "call_disposition": "remote_hangup_no_employer_transcript",
+            },
+        )
+        db.add(call)
+        await db.commit()
+        call_id = call.id
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(summary_module, "get_settings", lambda: settings)
+
+    result = await summary_module.finalize_pending_calls()
+    assert result["picked"] == 1
+    assert result["skipped"] == 1
+    async with sqlite_session_factory() as db:
+        call = await db.get(CommunicationSession, call_id)
+    assert call is not None
+    assert call.summary_state is PhoneSummaryState.SKIPPED
+    assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert call.needs_review is True
+    assert call.summary["post_call_disposition"] == "remote_hangup_no_employer_transcript"

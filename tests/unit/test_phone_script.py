@@ -4,21 +4,27 @@ from __future__ import annotations
 from app.phone.script import (
     SCRIPT_CLOSING,
     SCRIPT_CLOSING_INTERRUPTED,
+    SCRIPT_CLOSING_NO_RESPONSE,
     SCRIPT_CLOSING_SMS,
+    SCRIPT_DETAILS_PROMPT,
+    SCRIPT_FIRST_RESPONSE_RETRY,
     SCRIPT_GREETING,
 )
 
 
 def test_greeting_blocks_are_short_nonempty_strings() -> None:
     assert SCRIPT_GREETING == (
-        "Здравствуйте. Я голосовой ассистент Андрея и помогаю от его имени "
-        "согласовать собеседования.",
-        "Назовите, пожалуйста, вакансию, дату, время, адрес и часовой пояс.",
+        "Здравствуйте, это автоматизированный помощник Андрея Гомонова. "
+        "Он сейчас не может ответить лично. Подскажите, вы звоните по поводу работы?",
     )
-    assert "от его имени" in " ".join(SCRIPT_GREETING)
+    assert "автоматизированный помощник" in SCRIPT_GREETING[0]
+    assert "часовой пояс" not in SCRIPT_GREETING[0]
+    assert SCRIPT_FIRST_RESPONSE_RETRY
+    assert SCRIPT_DETAILS_PROMPT
+    assert SCRIPT_CLOSING_NO_RESPONSE
     for block in SCRIPT_GREETING:
         assert isinstance(block, str)
-        assert 0 < len(block) <= 200  # short blocks keep Piper + GSM quality up
+        assert 0 < len(block) <= 200
 
 
 def test_closing_blocks_present() -> None:

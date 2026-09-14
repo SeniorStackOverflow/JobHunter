@@ -15,12 +15,18 @@ from app.audit import record_audit_event
 from app.models.entities import CommunicationSession
 from app.models.enums import TurnDeliveryStatus
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
-from app.phone.critical import closing_for_transcript
+from app.phone.critical import closing_for_transcript, has_confirmation_critical_markers
 from app.phone.evidence import EvidenceCapturer
 from app.phone.numbers import mask_phone, normalize_e164
 from app.phone.policy import should_answer
 from app.phone.schemas import DeviceStatus
-from app.phone.script import SCRIPT_CLOSING_INTERRUPTED, SCRIPT_GREETING
+from app.phone.script import (
+    SCRIPT_CLOSING_INTERRUPTED,
+    SCRIPT_CLOSING_NO_RESPONSE,
+    SCRIPT_DETAILS_PROMPT,
+    SCRIPT_FIRST_RESPONSE_RETRY,
+    SCRIPT_GREETING,
+)
 from app.phone.sessions import SessionStore
 from app.phone.speak import observe_tx_delivery, speak_block, wait_until_speakable
 from app.settings.config import Settings
@@ -31,6 +37,7 @@ logger = structlog.get_logger(__name__)
 # decide whether a finished orchestrator should be restarted.
 TERMINAL_STAGES = {
     "greeting_completed",
+    "remote_ended",
     "aborted_operator",
     "aborted_error",
     "aborted_restart",
@@ -178,30 +185,78 @@ class CallOrchestrator:
         await asyncio.sleep(s.phone_post_connect_wait_seconds)
 
         # GREETING ------------------------------------------------------
-        for block in SCRIPT_GREETING:
-            if time.monotonic() - answer_start >= s.phone_call_hard_cap_seconds:
-                # Unlike the "ended" outcome below, the call is still IN_CALL
-                # here — the cap alone doesn't end it, so we must.
+        # One disclosure/question, then a real RX window. Never use a blind
+        # sleep between prompts: the caller must get a chance to answer.
+        if time.monotonic() - answer_start >= s.phone_call_hard_cap_seconds:
+            await self._hangup()
+            await self._finish("aborted_error", needs_review=True)
+            return "aborted_error"
+        outcome = await self._say(session_id, SCRIPT_GREETING[0])
+        if outcome == "ended":
+            await self._finish_remote_end("intro_tts")
+            return "remote_ended"
+
+        await self._set_stage("waiting_first_response")
+        wait_state, seen_transcript_id, observed_rx_entries = (
+            await self._wait_for_employer_response(
+                seen_transcript_id,
+                wait_seconds=s.phone_first_response_timeout_seconds,
+                answer_start=answer_start,
+                remote_phase="wait_first_rx",
+            )
+        )
+        if wait_state in TERMINAL_STAGES:
+            return wait_state
+        if wait_state == "hard_cap":
+            await self._hangup()
+            await self._finish("aborted_error", needs_review=True)
+            return "aborted_error"
+
+        if wait_state == "timeout":
+            outcome = await self._say(session_id, SCRIPT_FIRST_RESPONSE_RETRY)
+            if outcome == "ended":
+                await self._finish_remote_end("retry_tts")
+                return "remote_ended"
+            wait_state, seen_transcript_id, retry_rx = (
+                await self._wait_for_employer_response(
+                    seen_transcript_id,
+                    wait_seconds=s.phone_first_response_retry_timeout_seconds,
+                    answer_start=answer_start,
+                    remote_phase="wait_first_rx_retry",
+                )
+            )
+            observed_rx_entries.extend(retry_rx)
+            if wait_state in TERMINAL_STAGES:
+                return wait_state
+            if wait_state == "hard_cap":
                 await self._hangup()
                 await self._finish("aborted_error", needs_review=True)
                 return "aborted_error"
-            cmd = await self._cmd()
-            terminal = await self._dispatch_command(session_id, cmd)
-            if terminal is not None:
-                return terminal
-            if cmd == "mute":
-                await self._mark_mute_requested(session_id)
-                break
-            outcome = await self._say(session_id, block)
+
+        if not observed_rx_entries:
+            await self._set_no_response_review()
+            await self._set_stage("closing")
+            outcome = await self._say(session_id, SCRIPT_CLOSING_NO_RESPONSE)
+            if outcome != "ended":
+                await self._hangup()
+            await self._finish("greeting_completed")
+            return "greeting_completed"
+
+        # A short acknowledgement is useful after a terse "да"; if the caller
+        # already dictated substantive/critical details, do not interrupt them
+        # with another questionnaire-shaped prompt.
+        if (
+            sum(len(text) for text in observed_rx_entries) < 120
+            and not has_confirmation_critical_markers(observed_rx_entries)
+        ):
+            outcome = await self._say(session_id, SCRIPT_DETAILS_PROMPT)
             if outcome == "ended":
-                await self._finish("aborted_error", needs_review=True)
-                return "aborted_error"
-            await asyncio.sleep(s.phone_inter_block_listen_seconds)
+                await self._finish_remote_end("details_tts")
+                return "remote_ended"
 
         # LISTENING ---------------------------------------------------
         await self._set_stage("listening")
         last_activity = time.monotonic()
-        observed_rx_entries: list[str] = []
         while True:
             cmd = await self._cmd()
             terminal = await self._dispatch_command(session_id, cmd)
@@ -222,8 +277,8 @@ class CallOrchestrator:
                 return "aborted_error"
 
             if status.call_state != "IN_CALL":
-                await self._finish("aborted_error", needs_review=True)
-                return "aborted_error"
+                await self._finish_remote_end("listening")
+                return "remote_ended"
 
             now = time.monotonic()
             if page.entries:
@@ -254,6 +309,64 @@ class CallOrchestrator:
         await self._hangup()
         await self._finish("greeting_completed")
         return "greeting_completed"
+
+    async def _wait_for_employer_response(
+        self,
+        seen_transcript_id: int,
+        *,
+        wait_seconds: float,
+        answer_start: float,
+        remote_phase: str,
+    ) -> tuple[str, int, list[str]]:
+        """Wait for a real RX turn while continuously checking call state.
+
+        Returns ``(state, cursor, texts)`` where state is ``rx``, ``timeout``
+        or a terminal script stage. This is deliberately event-aware; a blind
+        sleep between TTS blocks recreates the caller-overlap failure mode.
+        """
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            cmd = await self._cmd()
+            terminal = await self._dispatch_command(self._sid, cmd)
+            if terminal is not None:
+                return terminal, seen_transcript_id, []
+            if cmd == "mute":
+                await self._mark_mute_requested(self._sid)
+
+            try:
+                status = await self._client.device_status()
+                page = await self._client.transcript(after_id=seen_transcript_id, limit=250)
+            except (PhoneGateUnavailable, PhoneGateError):
+                logger.warning("phone_orchestrator_first_response_poll_failed")
+                await self._finish("aborted_error", needs_review=True)
+                return "aborted_error", seen_transcript_id, []
+
+            if status.call_state != "IN_CALL":
+                await self._finish_remote_end(remote_phase)
+                return "remote_ended", seen_transcript_id, []
+
+            if page.entries:
+                seen_transcript_id = max(
+                    seen_transcript_id, max(entry.id for entry in page.entries)
+                )
+                rx_entries = [entry for entry in page.entries if entry.speaker == "rx"]
+                if rx_entries:
+                    try:
+                        await self._evidence.maybe_capture(rx_entries)
+                    except Exception as exc:
+                        logger.warning(
+                            "phone_evidence_capture_failed",
+                            error=type(exc).__name__,
+                            session_id=str(self._sid),
+                        )
+                    return "rx", seen_transcript_id, [entry.text for entry in rx_entries]
+
+            now = time.monotonic()
+            if now - answer_start >= self._s.phone_call_hard_cap_seconds:
+                return "hard_cap", seen_transcript_id, []
+            if now >= deadline:
+                return "timeout", seen_transcript_id, []
+            await asyncio.sleep(self._s.phone_orchestrator_poll_seconds)
 
     async def _dispatch_command(self, session_id: UUID, cmd: str | None) -> str | None:
         """Handle an operator command that ends the call. Returns the terminal
@@ -416,6 +529,29 @@ class CallOrchestrator:
                 await self._store.set_script_stage(call, stage)
                 if needs_review:
                     call.needs_review = True
+                await db.commit()
+
+    async def _finish_remote_end(self, phase: str) -> None:
+        async with self._sf() as db:
+            call = await db.get(CommunicationSession, self._sid)
+            if call is not None:
+                await self._store.set_script_stage(call, "remote_ended")
+                call.diagnostics = {
+                    **call.diagnostics,
+                    "remote_end_phase": phase,
+                    "remote_ended_at": datetime.now(UTC).isoformat(),
+                }
+                await db.commit()
+
+    async def _set_no_response_review(self) -> None:
+        async with self._sf() as db:
+            call = await db.get(CommunicationSession, self._sid)
+            if call is not None:
+                call.needs_review = True
+                call.diagnostics = {
+                    **call.diagnostics,
+                    "call_disposition": "no_employer_response_while_connected",
+                }
                 await db.commit()
 
     async def _mark_mute_requested(self, session_id: UUID) -> None:
