@@ -261,10 +261,8 @@ async def test_no_employer_turns_prompt_rejection_is_not_manual_review(
             outcome=CommunicationOutcome.COMPLETED,
             auto_answered=True,
             summary_state=PhoneSummaryState.PENDING,
-            diagnostics={
-                "phonegate_end_reason": "remote_or_network_hangup",
-                "peer_hangup_ms_after_last_tts": 840,
-            },
+            script_stage="remote_ended",
+            diagnostics={"remote_end_phase": "intro_tts"},
         )
         db.add(call)
         await db.commit()

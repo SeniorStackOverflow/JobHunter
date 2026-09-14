@@ -750,9 +750,13 @@ async def _finalize_claimed_call(
                             "intro_tts", "wait_first_rx", "retry_tts",
                             "wait_first_rx_retry", "details_tts",
                         }
-                        probable_rejection = (
+                        remote_observed = (
                             diagnostics.get("phonegate_end_reason")
                             == "remote_or_network_hangup"
+                            or call.script_stage == "remote_ended"
+                        )
+                        probable_rejection = (
+                            remote_observed
                             and disposition != "no_employer_response_while_connected"
                             and (quick or prompt_phase)
                         )
