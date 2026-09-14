@@ -27,6 +27,7 @@ from app.models.enums import (
     RunStatus,
 )
 from app.profiles import ProfileService
+from app.reports.phone_metrics import daily_phone_metrics
 from app.telemetry import external_call_metrics
 from app.time_utils import LOCAL_TIMEZONE_NAME, local_day_bounds
 
@@ -355,6 +356,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
     matching_metrics = await _daily_matching_metrics(session, start, end)
     external_metrics = await external_call_metrics(session, start, end)
     limit_metrics = await _daily_limit_metrics(session, start, end)
+    phone_metrics = await daily_phone_metrics(session, start, end)
     summary = {
         "calendar_date": start_local.date().isoformat(),
         "timezone": LOCAL_TIMEZONE_NAME,
@@ -378,6 +380,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
         "duplicates_merged": max(0, new_source_jobs - new_canonical_jobs),
         **matching_metrics,
         "external_calls": external_metrics,
+        "phone_calls": phone_metrics,
         # Legacy counters are retained for compatibility. The explicit fields below
         # distinguish today's application cohort from send events that may drain
         # applications created on earlier days.
