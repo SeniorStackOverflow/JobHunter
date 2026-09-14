@@ -14,11 +14,15 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    PhoneSummaryState,
+    PhoneVerificationStatus,
+    TurnSpeaker,
 )
 from app.phone.client import PhoneGateClient
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
 from app.phone.ingest import IngestLoop
+from app.phone.schemas import PhoneEvent
 from app.settings.config import Settings
 from tests.fixtures.fake_phonegate import FakePhoneGate
 from tests.fixtures.fake_redis import FakeAsyncRedis
@@ -1196,3 +1200,223 @@ async def test_call_lifecycle_persists_remote_hangup_evidence_and_disposition(
     assert call.diagnostics["rx_audio_duration_ms"] == 790
     assert call.diagnostics["call_disposition"] == "probable_prompt_rejection"
     assert call.diagnostics["phonegate_audio_evidence_sha256"] == "a" * 64
+
+
+async def test_late_asr_uses_call_id_after_hangup_and_reopens_skipped_summary(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        if await loop.load_cursor() is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        call_id = fake._call_id
+        fake.answer()
+        fake.hangup()
+        await _drain(loop)
+        status = await client.device_status()
+
+        async with profiled_factory() as db:
+            call = (await db.scalars(select(CommunicationSession))).one()
+            call.auto_answered = True
+            call.summary_state = PhoneSummaryState.SKIPPED
+            call.verification_status = PhoneVerificationStatus.NOT_APPLICABLE
+            call.summary = {"post_call_disposition": "probable_prompt_rejection"}
+            call.diagnostics = {"call_disposition": "probable_prompt_rejection"}
+            ended_at = call.ended_at
+            assert ended_at is not None
+            session_id = call.id
+            await db.commit()
+
+        late_at = ended_at + timedelta(seconds=8)
+        event = PhoneEvent(
+            id=999,
+            type="transcript",
+            timestamp=int(late_at.timestamp() * 1000),
+            data={
+                "transcript": {
+                    "id": 999,
+                    "speaker": "rx",
+                    "text": "Да, я звоню по вакансии",
+                    "backend": "groq",
+                    "confidence": 0.9,
+                    "timestamp_ms": int(late_at.timestamp() * 1000),
+                    "call_id": call_id,
+                    "direction": "incoming",
+                    "origin": "network",
+                    "utterance_end_ms": int(ended_at.timestamp() * 1000),
+                }
+            },
+        )
+        await loop._dispatch_batch([event], status)
+
+    async with profiled_factory() as db:
+        call = await db.get(CommunicationSession, session_id)
+        turns = list(
+            (
+                await db.scalars(
+                    select(CommunicationTurn).where(CommunicationTurn.session_id == session_id)
+                )
+            ).all()
+        )
+    assert call is not None
+    assert [turn.text for turn in turns if turn.speaker is TurnSpeaker.EMPLOYER] == [
+        "Да, я звоню по вакансии"
+    ]
+    assert call.summary_state is PhoneSummaryState.PENDING
+    assert call.verification_status is PhoneVerificationStatus.PENDING
+    assert call.diagnostics.get("call_disposition") is None
+    assert call.summary.get("post_call_disposition") is None
+    assert call.diagnostics["late_employer_transcript"] is True
+    assert call.verification_revision == 1
+
+
+async def test_legacy_late_asr_uses_bounded_unique_time_fallback(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        if await loop.load_cursor() is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        fake.answer()
+        fake.hangup()
+        await _drain(loop)
+        status = await client.device_status()
+
+        async with profiled_factory() as db:
+            call = (await db.scalars(select(CommunicationSession))).one()
+            ended_at = call.ended_at
+            assert ended_at is not None
+            assert call.answered_at is not None
+            assert call.direction is CommunicationDirection.INBOUND
+            assert call.phonegate_generation == loop._generation
+            session_id = call.id
+
+        ended_aware = ended_at if ended_at.tzinfo is not None else ended_at.replace(tzinfo=UTC)
+        late_at = ended_aware + timedelta(seconds=8)
+        event = PhoneEvent(
+            id=1000,
+            type="transcript",
+            timestamp=int(late_at.timestamp() * 1000),
+            data={
+                "transcript": {
+                    "id": 1000,
+                    "speaker": "rx",
+                    "text": "Поздняя реплика старого PhoneGate",
+                    "backend": "groq",
+                    "confidence": 0.9,
+                    "timestamp_ms": int(late_at.timestamp() * 1000),
+                }
+            },
+        )
+        await loop._dispatch_batch([event], status)
+
+    async with profiled_factory() as db:
+        turns = list(
+            (
+                await db.scalars(
+                    select(CommunicationTurn).where(CommunicationTurn.session_id == session_id)
+                )
+            ).all()
+        )
+    assert [turn.text for turn in turns] == ["Поздняя реплика старого PhoneGate"]
+
+
+async def test_late_asr_call_id_beats_new_open_call_session(
+    profiled_factory: async_sessionmaker[AsyncSession], redis: FakeAsyncRedis
+) -> None:
+    fake = FakePhoneGate()
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        loop = _make_loop(client, profiled_factory, redis)
+        if await loop.load_cursor() is None:
+            status = await client.device_status()
+            await loop.save_cursor(status.latest_event_id)
+
+        fake.ring("+37360111222")
+        old_call_id = fake._call_id
+        fake.answer()
+        fake.hangup()
+        await _drain(loop)
+
+        async with profiled_factory() as db:
+            old_call = (
+                await db.scalars(
+                    select(CommunicationSession).where(CommunicationSession.ended_at.is_not(None))
+                )
+            ).one()
+            old_session_id = old_call.id
+            old_ended_at = old_call.ended_at
+            assert old_ended_at is not None
+
+        fake.ring("+37360222333")
+        await loop.run_cycle()
+        status = await client.device_status()
+        async with profiled_factory() as db:
+            open_call = (
+                await db.scalars(
+                    select(CommunicationSession).where(CommunicationSession.ended_at.is_(None))
+                )
+            ).one()
+            new_session_id = open_call.id
+
+        old_ended_aware = (
+            old_ended_at
+            if old_ended_at.tzinfo is not None
+            else old_ended_at.replace(tzinfo=UTC)
+        )
+        event_at = old_ended_aware + timedelta(seconds=6)
+        event = PhoneEvent(
+            id=1001,
+            type="transcript",
+            timestamp=int(event_at.timestamp() * 1000),
+            data={
+                "transcript": {
+                    "id": 1001,
+                    "speaker": "rx",
+                    "text": "Это ещё реплика прошлого звонка",
+                    "backend": "groq",
+                    "confidence": 0.9,
+                    "timestamp_ms": int(event_at.timestamp() * 1000),
+                    "call_id": old_call_id,
+                    "direction": "incoming",
+                    "origin": "network",
+                    "utterance_end_ms": int(old_ended_aware.timestamp() * 1000),
+                }
+            },
+        )
+        await loop._dispatch_batch([event], status)
+
+    async with profiled_factory() as db:
+        old_turns = list(
+            (
+                await db.scalars(
+                    select(CommunicationTurn).where(
+                        CommunicationTurn.session_id == old_session_id
+                    )
+                )
+            ).all()
+        )
+        new_turns = list(
+            (
+                await db.scalars(
+                    select(CommunicationTurn).where(
+                        CommunicationTurn.session_id == new_session_id
+                    )
+                )
+            ).all()
+        )
+    assert [turn.text for turn in old_turns] == ["Это ещё реплика прошлого звонка"]
+    assert new_turns == []

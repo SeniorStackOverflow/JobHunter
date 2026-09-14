@@ -675,10 +675,11 @@ post-connect recovery (1.5 s)
   ↓
 short disclosure + one simple question
   ↓
-WAIT_FIRST_RESPONSE (real transcript/status polling, 4.5 s)
-  ├─ employer RX → continue
+WAIT_FIRST_RESPONSE (4.5 s of actual RX silence)
+  ├─ VAD active / ASR pending → keep waiting; never transmit over live speech
+  ├─ employer transcript → continue
   ├─ remote end → REMOTE_ENDED
-  └─ timeout → one short retry, then another 4.5 s RX window
+  └─ silence timeout → one short retry, then another 4.5 s silence window
         ├─ employer RX → continue
         ├─ remote end → REMOTE_ENDED
         └─ timeout while still connected → no-response review + polite close
@@ -690,7 +691,9 @@ LISTENING (5 s silence timeout, reset by new RX)
 closing / SMS confirmation path
 ```
 
-A blind `sleep()` is not a listening opportunity. JobHunter must poll both call state and transcript during the first-response windows. The old `phone_inter_block_listen_seconds` setting remains for configuration compatibility but is not the turn-taking mechanism.
+A blind `sleep()` is not a listening opportunity. JobHunter must poll call state, transcript, and PhoneGate RX-processing telemetry during the first-response windows. `rx_vad_active` and `rx_asr_pending` turn the 4.5 s value into a silence timeout rather than an ASR-result deadline. `last_rx_speech_at_ms` also protects short speech bursts that finish between polls. The old `phone_inter_block_listen_seconds` setting remains for configuration compatibility but is not the turn-taking mechanism.
+
+PhoneGate must capture `call_id` when an utterance enters the ASR queue and carry it into the eventual RX transcript. ASR completion timestamps are not sufficient identity because Groq may complete several seconds after the call ends. JobHunter therefore reconciles late transcripts by exact generation-scoped call identity first; a bounded time-window fallback exists only for older PhoneGate versions and must refuse ambiguous matches.
 
 Normal remote termination is not a technical `aborted_error`. The orchestrator records `remote_ended` plus `remote_end_phase`; PhoneGate lifecycle evidence (`end_reason`, `peer_hangup_ms_after_last_tts`, raw RX duration/bytes and evidence path) is correlated to the JobHunter session by generation-scoped PhoneGate `call_id`.
 

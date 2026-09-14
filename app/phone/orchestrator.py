@@ -82,6 +82,7 @@ class CallOrchestrator:
         self._store = SessionStore()
         self._session_id: UUID | None = None
         self._last_tx_transcript_id = 0
+        self._last_rx_speech_at_ms_seen = 0
         # Built per call in run(); _drive() (its only caller) always runs after.
         self._evidence: EvidenceCapturer
 
@@ -98,6 +99,7 @@ class CallOrchestrator:
         failure must never crash the hosting process.
         """
         self._session_id = session_id
+        self._last_rx_speech_at_ms_seen = 0
         self._evidence = EvidenceCapturer(
             client=self._client, settings=self._s, session_id=session_id
         )
@@ -281,6 +283,8 @@ class CallOrchestrator:
                 return "remote_ended"
 
             now = time.monotonic()
+            if self._observe_rx_processing(status):
+                last_activity = now
             if page.entries:
                 seen_transcript_id = max(seen_transcript_id, max(e.id for e in page.entries))
                 rx_entries = [e for e in page.entries if e.speaker == "rx"]
@@ -296,7 +300,10 @@ class CallOrchestrator:
                             session_id=str(session_id),
                         )
 
-            if now - last_activity >= s.phone_listen_silence_timeout_seconds:
+            silence_timeout = s.phone_listen_silence_timeout_seconds
+            if not self._rx_processing_telemetry_available(status):
+                silence_timeout = max(silence_timeout, s.phone_legacy_asr_guard_seconds)
+            if now - last_activity >= silence_timeout:
                 break
             if now - answer_start >= s.phone_call_hard_cap_seconds:
                 break
@@ -309,6 +316,17 @@ class CallOrchestrator:
         await self._hangup()
         await self._finish("greeting_completed")
         return "greeting_completed"
+
+    @staticmethod
+    def _rx_processing_telemetry_available(status: DeviceStatus) -> bool:
+        return status.rx_vad_active is not None and status.rx_asr_pending is not None
+
+    def _observe_rx_processing(self, status: DeviceStatus) -> bool:
+        active = bool(status.rx_vad_active) or bool(status.rx_asr_pending)
+        if status.last_rx_speech_at_ms > self._last_rx_speech_at_ms_seen:
+            self._last_rx_speech_at_ms_seen = status.last_rx_speech_at_ms
+            active = True
+        return active
 
     async def _wait_for_employer_response(
         self,
@@ -324,7 +342,9 @@ class CallOrchestrator:
         or a terminal script stage. This is deliberately event-aware; a blind
         sleep between TTS blocks recreates the caller-overlap failure mode.
         """
-        deadline = time.monotonic() + wait_seconds
+        started = time.monotonic()
+        deadline = started + wait_seconds
+        legacy_deadline = started + self._s.phone_legacy_asr_guard_seconds
         while True:
             cmd = await self._cmd()
             terminal = await self._dispatch_command(self._sid, cmd)
@@ -362,9 +382,17 @@ class CallOrchestrator:
                     return "rx", seen_transcript_id, [entry.text for entry in rx_entries]
 
             now = time.monotonic()
+            telemetry_available = self._rx_processing_telemetry_available(status)
+            if self._observe_rx_processing(status):
+                # The timeout is a silence timeout, not an ASR-result timeout.
+                # Keep the line quiet while VAD sees speech or ASR is still pending.
+                deadline = now + wait_seconds
             if now - answer_start >= self._s.phone_call_hard_cap_seconds:
                 return "hard_cap", seen_transcript_id, []
             if now >= deadline:
+                if not telemetry_available and now < legacy_deadline:
+                    await asyncio.sleep(self._s.phone_orchestrator_poll_seconds)
+                    continue
                 return "timeout", seen_transcript_id, []
             await asyncio.sleep(self._s.phone_orchestrator_poll_seconds)
 

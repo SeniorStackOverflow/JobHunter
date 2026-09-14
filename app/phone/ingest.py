@@ -19,7 +19,14 @@ from app.models.entities import (
     CommunicationTurn,
     PhoneDeviceSnapshot,
 )
-from app.models.enums import CommunicationChannel, CommunicationOutcome, TurnSpeaker
+from app.models.enums import (
+    CommunicationChannel,
+    CommunicationDirection,
+    CommunicationOutcome,
+    PhoneSummaryState,
+    PhoneVerificationStatus,
+    TurnSpeaker,
+)
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
 from app.phone.correlation import CallerCorrelation
 from app.phone.health import HealthTracker
@@ -699,25 +706,86 @@ class IngestLoop:
             # is the only writer that knows the spoken_text / delivery status.
             return
         open_row = await self._open_session_this_generation(session)
-        if open_row is None and status.call_state == "IDLE":
-            # Event delivery can lag the device-status poll. Recover a
-            # transcript emitted during a just-closed call by matching its
-            # gateway timestamp to the completed local session.
-            event_at = (
-                datetime.fromtimestamp(event.timestamp / 1000, UTC) if event.timestamp > 0 else None
-            )
-            if event_at is not None:
-                open_row = await session.scalar(
-                    select(CommunicationSession)
-                    .where(
+
+        # New PhoneGate builds stamp the call identity when VAD queues the audio,
+        # before cloud ASR starts. That survives a hangup while Whisper/Groq is
+        # still working. The explicit identity takes precedence even if a *new*
+        # call is already open when the old ASR result finally arrives.
+        if entry.call_id:
+            external_id = self._call_external_id(entry.call_id)
+            identity_values = [value for value in (external_id, entry.call_id) if value]
+            if open_row is None or open_row.transport_external_id not in identity_values:
+                matched = await session.scalar(
+                    select(CommunicationSession).where(
                         CommunicationSession.channel == CommunicationChannel.CALL,
+                        CommunicationSession.direction == CommunicationDirection.INBOUND,
+                        CommunicationSession.transport == "phonegate",
                         CommunicationSession.phonegate_generation == self._generation,
-                        CommunicationSession.started_at <= event_at + timedelta(seconds=2),
-                        CommunicationSession.ended_at >= event_at - timedelta(seconds=2),
+                        CommunicationSession.transport_external_id.in_(identity_values),
                     )
-                    .order_by(CommunicationSession.started_at.desc())
-                    .limit(1)
                 )
+                if matched is not None:
+                    open_row = matched
+                elif open_row is not None:
+                    logger.warning(
+                        "phone_transcript_call_id_mismatch",
+                        transcript_id=entry.id,
+                    )
+                    return
+
+        if open_row is None and status.call_state == "IDLE":
+            # Compatibility path for an older PhoneGate with no transcript call_id.
+            # Its timestamp is written after ASR completes, so allow the configured
+            # cloud-ASR delay, but only attach when exactly one answered call matches.
+            reference_ms = entry.utterance_end_ms or event.timestamp
+            reference_at = (
+                datetime.fromtimestamp(reference_ms / 1000, UTC) if reference_ms > 0 else None
+            )
+            if reference_at is not None:
+                delay_seconds = (
+                    2.0
+                    if entry.utterance_end_ms > 0
+                    else self._settings.phone_post_call_asr_reconcile_seconds
+                )
+                recent = list(
+                    (
+                        await session.scalars(
+                            select(CommunicationSession)
+                            .where(
+                                CommunicationSession.channel == CommunicationChannel.CALL,
+                                CommunicationSession.direction == CommunicationDirection.INBOUND,
+                                CommunicationSession.transport == "phonegate",
+                                CommunicationSession.phonegate_generation == self._generation,
+                                CommunicationSession.answered_at.is_not(None),
+                                CommunicationSession.ended_at.is_not(None),
+                            )
+                            .order_by(CommunicationSession.ended_at.desc())
+                            .limit(4)
+                        )
+                    ).all()
+                )
+
+                def _aware(value: datetime) -> datetime:
+                    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+                lower = reference_at - timedelta(seconds=delay_seconds)
+                upper = reference_at + timedelta(seconds=2)
+                candidates = [
+                    candidate
+                    for candidate in recent
+                    if candidate.ended_at is not None
+                    and lower <= _aware(candidate.ended_at) <= upper
+                    and _aware(candidate.started_at) <= upper
+                ]
+                if len(candidates) == 1:
+                    open_row = candidates[0]
+                elif len(candidates) > 1:
+                    logger.warning(
+                        "phone_transcript_after_call_end_ambiguous",
+                        transcript_id=entry.id,
+                        candidates=len(candidates),
+                    )
+                    return
             if open_row is None:
                 logger.info("phone_transcript_after_call_end", transcript_id=entry.id)
                 return
@@ -774,4 +842,40 @@ class IngestLoop:
                     "profile_id": str(correlation.profile_id),
                 },
             )
-        await self._store.append_turn(session, session_id=open_row.id, entry=entry)
+        appended = await self._store.append_turn(session, session_id=open_row.id, entry=entry)
+        if (
+            appended is not None
+            and open_row.ended_at is not None
+            and open_row.auto_answered
+        ):
+            # A late employer turn is new verification input. Re-open a terminal
+            # post-call state and invalidate an earlier "prompt rejection" guess.
+            open_row.verification_revision += 1
+            diagnostics = dict(open_row.diagnostics or {})
+            if diagnostics.get("call_disposition") in {
+                "probable_prompt_rejection",
+                "remote_hangup_no_employer_transcript",
+                "no_employer_response_while_connected",
+            }:
+                diagnostics.pop("call_disposition", None)
+            diagnostics["late_employer_transcript"] = True
+            diagnostics["late_employer_transcript_id"] = entry.id
+            open_row.diagnostics = diagnostics
+            summary = dict(open_row.summary or {})
+            if summary.get("post_call_disposition") in {
+                "probable_prompt_rejection",
+                "remote_hangup_no_employer_transcript",
+                "no_employer_transcript_unexplained",
+            }:
+                summary.pop("post_call_disposition", None)
+                open_row.summary = summary
+            if open_row.summary_state in {
+                PhoneSummaryState.SKIPPED,
+                PhoneSummaryState.DONE,
+                PhoneSummaryState.FAILED,
+            }:
+                open_row.summary_state = PhoneSummaryState.PENDING
+                open_row.processing_started_at = None
+                open_row.claim_token = None
+            if open_row.verification_status is PhoneVerificationStatus.NOT_APPLICABLE:
+                open_row.verification_status = PhoneVerificationStatus.PENDING

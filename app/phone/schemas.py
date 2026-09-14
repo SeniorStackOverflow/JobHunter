@@ -37,6 +37,11 @@ class DeviceStatus(_Lenient):
     caller_name: str = ""
     daemon_version: str = ""
     rx_audio_stats: RxAudioStats = Field(default_factory=RxAudioStats)
+    # Newer PhoneGate builds expose live RX processing state. None means the
+    # gateway is older and JobHunter must use its conservative compatibility wait.
+    rx_vad_active: bool | None = None
+    rx_asr_pending: bool | None = None
+    last_rx_speech_at_ms: int = 0
     device: dict[str, Any] = Field(default_factory=dict)
     latest_event_id: int = 0
     tx_active: bool = False
@@ -75,6 +80,10 @@ class TranscriptEntry(_Lenient):
     backend: str = ""
     confidence: float | None = None
     timestamp_ms: int = 0
+    call_id: str = ""
+    direction: str = ""
+    origin: str = ""
+    utterance_end_ms: int = 0
 
 
 class TranscriptPage(_Lenient):

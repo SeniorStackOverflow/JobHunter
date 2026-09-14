@@ -957,3 +957,100 @@ async def test_supervisor_disabled_by_config_does_not_answer(
         await sup.tick(await client.device_status(), session_id)
         assert await redis.get(CALL_OWNED_KEY) is None
         assert fake._call_state == "RINGING"
+
+
+@pytest.mark.asyncio
+async def test_first_response_waits_for_vad_and_asr_instead_of_retrying_over_speech(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+    settings = _fast_settings(
+        phone_first_response_timeout_seconds=0.03,
+        phone_first_response_retry_timeout_seconds=0.03,
+        phone_listen_silence_timeout_seconds=0.1,
+    )
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=file_factory, settings=settings)
+        task = asyncio.create_task(orch.run(session_id))
+        try:
+            for _ in range(300):
+                async with file_factory() as db:
+                    call = await db.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "waiting_first_response":
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                pytest.fail("never reached first-response window")
+
+            fake.set_rx_processing(vad_active=True, speech_at_ms=1_000)
+            await asyncio.sleep(0.08)  # > initial 30 ms silence window
+            assistant = await _assistant_turns(file_factory, session_id)
+            assert [turn.spoken_text for turn in assistant] == [SCRIPT_GREETING[0]]
+
+            fake.set_rx_processing(vad_active=False, asr_pending=True, speech_at_ms=1_020)
+            await asyncio.sleep(0.08)  # ASR may outlive speech; still no retry TTS
+            assistant = await _assistant_turns(file_factory, session_id)
+            assert [turn.spoken_text for turn in assistant] == [SCRIPT_GREETING[0]]
+
+            fake.transcript(speaker="rx", text="Да, звоню по вакансии")
+            fake.set_rx_processing(asr_pending=False)
+            stage = await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert stage == "greeting_completed"
+    assistant = await _assistant_turns(file_factory, session_id)
+    spoken = [turn.spoken_text for turn in assistant]
+    assert SCRIPT_FIRST_RESPONSE_RETRY not in spoken
+
+
+@pytest.mark.asyncio
+async def test_listening_silence_timeout_pauses_while_vad_is_active(
+    file_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(file_factory)
+    settings = _fast_settings(phone_listen_silence_timeout_seconds=0.12)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(client=client, session_factory=file_factory, settings=settings)
+        task = asyncio.create_task(orch.run(session_id))
+        try:
+            for _ in range(300):
+                async with file_factory() as db:
+                    call = await db.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "waiting_first_response":
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                pytest.fail("never reached first-response window")
+
+            fake.transcript(speaker="rx", text="Да, звоню по работе")
+            for _ in range(300):
+                async with file_factory() as db:
+                    call = await db.get(CommunicationSession, session_id)
+                if call is not None and call.script_stage == "listening":
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                pytest.fail("never reached listening")
+
+            fake.set_rx_processing(vad_active=True, speech_at_ms=2_000)
+            await asyncio.sleep(0.25)  # > listening silence timeout
+            async with file_factory() as db:
+                call = await db.get(CommunicationSession, session_id)
+            assert call is not None
+            assert call.script_stage == "listening"
+
+            fake.set_rx_processing(vad_active=False, asr_pending=False, speech_at_ms=2_020)
+            stage = await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert stage == "greeting_completed"

@@ -29,6 +29,9 @@ class FakePhoneGate:
         self._mode = "Zero-ADB"
         self._daemon_version = "0.2.30"
         self._rx_stats = {"captured_frames": 0, "queued_frames": 0, "dropped_frames": 0}
+        self._rx_vad_active = False
+        self._rx_asr_pending = False
+        self._last_rx_speech_at_ms = 0
         self._tx_preparing = False
         self._tx_active = False
         self._tx_stage = 0  # 0 idle, 1 preparing, 2 active
@@ -128,6 +131,10 @@ class FakePhoneGate:
             "confidence": confidence,
             "timestamp": "00:00:00",
             "timestamp_ms": int(time.time() * 1000),
+            "call_id": self._call_id,
+            "direction": self._call_direction,
+            "origin": self._call_origin,
+            "utterance_end_ms": int(time.time() * 1000),
         }
         self._next_transcript_id += 1
         self._transcripts.append(record)
@@ -142,6 +149,20 @@ class FakePhoneGate:
     def emit_raw(self, event_type: str, data: dict[str, Any]) -> int:
         """Append an event with an arbitrary type/data shape (for resilience tests)."""
         return self._emit(event_type, data)
+
+    def set_rx_processing(
+        self,
+        *,
+        vad_active: bool | None = None,
+        asr_pending: bool | None = None,
+        speech_at_ms: int | None = None,
+    ) -> None:
+        if vad_active is not None:
+            self._rx_vad_active = vad_active
+        if asr_pending is not None:
+            self._rx_asr_pending = asr_pending
+        if speech_at_ms is not None:
+            self._last_rx_speech_at_ms = speech_at_ms
 
     def set_connected(self, value: bool) -> None:
         self._connected = value
@@ -246,6 +267,9 @@ class FakePhoneGate:
             },
             "daemon_version": self._daemon_version,
             "rx_audio_stats": dict(self._rx_stats),
+            "rx_vad_active": self._rx_vad_active,
+            "rx_asr_pending": self._rx_asr_pending,
+            "last_rx_speech_at_ms": self._last_rx_speech_at_ms,
             "call_state": self._call_state,
             "call_duration_seconds": 0,
             "caller_number": self._caller,

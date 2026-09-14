@@ -12,6 +12,9 @@ def test_device_status_parses_and_ignores_extra() -> None:
             "call_state": "RINGING",
             "caller_number": "+37360111222",
             "rx_audio_stats": {"dropped_frames": 2},
+            "rx_vad_active": True,
+            "rx_asr_pending": True,
+            "last_rx_speech_at_ms": 123456,
             "device": {"battery": 87},
             "latest_event_id": 12,
             "unknown_field": "x",
@@ -20,6 +23,9 @@ def test_device_status_parses_and_ignores_extra() -> None:
     assert status.is_daemon_mode is True
     assert status.rx_audio_stats.dropped_frames == 2
     assert status.rx_audio_stats.captured_frames == 0
+    assert status.rx_vad_active is True
+    assert status.rx_asr_pending is True
+    assert status.last_rx_speech_at_ms == 123456
 
 
 def test_device_status_adb_fallback_not_daemon_mode() -> None:
@@ -58,5 +64,6 @@ def test_telephony_state_mapping() -> None:
 def test_device_status_tx_fields_default_false() -> None:
     st = DeviceStatus.model_validate({})
     assert st.tx_active is False and st.tx_preparing is False
+    assert st.rx_vad_active is None and st.rx_asr_pending is None
     st = DeviceStatus.model_validate({"tx_active": True, "tx_preparing": True})
     assert st.tx_active is True and st.tx_preparing is True

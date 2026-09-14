@@ -18,11 +18,12 @@ The 250 ms interval was not a real listening window. JobHunter did not consume R
 answer
   -> post-connect recovery
   -> one transparent disclosure + simple work-related question
-  -> WAIT_FIRST_RESPONSE (real transcript/status polling, default 4.5 s)
-     -> RX: continue
-     -> timeout: one short retry
+  -> WAIT_FIRST_RESPONSE (4.5 s of actual RX silence)
+     -> VAD active / ASR pending: keep waiting; do not speak over the caller
+     -> employer transcript: continue
+     -> silence timeout: one short retry
      -> remote end: terminal remote_ended
-  -> WAIT_FIRST_RESPONSE_RETRY (default 4.5 s)
+  -> WAIT_FIRST_RESPONSE_RETRY (another 4.5 s of actual RX silence)
      -> RX: continue
      -> timeout: no-response closing + review
   -> optional short details prompt only for terse/non-critical first replies
@@ -31,6 +32,8 @@ answer
 ```
 
 No vacancy/date/time/address/timezone questionnaire is fired immediately after the greeting. If the employer already supplied substantive or critical details, JobHunter does not interrupt them with the details prompt.
+
+The timeout is silence-based, not transcript-based. PhoneGate exposes `rx_vad_active`, `rx_asr_pending`, and `last_rx_speech_at_ms`; JobHunter resets the silence deadline while speech is active or recognition is still pending. During a rolling upgrade with an older PhoneGate that lacks these fields, JobHunter uses a conservative 24 s compatibility guard rather than risking TTS over live speech.
 
 ## Remote hangup semantics
 
@@ -48,7 +51,7 @@ Call sessions are linked to PhoneGate lifecycle records with a generation-scoped
 <phonegate_generation>:<phonegate_call_id>
 ```
 
-This avoids call-ID collision across PhoneGate restarts.
+This avoids call-ID collision across PhoneGate restarts. PhoneGate also stamps RX transcript entries with the call identity captured when VAD queues the utterance, before cloud ASR begins. A late transcript can therefore be attached by exact `call_id` even after hangup or after another call has already started. Older PhoneGate builds fall back to a bounded 12 s post-call reconciliation window and only attach when exactly one answered call matches.
 
 `call_lifecycle` data is persisted into `CommunicationSession.diagnostics`, including:
 

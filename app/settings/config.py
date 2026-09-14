@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     phone_inter_block_listen_seconds: float = Field(default=0.25, ge=0.2, le=5)
     phone_first_response_timeout_seconds: float = Field(default=4.5, ge=1.0, le=15)
     phone_first_response_retry_timeout_seconds: float = Field(default=4.5, ge=1.0, le=15)
+    # Compatibility guard for an older PhoneGate that cannot expose VAD/ASR state.
+    # It is intentionally conservative: never speak over a possible 15s utterance
+    # plus a slow cloud-ASR completion during a rolling upgrade.
+    phone_legacy_asr_guard_seconds: float = Field(default=24.0, ge=10.0, le=60.0)
+    phone_post_call_asr_reconcile_seconds: float = Field(default=12.0, ge=2.0, le=60.0)
     phone_prompt_rejection_window_ms: int = Field(default=3000, ge=250, le=10000)
     phone_listen_silence_timeout_seconds: float = Field(default=5.0, ge=5, le=120)
     phone_call_hard_cap_seconds: float = Field(default=180.0, ge=30, le=1800)
