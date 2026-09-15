@@ -10,10 +10,11 @@ from app.phone.critical import (
     CriticalField,
     canonical_critical_value,
     closing_for_transcript,
+    follow_up_action_for_texts,
     has_confirmation_critical_markers,
     normalize_critical_value,
 )
-from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_SMS
+from app.phone.script import SCRIPT_CLOSING_FOLLOW_UP, SCRIPT_CLOSING_SMS
 
 
 @pytest.mark.parametrize(
@@ -173,5 +174,10 @@ def test_date_marker_selects_sms_closing() -> None:
     assert closing_for_transcript(["Собеседование завтра в 10"]) == SCRIPT_CLOSING_SMS
 
 
-def test_noncritical_call_keeps_existing_closing() -> None:
-    assert closing_for_transcript(["Позвоните Андрею позже"]) == SCRIPT_CLOSING
+def test_follow_up_call_uses_neutral_closing() -> None:
+    assert closing_for_transcript(["Позвоните Андрею позже"]) == SCRIPT_CLOSING_FOLLOW_UP
+
+
+def test_follow_up_action_distinguishes_callback_owner() -> None:
+    assert follow_up_action_for_texts(["Перезвоните, пожалуйста"]) == "callback_requested"
+    assert follow_up_action_for_texts(["Я перезвоню попозже"]) == "caller_will_retry"

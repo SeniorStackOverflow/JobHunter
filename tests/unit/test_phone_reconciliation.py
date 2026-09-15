@@ -651,3 +651,116 @@ def test_vague_time_remains_unknown() -> None:
     decision = _decide(extracted=[candidate], verified=[candidate])
     assert decision.facts[0].state is CallFactState.UNKNOWN
     assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+
+
+def test_company_prefix_and_quotes_do_not_create_fake_conflict() -> None:
+    text = 'Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста.'
+    extracted = FactCandidate(
+        field="company",
+        raw_expression="Компетенс Маркетинг",
+        normalized_value="Компетенс Маркетинг",
+        quote=text,
+        turn_seq=1,
+        confidence=1.0,
+    )
+    verified = FactCandidate(
+        field="company",
+        raw_expression='Компания «Компетенс Маркетинг»',
+        normalized_value='Компания «Компетенс Маркетинг»',
+        quote=text,
+        turn_seq=1,
+        confidence=0.99,
+    )
+    decision = _decide(
+        extracted=[extracted],
+        verified=[verified],
+        arbitration=[
+            ArbitrationItem(
+                field="company",
+                accepted_value='Компания «Компетенс Маркетинг»',
+                supporting_quote=text,
+                accepted=True,
+                reason="одна и та же компания",
+            )
+        ],
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.84,
+                evidence_reference="phonegate-call.wav",
+            )
+        ],
+    )
+    assert decision.status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert decision.facts[0].state is CallFactState.CANDIDATE
+    assert decision.facts[0].normalized_value == "Компетенс Маркетинг"
+
+
+def test_callback_request_can_be_high_confidence_without_interview_facts() -> None:
+    text = 'Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста.'
+    context = VerificationContext(
+        call_id="call",
+        call_started_at=datetime(2026, 9, 15, 11, tzinfo=UTC),
+        timezone="Europe/Chisinau",
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text=text,
+                asr_confidence=0.84,
+                evidence_reference="phonegate-call.wav",
+            )
+        ],
+    )
+    decision = reconcile_verification(
+        context=context,
+        extracted=ExtractionResult(
+            summary_text="Работодатель просит перезвонить.",
+            outcome_guess="callback_requested",
+            facts=[],
+            review_reasons=[],
+        ),
+        verified=VerificationResult(facts=[], review_reasons=[]),
+        arbitration=ArbitrationResult(decisions=[]),
+        asr_floor=0.7,
+        evidence_turn_ids=[TURN_ID],
+    )
+    assert decision.status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert decision.facts == ()
+
+
+def test_callback_request_stays_review_when_asr_is_below_floor() -> None:
+    context = VerificationContext(
+        call_id="call",
+        call_started_at=datetime(2026, 9, 15, 11, tzinfo=UTC),
+        timezone="Europe/Chisinau",
+        transcript=[
+            VerificationTurn(
+                seq=1,
+                turn_id=TURN_ID,
+                speaker="employer",
+                text="Перезвоните, пожалуйста.",
+                asr_confidence=0.65,
+                evidence_reference="phonegate-call.wav",
+            )
+        ],
+    )
+    decision = reconcile_verification(
+        context=context,
+        extracted=ExtractionResult(
+            summary_text="Работодатель просит перезвонить.",
+            outcome_guess="callback_requested",
+            facts=[],
+            review_reasons=[],
+        ),
+        verified=VerificationResult(facts=[], review_reasons=[]),
+        arbitration=ArbitrationResult(decisions=[]),
+        asr_floor=0.7,
+        evidence_turn_ids=[TURN_ID],
+    )
+    assert decision.status is PhoneVerificationStatus.NEEDS_REVIEW
+    assert "follow-up outcome lacks high-confidence transcript evidence" in decision.reasons

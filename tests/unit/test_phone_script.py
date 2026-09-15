@@ -15,7 +15,7 @@ from app.phone.script import (
 def test_greeting_blocks_are_short_nonempty_strings() -> None:
     assert SCRIPT_GREETING == (
         "Здравствуйте, это автоматизированный помощник Андрея Гомонова. "
-        "Он сейчас не может ответить лично. Подскажите, вы звоните по поводу работы?",
+        "Вы звоните по поводу работы?",
     )
     assert "автоматизированный помощник" in SCRIPT_GREETING[0]
     assert "часовой пояс" not in SCRIPT_GREETING[0]

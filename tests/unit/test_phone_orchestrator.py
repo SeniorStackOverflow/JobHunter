@@ -24,7 +24,9 @@ from app.phone.correlation import CorrelationResult
 from app.phone.evidence import EvidenceCapturer
 from app.phone.orchestrator import CallOrchestrator
 from app.phone.script import (
+    SCRIPT_CLOSING_FOLLOW_UP,
     SCRIPT_CLOSING_SMS,
+    SCRIPT_DETAILS_PROMPT,
     SCRIPT_FIRST_RESPONSE_RETRY,
     SCRIPT_GREETING,
 )
@@ -161,9 +163,7 @@ async def test_first_response_window_does_not_fire_retry_before_timeout(
     )
 
     async with _pg(fake) as client:
-        orch = CallOrchestrator(
-            client=client, session_factory=file_factory, settings=settings
-        )
+        orch = CallOrchestrator(client=client, session_factory=file_factory, settings=settings)
         task = asyncio.create_task(orch.run(session_id))
         try:
             for _ in range(300):
@@ -499,6 +499,8 @@ async def test_unexpected_crash_after_answer_hangs_up(
         call = await s.get(CommunicationSession, session_id)
     assert call is not None
     assert call.needs_review is True
+    assert call.diagnostics["orchestrator_terminal_reason"] == "unexpected_exception"
+    assert call.diagnostics["orchestrator_error_type"] == "RuntimeError"
 
 
 @pytest.mark.asyncio
@@ -1054,3 +1056,44 @@ async def test_listening_silence_timeout_pauses_while_vad_is_active(
                 task.cancel()
 
     assert stage == "greeting_completed"
+
+
+@pytest.mark.asyncio
+async def test_explicit_callback_skips_generic_details_prompt(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    session_id = await _open_ringing_session(factory)
+    spoken: list[str] = []
+
+    async def fake_wait(
+        self: CallOrchestrator,
+        seen_transcript_id: int,
+        *,
+        wait_seconds: float,
+        answer_start: float,
+        remote_phase: str,
+    ) -> tuple[str, int, list[str]]:
+        return "rx", seen_transcript_id, [
+            'Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста.'
+        ]
+
+    async def fake_say(self: CallOrchestrator, session_id: UUID, text: str) -> str:
+        spoken.append(text)
+        return "ok"
+
+    monkeypatch.setattr(CallOrchestrator, "_wait_for_employer_response", fake_wait)
+    monkeypatch.setattr(CallOrchestrator, "_say", fake_say)
+
+    async with _pg(fake) as client:
+        orch = CallOrchestrator(
+            client=client,
+            session_factory=factory,
+            settings=_fast_settings(phone_listen_silence_timeout_seconds=0.03),
+        )
+        stage = await orch.run(session_id)
+
+    assert stage == "greeting_completed"
+    assert SCRIPT_DETAILS_PROMPT not in spoken
+    assert SCRIPT_CLOSING_FOLLOW_UP in spoken

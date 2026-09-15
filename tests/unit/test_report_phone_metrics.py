@@ -64,6 +64,8 @@ async def test_daily_phone_metrics_counts_calls_errors_interviews_and_evidence(
                 "peer_hangup_ms_after_last_tts": 800,
                 "rx_audio_bytes": 6400,
                 "rx_audio_duration_ms": 200,
+                "phonegate_audio_evidence_path": "/srv/phonegate/data/call_evidence/x.wav",
+                "phonegate_audio_evidence_sha256": "a" * 64,
                 "call_disposition": "probable_prompt_rejection",
             },
         )
@@ -137,7 +139,8 @@ async def test_daily_phone_metrics_counts_calls_errors_interviews_and_evidence(
         "calls_with_employer_transcript": 1,
         "assistant_only_calls": 1,
         "audio_evidence_turns": 1,
-        "calls_with_audio_evidence": 1,
+        "calls_with_audio_evidence": 2,
+        "calls_with_lifecycle_audio_evidence": 1,
         "calls_with_rx_audio": 2,
         "calls_with_rx_audio_but_no_employer_asr": 1,
     }
@@ -156,3 +159,41 @@ async def test_daily_phone_metrics_counts_calls_errors_interviews_and_evidence(
     assert first["audio_evidence_available"] is True
     assert first["transcript"][0]["speaker"] == "employer"
     assert first["interviews"][0]["status"] == "confirmed"
+
+
+async def test_daily_phone_metrics_counts_orchestrator_abort_as_technical_error(
+    sqlite_session_factory,
+) -> None:
+    _local, start, end = local_day_bounds()
+    now = start + timedelta(hours=13)
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="Phone abort candidate", is_default=True)
+        session.add(profile)
+        await session.flush()
+        call = CommunicationSession(
+            profile_id=profile.id,
+            channel=CommunicationChannel.CALL,
+            transport="phonegate",
+            direction=CommunicationDirection.INBOUND,
+            started_at=now,
+            answered_at=now + timedelta(seconds=2),
+            ended_at=now + timedelta(seconds=20),
+            outcome=CommunicationOutcome.COMPLETED,
+            script_stage="aborted_error",
+            needs_review=True,
+            summary_state=PhoneSummaryState.DONE,
+            verification_status=PhoneVerificationStatus.NEEDS_REVIEW,
+            diagnostics={
+                "orchestrator_terminal_reason": "listen_poll_error",
+                "orchestrator_error_type": "PhoneGateUnavailable",
+            },
+        )
+        session.add(call)
+        await session.flush()
+        metrics = await daily_phone_metrics(session, start, end)
+
+    assert metrics["errors"]["calls_with_technical_errors"] == 1
+    assert metrics["errors"]["by_code"] == {
+        "orchestrator:listen_poll_error:PhoneGateUnavailable": 1
+    }
+    assert metrics["analysis_items"][0]["script_stage"] == "aborted_error"

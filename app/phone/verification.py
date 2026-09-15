@@ -134,7 +134,15 @@ class ExtractionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     summary_text: str
-    outcome_guess: Literal["interview_proposed", "info_request", "not_relevant", "unclear", "other"]
+    outcome_guess: Literal[
+        "interview_proposed",
+        "callback_requested",
+        "caller_will_retry",
+        "info_request",
+        "not_relevant",
+        "unclear",
+        "other",
+    ]
     facts: list[FactCandidate]
     review_reasons: list[str]
 
@@ -372,7 +380,11 @@ _FIELD_CONTRACT = (
 _EXTRACTOR_SYSTEM = (
     "Вы извлекаете проверяемые факты из записи телефонного разговора на русском языке. "
     "Верните только JSON по схеме. Сохраняйте исходные выражения и точные цитаты; "
-    "не выдумывайте значения и указывайте неоднозначность."
+    "не выдумывайте значения и указывайте неоднозначность. "
+    "Для outcome_guess используйте callback_requested, только если работодатель просит "
+    "кандидата перезвонить; caller_will_retry, только если работодатель сам говорит, что "
+    "позвонит или перезвонит позже. Отсутствие даты, времени или деталей собеседования само "
+    "по себе не является причиной review, если собеседование не предлагалось."
 ) + _FIELD_CONTRACT
 _VERIFIER_SYSTEM = (
     "Вы независимо проверяете критические факты телефонного разговора на русском языке. "

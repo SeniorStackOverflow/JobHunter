@@ -15,7 +15,11 @@ from app.audit import record_audit_event
 from app.models.entities import CommunicationSession
 from app.models.enums import TurnDeliveryStatus
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
-from app.phone.critical import closing_for_transcript, has_confirmation_critical_markers
+from app.phone.critical import (
+    closing_for_transcript,
+    follow_up_action_for_texts,
+    has_confirmation_critical_markers,
+)
 from app.phone.evidence import EvidenceCapturer
 from app.phone.numbers import mask_phone, normalize_e164
 from app.phone.policy import should_answer
@@ -119,7 +123,7 @@ class CallOrchestrator:
             except Exception:
                 logger.warning("phone_orchestrator_crash_hangup_failed")
             try:
-                await self._finish("aborted_error", needs_review=True)
+                await self._finish_error("unexpected_exception", error_type=type(exc).__name__)
             except Exception:
                 logger.warning("phone_orchestrator_finish_failed")
             return "aborted_error"
@@ -191,7 +195,7 @@ class CallOrchestrator:
         # sleep between prompts: the caller must get a chance to answer.
         if time.monotonic() - answer_start >= s.phone_call_hard_cap_seconds:
             await self._hangup()
-            await self._finish("aborted_error", needs_review=True)
+            await self._finish_error("hard_cap_before_greeting")
             return "aborted_error"
         outcome = await self._say(session_id, SCRIPT_GREETING[0])
         if outcome == "ended":
@@ -199,19 +203,21 @@ class CallOrchestrator:
             return "remote_ended"
 
         await self._set_stage("waiting_first_response")
-        wait_state, seen_transcript_id, observed_rx_entries = (
-            await self._wait_for_employer_response(
-                seen_transcript_id,
-                wait_seconds=s.phone_first_response_timeout_seconds,
-                answer_start=answer_start,
-                remote_phase="wait_first_rx",
-            )
+        (
+            wait_state,
+            seen_transcript_id,
+            observed_rx_entries,
+        ) = await self._wait_for_employer_response(
+            seen_transcript_id,
+            wait_seconds=s.phone_first_response_timeout_seconds,
+            answer_start=answer_start,
+            remote_phase="wait_first_rx",
         )
         if wait_state in TERMINAL_STAGES:
             return wait_state
         if wait_state == "hard_cap":
             await self._hangup()
-            await self._finish("aborted_error", needs_review=True)
+            await self._finish_error("hard_cap_first_response")
             return "aborted_error"
 
         if wait_state == "timeout":
@@ -219,20 +225,18 @@ class CallOrchestrator:
             if outcome == "ended":
                 await self._finish_remote_end("retry_tts")
                 return "remote_ended"
-            wait_state, seen_transcript_id, retry_rx = (
-                await self._wait_for_employer_response(
-                    seen_transcript_id,
-                    wait_seconds=s.phone_first_response_retry_timeout_seconds,
-                    answer_start=answer_start,
-                    remote_phase="wait_first_rx_retry",
-                )
+            wait_state, seen_transcript_id, retry_rx = await self._wait_for_employer_response(
+                seen_transcript_id,
+                wait_seconds=s.phone_first_response_retry_timeout_seconds,
+                answer_start=answer_start,
+                remote_phase="wait_first_rx_retry",
             )
             observed_rx_entries.extend(retry_rx)
             if wait_state in TERMINAL_STAGES:
                 return wait_state
             if wait_state == "hard_cap":
                 await self._hangup()
-                await self._finish("aborted_error", needs_review=True)
+                await self._finish_error("hard_cap_first_response_retry")
                 return "aborted_error"
 
         if not observed_rx_entries:
@@ -250,6 +254,7 @@ class CallOrchestrator:
         if (
             sum(len(text) for text in observed_rx_entries) < 120
             and not has_confirmation_critical_markers(observed_rx_entries)
+            and follow_up_action_for_texts(observed_rx_entries) is None
         ):
             outcome = await self._say(session_id, SCRIPT_DETAILS_PROMPT)
             if outcome == "ended":
@@ -273,9 +278,9 @@ class CallOrchestrator:
             try:
                 status = await self._client.device_status()
                 page = await self._client.transcript(after_id=seen_transcript_id, limit=250)
-            except (PhoneGateUnavailable, PhoneGateError):
+            except (PhoneGateUnavailable, PhoneGateError) as exc:
                 logger.warning("phone_orchestrator_listen_poll_failed")
-                await self._finish("aborted_error", needs_review=True)
+                await self._finish_error("listen_poll_error", error_type=type(exc).__name__)
                 return "aborted_error"
 
             if status.call_state != "IN_CALL":
@@ -356,9 +361,9 @@ class CallOrchestrator:
             try:
                 status = await self._client.device_status()
                 page = await self._client.transcript(after_id=seen_transcript_id, limit=250)
-            except (PhoneGateUnavailable, PhoneGateError):
+            except (PhoneGateUnavailable, PhoneGateError) as exc:
                 logger.warning("phone_orchestrator_first_response_poll_failed")
-                await self._finish("aborted_error", needs_review=True)
+                await self._finish_error("first_response_poll_error", error_type=type(exc).__name__)
                 return "aborted_error", seen_transcript_id, []
 
             if status.call_state != "IN_CALL":
@@ -557,6 +562,19 @@ class CallOrchestrator:
                 await self._store.set_script_stage(call, stage)
                 if needs_review:
                     call.needs_review = True
+                await db.commit()
+
+    async def _finish_error(self, reason: str, *, error_type: str | None = None) -> None:
+        async with self._sf() as db:
+            call = await db.get(CommunicationSession, self._sid)
+            if call is not None:
+                await self._store.set_script_stage(call, "aborted_error")
+                call.needs_review = True
+                diagnostics = dict(call.diagnostics or {})
+                diagnostics["orchestrator_terminal_reason"] = reason
+                if error_type:
+                    diagnostics["orchestrator_error_type"] = error_type
+                call.diagnostics = diagnostics
                 await db.commit()
 
     async def _finish_remote_end(self, phase: str) -> None:

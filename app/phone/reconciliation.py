@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from app.models.enums import CallFactState, PhoneVerificationStatus
-from app.phone.critical import CriticalField, normalize_critical_value
+from app.phone.critical import CriticalField, follow_up_action_for_texts, normalize_critical_value
 from app.phone.verification import (
     ArbitrationResult,
     ExtractionResult,
@@ -50,12 +50,30 @@ def _comparison_value(field: CriticalField, value: str | None) -> str | None:
     if value is None:
         return None
     value = _normalized_text(value)
+    if field == "company":
+        folded = value.casefold()
+        folded = re.sub(r"^(?:компания|compania)\s+", "", folded).strip()
+        return folded.strip('«»"“”„ ')
     return value.casefold() if field == "address" else value
 
 
 _CORRECTION_MARKER = re.compile(
     r"\b(?:точнее|исправлен|исправим|перенес|перенесём|перенесем|вместо|давайте тогда)\b"
 )
+
+
+def _supported_follow_up_outcome(
+    context: VerificationContext, *, evidence_turn_ids: set[UUID], asr_floor: float
+) -> str | None:
+    for turn in context.transcript:
+        if turn.speaker != "employer" or turn.turn_id not in evidence_turn_ids:
+            continue
+        if turn.asr_confidence is None or turn.asr_confidence < asr_floor:
+            continue
+        outcome = follow_up_action_for_texts([turn.text])
+        if outcome is not None:
+            return outcome
+    return None
 
 
 @dataclass(frozen=True)
@@ -317,11 +335,24 @@ def reconcile_verification(
         elif field_reasons:
             reasons.extend(field_reasons)
 
+    supported_follow_up = _supported_follow_up_outcome(
+        context, evidence_turn_ids=evidence, asr_floor=asr_floor
+    )
+    follow_up_outcomes = {"callback_requested", "caller_will_retry"}
+    follow_up_supported = (
+        extracted.outcome_guess in follow_up_outcomes
+        and extracted.outcome_guess == supported_follow_up
+    )
+    if extracted.outcome_guess in follow_up_outcomes and not follow_up_supported:
+        reasons.append("follow-up outcome lacks high-confidence transcript evidence")
+
     status = (
         PhoneVerificationStatus.HIGH_CONFIDENCE
-        if facts
-        and not pass_review_required
-        and all(fact.state is CallFactState.CANDIDATE for fact in facts)
+        if not pass_review_required
+        and (
+            (facts and all(fact.state is CallFactState.CANDIDATE for fact in facts))
+            or (not facts and follow_up_supported)
+        )
         else PhoneVerificationStatus.NEEDS_REVIEW
     )
     return VerificationDecision(

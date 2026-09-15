@@ -608,3 +608,87 @@ def test_postgres_claim_and_finalize_queries_use_row_locks() -> None:
     )
     assert "FOR UPDATE SKIP LOCKED" in claim_sql
     assert "FOR UPDATE" in finalize_sql
+
+
+@pytest.mark.asyncio
+async def test_finalize_accepts_phonegate_lifecycle_audio_as_employer_evidence(
+    finalize_env: Callable[..., Awaitable[_Env]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await finalize_env(llm_enabled=True)
+    text = "Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста."
+    async with env.factory() as db:
+        call = await db.get(CommunicationSession, env.session_id)
+        assert call is not None
+        call.diagnostics = {
+            "rx_audio_bytes": 291840,
+            "phonegate_audio_evidence_path": "/srv/phonegate/data/call_evidence/test.wav",
+            "phonegate_audio_evidence_sha256": "a" * 64,
+        }
+        turn = await db.scalar(
+            select(CommunicationTurn).where(
+                CommunicationTurn.session_id == env.session_id,
+                CommunicationTurn.phonegate_transcript_id == 7,
+            )
+        )
+        assert turn is not None
+        turn.text = text
+        turn.raw_text = text
+        turn.asr_confidence = 0.84
+        await db.commit()
+
+    extracted = FactCandidate(
+        field="company",
+        raw_expression="Компетенс Маркетинг",
+        normalized_value="Компетенс Маркетинг",
+        quote=text,
+        turn_seq=2,
+        confidence=1.0,
+    )
+    verified = FactCandidate(
+        field="company",
+        raw_expression="Компания «Компетенс Маркетинг»",
+        normalized_value="Компания «Компетенс Маркетинг»",
+        quote=text,
+        turn_seq=2,
+        confidence=0.99,
+    )
+    meta = ModelCallMeta("llmrouter", "fixture", 1, 1)
+
+    class Provider:
+        async def extract(self, context: Any) -> tuple[ExtractionResult, ModelCallMeta]:
+            employer = [turn for turn in context.transcript if turn.speaker == "employer"]
+            assert (
+                employer
+                and employer[0].evidence_reference == "/srv/phonegate/data/call_evidence/test.wav"
+            )
+            return ExtractionResult(
+                summary_text="Работодатель просит перезвонить.",
+                outcome_guess="callback_requested",
+                facts=[extracted],
+                review_reasons=[],
+            ), meta
+
+        async def verify(self, context: Any) -> tuple[VerificationResult, ModelCallMeta]:
+            return VerificationResult(facts=[verified], review_reasons=[]), meta
+
+        async def arbitrate(
+            self, context: Any, extracted_result: Any, verified_result: Any
+        ) -> tuple[ArbitrationResult, ModelCallMeta]:
+            return ArbitrationResult(
+                decisions=[
+                    ArbitrationItem(
+                        field="company",
+                        accepted_value="Компания «Компетенс Маркетинг»",
+                        supporting_quote=text,
+                        accepted=True,
+                        reason="одна компания",
+                    )
+                ]
+            ), meta
+
+    monkeypatch.setattr(summary_module, "_build_verification_provider", lambda _: Provider())
+    assert await summary_module.finalize_call(env.session_id) == "done"
+    call = await env.get_session()
+    assert call.verification_status is PhoneVerificationStatus.HIGH_CONFIDENCE
+    assert call.needs_review is False
+    assert call.summary["hints"]["outcome_guess"] == "callback_requested"

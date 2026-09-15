@@ -122,12 +122,21 @@ async def daily_phone_metrics(
     }
     failed_turns = [turn for turn in turns if turn.delivery_status == TurnDeliveryStatus.FAILED]
     failed_turn_call_ids = {turn.session_id for turn in failed_turns}
-    technical_error_call_ids = summary_failed_ids | failed_turn_call_ids
+    orchestrator_error_ids = {call.id for call in calls if call.script_stage == "aborted_error"}
+    technical_error_call_ids = summary_failed_ids | failed_turn_call_ids | orchestrator_error_ids
 
     error_codes: Counter[str] = Counter()
     if failed_turns:
         error_codes["turn_delivery_failed"] = len(failed_turns)
     for call in calls:
+        if call.script_stage == "aborted_error":
+            diagnostics = call.diagnostics if isinstance(call.diagnostics, dict) else {}
+            reason = _safe_error_code(diagnostics.get("orchestrator_terminal_reason"))
+            error_type = _safe_error_code(diagnostics.get("orchestrator_error_type"))
+            detail = reason or "unknown"
+            if error_type:
+                detail = f"{detail}:{error_type}"
+            error_codes[f"orchestrator:{detail}"] += 1
         if call.summary_state != PhoneSummaryState.FAILED:
             continue
         summary = call.summary if isinstance(call.summary, dict) else {}
@@ -150,6 +159,7 @@ async def daily_phone_metrics(
     assistant_only_calls = calls_with_assistant - calls_with_employer
     audio_turns = [turn for turn in turns if turn.audio_evidence_path]
     calls_with_audio = {turn.session_id for turn in audio_turns}
+    calls_with_lifecycle_audio: set[UUID] = set()
     calls_with_raw_rx_audio: set[UUID] = set()
     remote_hangup_call_ids: set[UUID] = set()
     remote_hangup_deltas: list[int] = []
@@ -164,6 +174,10 @@ async def daily_phone_metrics(
             rx_bytes = 0
         if rx_bytes > 0:
             calls_with_raw_rx_audio.add(call.id)
+        evidence_path = str(diagnostics.get("phonegate_audio_evidence_path") or "").strip()
+        evidence_sha256 = str(diagnostics.get("phonegate_audio_evidence_sha256") or "").strip()
+        if rx_bytes > 0 and evidence_path and len(evidence_sha256) == 64:
+            calls_with_lifecycle_audio.add(call.id)
         if diagnostics.get("phonegate_end_reason") != "remote_or_network_hangup":
             continue
         remote_hangup_call_ids.add(call.id)
@@ -188,7 +202,8 @@ async def daily_phone_metrics(
             )
         ):
             probable_prompt_rejections += 1
-    calls_with_any_rx_audio = calls_with_audio | calls_with_raw_rx_audio
+    calls_with_any_audio_evidence = calls_with_audio | calls_with_lifecycle_audio
+    calls_with_any_rx_audio = calls_with_any_audio_evidence | calls_with_raw_rx_audio
 
     linked_by_call: dict[UUID, list[InterviewAppointment]] = defaultdict(list)
     for appointment in linked_appointments:
@@ -215,6 +230,7 @@ async def daily_phone_metrics(
                 "answered": call.answered_at is not None,
                 "needs_review": bool(call.needs_review),
                 "summary_state": _value(call.summary_state),
+                "script_stage": call.script_stage,
                 "verification_status": _value(call.verification_status),
                 "outcome_guess": hints.get("outcome_guess"),
                 "job_title": job.title if job else None,
@@ -306,7 +322,8 @@ async def daily_phone_metrics(
             "calls_with_employer_transcript": len(calls_with_employer),
             "assistant_only_calls": len(assistant_only_calls),
             "audio_evidence_turns": len(audio_turns),
-            "calls_with_audio_evidence": len(calls_with_audio),
+            "calls_with_audio_evidence": len(calls_with_any_audio_evidence),
+            "calls_with_lifecycle_audio_evidence": len(calls_with_lifecycle_audio),
             "calls_with_rx_audio": len(calls_with_any_rx_audio),
             "calls_with_rx_audio_but_no_employer_asr": len(
                 calls_with_any_rx_audio - calls_with_employer

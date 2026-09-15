@@ -9,7 +9,7 @@ from typing import Literal
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_SMS
+from app.phone.script import SCRIPT_CLOSING, SCRIPT_CLOSING_FOLLOW_UP, SCRIPT_CLOSING_SMS
 
 CriticalField = Literal[
     "interview_date",
@@ -452,6 +452,32 @@ def sms_field_evidence_matches(
     return len(set(normalized)) == 1 and normalized[0] == bound_canonical
 
 
+_CALLBACK_REQUEST_RE = re.compile(
+    r"\b(?:перезвоните|позвоните(?:\s+нам)?|suna(?:ți|ti)\s+(?:înapoi|inapoi))\b",
+    re.IGNORECASE,
+)
+_CALLER_WILL_RETRY_RE = re.compile(
+    r"\b(?:я\s+)?(?:перезвоню|позвоню)(?:\s+вам)?(?:\s+(?:позже|попозже))?\b"
+    r"|\b(?:v[ăa]\s+sun|revin\s+cu\s+un\s+apel)(?:\s+mai\s+t[âa]rziu)?\b",
+    re.IGNORECASE,
+)
+
+
+def follow_up_action_for_texts(
+    texts: Sequence[str],
+) -> Literal["callback_requested", "caller_will_retry"] | None:
+    """Classify explicit callback ownership without guessing from vague call context."""
+    for raw in texts:
+        text = _clean(raw)
+        if not text:
+            continue
+        if _CALLBACK_REQUEST_RE.search(text):
+            return "callback_requested"
+        if _CALLER_WILL_RETRY_RE.search(text):
+            return "caller_will_retry"
+    return None
+
+
 def has_confirmation_critical_markers(texts: Sequence[str]) -> bool:
     """Return whether any transcript text contains a confirmation marker."""
     for raw in texts:
@@ -484,4 +510,8 @@ def has_confirmation_critical_markers(texts: Sequence[str]) -> bool:
 
 
 def closing_for_transcript(texts: Sequence[str]) -> str:
-    return SCRIPT_CLOSING_SMS if has_confirmation_critical_markers(texts) else SCRIPT_CLOSING
+    if has_confirmation_critical_markers(texts):
+        return SCRIPT_CLOSING_SMS
+    if follow_up_action_for_texts(texts) is not None:
+        return SCRIPT_CLOSING_FOLLOW_UP
+    return SCRIPT_CLOSING

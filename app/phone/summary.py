@@ -244,6 +244,20 @@ async def build_summary_context(
     )
 
 
+def _lifecycle_audio_evidence_reference(session: CommunicationSession) -> str | None:
+    """Return trusted PhoneGate full-call RX evidence recorded at lifecycle end."""
+    diagnostics = session.diagnostics if isinstance(session.diagnostics, dict) else {}
+    path = str(diagnostics.get("phonegate_audio_evidence_path") or "").strip()
+    sha256 = str(diagnostics.get("phonegate_audio_evidence_sha256") or "").strip()
+    try:
+        rx_bytes = int(diagnostics.get("rx_audio_bytes") or 0)
+    except (TypeError, ValueError):
+        rx_bytes = 0
+    if not path or len(sha256) != 64 or rx_bytes <= 0:
+        return None
+    return path
+
+
 async def build_verification_context(
     db: AsyncSession, session: CommunicationSession
 ) -> VerificationContext:
@@ -257,6 +271,7 @@ async def build_verification_context(
             )
         ).all()
     )
+    lifecycle_evidence = _lifecycle_audio_evidence_reference(session)
     transcript = [
         VerificationTurn(
             seq=turn.seq,
@@ -266,7 +281,10 @@ async def build_verification_context(
             if turn.speaker is TurnSpeaker.ASSISTANT
             else turn.text,
             asr_confidence=turn.asr_confidence,
-            evidence_reference=turn.audio_evidence_path,
+            evidence_reference=(
+                turn.audio_evidence_path
+                or (lifecycle_evidence if turn.speaker is TurnSpeaker.EMPLOYER else None)
+            ),
         )
         for turn in turns
         if turn.speaker in (TurnSpeaker.ASSISTANT, TurnSpeaker.EMPLOYER)
@@ -847,6 +865,18 @@ async def _finalize_claimed_call(
                 )
             ).all()
         }
+        if _lifecycle_audio_evidence_reference(call) is not None:
+            evidence_turn_ids.update(
+                turn.id
+                for turn in (
+                    await db.scalars(
+                        select(CommunicationTurn).where(
+                            CommunicationTurn.session_id == call.id,
+                            CommunicationTurn.speaker == TurnSpeaker.EMPLOYER,
+                        )
+                    )
+                ).all()
+            )
         decision = reconcile_verification(
             context=current_context,
             extracted=extracted,
