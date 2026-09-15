@@ -28,6 +28,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafRateLimited,
     WafSolveFailed,
 )
+from app.crawlers.adapters.rabota_md.waf.http_client import _category_referer
 from app.crawlers.adapters.rabota_md.waf.token_provider import (
     MintedWafToken,
     WafTokenProvider,
@@ -74,8 +75,14 @@ class FallbackFetcher:
     async def get(self, url: str) -> httpx.Response:
         return await self._with_fallback(url, lambda fetcher: fetcher.get(url))
 
-    async def post_html_fragment(self, url: str) -> httpx.Response:
-        return await self._with_fallback(url, lambda fetcher: fetcher.post_html_fragment(url))
+    async def post_html_fragment(
+        self, url: str, *, referer: str | None = None
+    ) -> httpx.Response:
+        effective_referer = referer or _category_referer(url)
+        return await self._with_fallback(
+            url,
+            lambda fetcher: fetcher.post_html_fragment(url, referer=effective_referer),
+        )
 
     async def _with_fallback(
         self,

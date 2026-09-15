@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.applications.availability import block_closed_vacancy_applications
 from app.audit import record_audit_event
+from app.crawlers.adapters.rabota_md.errors import RabotaMdDegradedError, RabotaMdError
+from app.crawlers.browser import BrowserNavigationError
 from app.crawlers.registry import JobSourceAdapterRegistry
 from app.crawlers.schemas import (
     JobRecheckResult,
@@ -78,6 +80,8 @@ SOURCE_JOB_FIELDS = (
 def _degradation_reason(exc: Exception) -> str | None:
     if isinstance(exc, UnsafeURLError):
         return "adapter attempted an unsafe or non-allowlisted URL"
+    if isinstance(exc, RabotaMdDegradedError):
+        return "adapter access degraded: RabotaMdDegradedError"
     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {403, 429}:
         return f"source returned HTTP {exc.response.status_code}"
     message = str(exc).casefold()
@@ -120,7 +124,31 @@ def _safe_scan_error_reason(exc: Exception) -> str | None:
         return "browser_fragment_invalid_payload"
     if "browser fragment response was not successful" in message:
         return "browser_fragment_unsuccessful"
+    if "browser fragment fetch failed" in message:
+        return "browser_fragment_fetch_failed"
+    if "captcha" in message:
+        return "captcha_required"
     return None
+
+
+def _safe_iteration_diagnostics(exc: Exception) -> dict[str, str]:
+    details = {
+        "iteration_error": type(exc).__name__,
+        "iteration_error_module": type(exc).__module__,
+    }
+    reason = _safe_scan_error_reason(exc)
+    if reason is not None:
+        details["iteration_reason"] = reason
+    if isinstance(exc, (RabotaMdError, BrowserNavigationError, httpx.TimeoutException)):
+        message = str(exc).strip()
+        if message:
+            details["iteration_message"] = message[:500]
+    lowered = str(exc).casefold()
+    if "browser fallback" in lowered or "browser fragment" in lowered:
+        details["iteration_transport"] = "browser_fallback"
+    elif isinstance(exc, httpx.HTTPError):
+        details["iteration_transport"] = "http"
+    return details
 
 
 def scan_has_pending_reference_failures(run: ScanRun) -> bool:
@@ -532,7 +560,7 @@ class ScanService:
                 run.checkpoint = self._merge_checkpoint_progress(run.checkpoint, checkpoint)
                 run.diagnostics = {
                     **run.diagnostics,
-                    "iteration_error": type(exc).__name__,
+                    **_safe_iteration_diagnostics(exc),
                 }
                 run.finished_at = datetime.now(UTC)
                 source.last_scan_status = RunStatus.PARTIAL

@@ -6,6 +6,7 @@ import os
 from collections.abc import Iterable
 from contextlib import suppress
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -244,43 +245,84 @@ class StealthPlaywrightBrowser:
                 extensions={"job_agent_final_url": final},
             )
 
-    async def post_html_fragment(self, url: str) -> httpx.Response:
-        """Fetch a same-site HTML fragment through the live page cookie context."""
+    async def post_html_fragment(
+        self, url: str, *, referer: str | None = None
+    ) -> httpx.Response:
+        """Fetch a same-site HTML fragment through the live page cookie context.
+
+        Browser ``fetch`` must execute from the category page itself. Executing it
+        from a fresh ``about:blank`` page gives it a null origin and Chromium rejects
+        the request before it reaches Rabota.md.
+        """
 
         target = await self._validated_url(url)
+        validated_referer = await self._validated_url(referer) if referer else None
+        if validated_referer is not None:
+            target_parts = urlsplit(target)
+            referer_parts = urlsplit(validated_referer)
+            if (target_parts.scheme, target_parts.netloc) != (
+                referer_parts.scheme,
+                referer_parts.netloc,
+            ):
+                raise BrowserNavigationError("browser fragment referer must be same-origin")
+            navigation = await self.get(validated_referer)
+            action = navigation.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
+            if action == "captcha":
+                raise BrowserNavigationError("browser fragment referer navigation hit CAPTCHA")
+            if action == "block":
+                raise BrowserNavigationError("browser fragment referer navigation was blocked")
+
         await self.start()
         assert self._page is not None
         async with self._lock:
             await self._limiter.wait()
-            result = await self._page.evaluate(
-                """
-                async (target) => {
-                  const response = await fetch(target, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: {'X-Requested-With': 'XMLHttpRequest'},
-                  });
-                  return {
-                    status: response.status,
-                    url: response.url,
-                    contentType: response.headers.get('content-type') || '',
-                    body: await response.text(),
-                  };
-                }
-                """,
-                target,
-            )
+            try:
+                result = await self._page.evaluate(
+                    """
+                    async (target) => {
+                      const response = await fetch(target, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                          'X-Requested-With': 'XMLHttpRequest',
+                          'Accept': 'application/json, text/javascript, */*; q=0.01',
+                        },
+                      });
+                      return {
+                        status: response.status,
+                        url: response.url,
+                        contentType: response.headers.get('content-type') || '',
+                        wafAction: response.headers.get('x-amzn-waf-action') || '',
+                        body: await response.text(),
+                      };
+                    }
+                    """,
+                    target,
+                )
+            except Exception as exc:
+                raise BrowserNavigationError(
+                    f"browser fragment fetch failed: {type(exc).__name__}"
+                ) from exc
             if not isinstance(result, dict):
                 raise BrowserNavigationError("browser fragment fetch returned no result")
             final = await self._validated_url(str(result.get("url") or target))
             body = str(result.get("body") or "")
             self._require_bounded(body)
             status = int(result.get("status") or 0)
+            response_headers: dict[str, str] = {}
+            content_type = str(result.get("contentType") or "")
+            waf_action = str(result.get("wafAction") or "")
+            if content_type:
+                response_headers["content-type"] = content_type
+            if waf_action:
+                response_headers[AWS_WAF_ACTION_HEADER] = waf_action
             if status != 200:
                 return httpx.Response(
                     status,
                     text=body,
+                    headers=response_headers,
                     request=httpx.Request("POST", final),
+                    extensions={"job_agent_final_url": final, "job_agent_fragment": True},
                 )
             try:
                 payload = json.loads(body)
@@ -292,10 +334,11 @@ class StealthPlaywrightBrowser:
             if payload.get("success") is not True or not isinstance(content, str):
                 raise BrowserNavigationError("browser fragment response was not successful")
             self._require_bounded(content)
+            response_headers["content-type"] = "text/html; charset=utf-8"
             return httpx.Response(
                 200,
                 text=content,
-                headers={"content-type": "text/html; charset=utf-8"},
+                headers=response_headers,
                 request=httpx.Request("POST", final),
                 extensions={"job_agent_final_url": final, "job_agent_fragment": True},
             )

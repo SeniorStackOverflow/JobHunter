@@ -11,12 +11,14 @@ from app.crawlers.browser import BrowserNavigationError, StealthPlaywrightBrowse
 
 
 class FakePage:
-    def __init__(self, result: dict[str, Any]) -> None:
+    def __init__(self, result: dict[str, Any] | Exception) -> None:
         self.result = result
         self.calls: list[str] = []
 
     async def evaluate(self, _expression: str, target: str) -> dict[str, Any]:
         self.calls.append(target)
+        if isinstance(self.result, Exception):
+            raise self.result
         return self.result
 
 
@@ -142,6 +144,53 @@ async def test_persistent_browser_unwraps_rabota_ajax_fragment(
 
 
 @pytest.mark.asyncio
+async def test_persistent_browser_preserves_waf_action_on_fragment_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakePage(
+        {
+            "status": 405,
+            "url": "https://www.rabota.md/ru/vacancies/category/operating/2",
+            "contentType": "text/html; charset=UTF-8",
+            "wafAction": "captcha",
+            "body": "<title>Human Verification</title>",
+        }
+    )
+    browser = StealthPlaywrightBrowser(
+        allowed_domains=("rabota.md", "www.rabota.md"),
+        requests_per_minute=600,
+        minimum_interval_seconds=0,
+    )
+    browser._page = page
+    monkeypatch.setattr(browser, "_validated_url", _same_url)
+
+    response = await browser.post_html_fragment(
+        "https://www.rabota.md/ru/vacancies/category/operating/2"
+    )
+
+    assert response.status_code == 405
+    assert response.headers["x-amzn-waf-action"] == "captcha"
+    assert response.headers["content-type"] == "text/html; charset=UTF-8"
+
+
+async def test_persistent_browser_normalizes_fragment_evaluate_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakePage(TypeError("Failed to fetch"))
+    browser = StealthPlaywrightBrowser(
+        allowed_domains=("rabota.md", "www.rabota.md"),
+        requests_per_minute=600,
+        minimum_interval_seconds=0,
+    )
+    browser._page = page
+    monkeypatch.setattr(browser, "_validated_url", _same_url)
+
+    with pytest.raises(BrowserNavigationError, match="browser fragment fetch failed: TypeError"):
+        await browser.post_html_fragment(
+            "https://www.rabota.md/ru/vacancies/category/operating/2"
+        )
+
+
 async def test_persistent_browser_rejects_invalid_fragment_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

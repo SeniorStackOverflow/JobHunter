@@ -164,6 +164,16 @@ async def test_get_captcha_fail_closed() -> None:
         await client.get(f"{BASE}/ru/vacancies")
 
 
+async def test_non_202_captcha_header_is_fail_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(405, headers={"x-amzn-waf-action": "captcha"})
+
+    provider, _ = make_provider()
+    client = make_transport(handler, provider)
+    with pytest.raises(WafCaptchaRequired):
+        await client.post_html_fragment(f"{BASE}/ru/vacancies/category/operating/2")
+
+
 def test_category_referer() -> None:
     assert (
         _category_referer(f"{BASE}/ru/vacancies/category/it/3")
@@ -219,6 +229,7 @@ class StubPrimary:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.calls = 0
+        self.fragment_referer: str | None = None
 
     async def get(self, url: str) -> httpx.Response:
         self.calls += 1
@@ -226,7 +237,10 @@ class StubPrimary:
             raise self.error
         return httpx.Response(200, text="http")
 
-    async def post_html_fragment(self, url: str) -> httpx.Response:
+    async def post_html_fragment(
+        self, url: str, *, referer: str | None = None
+    ) -> httpx.Response:
+        self.fragment_referer = referer
         return await self.get(url)
 
     async def aclose(self) -> None:
@@ -239,13 +253,17 @@ class StubBrowser:
         self.waf_action = waf_action
         self.calls = 0
         self.close_calls = 0
+        self.fragment_referer: str | None = None
 
     async def get(self, url: str) -> httpx.Response:
         self.calls += 1
         headers = {"x-amzn-waf-action": self.waf_action} if self.waf_action else {}
         return httpx.Response(202 if self.waf_action else 200, text="browser", headers=headers)
 
-    async def post_html_fragment(self, url: str) -> httpx.Response:
+    async def post_html_fragment(
+        self, url: str, *, referer: str | None = None
+    ) -> httpx.Response:
+        self.fragment_referer = referer
         return await self.get(url)
 
     async def find_cookie(self, name: str, *, domain_suffix: str | None = None) -> dict | None:
@@ -284,6 +302,19 @@ async def test_browser_fallback_captcha_is_fail_closed() -> None:
     with pytest.raises(RabotaMdDegradedError, match="CAPTCHA"):
         await fetcher.get(f"{BASE}/ru/vacancies")
     assert browser.calls == 1
+    assert browser.close_calls == 1
+
+
+async def test_fragment_fallback_uses_category_referer_and_fails_closed_on_captcha() -> None:
+    fetcher, primary, browser, _ = make_fallback(
+        WafPostContractError("403"), waf_action="captcha"
+    )
+    url = f"{BASE}/ru/vacancies/category/operating/2"
+    with pytest.raises(RabotaMdDegradedError, match="CAPTCHA"):
+        await fetcher.post_html_fragment(url)
+    expected = f"{BASE}/ru/vacancies/category/operating"
+    assert primary.fragment_referer == expected
+    assert browser.fragment_referer == expected
     assert browser.close_calls == 1
 
 

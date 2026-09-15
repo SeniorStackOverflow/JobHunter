@@ -65,9 +65,11 @@ class WafHttpClient:
     async def get(self, url: str) -> httpx.Response:
         return await self._request_with_token("GET", url)
 
-    async def post_html_fragment(self, url: str) -> httpx.Response:
+    async def post_html_fragment(
+        self, url: str, *, referer: str | None = None
+    ) -> httpx.Response:
         response = await self._request_with_token(
-            "POST", url, extra_headers=_ajax_headers(_category_referer(url))
+            "POST", url, extra_headers=_ajax_headers(referer or _category_referer(url))
         )
         if response.status_code == 403:
             # Canonical headers were used by construction: the POST contract broke.
@@ -150,8 +152,8 @@ class WafHttpClient:
     def _reject_terminal_waf(response: httpx.Response) -> None:
         if response.status_code == 429:
             raise WafRateLimited("Rabota.md rate limited the request")
-        if response.status_code != 202:
-            return
+        # AWS WAF action headers are authoritative regardless of HTTP status.
+        # Rabota.md has returned CAPTCHA as HTTP 405 in production.
         action = response.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
         if action == "captcha":
             raise WafCaptchaRequired("Rabota.md requested a CAPTCHA; fail-closed by policy")

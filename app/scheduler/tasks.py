@@ -812,6 +812,96 @@ def _rabota_md_uses_waf_http(source: JobSource) -> bool:
     return transport == "waf_http"
 
 
+async def _rabota_md_waf_pagination_probe(source: JobSource, token: str) -> None:
+    """Probe one real pagination request through the configured WAF+browser stack.
+
+    Token solving alone is not enough: AWS WAF can accept the token for document
+    navigation while escalating the AJAX pagination POST to CAPTCHA.
+    """
+
+    from redis.asyncio import Redis as AsyncRedis
+
+    from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
+    from app.crawlers.adapters.rabota_md.waf.http_client import WafHttpClient
+    from app.crawlers.adapters.rabota_md.waf.token_provider import (
+        MintedWafToken,
+        WafTokenProvider,
+    )
+    from app.crawlers.browser import StealthPlaywrightBrowser
+    from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
+
+    configured = source.configuration.get("source", source.configuration)
+    raw = configured if isinstance(configured, dict) else {}
+    incremental = raw.get("incremental_scan")
+    incremental = incremental if isinstance(incremental, dict) else {}
+    slugs = incremental.get("category_slugs")
+    slugs = [slug for slug in slugs if isinstance(slug, str)] if isinstance(slugs, list) else []
+    slug = "operating" if "operating" in slugs else (slugs[0] if slugs else "others")
+    locales = raw.get("locale_priority")
+    locales = (
+        [locale for locale in locales if isinstance(locale, str)]
+        if isinstance(locales, list)
+        else []
+    )
+    locale = locales[0] if locales else "ru"
+    base_url = source.base_url.rstrip("/")
+    referer = f"{base_url}/{locale}/vacancies/category/{slug}"
+    page_url = f"{referer}/2"
+
+    requests_per_minute = int(raw.get("requests_per_minute", min(source.rate_limit, 60)))
+    minimum_interval_seconds = float(raw.get("minimum_interval_seconds", 1.2))
+    timeout_seconds = float(raw.get("timeout_seconds", 30.0))
+    max_redirects = int(raw.get("max_redirects", 3))
+    browser_max_navigations = int(raw.get("browser_max_navigations_per_page", 50))
+    limiter = AsyncRateLimiter(
+        requests_per_minute, minimum_interval_seconds=minimum_interval_seconds
+    )
+
+    class _CanaryTokenBackend:
+        async def mint(self) -> MintedWafToken:
+            return MintedWafToken(token)
+
+    redis = AsyncRedis.from_url(get_settings().redis_url)
+    provider = WafTokenProvider(
+        redis,
+        [_CanaryTokenBackend()],
+        token_key="crawler:rabota_md:waf_canary_probe_token",  # noqa: S106 - Redis key
+        lock_key="crawler:rabota_md:waf_canary_probe_token:refresh_lock",
+        max_ttl_seconds=300,
+        safety_margin_seconds=0,
+    )
+    await provider.publish_token(MintedWafToken(token))
+    secure = SecureHttpClient(
+        allowed_domains=("rabota.md", "www.rabota.md"),
+        user_agent=get_settings().crawler_user_agent,
+        requests_per_minute=requests_per_minute,
+        minimum_interval_seconds=minimum_interval_seconds,
+        timeout_seconds=timeout_seconds,
+        max_redirects=max_redirects,
+        rate_limiter=limiter,
+    )
+    primary = WafHttpClient(secure, provider)
+    browser = StealthPlaywrightBrowser(
+        allowed_domains=(
+            "rabota.md",
+            "www.rabota.md",
+            "token.awswaf.com",
+            "captcha.awswaf.com",
+        ),
+        requests_per_minute=requests_per_minute,
+        minimum_interval_seconds=minimum_interval_seconds,
+        timeout_seconds=timeout_seconds,
+        max_navigations_per_page=browser_max_navigations,
+    )
+    fetcher = FallbackFetcher(primary, browser, provider, max_switches_per_scan=1)
+    try:
+        response = await fetcher.post_html_fragment(page_url, referer=referer)
+        if response.status_code != 200:
+            raise RuntimeError(f"pagination probe returned HTTP {response.status_code}")
+    finally:
+        await fetcher.aclose()
+
+
 async def _rabota_md_waf_canary() -> dict[str, str]:
     from redis.asyncio import Redis as AsyncRedis
 
@@ -842,6 +932,20 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
             WAF_SOLVER_COMPATIBILITY.set(0)
             logger.warning("rabota_md_waf_canary_failed", error_type="MissingScriptHash")
             return {"outcome": "failure", "error_type": "MissingScriptHash"}
+        try:
+            await _rabota_md_waf_pagination_probe(source, token)
+        except Exception as exc:
+            WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            WAF_SOLVER_COMPATIBILITY.set(0)
+            logger.warning(
+                "rabota_md_waf_canary_pagination_failed",
+                error_type=type(exc).__name__,
+            )
+            return {
+                "outcome": "failure",
+                "stage": "pagination_probe",
+                "error_type": type(exc).__name__,
+            }
         await watchdog.record_canary_success(script_hash)
         WAF_SOLVER_CANARY.labels(outcome="success").inc()
         WAF_SOLVER_COMPATIBILITY.set(1)
