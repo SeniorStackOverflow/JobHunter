@@ -27,12 +27,31 @@ from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
 from app.security.ssrf import Resolver
 from app.settings import get_settings
 
-# The solver reproduces a real browser session; the crawl itself keeps the
-# identifying job-agent UA from the source config.
+# The solver reproduces a real browser session. Since 2026-09-15 AWS WAF on
+# rabota.md binds the aws-waf-token to the User-Agent of the minting session:
+# requests with any other UA get a bare 403 on paginated paths. Token minting
+# and every crawl request must therefore share one browser-shaped UA.
 WAF_SOLVER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+
+
+def effective_waf_user_agent(user_agent: str) -> str:
+    """Single User-Agent for token minting and all waf_http requests.
+
+    A browser-shaped configured UA is used as-is; an identifying non-browser
+    UA (e.g. ``job-agent/0.1``) is appended to the browser base string, which
+    keeps both the WAF token binding and the identification policy satisfied.
+    A purely synthetic UA is rejected by the WAF on paginated paths even with
+    a bound token (verified live 2026-09-15).
+    """
+    cleaned = user_agent.strip()
+    if cleaned.startswith("Mozilla/5.0"):
+        return cleaned
+    if not cleaned:
+        return WAF_SOLVER_USER_AGENT
+    return f"{WAF_SOLVER_USER_AGENT} {cleaned}"
 
 
 def build_waf_fetcher(
@@ -47,6 +66,7 @@ def build_waf_fetcher(
     browser_max_navigations_per_page: int = 50,
     resolver: Resolver | None = None,
 ) -> RabotaMdFetcher:
+    waf_user_agent = effective_waf_user_agent(user_agent)
     redis = AsyncRedis.from_url(get_settings().redis_url)
     watchdog = ScriptWatchdog(redis)
     limiter = AsyncRateLimiter(
@@ -63,7 +83,7 @@ def build_waf_fetcher(
 
     browser: StealthPlaywrightBrowser | None = None
     backends: list[WafTokenBackend] = [
-        PurePythonSolverBackend(solver, base_url, WAF_SOLVER_USER_AGENT, watchdog),
+        PurePythonSolverBackend(solver, base_url, waf_user_agent, watchdog),
     ]
     if fallback_transport == "stealth_browser":
         browser = StealthPlaywrightBrowser(
@@ -84,7 +104,7 @@ def build_waf_fetcher(
     provider = WafTokenProvider(redis, backends)
     secure = SecureHttpClient(
         allowed_domains=("rabota.md", "www.rabota.md"),
-        user_agent=user_agent,
+        user_agent=waf_user_agent,
         requests_per_minute=requests_per_minute,
         minimum_interval_seconds=minimum_interval_seconds,
         timeout_seconds=timeout_seconds,
@@ -95,4 +115,4 @@ def build_waf_fetcher(
     waf_client = WafHttpClient(secure, provider)
     if browser is None:
         return waf_client
-    return FallbackFetcher(waf_client, browser, provider)
+    return FallbackFetcher(waf_client, browser, provider, expected_user_agent=waf_user_agent)

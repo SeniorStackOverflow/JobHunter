@@ -4,7 +4,8 @@ Implements the FallbackFetcher state machine from docs/sources/rabota-md-http.md
 Switching happens below the adapter/pipeline boundary so a waf_http hiccup never
 puts the source into DEGRADED/paused while the browser can still serve the scan.
 After a successful browser request the fresh ``aws-waf-token`` cookie is
-published back to the WafTokenProvider, so the next request returns to HTTP.
+published back to the WafTokenProvider, but only when the browser User-Agent
+matches the HTTP transport UA — AWS WAF binds tokens to the minting UA.
 """
 
 from __future__ import annotations
@@ -63,11 +64,13 @@ class FallbackFetcher:
         token_provider: WafTokenProvider,
         *,
         max_switches_per_scan: int = DEFAULT_MAX_SWITCHES_PER_SCAN,
+        expected_user_agent: str | None = None,
     ) -> None:
         self._primary = primary
         self._fallback = fallback
         self._tokens = token_provider
         self._max_switches = max_switches_per_scan
+        self._expected_user_agent = expected_user_agent
         self._switches = 0
         self._logical_requests = 0
         self._http_requests = 0
@@ -165,6 +168,19 @@ class FallbackFetcher:
 
     async def _republish_browser_token(self) -> None:
         assert self._fallback is not None
+        # AWS WAF binds the token to the minting session's User-Agent. A token
+        # minted by the browser is only useful for the HTTP transport when both
+        # share the exact same UA; publishing a mismatched token would make the
+        # next HTTP requests fail with a bare 403 (incident 2026-09-15).
+        if (
+            self._expected_user_agent is not None
+            and self._fallback.user_agent != self._expected_user_agent
+        ):
+            log.info(
+                "rabota_md_browser_token_not_republished",
+                reason="user_agent_mismatch",
+            )
+            return
         cookie = await self._fallback.find_cookie("aws-waf-token", domain_suffix="rabota.md")
         if cookie is None:
             return

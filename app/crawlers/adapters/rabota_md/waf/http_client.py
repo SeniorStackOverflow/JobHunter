@@ -3,7 +3,9 @@
 Implements the WafHttpClient design from docs/sources/rabota-md-http.md.
 Challenge detection uses only the 202 status and the ``x-amzn-waf-action``
 header — the 202 body is empty unless browser Accept headers are sent, so it
-must never be inspected (spike finding 2026-09-12, doc п. 7).
+must never be inspected (spike finding 2026-09-12, doc п. 7). A bare 403
+without the action header means token rejection (UA/IP binding), so it goes
+through the same invalidate-refresh-retry path (incident 2026-09-15).
 """
 
 from __future__ import annotations
@@ -99,16 +101,18 @@ class WafHttpClient:
     ) -> httpx.Response:
         response = await self._send(method, url, extra_headers)
         response = await self._retry_rate_limit(method, url, extra_headers, response)
-        if not self._is_challenge(response):
+        if not self._is_challenge(response) and not self._is_token_rejection(response):
             self._reject_terminal_waf(response)
             return response
-        # Stale/missing token: invalidate, single-flight refresh, one retry.
+        # Stale/missing/rejected token: invalidate, single-flight refresh, one retry.
         await self._tokens.invalidate()
         await self._tokens.refresh_token()
         response = await self._send(method, url, extra_headers)
         response = await self._retry_rate_limit(method, url, extra_headers, response)
         if self._is_challenge(response):
             raise WafChallengeRequired(f"AWS WAF challenge persists after token refresh: {url}")
+        if self._is_token_rejection(response):
+            raise WafChallengeRequired(f"AWS WAF rejects even a fresh token: {url}")
         self._reject_terminal_waf(response)
         return response
 
@@ -147,6 +151,17 @@ class WafHttpClient:
             RABOTA_WAF_CHALLENGE.inc()
             return True
         return False
+
+    @staticmethod
+    def _is_token_rejection(response: httpx.Response) -> bool:
+        """Bare 403 without a WAF action header: the token was rejected.
+
+        AWS WAF answers token/UA-binding violations with an unmarked ELB 403
+        (incident 2026-09-15). It is not fail-closed: a fresh token may pass.
+        A genuine hard block carries the explicit ``block`` action header and
+        is handled by ``_reject_terminal_waf``.
+        """
+        return response.status_code == 403 and not response.headers.get(AWS_WAF_ACTION_HEADER)
 
     @staticmethod
     def _reject_terminal_waf(response: httpx.Response) -> None:

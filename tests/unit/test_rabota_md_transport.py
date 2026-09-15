@@ -6,7 +6,11 @@ import pytest
 
 from app.crawlers.adapters.rabota_md.adapter import RabotaMdConfig
 from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
-from app.crawlers.adapters.rabota_md.transport import build_waf_fetcher
+from app.crawlers.adapters.rabota_md.transport import (
+    WAF_SOLVER_USER_AGENT,
+    build_waf_fetcher,
+    effective_waf_user_agent,
+)
 from app.crawlers.adapters.rabota_md.waf.http_client import WafHttpClient
 from app.crawlers.adapters.rabota_md.waf.watchdog import (
     CANARY_TTL_SECONDS,
@@ -122,3 +126,37 @@ def test_build_waf_fetcher_with_browser_fallback() -> None:
         fallback_transport="stealth_browser",
     )
     assert isinstance(fetcher, FallbackFetcher)
+
+
+def test_effective_waf_user_agent_passthrough_for_browser_ua() -> None:
+    browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/140.0.0.0"
+    assert effective_waf_user_agent(browser_ua) == browser_ua
+
+
+def test_effective_waf_user_agent_suffixes_identifying_ua() -> None:
+    assert (
+        effective_waf_user_agent("job-agent/0.1 (+contact)")
+        == f"{WAF_SOLVER_USER_AGENT} job-agent/0.1 (+contact)"
+    )
+
+
+def test_effective_waf_user_agent_blank_falls_back_to_browser_base() -> None:
+    assert effective_waf_user_agent("   ") == WAF_SOLVER_USER_AGENT
+
+
+def test_build_waf_fetcher_unifies_token_and_crawl_user_agent() -> None:
+    fetcher = build_waf_fetcher(
+        base_url="https://www.rabota.md",
+        user_agent="job-agent/test",
+        requests_per_minute=10,
+        minimum_interval_seconds=1.0,
+        timeout_seconds=10.0,
+        max_redirects=3,
+        fallback_transport="stealth_browser",
+    )
+    assert isinstance(fetcher, FallbackFetcher)
+    expected = f"{WAF_SOLVER_USER_AGENT} job-agent/test"
+    assert fetcher._expected_user_agent == expected
+    primary = fetcher._primary
+    assert isinstance(primary, WafHttpClient)
+    assert primary._client._client.headers["user-agent"] == expected

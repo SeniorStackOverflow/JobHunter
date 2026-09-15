@@ -812,7 +812,9 @@ def _rabota_md_uses_waf_http(source: JobSource) -> bool:
     return transport == "waf_http"
 
 
-async def _rabota_md_waf_pagination_probe(source: JobSource, token: str) -> None:
+async def _rabota_md_waf_pagination_probe(
+    source: JobSource, token: str, *, user_agent: str
+) -> None:
     """Probe one real pagination request through the configured WAF+browser stack.
 
     Token solving alone is not enough: AWS WAF can accept the token for document
@@ -873,7 +875,7 @@ async def _rabota_md_waf_pagination_probe(source: JobSource, token: str) -> None
     await provider.publish_token(MintedWafToken(token))
     secure = SecureHttpClient(
         allowed_domains=("rabota.md", "www.rabota.md"),
-        user_agent=get_settings().crawler_user_agent,
+        user_agent=user_agent,
         requests_per_minute=requests_per_minute,
         minimum_interval_seconds=minimum_interval_seconds,
         timeout_seconds=timeout_seconds,
@@ -905,7 +907,7 @@ async def _rabota_md_waf_pagination_probe(source: JobSource, token: str) -> None
 async def _rabota_md_waf_canary() -> dict[str, str]:
     from redis.asyncio import Redis as AsyncRedis
 
-    from app.crawlers.adapters.rabota_md.transport import WAF_SOLVER_USER_AGENT
+    from app.crawlers.adapters.rabota_md.transport import effective_waf_user_agent
     from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
     from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
     from app.observability.metrics import WAF_SOLVER_CANARY, WAF_SOLVER_COMPATIBILITY
@@ -915,12 +917,21 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
         WAF_SOLVER_CANARY.labels(outcome="skipped").inc()
         return {"outcome": "skipped", "reason": "waf_http_not_enabled"}
 
+    configured = source.configuration.get("source", source.configuration)
+    raw_config = configured if isinstance(configured, dict) else {}
+    configured_ua = raw_config.get("user_agent")
+    user_agent = effective_waf_user_agent(
+        configured_ua
+        if isinstance(configured_ua, str) and configured_ua.strip()
+        else get_settings().crawler_user_agent
+    )
+
     redis = AsyncRedis.from_url(get_settings().redis_url)
     try:
         watchdog = ScriptWatchdog(redis)
         solver = AwsWafSolver(script_hash_checker=lambda _digest: True)
         try:
-            token = await solver.solve(source.base_url, WAF_SOLVER_USER_AGENT)
+            token = await solver.solve(source.base_url, user_agent)
         except Exception as exc:
             WAF_SOLVER_CANARY.labels(outcome="failure").inc()
             WAF_SOLVER_COMPATIBILITY.set(0)
@@ -933,7 +944,7 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
             logger.warning("rabota_md_waf_canary_failed", error_type="MissingScriptHash")
             return {"outcome": "failure", "error_type": "MissingScriptHash"}
         try:
-            await _rabota_md_waf_pagination_probe(source, token)
+            await _rabota_md_waf_pagination_probe(source, token, user_agent=user_agent)
         except Exception as exc:
             WAF_SOLVER_CANARY.labels(outcome="failure").inc()
             WAF_SOLVER_COMPATIBILITY.set(0)

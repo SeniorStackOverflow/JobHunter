@@ -205,14 +205,54 @@ async def test_post_html_fragment_success() -> None:
     assert request.headers["cookie"].startswith("aws-waf-token=")
 
 
-async def test_post_html_fragment_403_is_contract_error() -> None:
+async def test_post_html_fragment_bare_403_recovers_with_fresh_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("cookie") == "aws-waf-token=token-1":
+            return httpx.Response(403)
+        return httpx.Response(
+            200,
+            json={"success": True, "data": {"content": "<div>cards</div>"}},
+        )
+
+    provider, backend = make_provider()
+    client = make_transport(handler, provider)
+    response = await client.post_html_fragment(f"{BASE}/ru/vacancies/category/it/2")
+    assert response.status_code == 200
+    assert backend.count == 2  # initial mint + refresh after bare 403
+
+
+async def test_post_html_fragment_persistent_bare_403_is_challenge_required() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403)
 
     provider, _ = make_provider()
     client = make_transport(handler, provider)
-    with pytest.raises(WafPostContractError):
+    with pytest.raises(WafChallengeRequired):
         await client.post_html_fragment(f"{BASE}/ru/vacancies/category/it/2")
+
+
+async def test_get_bare_403_triggers_refresh_and_retry() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("cookie") == "aws-waf-token=token-1":
+            return httpx.Response(403)
+        return httpx.Response(200, text="<html>ok</html>")
+
+    provider, backend = make_provider()
+    client = make_transport(handler, provider)
+    response = await client.get(f"{BASE}/ru/vacancies")
+    assert response.status_code == 200
+    assert backend.count == 2
+
+
+async def test_403_with_block_action_header_is_fail_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"x-amzn-waf-action": "block"})
+
+    provider, backend = make_provider()
+    client = make_transport(handler, provider)
+    with pytest.raises(WafBlocked):
+        await client.get(f"{BASE}/ru/vacancies")
+    assert backend.count == 1  # no token refresh for an explicit block
 
 
 async def test_post_html_fragment_bad_payload_is_contract_error() -> None:
@@ -248,9 +288,15 @@ class StubPrimary:
 
 
 class StubBrowser:
-    def __init__(self, cookie: dict | None = None, waf_action: str | None = None) -> None:
+    def __init__(
+        self,
+        cookie: dict | None = None,
+        waf_action: str | None = None,
+        user_agent: str | None = None,
+    ) -> None:
         self.cookie = cookie
         self.waf_action = waf_action
+        self.user_agent = user_agent
         self.calls = 0
         self.close_calls = 0
         self.fragment_referer: str | None = None
@@ -277,12 +323,41 @@ def make_fallback(
     primary_error: Exception | None,
     cookie: dict | None = None,
     waf_action: str | None = None,
+    browser_user_agent: str | None = None,
+    expected_user_agent: str | None = None,
 ) -> tuple[FallbackFetcher, StubPrimary, StubBrowser, FakeRedis]:
     redis = FakeRedis()
     provider = WafTokenProvider(redis, [RotatingBackend()])  # type: ignore[arg-type]
     primary = StubPrimary(primary_error)
-    browser = StubBrowser(cookie, waf_action)
-    return FallbackFetcher(primary, browser, provider), primary, browser, redis  # type: ignore[arg-type]
+    browser = StubBrowser(cookie, waf_action, browser_user_agent)
+    return (
+        FallbackFetcher(primary, browser, provider, expected_user_agent=expected_user_agent),  # type: ignore[arg-type]
+        primary,
+        browser,
+        redis,
+    )
+
+
+async def test_fallback_republishes_token_when_user_agent_matches() -> None:
+    fetcher, _, _, _ = make_fallback(
+        WafChallengeRequired("202"),
+        cookie={"value": "browser-token", "expires": -1},
+        browser_user_agent="Mozilla/5.0 Chrome/136",
+        expected_user_agent="Mozilla/5.0 Chrome/136",
+    )
+    await fetcher.get(f"{BASE}/ru/vacancies")
+    assert await fetcher._tokens.get_token() == "browser-token"
+
+
+async def test_fallback_skips_republish_on_user_agent_mismatch() -> None:
+    fetcher, _, _, _ = make_fallback(
+        WafChallengeRequired("202"),
+        cookie={"value": "browser-token", "expires": -1},
+        browser_user_agent="Mozilla/5.0 Chrome/131",
+        expected_user_agent="Mozilla/5.0 Chrome/136",
+    )
+    await fetcher.get(f"{BASE}/ru/vacancies")
+    assert await fetcher._tokens.get_token() is None
 
 
 async def test_fallback_on_persistent_challenge() -> None:

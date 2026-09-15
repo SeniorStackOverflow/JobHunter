@@ -208,6 +208,31 @@ browser mint не является основанием сразу повтор�
 - `token.awswaf.com`/`captcha.awswaf.com` в allowlist нужны только solver'у
   (см. ниже), не crawl-трафику.
 
+#### Инцидент 2026-09-15: привязка токена к User-Agent
+
+AWS WAF включил на rabota.md проверку соответствия User-Agent запроса тому UA, с
+которым был выминчен `aws-waf-token` (rollout: первый сбой в 01:00 UTC, стабильно с
+08:00 UTC). Симптом: `GET` страницы 1 категории проходит, а paginated `GET`/`POST`
+получают голый `403` от ELB без заголовка `x-amzn-waf-action`. Контрольный
+эксперимент: один и тот же токен — `200` с UA минта, `403` с любым другим UA,
+снова `200` при возврате исходного UA.
+
+Выводы, зафиксированные в реализации:
+
+- **один UA для минта и всех crawl-запросов**: `effective_waf_user_agent()` в
+  `transport.py` — browser-shaped UA используется как есть, идентифицирующий
+  `job-agent/...` дописывается суффиксом к browser-базе (полностью синтетический
+  UA отклоняется WAF на paginated путях даже с привязанным токеном — проверено
+  live); solver, `SecureHttpClient` и canary probe используют только эту строку;
+- **голый 403 без action-заголовка = token rejection**, а не hard block: тот же
+  путь invalidate → refresh → один retry; повторный 403 после refresh —
+  `WafChallengeRequired` (fallback-allowed). Явный `x-amzn-waf-action: block`
+  остаётся fail-closed;
+- **републикация браузерного токена в provider — только при совпадении UA**
+  браузера и HTTP-транспорта: браузерный токен привязан к UA Chromium, с
+  crawl-UA он гарантированно получит 403;
+- токены из `EnvTokenBackend` обязаны быть выминчены с тем же effective UA.
+
 ### WafTokenProvider
 
 Протокол минимум `async get_token() -> str`, `async refresh_token() -> str`,
