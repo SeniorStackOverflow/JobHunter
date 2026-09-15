@@ -754,4 +754,12 @@ class OrchestratorSupervisor:
                 await self._task
         self._task = None
         self._task_session_id = None
-        await self._redis.delete(CALL_OWNED_KEY)
+        try:
+            await self._redis.delete(CALL_OWNED_KEY)
+        except Exception as exc:
+            # Redis can disappear while Docker is stopping/restarting. Shutdown
+            # cleanup is best-effort; surfacing this only creates restart churn.
+            logger.warning(
+                "phone_orchestrator_shutdown_redis_failed",
+                error_type=type(exc).__name__,
+            )

@@ -1097,3 +1097,27 @@ async def test_explicit_callback_skips_generic_details_prompt(
     assert stage == "greeting_completed"
     assert SCRIPT_DETAILS_PROMPT not in spoken
     assert SCRIPT_CLOSING_FOLLOW_UP in spoken
+
+
+@pytest.mark.asyncio
+async def test_supervisor_shutdown_ignores_redis_outage(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Docker can stop Redis before call-agent; shutdown cleanup must not crash."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from app.phone.orchestrator import OrchestratorSupervisor
+
+    class _DownRedis:
+        async def delete(self, *args: object, **kwargs: object) -> int:
+            raise RedisConnectionError("redis stopped first")
+
+    fake = FakePhoneGate()
+    async with _pg(fake) as client:
+        sup = OrchestratorSupervisor(
+            client=client,
+            session_factory=factory,
+            redis=_DownRedis(),  # type: ignore[arg-type]
+            settings=_fast_settings(),
+        )
+        await sup.shutdown()

@@ -10,6 +10,7 @@ from pathlib import Path
 import structlog
 from redis import Redis as SyncRedis
 from redis.asyncio import Redis as AsyncRedis
+from redis.exceptions import RedisError
 
 from app.database import async_session_factory
 from app.phone.client import PhoneGateClient, PhoneGateError, PhoneGateUnavailable
@@ -28,6 +29,7 @@ HEARTBEAT_PATH = Path(
 )
 
 _SINGLETON_LOCK_TTL = 60
+_REDIS_STARTUP_RETRY_SECONDS = 3.0
 _DORMANT_HEARTBEAT_SECONDS = 30
 
 
@@ -197,23 +199,49 @@ async def run() -> int:
         logger.error("phone_agent_missing_token")
         return 2
 
-    sync_redis: SyncRedis = SyncRedis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        with leased_redis_lock(
-            sync_redis,
-            lock_key("phone-agent", "singleton"),
-            ttl_seconds=_SINGLETON_LOCK_TTL,
-        ) as lease:
-            if lease is None:
-                logger.warning("phone_agent_not_singleton")
-                return 1
-            await _run_loop(lease_lost=lambda: lease.lease_lost)
-            if lease.lease_lost:
-                logger.warning("phone_agent_lease_lost")
-                return 1
-    finally:
-        close_redis_client(sync_redis)
-    return 0
+    # Compose dependency ordering applies to `compose up`, not a Docker daemon
+    # restart. Redis DNS/readiness may lag the phone-agent by a few seconds, and
+    # the pre-restart singleton lease can survive until its TTL expires. Both are
+    # startup states, not process-fatal errors: stay in one process instead of
+    # letting restart=unless-stopped amplify them into a restart storm.
+    while True:
+        sync_redis: SyncRedis = SyncRedis.from_url(settings.redis_url, decode_responses=True)
+        retry_reason: str | None = None
+        try:
+            try:
+                with leased_redis_lock(
+                    sync_redis,
+                    lock_key("phone-agent", "singleton"),
+                    ttl_seconds=_SINGLETON_LOCK_TTL,
+                ) as lease:
+                    if lease is None:
+                        retry_reason = "singleton_busy"
+                        logger.warning(
+                            "phone_agent_singleton_wait",
+                            retry_seconds=_REDIS_STARTUP_RETRY_SECONDS,
+                        )
+                    else:
+                        await _run_loop(lease_lost=lambda: lease.lease_lost)
+                        if not lease.lease_lost:
+                            return 0
+                        retry_reason = "lease_lost"
+                        logger.warning(
+                            "phone_agent_lease_lost",
+                            retry_seconds=_REDIS_STARTUP_RETRY_SECONDS,
+                        )
+            except RedisError as exc:
+                retry_reason = "redis_unavailable"
+                logger.warning(
+                    "phone_agent_redis_wait",
+                    error_type=type(exc).__name__,
+                    retry_seconds=_REDIS_STARTUP_RETRY_SECONDS,
+                )
+        finally:
+            close_redis_client(sync_redis)
+
+        if retry_reason is None:
+            return 0
+        await asyncio.sleep(_REDIS_STARTUP_RETRY_SECONDS)
 
 
 def main() -> None:

@@ -126,6 +126,59 @@ async def test_run_returns_two_when_token_missing(
     assert not redis_from_url_called
 
 
+@pytest.mark.asyncio
+async def test_run_waits_for_redis_and_stale_singleton_without_exiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon restart ordering is not Compose startup ordering: stay in-process
+    while Redis DNS/readiness catches up and while a stale singleton lease expires."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    attempts = 0
+    run_loop_calls = 0
+
+    class _MockRedis:
+        @staticmethod
+        def from_url(*args: Any, **kwargs: Any) -> object:
+            return object()
+
+    @contextmanager
+    def _lock(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RedisConnectionError("dns not ready")
+        if attempts == 2:
+            yield None
+            return
+        yield SimpleNamespace(lease_lost=False)
+
+    async def _run_loop(*, lease_lost: Any) -> None:
+        nonlocal run_loop_calls
+        run_loop_calls += 1
+        assert lease_lost() is False
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, phone_agent_enabled=True, phonegate_auth_token="tok"),
+    )
+    monkeypatch.setattr(agent_module, "SyncRedis", _MockRedis)
+    monkeypatch.setattr(agent_module, "leased_redis_lock", _lock)
+    monkeypatch.setattr(agent_module, "close_redis_client", lambda client: None)
+    monkeypatch.setattr(agent_module, "_run_loop", _run_loop)
+    monkeypatch.setattr(agent_module, "_REDIS_STARTUP_RETRY_SECONDS", 0.0)
+
+    code = await agent_module.run()
+
+    assert code == 0
+    assert attempts == 3
+    assert run_loop_calls == 1
+
+
 def test_cli_registers_phone_agent_subcommand() -> None:
     from app.cli import build_parser
 
