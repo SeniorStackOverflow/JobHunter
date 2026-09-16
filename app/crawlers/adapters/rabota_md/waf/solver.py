@@ -46,7 +46,10 @@ RE_CHAL_EXT = re.compile(
 RE_CHAL_SDK = re.compile(
     r"(https://[a-z0-9]+\.edge\.sdk\.awswaf\.com/[a-z0-9]+/[a-z0-9]+)/challenge\.js"
 )
-RE_CHAL_SCRIPT = re.compile(r'src="(https://[^"]*awswaf\.com[^"]*challenge\.js[^"]*)"')
+RE_CHAL_SCRIPT = re.compile(
+    r"""src\s*=\s*["'](https://[^"']*awswaf\.com[^"']*challenge\.js[^"']*)["']""",
+    re.IGNORECASE,
+)
 RE_GOKU = re.compile(r"window\.gokuProps\s*=\s*(\{[^}]+\})")
 
 AWS_WAF_ACTION_HEADER = "x-amzn-waf-action"
@@ -309,21 +312,27 @@ class AwsWafSolver:
         self._reject_waf_response(response)
         html = response.text
 
+        script_match = RE_CHAL_SCRIPT.search(html)
+        script_url = script_match.group(1) if script_match is not None else None
+
         match = RE_CHAL_SAME.search(html)
         if match:
             challenge_url, same_origin = f"{site}{match.group(1)}", True
         else:
             match = RE_CHAL_EXT.search(html) or RE_CHAL_SDK.search(html)
-            if not match:
+            if match:
+                challenge_url, same_origin = match.group(1), False
+            elif script_url is not None:
+                _require_allowed_url(script_url)
+                challenge_url = script_url.split("/challenge.js", 1)[0].rstrip("/")
+                same_origin = False
+            else:
                 raise WafUnsupportedChallenge("challenge URL not found on the 202 page")
-            challenge_url, same_origin = match.group(1), False
         _require_allowed_url(challenge_url)
 
         if self._script_hash_checker is not None:
-            script_match = RE_CHAL_SCRIPT.search(html)
-            if script_match is None:
+            if script_url is None:
                 raise WafUnsupportedChallenge("challenge.js URL not found on the 202 page")
-            script_url = script_match.group(1)
             _require_allowed_url(script_url)
             script_response = await self._get(client, script_url, headers=_nav_headers(user_agent))
             self._reject_waf_response(script_response)

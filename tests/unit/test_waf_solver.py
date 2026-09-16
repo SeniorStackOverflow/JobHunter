@@ -180,3 +180,24 @@ async def test_solve_no_token_returned() -> None:
     solver = AwsWafSolver(client=mock_client(verify_json={"success": False}))
     with pytest.raises(WafSolveFailed):
         await solver.solve(SITE, UA)
+
+
+async def test_solve_derives_challenge_base_from_single_quoted_script_src() -> None:
+    script_url = "https://abc.edge.sdk.awswaf.com/proto-v2/ABC_123/challenge.js?rev=7"
+    challenge_base = script_url.split("/challenge.js", 1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            html = f"<html><script async src='{script_url}'></script></html>"
+            return httpx.Response(202, text=html, headers={"x-amzn-waf-action": "challenge"})
+        if url.startswith(f"{challenge_base}/inputs"):
+            return httpx.Response(200, json=inputs_payload("SHA256", 4))
+        if url.endswith("/verify"):
+            return httpx.Response(200, json={"token": TOKEN})
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client)
+    assert await solver.solve(SITE, UA) == TOKEN
+    await client.aclose()

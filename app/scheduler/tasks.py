@@ -829,7 +829,7 @@ async def _rabota_md_waf_pagination_probe(
         MintedWafToken,
         WafTokenProvider,
     )
-    from app.crawlers.browser import StealthPlaywrightBrowser
+    from app.crawlers.browser import AWS_WAF_BROWSER_ALLOWED_DOMAINS, StealthPlaywrightBrowser
     from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
 
     configured = source.configuration.get("source", source.configuration)
@@ -884,15 +884,11 @@ async def _rabota_md_waf_pagination_probe(
     )
     primary = WafHttpClient(secure, provider)
     browser = StealthPlaywrightBrowser(
-        allowed_domains=(
-            "rabota.md",
-            "www.rabota.md",
-            "token.awswaf.com",
-            "captcha.awswaf.com",
-        ),
+        allowed_domains=AWS_WAF_BROWSER_ALLOWED_DOMAINS,
         requests_per_minute=requests_per_minute,
         minimum_interval_seconds=minimum_interval_seconds,
         timeout_seconds=timeout_seconds,
+        user_agent=user_agent,
         max_navigations_per_page=browser_max_navigations,
     )
     fetcher = FallbackFetcher(primary, browser, provider, max_switches_per_scan=1)

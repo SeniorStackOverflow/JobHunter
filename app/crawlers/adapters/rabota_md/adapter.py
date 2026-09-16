@@ -21,7 +21,11 @@ from app.crawlers.adapters.rabota_md.errors import (
     RabotaMdParseError,
     RabotaMdTemporaryError,
 )
-from app.crawlers.browser import BrowserNavigationError, StealthPlaywrightBrowser
+from app.crawlers.browser import (
+    AWS_WAF_BROWSER_ALLOWED_DOMAINS,
+    BrowserNavigationError,
+    StealthPlaywrightBrowser,
+)
 from app.crawlers.http import HttpFetcher
 from app.crawlers.schemas import (
     AccessPolicyResult,
@@ -306,12 +310,7 @@ class RabotaMdAdapter:
             self._http = injected_fetcher
         elif self.config.resolved_transport() == "stealth_browser":
             self._http = StealthPlaywrightBrowser(
-                allowed_domains=(
-                    "rabota.md",
-                    "www.rabota.md",
-                    "token.awswaf.com",
-                    "captcha.awswaf.com",
-                ),
+                allowed_domains=AWS_WAF_BROWSER_ALLOWED_DOMAINS,
                 requests_per_minute=self.config.requests_per_minute,
                 minimum_interval_seconds=self.config.minimum_interval_seconds,
                 timeout_seconds=self.config.timeout_seconds,

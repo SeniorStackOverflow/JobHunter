@@ -277,9 +277,7 @@ class StubPrimary:
             raise self.error
         return httpx.Response(200, text="http")
 
-    async def post_html_fragment(
-        self, url: str, *, referer: str | None = None
-    ) -> httpx.Response:
+    async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:
         self.fragment_referer = referer
         return await self.get(url)
 
@@ -306,9 +304,7 @@ class StubBrowser:
         headers = {"x-amzn-waf-action": self.waf_action} if self.waf_action else {}
         return httpx.Response(202 if self.waf_action else 200, text="browser", headers=headers)
 
-    async def post_html_fragment(
-        self, url: str, *, referer: str | None = None
-    ) -> httpx.Response:
+    async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:
         self.fragment_referer = referer
         return await self.get(url)
 
@@ -360,16 +356,26 @@ async def test_fallback_skips_republish_on_user_agent_mismatch() -> None:
     assert await fetcher._tokens.get_token() is None
 
 
-async def test_fallback_on_persistent_challenge() -> None:
-    fetcher, _primary, browser, _redis = make_fallback(
+async def test_fallback_promotes_scan_and_keeps_browser_context() -> None:
+    fetcher, primary, browser, _redis = make_fallback(
         WafChallengeRequired("202"), cookie={"value": "browser-token", "expires": -1}
     )
     response = await fetcher.get(f"{BASE}/ru/vacancies")
     assert response.text == "browser"
+    assert primary.calls == 1
     assert browser.calls == 1
-    assert browser.close_calls == 1
-    # browser token republished so the next request returns to HTTP
+    assert browser.close_calls == 0
     assert await fetcher._tokens.get_token() == "browser-token"
+
+    url = f"{BASE}/ru/vacancies/category/operating/2"
+    await fetcher.post_html_fragment(url)
+    assert primary.calls == 1  # no return to HTTP after promotion
+    assert browser.calls == 2
+    assert browser.fragment_referer == f"{BASE}/ru/vacancies/category/operating"
+    assert browser.close_calls == 0
+
+    await fetcher.aclose()
+    assert browser.close_calls == 1
 
 
 async def test_browser_fallback_captcha_is_fail_closed() -> None:
@@ -377,19 +383,21 @@ async def test_browser_fallback_captcha_is_fail_closed() -> None:
     with pytest.raises(RabotaMdDegradedError, match="CAPTCHA"):
         await fetcher.get(f"{BASE}/ru/vacancies")
     assert browser.calls == 1
+    assert browser.close_calls == 0
+    await fetcher.aclose()
     assert browser.close_calls == 1
 
 
 async def test_fragment_fallback_uses_category_referer_and_fails_closed_on_captcha() -> None:
-    fetcher, primary, browser, _ = make_fallback(
-        WafPostContractError("403"), waf_action="captcha"
-    )
+    fetcher, primary, browser, _ = make_fallback(WafPostContractError("403"), waf_action="captcha")
     url = f"{BASE}/ru/vacancies/category/operating/2"
     with pytest.raises(RabotaMdDegradedError, match="CAPTCHA"):
         await fetcher.post_html_fragment(url)
     expected = f"{BASE}/ru/vacancies/category/operating"
     assert primary.fragment_referer == expected
     assert browser.fragment_referer == expected
+    assert browser.close_calls == 0
+    await fetcher.aclose()
     assert browser.close_calls == 1
 
 
@@ -408,11 +416,13 @@ async def test_fallback_429_is_temporary_and_never_uses_browser() -> None:
     assert browser.calls == 0
 
 
-async def test_exhausted_token_backends_do_not_trigger_second_browser_attempt() -> None:
-    fetcher, _, browser, _ = make_fallback(WafSolveFailed("backends exhausted"))
-    with pytest.raises(RabotaMdDegradedError, match="token refresh exhausted"):
-        await fetcher.get(f"{BASE}/ru/vacancies")
-    assert browser.calls == 0
+async def test_exhausted_token_backends_promote_to_browser_transport() -> None:
+    fetcher, primary, browser, _ = make_fallback(WafSolveFailed("backends exhausted"))
+    response = await fetcher.get(f"{BASE}/ru/vacancies")
+    assert response.text == "browser"
+    assert primary.calls == 1
+    assert browser.calls == 1
+    assert fetcher._promoted is True
 
 
 async def test_fallback_without_browser_degrades() -> None:
@@ -426,7 +436,7 @@ async def test_fallback_without_browser_degrades() -> None:
 async def test_fallback_switch_budget() -> None:
     fetcher, _, _browser, _ = make_fallback(WafChallengeRequired("202"))
     fetcher._switches = fetcher._max_switches
-    with pytest.raises(RabotaMdDegradedError, match="transport fallbacks"):
+    with pytest.raises(RabotaMdDegradedError, match="transport promotions"):
         await fetcher.get(f"{BASE}/ru/vacancies")
 
 

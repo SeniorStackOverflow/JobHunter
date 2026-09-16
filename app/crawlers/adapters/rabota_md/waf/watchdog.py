@@ -88,6 +88,12 @@ class ScriptWatchdog:
         self._canary_script_hash = script_hash
         self._loaded = True
 
+    async def invalidate_compatibility(self) -> None:
+        await self._redis.delete(self._canary_key)
+        self._compatible = False
+        self._canary_script_hash = None
+        self._loaded = True
+
     async def canary_script_hash(self) -> str | None:
         await self.load()
         return self._canary_script_hash

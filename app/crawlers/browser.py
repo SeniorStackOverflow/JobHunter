@@ -32,6 +32,13 @@ class BrowserNavigationError(RuntimeError):
 
 AWS_WAF_ACTION_HEADER = "x-amzn-waf-action"
 AWS_WAF_CHALLENGE_ACTION = "challenge"
+AWS_WAF_BROWSER_ALLOWED_DOMAINS = (
+    "rabota.md",
+    "www.rabota.md",
+    "token.awswaf.com",
+    "captcha.awswaf.com",
+    "sdk.awswaf.com",
+)
 
 
 class StealthPlaywrightBrowser:
@@ -55,6 +62,7 @@ class StealthPlaywrightBrowser:
         headless: bool = True,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         proxy_server: str | None = None,
+        user_agent: str | None = None,
         max_navigations_per_page: int = 50,
     ) -> None:
         self.allowed_domains = tuple(item.casefold() for item in allowed_domains)
@@ -77,7 +85,7 @@ class StealthPlaywrightBrowser:
         self._browser: Any | None = None
         self._context: Any | None = None
         self._page: Any | None = None
-        self.user_agent: str | None = None
+        self.user_agent: str | None = user_agent
 
     async def _validated_url(self, url: str) -> str:
         validated = await validate_outbound_url(url, self.allowed_domains)
@@ -106,10 +114,11 @@ class StealthPlaywrightBrowser:
                     f"--lang={self.locale}",
                 ],
             )
-            probe = await self._browser.new_page()
-            raw_user_agent = await probe.evaluate("navigator.userAgent")
-            await probe.close()
-            self.user_agent = str(raw_user_agent).replace("HeadlessChrome/", "Chrome/")
+            if self.user_agent is None:
+                probe = await self._browser.new_page()
+                raw_user_agent = await probe.evaluate("navigator.userAgent")
+                await probe.close()
+                self.user_agent = str(raw_user_agent).replace("HeadlessChrome/", "Chrome/")
             stealth = Stealth(
                 chrome_runtime=True,
                 navigator_languages_override=(self.locale, self.locale.split("-", 1)[0]),
@@ -245,9 +254,7 @@ class StealthPlaywrightBrowser:
                 extensions={"job_agent_final_url": final},
             )
 
-    async def post_html_fragment(
-        self, url: str, *, referer: str | None = None
-    ) -> httpx.Response:
+    async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:
         """Fetch a same-site HTML fragment through the live page cookie context.
 
         Browser ``fetch`` must execute from the category page itself. Executing it

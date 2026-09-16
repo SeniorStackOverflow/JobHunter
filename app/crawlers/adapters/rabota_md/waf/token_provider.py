@@ -23,6 +23,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafCaptchaRequired,
     WafRateLimited,
     WafSolveFailed,
+    WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
 from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
@@ -191,6 +192,11 @@ class PurePythonSolverBackend:
         WAF_SOLVER_ATTEMPTS.inc()
         try:
             token = await self._solver.solve(self._site, self._user_agent)
+        except WafUnsupportedChallenge:
+            if self._watchdog is not None:
+                await self._watchdog.invalidate_compatibility()
+                WAF_SOLVER_COMPATIBILITY.set(0)
+            raise
         finally:
             WAF_SOLVER_SOLVE_DURATION.observe(time.monotonic() - started)
         WAF_SOLVER_SUCCESS.inc()
@@ -216,7 +222,14 @@ class StealthBrowserTokenMinterBackend:
                     )
                 if action == "block":
                     raise WafBlocked("browser token minter encountered WAF block")
-                cookie = await self._browser.find_cookie("aws-waf-token", domain_suffix="rabota.md")
+                cookie = None
+                for _ in range(6):
+                    cookie = await self._browser.find_cookie(
+                        "aws-waf-token", domain_suffix="rabota.md"
+                    )
+                    if cookie is not None:
+                        break
+                    await self._browser.wait(500)
             except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
                 raise WafSolveFailed(f"browser token minter failed: {type(exc).__name__}") from exc
             if cookie is None:

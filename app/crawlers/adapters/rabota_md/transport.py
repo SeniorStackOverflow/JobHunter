@@ -22,7 +22,7 @@ from app.crawlers.adapters.rabota_md.waf.token_provider import (
     WafTokenProvider,
 )
 from app.crawlers.adapters.rabota_md.waf.watchdog import ScriptWatchdog
-from app.crawlers.browser import StealthPlaywrightBrowser
+from app.crawlers.browser import AWS_WAF_BROWSER_ALLOWED_DOMAINS, StealthPlaywrightBrowser
 from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
 from app.security.ssrf import Resolver
 from app.settings import get_settings
@@ -87,15 +87,11 @@ def build_waf_fetcher(
     ]
     if fallback_transport == "stealth_browser":
         browser = StealthPlaywrightBrowser(
-            allowed_domains=(
-                "rabota.md",
-                "www.rabota.md",
-                "token.awswaf.com",
-                "captcha.awswaf.com",
-            ),
+            allowed_domains=AWS_WAF_BROWSER_ALLOWED_DOMAINS,
             requests_per_minute=requests_per_minute,
             minimum_interval_seconds=minimum_interval_seconds,
             timeout_seconds=timeout_seconds,
+            user_agent=waf_user_agent,
             max_navigations_per_page=browser_max_navigations_per_page,
         )
         backends.append(StealthBrowserTokenMinterBackend(browser, f"{base_url}/ru/vacancies"))
