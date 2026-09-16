@@ -123,6 +123,7 @@ def test_solve_pow_budget_exceeded() -> None:
         (200, "captcha", WafCaptchaRequired),
         (200, "block", WafBlocked),
         (429, "", WafRateLimited),
+        (403, "", WafSolveFailed),
         (200, "puzzle", WafUnsupportedChallenge),
     ],
 )

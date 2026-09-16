@@ -399,6 +399,8 @@ class AwsWafSolver:
             raise WafCaptchaRequired("AWS WAF requested a CAPTCHA; fail-closed by policy")
         if action == "block":
             raise WafBlocked("AWS WAF hard-blocked the request")
+        if response.status_code == 403 and not action:
+            raise WafSolveFailed("AWS WAF rejected the request with bare HTTP 403")
         if action and action != "challenge":
             raise WafUnsupportedChallenge(f"unknown x-amzn-waf-action: {action!r}")
 

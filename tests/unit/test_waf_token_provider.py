@@ -64,14 +64,16 @@ def make_provider(
 
 
 class StubTokenBrowser:
-    def __init__(self, action: str) -> None:
+    def __init__(self, action: str = "", status_code: int = 202) -> None:
         self.action = action
+        self.status_code = status_code
         self.closed = False
 
     async def get(self, url: str) -> httpx.Response:
+        headers = {"x-amzn-waf-action": self.action} if self.action else {}
         return httpx.Response(
-            202,
-            headers={"x-amzn-waf-action": self.action},
+            self.status_code,
+            headers=headers,
             request=httpx.Request("GET", url),
         )
 
@@ -86,6 +88,14 @@ async def test_browser_token_minter_captcha_is_fail_closed() -> None:
     browser = StubTokenBrowser("captcha")
     backend = StealthBrowserTokenMinterBackend(browser, "https://www.rabota.md/ru/vacancies")  # type: ignore[arg-type]
     with pytest.raises(WafCaptchaRequired):
+        await backend.mint()
+    assert browser.closed
+
+
+async def test_browser_token_minter_bare_403_is_not_treated_as_missing_cookie() -> None:
+    browser = StubTokenBrowser(status_code=403)
+    backend = StealthBrowserTokenMinterBackend(browser, "https://www.rabota.md/ru/vacancies")  # type: ignore[arg-type]
+    with pytest.raises(WafSolveFailed, match="bare HTTP 403"):
         await backend.mint()
     assert browser.closed
 

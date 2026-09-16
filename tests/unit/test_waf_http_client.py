@@ -291,10 +291,12 @@ class StubBrowser:
         cookie: dict | None = None,
         waf_action: str | None = None,
         user_agent: str | None = None,
+        status_code: int | None = None,
     ) -> None:
         self.cookie = cookie
         self.waf_action = waf_action
         self.user_agent = user_agent
+        self.status_code = status_code
         self.calls = 0
         self.close_calls = 0
         self.fragment_referer: str | None = None
@@ -302,7 +304,8 @@ class StubBrowser:
     async def get(self, url: str) -> httpx.Response:
         self.calls += 1
         headers = {"x-amzn-waf-action": self.waf_action} if self.waf_action else {}
-        return httpx.Response(202 if self.waf_action else 200, text="browser", headers=headers)
+        status = self.status_code if self.status_code is not None else (202 if self.waf_action else 200)
+        return httpx.Response(status, text="browser", headers=headers)
 
     async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:
         self.fragment_referer = referer
@@ -321,11 +324,12 @@ def make_fallback(
     waf_action: str | None = None,
     browser_user_agent: str | None = None,
     expected_user_agent: str | None = None,
+    browser_status_code: int | None = None,
 ) -> tuple[FallbackFetcher, StubPrimary, StubBrowser, FakeRedis]:
     redis = FakeRedis()
     provider = WafTokenProvider(redis, [RotatingBackend()])  # type: ignore[arg-type]
     primary = StubPrimary(primary_error)
-    browser = StubBrowser(cookie, waf_action, browser_user_agent)
+    browser = StubBrowser(cookie, waf_action, browser_user_agent, browser_status_code)
     return (
         FallbackFetcher(primary, browser, provider, expected_user_agent=expected_user_agent),  # type: ignore[arg-type]
         primary,
@@ -386,6 +390,16 @@ async def test_browser_fallback_captcha_is_fail_closed() -> None:
     assert browser.close_calls == 0
     await fetcher.aclose()
     assert browser.close_calls == 1
+
+
+async def test_browser_fallback_bare_403_is_access_rejected() -> None:
+    fetcher, _, browser, _ = make_fallback(
+        WafSolveFailed("backends exhausted"), browser_status_code=403
+    )
+    with pytest.raises(RabotaMdDegradedError, match="access rejected"):
+        await fetcher.get(f"{BASE}/ru/vacancies")
+    assert browser.calls == 1
+    assert fetcher._promoted is False
 
 
 async def test_fragment_fallback_uses_category_referer_and_fails_closed_on_captcha() -> None:

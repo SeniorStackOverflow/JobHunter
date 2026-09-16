@@ -137,6 +137,11 @@ class FallbackFetcher:
                 )
             if action == "block":
                 raise RabotaMdDegradedError("Rabota.md browser fallback encountered a WAF block")
+            if response.status_code == 403 and not action:
+                raise RabotaMdDegradedError(
+                    "Rabota.md browser fallback access rejected "
+                    "(HTTP 403 without WAF action)"
+                )
         except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
             raise RabotaMdDegradedError(
                 f"Rabota.md browser fallback failed ({type(exc).__name__}) for {url}"

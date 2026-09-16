@@ -222,6 +222,8 @@ class StealthBrowserTokenMinterBackend:
                     )
                 if action == "block":
                     raise WafBlocked("browser token minter encountered WAF block")
+                if response.status_code == 403 and not action:
+                    raise WafSolveFailed("browser token minter received bare HTTP 403")
                 cookie = None
                 for _ in range(6):
                     cookie = await self._browser.find_cookie(
