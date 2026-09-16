@@ -201,6 +201,7 @@ class AwsWafSolver:
         max_redirects: int = 3,
         resolver: Resolver | None = None,
         rate_limiter: AsyncRateLimiter | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self._timeout = timeout_seconds
         self._pow_budget = pow_budget_seconds
@@ -211,11 +212,22 @@ class AwsWafSolver:
         self._max_redirects = max_redirects
         self._resolver = resolver
         self._rate_limiter = rate_limiter
+        self._proxy_url = proxy_url
         self.last_script_hash: str | None = None
 
     async def solve(self, site: str, user_agent: str) -> str:
         site = site.rstrip("/")
         _require_allowed_url(site)
+        proxy_transport = (
+            httpx.AsyncHTTPTransport(
+                proxy=self._proxy_url,
+                trust_env=False,
+                retries=0,
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=0),
+            )
+            if self._client is None and self._proxy_url is not None
+            else None
+        )
         client = self._client or SecureHttpClient(
             allowed_domains=(
                 "rabota.md",
@@ -229,6 +241,8 @@ class AwsWafSolver:
             timeout_seconds=self._timeout,
             max_redirects=self._max_redirects,
             resolver=self._resolver,
+            transport=proxy_transport,
+            pin_resolved_addresses=False if self._proxy_url else None,
             rate_limiter=self._rate_limiter,
         )
         try:

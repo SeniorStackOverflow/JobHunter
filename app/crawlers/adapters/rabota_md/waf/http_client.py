@@ -1,11 +1,9 @@
-"""waf_http transport: plain-HTTP Rabota.md fetcher authenticated by aws-waf-token.
+"""waf_http transport: HTTP Rabota.md fetcher with lazy aws-waf-token use.
 
-Implements the WafHttpClient design from docs/sources/rabota-md-http.md.
-Challenge detection uses only the 202 status and the ``x-amzn-waf-action``
-header — the 202 body is empty unless browser Accept headers are sent, so it
-must never be inspected (spike finding 2026-09-12, doc п. 7). A bare 403
-without the action header means token rejection (UA/IP binding), so it goes
-through the same invalidate-refresh-retry path (incident 2026-09-15).
+A WAF token is not minted pre-emptively. Trusted/residential egresses may receive a
+normal 200 without any challenge at all, while challenged egresses mint a token only
+after an authoritative AWS WAF challenge/bare token rejection. This also keeps WAF
+state scoped to the egress that actually needs it.
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ _TOKEN_COOKIE = "aws-waf-token"  # noqa: S105 - cookie name, not a secret
 
 
 def _ajax_headers(referer: str) -> dict[str, str]:
-    """Canonical browser header set required by the pagination POST (recon п. 6)."""
+    """Canonical browser header set required by the pagination POST."""
     parsed = urlsplit(referer)
     origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     return {
@@ -67,14 +65,11 @@ class WafHttpClient:
     async def get(self, url: str) -> httpx.Response:
         return await self._request_with_token("GET", url)
 
-    async def post_html_fragment(
-        self, url: str, *, referer: str | None = None
-    ) -> httpx.Response:
+    async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:
         response = await self._request_with_token(
             "POST", url, extra_headers=_ajax_headers(referer or _category_referer(url))
         )
         if response.status_code == 403:
-            # Canonical headers were used by construction: the POST contract broke.
             raise WafPostContractError(f"Rabota.md AJAX pagination rejected POST {url}")
         if response.status_code != 200:
             return response
@@ -99,16 +94,39 @@ class WafHttpClient:
     async def _request_with_token(
         self, method: str, url: str, extra_headers: dict[str, str] | None = None
     ) -> httpx.Response:
-        response = await self._send(method, url, extra_headers)
-        response = await self._retry_rate_limit(method, url, extra_headers, response)
+        # Reuse a token only within this egress namespace, but never mint one before
+        # the site asks for it. A14 normally receives plain 200 responses.
+        token = await self._tokens.get_token()
+        response = await self._send(method, url, extra_headers, token=token)
+        response = await self._retry_rate_limit(
+            method, url, extra_headers, response, token=token
+        )
         if not self._is_challenge(response) and not self._is_token_rejection(response):
             self._reject_terminal_waf(response)
             return response
-        # Stale/missing/rejected token: invalidate, single-flight refresh, one retry.
+
+        # A mobile/residential egress can change its public IP while the proxy endpoint
+        # stays stable. In that case an old IP-bound cookie may itself trigger a bare
+        # 403 even though the new egress works perfectly without a token. Drop the stale
+        # cookie and give the same identity one clean request before invoking a solver.
+        if token is not None and self._is_token_rejection(response):
+            await self._tokens.invalidate()
+            response = await self._send(method, url, extra_headers, token=None)
+            response = await self._retry_rate_limit(
+                method, url, extra_headers, response, token=None
+            )
+            if not self._is_challenge(response) and not self._is_token_rejection(response):
+                self._reject_terminal_waf(response)
+                return response
+
+        # The same egress genuinely needs WAF state. Mint exactly once through this
+        # network identity, then retry with that token.
         await self._tokens.invalidate()
-        await self._tokens.refresh_token()
-        response = await self._send(method, url, extra_headers)
-        response = await self._retry_rate_limit(method, url, extra_headers, response)
+        fresh_token = await self._tokens.refresh_token()
+        response = await self._send(method, url, extra_headers, token=fresh_token)
+        response = await self._retry_rate_limit(
+            method, url, extra_headers, response, token=fresh_token
+        )
         if self._is_challenge(response):
             raise WafChallengeRequired(f"AWS WAF challenge persists after token refresh: {url}")
         if self._is_token_rejection(response):
@@ -117,13 +135,19 @@ class WafHttpClient:
         return response
 
     async def _send(
-        self, method: str, url: str, extra_headers: dict[str, str] | None
+        self,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str] | None,
+        *,
+        token: str | None,
     ) -> httpx.Response:
-        token = await self._tokens.get_token() or await self._tokens.refresh_token()
-        headers = {**(extra_headers or {}), "cookie": f"{_TOKEN_COOKIE}={token}"}
+        headers = dict(extra_headers or {})
+        if token is not None:
+            headers["cookie"] = f"{_TOKEN_COOKIE}={token}"
         if method == "POST":
             return await self._client.post_bounded(url, content="", headers=headers)
-        return await self._client.get(url, headers=headers)
+        return await self._client.get(url, headers=headers or None)
 
     async def _retry_rate_limit(
         self,
@@ -131,6 +155,8 @@ class WafHttpClient:
         url: str,
         extra_headers: dict[str, str] | None,
         response: httpx.Response,
+        *,
+        token: str | None,
     ) -> httpx.Response:
         if response.status_code != 429:
             return response
@@ -140,7 +166,7 @@ class WafHttpClient:
         except ValueError:
             delay = 5.0
         await asyncio.sleep(delay)
-        return await self._send(method, url, extra_headers)
+        return await self._send(method, url, extra_headers, token=token)
 
     @staticmethod
     def _is_challenge(response: httpx.Response) -> bool:
@@ -154,12 +180,11 @@ class WafHttpClient:
 
     @staticmethod
     def _is_token_rejection(response: httpx.Response) -> bool:
-        """Bare 403 without a WAF action header: the token was rejected.
+        """Bare 403 can be stale-token rejection or egress rejection.
 
-        AWS WAF answers token/UA-binding violations with an unmarked ELB 403
-        (incident 2026-09-15). It is not fail-closed: a fresh token may pass.
-        A genuine hard block carries the explicit ``block`` action header and
-        is handled by ``_reject_terminal_waf``.
+        A single token refresh is allowed. If the egress itself is rejected, token
+        backends/browser will fail on that same egress and the proxy-pool layer can
+        rotate the whole session. Explicit CAPTCHA/block actions never reach rotation.
         """
         return response.status_code == 403 and not response.headers.get(AWS_WAF_ACTION_HEADER)
 
@@ -167,8 +192,6 @@ class WafHttpClient:
     def _reject_terminal_waf(response: httpx.Response) -> None:
         if response.status_code == 429:
             raise WafRateLimited("Rabota.md rate limited the request")
-        # AWS WAF action headers are authoritative regardless of HTTP status.
-        # Rabota.md has returned CAPTCHA as HTTP 405 in production.
         action = response.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
         if action == "captcha":
             raise WafCaptchaRequired("Rabota.md requested a CAPTCHA; fail-closed by policy")

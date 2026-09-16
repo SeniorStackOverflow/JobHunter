@@ -125,6 +125,16 @@ class Settings(BaseSettings):
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
     crawler_user_agent: str = "job-agent/0.1 (+operator contact configured by deployment)"
+    rabota_proxy_pool_enabled: bool = False
+    rabota_proxy_primary_url: SecretStr | None = None
+    rabota_proxy_free_fallback_enabled: bool = True
+    rabota_proxy_discovery_batch: int = Field(default=240, ge=20, le=1000)
+    rabota_proxy_validation_concurrency: int = Field(default=24, ge=1, le=64)
+    rabota_proxy_validation_timeout_seconds: float = Field(default=8.0, ge=2.0, le=30.0)
+    rabota_proxy_ban_cooldown_seconds: int = Field(default=21600, ge=60, le=86400)
+    rabota_proxy_dead_cooldown_seconds: int = Field(default=3600, ge=60, le=86400)
+    rabota_proxy_primary_dead_cooldown_seconds: int = Field(default=300, ge=10, le=3600)
+    rabota_proxy_max_failovers: int = Field(default=4, ge=0, le=12)
     crawler_min_mem_available_mb: int = Field(default=700, ge=128, le=16_384)
     crawler_memory_retry_seconds: int = Field(default=900, ge=60, le=86_400)
     crawler_browser_resume_backoff_seconds: int = Field(default=900, ge=60, le=86_400)
@@ -188,6 +198,7 @@ class Settings(BaseSettings):
         "llmrouter_api_key",
         "phonegate_auth_token",
         "phone_summary_llm_api_key",
+        "rabota_proxy_primary_url",
         "telegram_bot_token",
         mode="before",
     )
@@ -197,6 +208,30 @@ class Settings(BaseSettings):
             return None
         raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
         return None if not raw.strip() else value
+
+    @field_validator("rabota_proxy_primary_url")
+    @classmethod
+    def validate_rabota_proxy_primary_url(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value()
+        try:
+            parts = urlsplit(raw)
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("RABOTA_PROXY_PRIMARY_URL must be a valid proxy URL") from exc
+        if (
+            parts.scheme not in {"http", "https", "socks5", "socks5h"}
+            or not parts.hostname
+            or port is None
+            or parts.query
+            or parts.fragment
+            or parts.path not in {"", "/"}
+        ):
+            raise ValueError(
+                "RABOTA_PROXY_PRIMARY_URL must be an http(s)/socks5 URL with an explicit port"
+            )
+        return value
 
     @field_validator("phonegate_auth_token_file", mode="before")
     @classmethod
@@ -255,6 +290,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_secure_production(self) -> Settings:
+        if (
+            self.rabota_proxy_pool_enabled
+            and self.rabota_proxy_primary_url is None
+            and not self.rabota_proxy_free_fallback_enabled
+        ):
+            raise ValueError("Rabota proxy pool requires a primary URL or free fallback")
         token_file = self.phonegate_auth_token_file
         if token_file is not None:
             if self.phonegate_auth_token is not None:

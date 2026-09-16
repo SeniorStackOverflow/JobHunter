@@ -16,8 +16,9 @@ import httpx
 import structlog
 
 from app.crawlers.adapters.rabota_md.errors import (
-    RabotaMdDegradedError,
+    RabotaMdEgressError,
     RabotaMdTemporaryError,
+    RabotaMdWafFailClosedError,
 )
 from app.crawlers.adapters.rabota_md.fetcher import RabotaMdFetcher
 from app.crawlers.adapters.rabota_md.waf.errors import (
@@ -98,11 +99,12 @@ class FallbackFetcher:
             self._record_transport("http")
             return response
         except WafRateLimited as exc:
+            # A target-side rate limit is not an excuse to rotate identity.
             raise RabotaMdTemporaryError(
                 f"Rabota.md remained rate-limited after backoff for {url}"
             ) from exc
         except _FAIL_CLOSED as exc:
-            raise RabotaMdDegradedError(
+            raise RabotaMdWafFailClosedError(
                 f"Rabota.md WAF fail-closed ({type(exc).__name__}) for {url}"
             ) from exc
         except _PROMOTION_ALLOWED as exc:
@@ -112,11 +114,11 @@ class FallbackFetcher:
                     if isinstance(exc, WafSolveFailed)
                     else f"waf_http degraded ({type(exc).__name__})"
                 )
-                raise RabotaMdDegradedError(
+                raise RabotaMdEgressError(
                     f"Rabota.md {detail} without browser fallback for {url}"
                 ) from exc
             if self._switches >= self._max_switches:
-                raise RabotaMdDegradedError(
+                raise RabotaMdEgressError(
                     f"Rabota.md exceeded {self._max_switches} transport promotions per scan"
                 ) from exc
             return await self._browser_request(url, call, cause=exc)
@@ -132,18 +134,24 @@ class FallbackFetcher:
             response = await call(self._fallback)
             action = response.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
             if action == "captcha":
-                raise RabotaMdDegradedError(
+                raise RabotaMdWafFailClosedError(
                     "Rabota.md browser fallback encountered CAPTCHA; fail-closed"
                 )
             if action == "block":
-                raise RabotaMdDegradedError("Rabota.md browser fallback encountered a WAF block")
-            if response.status_code == 403 and not action:
-                raise RabotaMdDegradedError(
-                    "Rabota.md browser fallback access rejected "
-                    "(HTTP 403 without WAF action)"
+                raise RabotaMdWafFailClosedError(
+                    "Rabota.md browser fallback encountered a WAF block"
                 )
+            if response.status_code == 403 and not action:
+                raise RabotaMdEgressError(
+                    "Rabota.md browser fallback access rejected (HTTP 403 without WAF action)",
+                    access_rejected=True,
+                )
+        except RabotaMdWafFailClosedError:
+            raise
+        except RabotaMdEgressError:
+            raise
         except (BrowserFallbackUnavailable, BrowserNavigationError) as exc:
-            raise RabotaMdDegradedError(
+            raise RabotaMdEgressError(
                 f"Rabota.md browser fallback failed ({type(exc).__name__}) for {url}"
             ) from exc
 

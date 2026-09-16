@@ -67,6 +67,20 @@ RABOTA_TRANSPORT_FALLBACK = Counter(
     "In-scan switches from waf_http to the stealth browser.",
     ("reason",),
 )
+RABOTA_PROXY_EGRESS = Counter(
+    "job_agent_rabota_md_proxy_egress_total",
+    "Rabota.md proxy egress selection and health outcomes.",
+    ("kind", "outcome"),
+)
+RABOTA_PROXY_FAILOVER = Counter(
+    "job_agent_rabota_md_proxy_failover_total",
+    "Rabota.md egress failovers by previous egress kind and bounded reason.",
+    ("from_kind", "reason"),
+)
+RABOTA_PROXY_POOL_ALIVE = Gauge(
+    "job_agent_rabota_md_proxy_pool_alive",
+    "Currently usable validated free proxy egress endpoints.",
+)
 WAF_SOLVER_ATTEMPTS = Counter(
     "job_agent_waf_solver_attempts_total",
     "Pure-Python AWS WAF solver attempts.",
@@ -111,6 +125,9 @@ __all__ = [
     "HTTP_REQUESTS",
     "HTTP_REQUEST_DURATION",
     "RABOTA_HTTP_WITHOUT_BROWSER_RATIO",
+    "RABOTA_PROXY_EGRESS",
+    "RABOTA_PROXY_FAILOVER",
+    "RABOTA_PROXY_POOL_ALIVE",
     "RABOTA_TRANSPORT_FALLBACK",
     "RABOTA_TRANSPORT_REQUESTS",
     "RABOTA_WAF_CHALLENGE",

@@ -913,6 +913,47 @@ async def _rabota_md_waf_pagination_probe(
         await fetcher.aclose()
 
 
+async def _rabota_md_proxy_pool_probe(source: JobSource, *, user_agent: str) -> None:
+    """Probe the same GET + AJAX POST path used by scans through the configured egress pool."""
+    from app.crawlers.adapters.rabota_md.transport import build_waf_fetcher
+
+    configured = source.configuration.get("source", source.configuration)
+    raw = configured if isinstance(configured, dict) else {}
+    incremental = raw.get("incremental_scan")
+    incremental = incremental if isinstance(incremental, dict) else {}
+    slugs = incremental.get("category_slugs")
+    slugs = [slug for slug in slugs if isinstance(slug, str)] if isinstance(slugs, list) else []
+    slug = "operating" if "operating" in slugs else (slugs[0] if slugs else "others")
+    locales = raw.get("locale_priority")
+    locales = (
+        [item for item in locales if isinstance(item, str)] if isinstance(locales, list) else []
+    )
+    locale = locales[0] if locales else "ru"
+    base_url = source.base_url.rstrip("/")
+    referer = f"{base_url}/{locale}/vacancies/category/{slug}"
+    page_url = f"{referer}/2"
+
+    fetcher = build_waf_fetcher(
+        base_url=base_url,
+        user_agent=user_agent,
+        requests_per_minute=int(raw.get("requests_per_minute", min(source.rate_limit, 60))),
+        minimum_interval_seconds=float(raw.get("minimum_interval_seconds", 1.2)),
+        timeout_seconds=float(raw.get("timeout_seconds", 30.0)),
+        max_redirects=int(raw.get("max_redirects", 3)),
+        fallback_transport=str(raw.get("fallback_transport", "stealth_browser")),
+        browser_max_navigations_per_page=int(raw.get("browser_max_navigations_per_page", 50)),
+    )
+    try:
+        landing = await fetcher.get(f"{base_url}/{locale}/")
+        if landing.status_code != 200:
+            raise RuntimeError(f"proxy landing probe returned HTTP {landing.status_code}")
+        pagination = await fetcher.post_html_fragment(page_url, referer=referer)
+        if pagination.status_code != 200:
+            raise RuntimeError(f"proxy pagination probe returned HTTP {pagination.status_code}")
+    finally:
+        await fetcher.aclose()
+
+
 async def _rabota_md_waf_canary() -> dict[str, str]:
     from redis.asyncio import Redis as AsyncRedis
 
@@ -935,7 +976,26 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
         else get_settings().crawler_user_agent
     )
 
-    redis = AsyncRedis.from_url(get_settings().redis_url)
+    settings = get_settings()
+    if settings.rabota_proxy_pool_enabled:
+        try:
+            await _rabota_md_proxy_pool_probe(source, user_agent=user_agent)
+        except Exception as exc:
+            WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            logger.warning(
+                "rabota_md_proxy_pool_canary_failed",
+                error_type=type(exc).__name__,
+            )
+            return {
+                "outcome": "failure",
+                "mode": "proxy_pool",
+                "error_type": type(exc).__name__,
+            }
+        WAF_SOLVER_CANARY.labels(outcome="success").inc()
+        logger.info("rabota_md_proxy_pool_canary_ok")
+        return {"outcome": "success", "mode": "proxy_pool"}
+
+    redis = AsyncRedis.from_url(settings.redis_url)
     try:
         watchdog = ScriptWatchdog(redis)
         solver = AwsWafSolver(script_hash_checker=lambda _digest: True)

@@ -5,6 +5,7 @@ import pytest
 
 from app.crawlers.adapters.rabota_md.errors import (
     RabotaMdDegradedError,
+    RabotaMdEgressError,
     RabotaMdTemporaryError,
 )
 from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
@@ -107,8 +108,32 @@ async def test_get_plain_200() -> None:
     client = make_transport(handler, provider)
     response = await client.get(f"{BASE}/ru/vacancies")
     assert response.status_code == 200
-    assert seen_headers[0].get("cookie") == "aws-waf-token=token-1"
-    assert backend.count == 1
+    assert seen_headers[0].get("cookie") is None
+    assert backend.count == 0
+
+
+async def test_stale_cached_token_retries_without_cookie_before_minting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cookie = request.headers.get("cookie", "")
+        calls.append(cookie)
+        if cookie == "aws-waf-token=old-token":
+            return httpx.Response(403)
+        if not cookie:
+            return httpx.Response(200, text="<html>new egress works</html>")
+        raise AssertionError("solver should not mint when the new egress works without a token")
+
+    redis = FakeRedis()
+    provider, backend = make_provider(redis)
+    await provider.publish_token(MintedWafToken("old-token"))
+    client = make_transport(handler, provider)
+
+    response = await client.get(f"{BASE}/ru/vacancies")
+
+    assert response.status_code == 200
+    assert calls == ["aws-waf-token=old-token", ""]
+    assert backend.count == 0
 
 
 async def test_get_challenge_triggers_refresh_and_retry() -> None:
@@ -117,7 +142,7 @@ async def test_get_challenge_triggers_refresh_and_retry() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         cookie = request.headers.get("cookie", "")
         calls.append(cookie)
-        if cookie == "aws-waf-token=token-1":
+        if not cookie:
             return httpx.Response(202, headers=CHALLENGE_HEADERS)
         return httpx.Response(200, text="<html>ok</html>")
 
@@ -125,8 +150,8 @@ async def test_get_challenge_triggers_refresh_and_retry() -> None:
     client = make_transport(handler, provider)
     response = await client.get(f"{BASE}/ru/vacancies")
     assert response.status_code == 200
-    assert backend.count == 2  # initial mint + refresh after 202
-    assert calls == ["aws-waf-token=token-1", "aws-waf-token=token-2"]
+    assert backend.count == 1
+    assert calls == ["", "aws-waf-token=token-1"]
 
 
 async def test_get_persistent_challenge_raises() -> None:
@@ -202,12 +227,12 @@ async def test_post_html_fragment_success() -> None:
     assert request.method == "POST"
     assert request.headers["x-requested-with"] == "XMLHttpRequest"
     assert request.headers["referer"] == f"{BASE}/ru/vacancies/category/it"
-    assert request.headers["cookie"].startswith("aws-waf-token=")
+    assert request.headers.get("cookie") is None
 
 
 async def test_post_html_fragment_bare_403_recovers_with_fresh_token() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.headers.get("cookie") == "aws-waf-token=token-1":
+        if request.headers.get("cookie") is None:
             return httpx.Response(403)
         return httpx.Response(
             200,
@@ -218,7 +243,7 @@ async def test_post_html_fragment_bare_403_recovers_with_fresh_token() -> None:
     client = make_transport(handler, provider)
     response = await client.post_html_fragment(f"{BASE}/ru/vacancies/category/it/2")
     assert response.status_code == 200
-    assert backend.count == 2  # initial mint + refresh after bare 403
+    assert backend.count == 1
 
 
 async def test_post_html_fragment_persistent_bare_403_is_challenge_required() -> None:
@@ -233,7 +258,7 @@ async def test_post_html_fragment_persistent_bare_403_is_challenge_required() ->
 
 async def test_get_bare_403_triggers_refresh_and_retry() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.headers.get("cookie") == "aws-waf-token=token-1":
+        if request.headers.get("cookie") is None:
             return httpx.Response(403)
         return httpx.Response(200, text="<html>ok</html>")
 
@@ -241,7 +266,7 @@ async def test_get_bare_403_triggers_refresh_and_retry() -> None:
     client = make_transport(handler, provider)
     response = await client.get(f"{BASE}/ru/vacancies")
     assert response.status_code == 200
-    assert backend.count == 2
+    assert backend.count == 1
 
 
 async def test_403_with_block_action_header_is_fail_closed() -> None:
@@ -252,7 +277,7 @@ async def test_403_with_block_action_header_is_fail_closed() -> None:
     client = make_transport(handler, provider)
     with pytest.raises(WafBlocked):
         await client.get(f"{BASE}/ru/vacancies")
-    assert backend.count == 1  # no token refresh for an explicit block
+    assert backend.count == 0
 
 
 async def test_post_html_fragment_bad_payload_is_contract_error() -> None:
@@ -398,7 +423,7 @@ async def test_browser_fallback_bare_403_is_access_rejected() -> None:
     fetcher, _, browser, _ = make_fallback(
         WafSolveFailed("backends exhausted"), browser_status_code=403
     )
-    with pytest.raises(RabotaMdDegradedError, match="access rejected"):
+    with pytest.raises(RabotaMdEgressError, match="access rejected"):
         await fetcher.get(f"{BASE}/ru/vacancies")
     assert browser.calls == 1
     assert fetcher._promoted is False
@@ -445,14 +470,14 @@ async def test_fallback_without_browser_degrades() -> None:
     redis = FakeRedis()
     provider = WafTokenProvider(redis, [RotatingBackend()])  # type: ignore[arg-type]
     fetcher = FallbackFetcher(StubPrimary(WafChallengeRequired("202")), None, provider)
-    with pytest.raises(RabotaMdDegradedError):
+    with pytest.raises(RabotaMdEgressError):
         await fetcher.get(f"{BASE}/ru/vacancies")
 
 
 async def test_fallback_switch_budget() -> None:
     fetcher, _, _browser, _ = make_fallback(WafChallengeRequired("202"))
     fetcher._switches = fetcher._max_switches
-    with pytest.raises(RabotaMdDegradedError, match="transport promotions"):
+    with pytest.raises(RabotaMdEgressError, match="transport promotions"):
         await fetcher.get(f"{BASE}/ru/vacancies")
 
 
