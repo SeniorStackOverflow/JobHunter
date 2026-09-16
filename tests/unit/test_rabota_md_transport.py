@@ -9,6 +9,7 @@ from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
 from app.crawlers.adapters.rabota_md.transport import (
     WAF_SOLVER_USER_AGENT,
     build_waf_fetcher,
+    default_waf_browser_user_agent,
     effective_waf_user_agent,
 )
 from app.crawlers.adapters.rabota_md.waf.http_client import WafHttpClient
@@ -126,6 +127,16 @@ def test_build_waf_fetcher_with_browser_fallback() -> None:
         fallback_transport="stealth_browser",
     )
     assert isinstance(fetcher, FallbackFetcher)
+
+
+def test_default_waf_browser_user_agent_tracks_bundled_chromium(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.transport._bundled_chromium_version",
+        lambda: "151.0.7922.34",
+    )
+    assert "Chrome/151.0.7922.34" in default_waf_browser_user_agent()
 
 
 def test_effective_waf_user_agent_passthrough_for_browser_ua() -> None:

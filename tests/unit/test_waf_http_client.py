@@ -304,7 +304,9 @@ class StubBrowser:
     async def get(self, url: str) -> httpx.Response:
         self.calls += 1
         headers = {"x-amzn-waf-action": self.waf_action} if self.waf_action else {}
-        status = self.status_code if self.status_code is not None else (202 if self.waf_action else 200)
+        status = (
+            self.status_code if self.status_code is not None else (202 if self.waf_action else 200)
+        )
         return httpx.Response(status, text="browser", headers=headers)
 
     async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:

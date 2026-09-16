@@ -8,6 +8,9 @@ when the browser fallback is enabled.
 
 from __future__ import annotations
 
+import json
+from importlib import resources
+
 from redis.asyncio import Redis as AsyncRedis
 
 from app.crawlers.adapters.rabota_md.fallback import FallbackFetcher
@@ -31,10 +34,37 @@ from app.settings import get_settings
 # rabota.md binds the aws-waf-token to the User-Agent of the minting session:
 # requests with any other UA get a bare 403 on paginated paths. Token minting
 # and every crawl request must therefore share one browser-shaped UA.
-WAF_SOLVER_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
-)
+_FALLBACK_WAF_BROWSER_VERSION = "136.0.0.0"
+
+
+def _bundled_chromium_version() -> str | None:
+    try:
+        data = json.loads(
+            resources.files("playwright")
+            .joinpath("driver/package/browsers.json")
+            .read_text(encoding="utf-8")
+        )
+    except (ModuleNotFoundError, FileNotFoundError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for browser in data.get("browsers", []):
+        if isinstance(browser, dict) and browser.get("name") == "chromium":
+            version = browser.get("browserVersion")
+            if isinstance(version, str) and version:
+                return version
+    return None
+
+
+def default_waf_browser_user_agent() -> str:
+    version = _bundled_chromium_version() or _FALLBACK_WAF_BROWSER_VERSION
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{version} Safari/537.36"
+    )
+
+
+WAF_SOLVER_USER_AGENT = default_waf_browser_user_agent()
 
 
 def effective_waf_user_agent(user_agent: str) -> str:
