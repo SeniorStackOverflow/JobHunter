@@ -304,3 +304,20 @@ async def test_sms_history_preserves_existing_error_classification() -> None:
     ) as client:
         with pytest.raises(PhoneGateUnavailable):
             await client.sms_history()
+
+
+@pytest.mark.asyncio
+async def test_transcript_accepts_tx_null_utterance_end_and_keeps_valid_rows() -> None:
+    fake = FakePhoneGate()
+    fake.ring("+37360111222")
+    async with PhoneGateClient(
+        base_url="http://pg", token="t", transport=fake.transport()
+    ) as client:
+        await client.answer()
+        await client.speak("Здравствуйте")
+        fake.transcript(speaker="rx", text="Да")
+        fake._transcripts.append({"id": 2, "speaker": "rx"})
+        page = await client.transcript(after_id=0)
+    assert [entry.speaker for entry in page.entries] == ["tx", "rx"]
+    assert page.entries[0].utterance_end_ms == 0
+    assert page.latest_id == 2

@@ -13,6 +13,7 @@ from app.phone.schemas import (
     EventsPage,
     PhoneEvent,
     PhoneSmsPage,
+    TranscriptEntry,
     TranscriptPage,
 )
 
@@ -138,9 +139,27 @@ class PhoneGateClient:
 
     async def transcript(self, *, after_id: int = 0, limit: int = 250) -> TranscriptPage:
         data = await self._get("/api/call/transcript", {"after_id": after_id, "limit": limit})
+        raw_entries = data.get("entries") or []
+        if not isinstance(raw_entries, list):
+            raise PhoneGateError("/api/call/transcript: entries is not a list")
+        parsed: list[TranscriptEntry] = []
+        for raw in raw_entries:
+            try:
+                parsed.append(TranscriptEntry.model_validate(raw))
+            except ValidationError:
+                logger.warning(
+                    "phone_transcript_entry_malformed",
+                    raw_id=raw.get("id") if isinstance(raw, dict) else None,
+                    raw_speaker=raw.get("speaker") if isinstance(raw, dict) else None,
+                )
         try:
-            return TranscriptPage.model_validate(data)
-        except ValidationError as exc:
+            return TranscriptPage(
+                entries=parsed,
+                latest_id=int(data["latest_id"]),
+                call_state=str(data.get("call_state") or "IDLE"),
+                caller_number=str(data.get("caller_number") or ""),
+            )
+        except (ValidationError, KeyError, TypeError, ValueError) as exc:
             raise PhoneGateError("/api/call/transcript: unexpected response schema") from exc
 
     async def sms_history(self, *, limit: int = 200, number: str | None = None) -> PhoneSmsPage:

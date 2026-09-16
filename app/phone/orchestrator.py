@@ -23,7 +23,7 @@ from app.phone.critical import (
 from app.phone.evidence import EvidenceCapturer
 from app.phone.numbers import mask_phone, normalize_e164
 from app.phone.policy import should_answer
-from app.phone.schemas import DeviceStatus
+from app.phone.schemas import DeviceStatus, TranscriptEntry, TranscriptPage
 from app.phone.script import (
     SCRIPT_CLOSING_INTERRUPTED,
     SCRIPT_CLOSING_NO_RESPONSE,
@@ -59,6 +59,14 @@ CALL_CMD_KEY = "job-agent:phone:call:cmd"
 # How long a fresh ``/speak`` has to make TX activate before the turn is judged a
 # non-delivery. Kept well above a realistic Piper+downlink startup.
 _TX_START_GRACE = 1.5
+_POLL_FAILURE_LIMIT = 3
+
+
+class _PhonePollError(Exception):
+    def __init__(self, endpoint: str, cause: PhoneGateUnavailable | PhoneGateError) -> None:
+        super().__init__(endpoint)
+        self.endpoint = endpoint
+        self.cause = cause
 
 
 class CallOrchestrator:
@@ -180,6 +188,7 @@ class CallOrchestrator:
         # mistake an old employer line for a new one (and capture its audio
         # under the current session).
         seen_transcript_id = await self._latest_transcript_cursor()
+        self._last_tx_transcript_id = max(self._last_tx_transcript_id, seen_transcript_id)
 
         async with self._sf() as db:
             call = await db.get(CommunicationSession, session_id)
@@ -201,6 +210,7 @@ class CallOrchestrator:
         if outcome == "ended":
             await self._finish_remote_end("intro_tts")
             return "remote_ended"
+        seen_transcript_id = max(seen_transcript_id, self._last_tx_transcript_id)
 
         await self._set_stage("waiting_first_response")
         (
@@ -225,6 +235,7 @@ class CallOrchestrator:
             if outcome == "ended":
                 await self._finish_remote_end("retry_tts")
                 return "remote_ended"
+            seen_transcript_id = max(seen_transcript_id, self._last_tx_transcript_id)
             wait_state, seen_transcript_id, retry_rx = await self._wait_for_employer_response(
                 seen_transcript_id,
                 wait_seconds=s.phone_first_response_retry_timeout_seconds,
@@ -260,10 +271,12 @@ class CallOrchestrator:
             if outcome == "ended":
                 await self._finish_remote_end("details_tts")
                 return "remote_ended"
+            seen_transcript_id = max(seen_transcript_id, self._last_tx_transcript_id)
 
         # LISTENING ---------------------------------------------------
         await self._set_stage("listening")
         last_activity = time.monotonic()
+        consecutive_poll_failures = 0
         while True:
             cmd = await self._cmd()
             terminal = await self._dispatch_command(session_id, cmd)
@@ -276,12 +289,29 @@ class CallOrchestrator:
                 await self._mark_mute_requested(session_id)
 
             try:
-                status = await self._client.device_status()
-                page = await self._client.transcript(after_id=seen_transcript_id, limit=250)
-            except (PhoneGateUnavailable, PhoneGateError) as exc:
-                logger.warning("phone_orchestrator_listen_poll_failed")
-                await self._finish_error("listen_poll_error", error_type=type(exc).__name__)
-                return "aborted_error"
+                status, page = await self._poll_phonegate(seen_transcript_id)
+            except _PhonePollError as exc:
+                consecutive_poll_failures += 1
+                logger.warning(
+                    "phone_orchestrator_listen_poll_failed",
+                    endpoint=exc.endpoint,
+                    error=type(exc.cause).__name__,
+                    consecutive_failures=consecutive_poll_failures,
+                )
+                if consecutive_poll_failures >= _POLL_FAILURE_LIMIT:
+                    await self._finish_error(
+                        "listen_poll_error",
+                        error_type=type(exc.cause).__name__,
+                        endpoint=exc.endpoint,
+                        consecutive_failures=consecutive_poll_failures,
+                    )
+                    return "aborted_error"
+                if time.monotonic() - answer_start >= s.phone_call_hard_cap_seconds:
+                    await self._finish_error("hard_cap_listen_poll")
+                    return "aborted_error"
+                await asyncio.sleep(self._poll_retry_delay(consecutive_poll_failures))
+                continue
+            consecutive_poll_failures = 0
 
             if status.call_state != "IN_CALL":
                 await self._finish_remote_end("listening")
@@ -290,9 +320,9 @@ class CallOrchestrator:
             now = time.monotonic()
             if self._observe_rx_processing(status):
                 last_activity = now
+            seen_transcript_id = self._advance_transcript_cursor(seen_transcript_id, page)
             if page.entries:
-                seen_transcript_id = max(seen_transcript_id, max(e.id for e in page.entries))
-                rx_entries = [e for e in page.entries if e.speaker == "rx"]
+                rx_entries = self._rx_entries_for_active_call(status, page.entries)
                 if rx_entries:
                     observed_rx_entries.extend(e.text for e in rx_entries)
                     last_activity = now
@@ -350,6 +380,7 @@ class CallOrchestrator:
         started = time.monotonic()
         deadline = started + wait_seconds
         legacy_deadline = started + self._s.phone_legacy_asr_guard_seconds
+        consecutive_poll_failures = 0
         while True:
             cmd = await self._cmd()
             terminal = await self._dispatch_command(self._sid, cmd)
@@ -359,22 +390,36 @@ class CallOrchestrator:
                 await self._mark_mute_requested(self._sid)
 
             try:
-                status = await self._client.device_status()
-                page = await self._client.transcript(after_id=seen_transcript_id, limit=250)
-            except (PhoneGateUnavailable, PhoneGateError) as exc:
-                logger.warning("phone_orchestrator_first_response_poll_failed")
-                await self._finish_error("first_response_poll_error", error_type=type(exc).__name__)
-                return "aborted_error", seen_transcript_id, []
+                status, page = await self._poll_phonegate(seen_transcript_id)
+            except _PhonePollError as exc:
+                consecutive_poll_failures += 1
+                logger.warning(
+                    "phone_orchestrator_first_response_poll_failed",
+                    endpoint=exc.endpoint,
+                    error=type(exc.cause).__name__,
+                    consecutive_failures=consecutive_poll_failures,
+                )
+                if consecutive_poll_failures >= _POLL_FAILURE_LIMIT:
+                    await self._finish_error(
+                        "first_response_poll_error",
+                        error_type=type(exc.cause).__name__,
+                        endpoint=exc.endpoint,
+                        consecutive_failures=consecutive_poll_failures,
+                    )
+                    return "aborted_error", seen_transcript_id, []
+                if time.monotonic() - answer_start >= self._s.phone_call_hard_cap_seconds:
+                    return "hard_cap", seen_transcript_id, []
+                await asyncio.sleep(self._poll_retry_delay(consecutive_poll_failures))
+                continue
+            consecutive_poll_failures = 0
 
             if status.call_state != "IN_CALL":
                 await self._finish_remote_end(remote_phase)
                 return "remote_ended", seen_transcript_id, []
 
+            seen_transcript_id = self._advance_transcript_cursor(seen_transcript_id, page)
             if page.entries:
-                seen_transcript_id = max(
-                    seen_transcript_id, max(entry.id for entry in page.entries)
-                )
-                rx_entries = [entry for entry in page.entries if entry.speaker == "rx"]
+                rx_entries = self._rx_entries_for_active_call(status, page.entries)
                 if rx_entries:
                     try:
                         await self._evidence.maybe_capture(rx_entries)
@@ -400,6 +445,48 @@ class CallOrchestrator:
                     continue
                 return "timeout", seen_transcript_id, []
             await asyncio.sleep(self._s.phone_orchestrator_poll_seconds)
+
+    async def _poll_phonegate(
+        self, seen_transcript_id: int
+    ) -> tuple[DeviceStatus, TranscriptPage]:
+        try:
+            status = await self._client.device_status()
+        except (PhoneGateUnavailable, PhoneGateError) as exc:
+            raise _PhonePollError("device_status", exc) from exc
+        try:
+            page = await self._client.transcript(after_id=seen_transcript_id, limit=250)
+        except (PhoneGateUnavailable, PhoneGateError) as exc:
+            raise _PhonePollError("transcript", exc) from exc
+        return status, page
+
+    def _poll_retry_delay(self, failure_count: int) -> float:
+        return min(
+            1.0,
+            self._s.phone_orchestrator_poll_seconds * (2 ** max(0, failure_count - 1)),
+        )
+
+    @staticmethod
+    def _advance_transcript_cursor(current: int, page: TranscriptPage) -> int:
+        return max([current, page.latest_id, *(entry.id for entry in page.entries)])
+
+    @staticmethod
+    def _rx_entries_for_active_call(
+        status: DeviceStatus, entries: list[TranscriptEntry]
+    ) -> list[TranscriptEntry]:
+        rx_entries = [entry for entry in entries if entry.speaker == "rx"]
+        active_call_id = status.current_call.call_id if status.current_call is not None else ""
+        if not active_call_id:
+            return rx_entries
+        matched: list[TranscriptEntry] = []
+        mismatched = 0
+        for entry in rx_entries:
+            if entry.call_id and entry.call_id != active_call_id:
+                mismatched += 1
+                continue
+            matched.append(entry)
+        if mismatched:
+            logger.warning("phone_orchestrator_stale_rx_ignored", count=mismatched)
+        return matched
 
     async def _dispatch_command(self, session_id: UUID, cmd: str | None) -> str | None:
         """Handle an operator command that ends the call. Returns the terminal
@@ -564,7 +651,10 @@ class CallOrchestrator:
                     call.needs_review = True
                 await db.commit()
 
-    async def _finish_error(self, reason: str, *, error_type: str | None = None) -> None:
+    async def _finish_error(
+        self, reason: str, *, error_type: str | None = None, endpoint: str | None = None,
+        consecutive_failures: int | None = None,
+    ) -> None:
         async with self._sf() as db:
             call = await db.get(CommunicationSession, self._sid)
             if call is not None:
@@ -574,6 +664,10 @@ class CallOrchestrator:
                 diagnostics["orchestrator_terminal_reason"] = reason
                 if error_type:
                     diagnostics["orchestrator_error_type"] = error_type
+                if endpoint:
+                    diagnostics["orchestrator_error_endpoint"] = endpoint
+                if consecutive_failures is not None:
+                    diagnostics["orchestrator_error_consecutive_failures"] = consecutive_failures
                 call.diagnostics = diagnostics
                 await db.commit()
 

@@ -113,6 +113,7 @@ async def test_agent_auto_answers_and_runs_the_script(
         fake.ring("+37360111222")
         # let the loop answer + start the greeting, then inject one caller turn
         await asyncio.sleep(0.2)
+        fake.fail_next_transcript_requests(1)
         rx = fake.transcript(speaker="rx", text="Звоню по вакансии грузчика")
         assert rx > 0
 

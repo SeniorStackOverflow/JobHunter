@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _Lenient(BaseModel):
@@ -84,6 +84,11 @@ class TranscriptEntry(_Lenient):
     direction: str = ""
     origin: str = ""
     utterance_end_ms: int = 0
+
+    @field_validator("utterance_end_ms", mode="before")
+    @classmethod
+    def _normalize_missing_utterance_end(cls, value: object) -> object:
+        return 0 if value is None else value
 
 
 class TranscriptPage(_Lenient):

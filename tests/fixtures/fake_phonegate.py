@@ -37,6 +37,7 @@ class FakePhoneGate:
         self._tx_stage = 0  # 0 idle, 1 preparing, 2 active
         self._tx_auto_advance = True
         self._fail_next_speak: str | None = None
+        self._fail_transcript_requests = 0
         self.answered_by_agent = False
         # 0 = old/default behaviour: /api/call/answer flips call_state straight
         # to IN_CALL. A real A14 accepts the answer command immediately but can
@@ -182,6 +183,9 @@ class FakePhoneGate:
     def fail_next_speak(self, *, mode: str) -> None:
         self._fail_next_speak = mode
 
+    def fail_next_transcript_requests(self, count: int = 1) -> None:
+        self._fail_transcript_requests = max(0, int(count))
+
     def set_call_audio(self, wav_bytes: bytes) -> None:
         self._call_audio = wav_bytes
 
@@ -321,6 +325,9 @@ class FakePhoneGate:
     async def _transcript_route(self, request: Request) -> JSONResponse:
         if not self._auth_ok(request):
             return JSONResponse({"detail": "auth"}, status_code=401)
+        if self._fail_transcript_requests > 0:
+            self._fail_transcript_requests -= 1
+            return JSONResponse({"detail": "transient transcript failure"}, status_code=503)
         after_id = int(request.query_params.get("after_id", "0"))
         rows = [t for t in self._transcripts if t["id"] > after_id]
         return JSONResponse(
@@ -371,6 +378,10 @@ class FakePhoneGate:
             "confidence": None,
             "timestamp": "00:00:00",
             "timestamp_ms": int(time.time() * 1000),
+            "call_id": self._call_id,
+            "direction": self._call_direction,
+            "origin": self._call_origin,
+            "utterance_end_ms": None,
         }
         self._transcripts.append(record)
         self._emit("transcript", {"transcript": record})
