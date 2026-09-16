@@ -51,6 +51,7 @@ _CONFIG_SECTION = {
     "full": "full_scan",
 }
 _SOURCE_STATES = tuple(item.value for item in SourceHealth)
+_RABOTA_DEGRADED_RECOVERY_INTERVAL_HOURS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,6 +522,16 @@ def _operation_allowed_for_source(source: SourceSchedule, operation: str) -> boo
     return source.health_status != SourceHealth.DEGRADED or operation == "incremental"
 
 
+def _degraded_recovery_probe_due(source: SourceSchedule, operation: str, now: datetime) -> bool:
+    if (
+        source.adapter_type != "rabota_md"
+        or source.health_status != SourceHealth.DEGRADED
+        or operation != "incremental"
+    ):
+        return True
+    return now.astimezone(UTC).hour % _RABOTA_DEGRADED_RECOVERY_INTERVAL_HOURS == 0
+
+
 def _dispatch_one(
     client: Redis,
     source: SourceSchedule,
@@ -535,6 +546,8 @@ def _dispatch_one(
         return None
     expression = _configured_schedule(source, operation)
     if not cron_expression_is_due(expression, now):
+        return None
+    if not _degraded_recovery_probe_due(source, operation, now):
         return None
     minute_slot = now.astimezone(UTC).strftime("%Y%m%d%H%M")
     reservation = reserve_once(

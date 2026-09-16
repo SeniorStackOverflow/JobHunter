@@ -1,9 +1,11 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.models.enums import SourceHealth
 from app.scheduler.tasks import (
     RecheckPolicy,
     SourceSchedule,
+    _degraded_recovery_probe_due,
     _operation_allowed_for_source,
     _recheck_policy_from_configuration,
 )
@@ -77,3 +79,47 @@ def test_healthy_source_keeps_normal_scheduled_operations() -> None:
     assert _operation_allowed_for_source(source, "incremental") is True
     assert _operation_allowed_for_source(source, "recheck") is True
     assert _operation_allowed_for_source(source, "full") is True
+
+
+def test_degraded_rabota_recovery_probe_is_limited_to_six_hour_slots() -> None:
+    source = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="rabota_md",
+        configuration={},
+        health_status=SourceHealth.DEGRADED,
+        has_successful_full_scan=True,
+    )
+
+    assert (
+        _degraded_recovery_probe_due(
+            source, "incremental", datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
+        )
+        is True
+    )
+    assert (
+        _degraded_recovery_probe_due(
+            source, "incremental", datetime(2026, 9, 16, 13, 0, tzinfo=UTC)
+        )
+        is False
+    )
+
+
+def test_recovery_cooldown_does_not_affect_healthy_or_other_sources() -> None:
+    healthy = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="rabota_md",
+        configuration={},
+        health_status=SourceHealth.HEALTHY,
+        has_successful_full_scan=True,
+    )
+    other = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="generic_html",
+        configuration={},
+        health_status=SourceHealth.DEGRADED,
+        has_successful_full_scan=True,
+    )
+    now = datetime(2026, 9, 16, 13, 0, tzinfo=UTC)
+
+    assert _degraded_recovery_probe_due(healthy, "incremental", now) is True
+    assert _degraded_recovery_probe_due(other, "incremental", now) is True
