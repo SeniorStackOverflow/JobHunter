@@ -10,13 +10,19 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --extra playwright --no-install-project
+ARG INSTALL_PLAYWRIGHT=0
+RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
+        uv sync --frozen --no-dev --extra playwright --no-install-project; \
+    else \
+        uv sync --frozen --no-dev --no-install-project; \
+    fi
 
 
 FROM python:3.12-slim-bookworm AS runtime
 
 ARG APP_REVISION=dev
 ARG APP_BUILD_FLAVOR=development
+ARG INSTALL_PLAYWRIGHT=0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -35,8 +41,10 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 
-RUN /opt/venv/bin/playwright install --with-deps chromium \
-    && chmod -R a+rX /ms-playwright \
+RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
+        /opt/venv/bin/playwright install --with-deps chromium \
+        && chmod -R a+rX /ms-playwright; \
+    fi \
     && printf '#!/bin/sh\nexec python -m app.cli "$@"\n' > /usr/local/bin/job-agent \
     && chmod 0555 /usr/local/bin/job-agent
 
@@ -44,7 +52,8 @@ ENV APP_REVISION=$APP_REVISION \
     APP_BUILD_FLAVOR=$APP_BUILD_FLAVOR
 
 LABEL org.opencontainers.image.revision=$APP_REVISION \
-      org.opencontainers.image.jobhunter-flavor=$APP_BUILD_FLAVOR
+      org.opencontainers.image.jobhunter-flavor=$APP_BUILD_FLAVOR \
+      org.opencontainers.image.jobhunter-playwright=$INSTALL_PLAYWRIGHT
 
 WORKDIR /srv/job-agent
 COPY --chown=jobagent:jobagent app ./app

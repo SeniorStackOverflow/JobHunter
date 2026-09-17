@@ -150,9 +150,9 @@ class RabotaMdConfig(BaseModel):
     policy_review_acknowledged: bool = False
     policy_review_reference: str | None = None
     locale_priority: list[Literal["ru", "ro"]] = Field(default_factory=_default_locales)
-    use_stealth_browser: bool = True
+    use_stealth_browser: bool = False
     transport: Literal["waf_http", "stealth_browser"] | None = None
-    fallback_transport: Literal["stealth_browser", "none"] = "stealth_browser"
+    fallback_transport: Literal["stealth_browser", "none"] = "none"
     requests_per_minute: int = Field(default=50, ge=1, le=60)
     minimum_interval_seconds: float = Field(default=1.2, ge=1.0)
     timeout_seconds: float = Field(default=30.0, gt=0, le=120)

@@ -61,7 +61,7 @@ def test_transport_consistent_with_legacy_flag() -> None:
 
 
 def test_resolved_transport_legacy_mapping() -> None:
-    assert RabotaMdConfig().resolved_transport() == "stealth_browser"
+    assert RabotaMdConfig().resolved_transport() == "waf_http"
     assert RabotaMdConfig(use_stealth_browser=False).resolved_transport() == "waf_http"
     assert RabotaMdConfig(transport="waf_http").resolved_transport() == "waf_http"
 
@@ -127,6 +127,62 @@ def test_build_waf_fetcher_with_browser_fallback() -> None:
         fallback_transport="stealth_browser",
     )
     assert isinstance(fetcher, FallbackFetcher)
+
+
+def test_runtime_none_override_disables_source_browser_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        rabota_browser_fallback_mode="none",
+        rabota_proxy_pool_enabled=False,
+        redis_url="redis://localhost:6379/0",
+    )
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.transport.get_settings", lambda: settings
+    )
+    fetcher = build_waf_fetcher(
+        base_url="https://www.rabota.md",
+        user_agent="job-agent/test",
+        requests_per_minute=10,
+        minimum_interval_seconds=1.0,
+        timeout_seconds=10.0,
+        max_redirects=3,
+        fallback_transport="stealth_browser",
+    )
+    assert isinstance(fetcher, WafHttpClient)
+
+
+def test_runtime_browser_override_enables_emergency_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        rabota_browser_fallback_mode="stealth_browser",
+        rabota_proxy_pool_enabled=False,
+        redis_url="redis://localhost:6379/0",
+    )
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.transport.get_settings", lambda: settings
+    )
+    fetcher = build_waf_fetcher(
+        base_url="https://www.rabota.md",
+        user_agent="job-agent/test",
+        requests_per_minute=10,
+        minimum_interval_seconds=1.0,
+        timeout_seconds=10.0,
+        max_redirects=3,
+        fallback_transport="none",
+    )
+    assert isinstance(fetcher, FallbackFetcher)
+
+
+def test_browser_free_image_keeps_current_http_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.transport._bundled_chromium_version",
+        lambda: None,
+    )
+    assert "Chrome/151.0.7922.34" in default_waf_browser_user_agent()
 
 
 def test_default_waf_browser_user_agent_tracks_bundled_chromium(

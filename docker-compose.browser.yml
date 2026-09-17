@@ -1,0 +1,12 @@
+services:
+  worker:
+    image: jobhunter-prod-browser:${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-browser-compose.sh}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-browser-compose.sh}
+        APP_BUILD_FLAVOR: production
+        INSTALL_PLAYWRIGHT: "1"
+    environment:
+      RABOTA_BROWSER_FALLBACK_MODE: stealth_browser

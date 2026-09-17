@@ -48,7 +48,7 @@ from app.crawlers.http import AsyncRateLimiter, SecureHttpClient
 from app.security.ssrf import Resolver
 from app.settings import get_settings
 
-_FALLBACK_WAF_BROWSER_VERSION = "136.0.0.0"
+_FALLBACK_WAF_BROWSER_VERSION = "151.0.7922.34"
 
 
 def _bundled_chromium_version() -> str | None:
@@ -311,6 +311,9 @@ def build_waf_fetcher(
 ) -> RabotaMdFetcher:
     settings = get_settings()
     waf_user_agent = effective_waf_user_agent(user_agent)
+    runtime_fallback = settings.rabota_browser_fallback_mode
+    if runtime_fallback != "source":
+        fallback_transport = runtime_fallback
 
     if settings.rabota_proxy_pool_enabled:
         primary = (

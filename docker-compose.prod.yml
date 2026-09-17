@@ -6,6 +6,7 @@ x-production-build: &production-build
     args:
       APP_REVISION: ${JOBHUNTER_IMAGE_TAG:?JOBHUNTER_IMAGE_TAG is required; use deploy/prod-compose.sh}
       APP_BUILD_FLAVOR: production
+      INSTALL_PLAYWRIGHT: "0"
 
 x-production-app: &production-app
   <<: *production-build
@@ -53,6 +54,7 @@ x-production-app: &production-app
     TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    RABOTA_BROWSER_FALLBACK_MODE: none
     RABOTA_PROXY_POOL_ENABLED: ${RABOTA_PROXY_POOL_ENABLED:-false}
     RABOTA_PROXY_PRIMARY_URL: ${RABOTA_PROXY_PRIMARY_URL:-}
     RABOTA_PROXY_FREE_FALLBACK_ENABLED: ${RABOTA_PROXY_FREE_FALLBACK_ENABLED:-true}

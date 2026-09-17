@@ -125,6 +125,7 @@ class Settings(BaseSettings):
     resume_storage_path: Path = Path("./storage/resumes")
     max_resume_bytes: int = 5 * 1024 * 1024
     crawler_user_agent: str = "job-agent/0.1 (+operator contact configured by deployment)"
+    rabota_browser_fallback_mode: Literal["source", "none", "stealth_browser"] = "source"
     rabota_proxy_pool_enabled: bool = False
     rabota_proxy_primary_url: SecretStr | None = None
     rabota_proxy_free_fallback_enabled: bool = True
