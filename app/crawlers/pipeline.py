@@ -426,6 +426,36 @@ class ScanService:
                     + len(await adapter.discover_locales())
                 )
                 await session.commit()
+            except RabotaMdDegradedError as exc:
+                # Exhausted egress is a transport failure, not a parse warning. Stop the
+                # scan here instead of reusing the already-exhausted ProxyPoolFetcher.
+                run.network_errors += 1
+                run.status = RunStatus.PARTIAL
+                run.diagnostics = {
+                    "discovery_error": type(exc).__name__,
+                    **_safe_iteration_diagnostics(exc),
+                }
+                run.finished_at = datetime.now(UTC)
+                source.last_scan_status = RunStatus.PARTIAL
+                source.health_status = SourceHealth.DEGRADED
+                source.automatic_actions_paused = True
+                session.add(
+                    Alert(
+                        source_id=source.id,
+                        severity="high",
+                        code="adapter_access_degraded",
+                        message=_degradation_reason(exc)
+                        or "adapter access degraded during discovery",
+                        safe_diagnostics={
+                            "scan_id": str(run.id),
+                            "error_type": type(exc).__name__,
+                            "stage": "discovery",
+                        },
+                    )
+                )
+                await session.commit()
+                await adapter.aclose()
+                return run
             except Exception as exc:  # adapter boundaries must turn parse failures into run state
                 run.parsing_errors += 1
                 run.diagnostics = {"discovery_error": type(exc).__name__}

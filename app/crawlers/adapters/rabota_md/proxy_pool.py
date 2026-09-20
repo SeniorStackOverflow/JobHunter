@@ -32,17 +32,27 @@ log = structlog.get_logger()
 _STATE_KEY = "crawler:rabota_md:proxy_pool:state"
 _DISCOVERY_LOCK_KEY = "crawler:rabota_md:proxy_pool:discovery_lock"
 _DISCOVERY_LOCK_TTL_SECONDS = 120
-_FREE_PROXY_SOURCES: tuple[tuple[str, Literal["lines", "geonode"]], ...] = (
+_FREE_PROXY_SOURCES: tuple[
+    tuple[str, Literal["lines", "proxmint_json", "hproxy_json"]], ...
+] = (
+    (
+        "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/all.json",
+        "proxmint_json",
+    ),
     (
         "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
         "&protocol=http&proxy_format=ipport&format=text&timeout=5000",
         "lines",
     ),
-    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "lines"),
     (
-        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1"
-        "&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
-        "geonode",
+        "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/all.json",
+        "hproxy_json",
+    ),
+    ("https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt", "lines"),
+    (
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
+        "proxies/protocols/http/data.txt",
+        "lines",
     ),
 )
 
@@ -95,6 +105,9 @@ class RabotaProxyPool:
         discovery_batch: int = 240,
         validation_concurrency: int = 24,
         validation_timeout_seconds: float = 8.0,
+        candidate_ttl_seconds: int = 900,
+        ready_ttl_seconds: int = 1800,
+        min_fresh_free: int = 5,
         ban_cooldown_seconds: int = 6 * 3600,
         dead_cooldown_seconds: int = 3600,
         primary_dead_cooldown_seconds: int = 300,
@@ -109,6 +122,9 @@ class RabotaProxyPool:
         self._discovery_batch = discovery_batch
         self._validation_concurrency = validation_concurrency
         self._validation_timeout = validation_timeout_seconds
+        self._candidate_ttl = candidate_ttl_seconds
+        self._ready_ttl = ready_ttl_seconds
+        self._min_fresh_free = min_fresh_free
         self._ban_cooldown = ban_cooldown_seconds
         self._dead_cooldown = dead_cooldown_seconds
         self._primary_dead_cooldown = primary_dead_cooldown_seconds
@@ -142,12 +158,17 @@ class RabotaProxyPool:
                 await self._touch(self._primary)
                 return self._primary
 
+        if not self._free_enabled:
+            return None
+
+        # Refill before the reserve collapses. Stale entries do not count as usable.
+        if await self._known_free_count() < self._min_fresh_free:
+            await self.discover()
+
         candidate = await self._known_free_endpoint(excluded)
         if candidate is not None:
             await self._touch(candidate)
             return candidate
-        if not self._free_enabled:
-            return None
 
         await self.discover()
         candidate = await self._known_free_endpoint(excluded)
@@ -163,8 +184,16 @@ class RabotaProxyPool:
         validated_capability: str | None = None,
     ) -> None:
         payload = await self._entry(endpoint.identity)
+        capability = validated_capability or endpoint.capability or payload.get(
+            "validated_capability"
+        )
+        status = (
+            "candidate"
+            if endpoint.kind == "free" and capability == "waf_candidate"
+            else "alive"
+        )
         payload.update(
-            status="alive",
+            status=status,
             kind=endpoint.kind,
             last_check=time.time(),
             last_http_status=status_code,
@@ -173,8 +202,8 @@ class RabotaProxyPool:
         )
         if endpoint.kind == "free":
             payload["url"] = endpoint.url
-            if validated_capability is not None:
-                payload["validated_capability"] = validated_capability
+            if capability is not None:
+                payload["validated_capability"] = capability
         await self._write_entry(endpoint.identity, payload)
         RABOTA_PROXY_EGRESS.labels(kind=endpoint.kind, outcome="success").inc()
 
@@ -236,10 +265,7 @@ class RabotaProxyPool:
                     continue
                 eligible.append(proxy)
 
-            # Do not always validate the same lexicographic prefix. The hourly salt keeps
-            # discovery deterministic within one run while spreading load across the lists.
-            hour = int(now // 3600)
-            eligible.sort(key=lambda proxy: hashlib.sha256(f"{hour}:{proxy}".encode()).digest())
+            # _fetch_candidates already balances and salts each source independently.
             selected = eligible[: self._discovery_batch]
             semaphore = asyncio.Semaphore(self._validation_concurrency)
             await asyncio.gather(
@@ -258,7 +284,6 @@ class RabotaProxyPool:
             await self._redis.delete(_DISCOVERY_LOCK_KEY)
 
     async def _fetch_candidates(self) -> list[str]:
-        found: set[str] = set()
         timeout = httpx.Timeout(15.0, connect=8.0)
         async with httpx.AsyncClient(
             timeout=timeout, trust_env=False, follow_redirects=True
@@ -266,35 +291,79 @@ class RabotaProxyPool:
             responses = await asyncio.gather(
                 *(self._fetch_source(client, url, kind) for url, kind in _FREE_PROXY_SOURCES)
             )
-        for batch in responses:
-            found.update(batch)
-        return sorted(found)
+
+        # Balance sources so giant low-quality feeds cannot drown out smaller fresher ones.
+        hour = int(time.time() // 3600)
+        buckets: list[list[str]] = []
+        for source_index, batch in enumerate(responses):
+            ordered = sorted(
+                batch,
+                key=lambda proxy: hashlib.sha256(
+                    f"{hour}:{source_index}:{proxy}".encode()
+                ).digest(),
+            )
+            buckets.append(ordered)
+
+        quota = max(10, self._discovery_batch // max(1, len(buckets)))
+        selected: list[str] = []
+        seen: set[str] = set()
+        leftovers: list[list[str]] = []
+        for bucket in buckets:
+            for proxy in bucket[:quota]:
+                if proxy not in seen:
+                    seen.add(proxy)
+                    selected.append(proxy)
+            leftovers.append(bucket[quota:])
+
+        for bucket in leftovers:
+            for proxy in bucket:
+                if len(selected) >= self._discovery_batch:
+                    break
+                if proxy not in seen:
+                    seen.add(proxy)
+                    selected.append(proxy)
+            if len(selected) >= self._discovery_batch:
+                break
+        return selected
 
     async def _fetch_source(
         self,
         client: httpx.AsyncClient,
         url: str,
-        kind: Literal["lines", "geonode"],
+        kind: Literal["lines", "proxmint_json", "hproxy_json"],
     ) -> set[str]:
         found: set[str] = set()
         try:
             response = await client.get(url)
             response.raise_for_status()
             if kind == "lines":
-                for raw in response.text.splitlines():
-                    proxy = self._normalize_public_proxy(raw)
-                    if proxy is not None:
-                        found.add(proxy)
+                raw_candidates = response.text.splitlines()
+            elif kind == "proxmint_json":
+                data = response.json()
+                raw_candidates = [
+                    f"{item.get('ip', '')}:{item.get('port', '')}"
+                    for item in data.get("proxies", [])
+                    if isinstance(item, dict)
+                    and item.get("protocol") == "http"
+                    and self._as_int(item.get("score", 0)) >= 90
+                    and self._as_int(item.get("latencyMs", 999999)) <= 1200
+                ]
             else:
                 data = response.json()
-                for item in data.get("data", []):
-                    if not isinstance(item, dict):
-                        continue
-                    proxy = self._normalize_public_proxy(
-                        f"{item.get('ip', '')}:{item.get('port', '')}"
-                    )
-                    if proxy is not None:
-                        found.add(proxy)
+                raw_candidates = [
+                    str(item.get("proxy", ""))
+                    for item in data
+                    if isinstance(item, dict)
+                    and item.get("alive") is True
+                    and "http" in item.get("protocols", [])
+                    and self._as_float(item.get("uptime_pct", 0)) >= 90
+                    and self._as_int(item.get("latency_ms", 999999)) <= 1200
+                ]
+
+            for raw in raw_candidates:
+                proxy = self._normalize_public_proxy(raw)
+                if proxy is not None:
+                    found.add(proxy)
         except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
             log.info(
                 "rabota_proxy_source_failed",
@@ -400,6 +469,28 @@ class RabotaProxyPool:
             except httpx.TransportError:
                 await self.report_dead(endpoint)
 
+    def _fresh_free_state(self, payload: dict[str, object], now: float) -> bool:
+        if self._as_float(payload.get("cooldown_until", 0)) > now:
+            return False
+        last_check = self._as_float(payload.get("last_check", 0))
+        if last_check <= 0:
+            return False
+        capability = payload.get("validated_capability")
+        if capability not in {"waf_candidate", "direct_pagination", "full_waf"}:
+            return False
+        status = payload.get("status")
+        if capability == "waf_candidate":
+            # Accept legacy "alive" entries during rollout, but new candidates are
+            # explicitly marked as candidates until full protocol proof succeeds.
+            if status not in {"candidate", "alive"}:
+                return False
+            ttl = self._candidate_ttl
+        else:
+            if status != "alive":
+                return False
+            ttl = self._ready_ttl
+        return now - last_check <= ttl
+
     async def _known_free_endpoint(self, excluded: set[str]) -> ProxyEndpoint | None:
         now = time.time()
         entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
@@ -412,9 +503,7 @@ class RabotaProxyPool:
                 payload = json.loads(self._decode(raw_payload))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if payload.get("status") != "alive":
-                continue
-            if self._as_float(payload.get("cooldown_until", 0)) > now:
+            if not self._fresh_free_state(payload, now):
                 continue
             url = payload.get("url")
             if not isinstance(url, str) or not url.startswith("http://"):
@@ -458,10 +547,7 @@ class RabotaProxyPool:
                 payload = json.loads(self._decode(raw_payload))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if (
-                payload.get("status") == "alive"
-                and self._as_float(payload.get("cooldown_until", 0)) <= now
-            ):
+            if self._fresh_free_state(payload, now):
                 count += 1
         return count
 
@@ -508,15 +594,18 @@ class ProxyPoolFetcher:
         *,
         preflight: PreflightProbe | None = None,
         max_egress_failovers: int = 4,
+        max_preflight_attempts: int = 8,
     ) -> None:
         self._pool = pool
         self._factory = factory
         self._preflight = preflight
         self._max_failovers = max_egress_failovers
+        self._max_preflight_attempts = max_preflight_attempts
         self._active_endpoint: ProxyEndpoint | None = None
         self._active_fetcher: RabotaMdFetcher | None = None
         self._excluded: set[str] = set()
         self._failovers = 0
+        self._preflight_attempts = 0
 
     async def get(self, url: str) -> httpx.Response:
         return await self._request("get", url)
@@ -559,6 +648,16 @@ class ProxyPoolFetcher:
         if self._active_endpoint is not None and self._active_fetcher is not None:
             return self._active_endpoint, self._active_fetcher
 
+        if self._failovers > self._max_failovers:
+            raise RabotaMdDegradedError(
+                f"Rabota.md exhausted proxy egress failover budget ({self._max_failovers})"
+            )
+        if self._preflight_attempts >= self._max_preflight_attempts:
+            raise RabotaMdDegradedError(
+                "Rabota.md exhausted free-proxy preflight budget "
+                f"({self._max_preflight_attempts})"
+            )
+
         while True:
             endpoint = await self._pool.next_endpoint(self._excluded)
             if endpoint is None:
@@ -587,18 +686,18 @@ class ProxyPoolFetcher:
                 # This is candidate validation before the caller's real request. Reject
                 # the candidate, but preserve fail-closed semantics once a scan starts.
                 await self._pool.report_access_rejected(endpoint)
-                await self._rotate(endpoint, f"preflight_{type(exc).__name__}")
+                await self._reject_candidate(endpoint, type(exc).__name__)
                 continue
             except RabotaMdEgressError as exc:
                 if exc.access_rejected:
                     await self._pool.report_access_rejected(endpoint)
                 else:
                     await self._pool.report_dead(endpoint)
-                await self._rotate(endpoint, f"preflight_{type(exc).__name__}")
+                await self._reject_candidate(endpoint, type(exc).__name__)
                 continue
             except httpx.TransportError as exc:
                 await self._pool.report_dead(endpoint)
-                await self._rotate(endpoint, f"preflight_{type(exc).__name__}")
+                await self._reject_candidate(endpoint, type(exc).__name__)
                 continue
 
             await self._pool.report_success(
@@ -615,6 +714,23 @@ class ProxyPoolFetcher:
             self._active_endpoint = promoted
             log.info("rabota_proxy_preflight_ok", kind=endpoint.kind)
             return promoted, self._active_fetcher
+
+    async def _reject_candidate(self, endpoint: ProxyEndpoint, reason: str) -> None:
+        self._excluded.add(endpoint.identity)
+        self._preflight_attempts += 1
+        RABOTA_PROXY_EGRESS.labels(kind=endpoint.kind, outcome="preflight_rejected").inc()
+        log.warning(
+            "rabota_proxy_candidate_rejected",
+            reason=reason,
+            attempts=self._preflight_attempts,
+            max_attempts=self._max_preflight_attempts,
+        )
+        await self._close_active()
+        if self._preflight_attempts >= self._max_preflight_attempts:
+            raise RabotaMdDegradedError(
+                "Rabota.md exhausted free-proxy preflight budget "
+                f"({self._max_preflight_attempts})"
+            )
 
     async def _rotate(self, endpoint: ProxyEndpoint, reason: str) -> None:
         self._excluded.add(endpoint.identity)

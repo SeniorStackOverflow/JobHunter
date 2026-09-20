@@ -330,6 +330,9 @@ def build_waf_fetcher(
             discovery_batch=settings.rabota_proxy_discovery_batch,
             validation_concurrency=settings.rabota_proxy_validation_concurrency,
             validation_timeout_seconds=settings.rabota_proxy_validation_timeout_seconds,
+            candidate_ttl_seconds=settings.rabota_proxy_candidate_ttl_seconds,
+            ready_ttl_seconds=settings.rabota_proxy_ready_ttl_seconds,
+            min_fresh_free=settings.rabota_proxy_min_fresh_free,
             ban_cooldown_seconds=settings.rabota_proxy_ban_cooldown_seconds,
             dead_cooldown_seconds=settings.rabota_proxy_dead_cooldown_seconds,
             primary_dead_cooldown_seconds=settings.rabota_proxy_primary_dead_cooldown_seconds,
@@ -384,6 +387,7 @@ def build_waf_fetcher(
             factory,
             preflight=preflight,
             max_egress_failovers=settings.rabota_proxy_max_failovers,
+            max_preflight_attempts=settings.rabota_proxy_max_preflight_attempts,
         )
 
     return _build_single_waf_fetcher(

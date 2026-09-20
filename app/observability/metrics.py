@@ -79,7 +79,7 @@ RABOTA_PROXY_FAILOVER = Counter(
 )
 RABOTA_PROXY_POOL_ALIVE = Gauge(
     "job_agent_rabota_md_proxy_pool_alive",
-    "Currently usable validated free proxy egress endpoints.",
+    "Fresh free-proxy reserve entries; WAF candidates are not yet full-protocol ready.",
 )
 WAF_SOLVER_ATTEMPTS = Counter(
     "job_agent_waf_solver_attempts_total",

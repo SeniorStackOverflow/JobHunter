@@ -81,7 +81,7 @@ def test_healthy_source_keeps_normal_scheduled_operations() -> None:
     assert _operation_allowed_for_source(source, "full") is True
 
 
-def test_degraded_rabota_recovery_probe_is_limited_to_six_hour_slots() -> None:
+def test_degraded_rabota_recovery_probe_runs_on_each_incremental_slot() -> None:
     source = SourceSchedule(
         source_id=uuid4(),
         adapter_type="rabota_md",
@@ -100,7 +100,7 @@ def test_degraded_rabota_recovery_probe_is_limited_to_six_hour_slots() -> None:
         _degraded_recovery_probe_due(
             source, "incremental", datetime(2026, 9, 16, 13, 0, tzinfo=UTC)
         )
-        is False
+        is True
     )
 
 

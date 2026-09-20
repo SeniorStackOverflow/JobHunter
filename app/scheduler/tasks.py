@@ -51,7 +51,7 @@ _CONFIG_SECTION = {
     "full": "full_scan",
 }
 _SOURCE_STATES = tuple(item.value for item in SourceHealth)
-_RABOTA_DEGRADED_RECOVERY_INTERVAL_HOURS = 6
+_RABOTA_DEGRADED_RECOVERY_INTERVAL_HOURS = 1
 
 
 @dataclass(frozen=True, slots=True)

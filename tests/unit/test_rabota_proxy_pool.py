@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
 
 from app.crawlers.adapters.rabota_md.errors import (
+    RabotaMdDegradedError,
     RabotaMdEgressError,
     RabotaMdTemporaryError,
     RabotaMdWafFailClosedError,
@@ -142,6 +144,7 @@ async def test_pool_prefers_a14_then_uses_known_free_when_primary_cools_down() -
         primary_url="socks5://100.106.163.104:18080",
         target_url="https://www.rabota.md/ru/",
         user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
     )
     primary = await pool.next_endpoint(set())
     assert primary is not None
@@ -159,6 +162,7 @@ async def test_pool_prefers_a14_then_uses_known_free_when_primary_cools_down() -
                 "url": free.url,
                 "cooldown_until": 0,
                 "last_used": 0,
+                "last_check": time.time(),
                 "validated_capability": "waf_candidate",
             }
         ),
@@ -249,6 +253,7 @@ async def test_pool_prefers_direct_200_free_proxy_over_waf_candidate() -> None:
         primary_url=None,
         target_url="https://www.rabota.md/ru/",
         user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
     )
     challenged = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="waf_candidate")
     direct = ProxyEndpoint("free", "http://8.8.8.8:3128", "free", capability="direct_pagination")
@@ -258,8 +263,8 @@ async def test_pool_prefers_direct_200_free_proxy_over_waf_candidate() -> None:
         challenged.identity,
         json.dumps({
             "status": "alive", "kind": "free", "url": challenged.url,
-            "cooldown_until": 0, "last_used": 0, "last_http_status": 202,
-            "validated_capability": "waf_candidate",
+            "cooldown_until": 0, "last_used": 0, "last_check": time.time(),
+            "last_http_status": 202, "validated_capability": "waf_candidate",
         }),
     )
     await redis.hset(
@@ -267,8 +272,8 @@ async def test_pool_prefers_direct_200_free_proxy_over_waf_candidate() -> None:
         direct.identity,
         json.dumps({
             "status": "alive", "kind": "free", "url": direct.url,
-            "cooldown_until": 0, "last_used": 9999, "last_http_status": 200,
-            "validated_capability": "direct_pagination",
+            "cooldown_until": 0, "last_used": 9999, "last_check": time.time(),
+            "last_http_status": 200, "validated_capability": "direct_pagination",
         }),
     )
 
@@ -392,3 +397,92 @@ async def test_failed_candidate_preflight_rotates_before_real_request() -> None:
     assert candidate_fetcher.calls == 0
     assert direct_fetcher.calls == 1
     assert pool.dead == [candidate.identity]
+
+
+async def test_stale_free_proxy_is_not_selected() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        free_fallback_enabled=False,
+        candidate_ttl_seconds=60,
+    )
+    stale = ProxyEndpoint(
+        "free", "http://1.1.1.1:8080", "free", capability="waf_candidate"
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        stale.identity,
+        json.dumps(
+            {
+                "status": "alive",
+                "kind": "free",
+                "url": stale.url,
+                "cooldown_until": 0,
+                "last_check": time.time() - 120,
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+
+    assert await pool._known_free_endpoint(set()) is None
+
+
+async def test_candidate_preflight_failures_do_not_consume_egress_failover_budget() -> None:
+    first = ProxyEndpoint(
+        "free", "http://1.1.1.1:8080", "free", capability="waf_candidate"
+    )
+    second = ProxyEndpoint(
+        "free", "http://8.8.8.8:3128", "free", capability="waf_candidate"
+    )
+    pool = StubPool([first, second])
+    first_fetcher = StubFetcher([])
+    second_fetcher = StubFetcher([httpx.Response(200, text="ok")])
+
+    async def preflight(endpoint: ProxyEndpoint, _fetcher) -> None:
+        if endpoint.identity == first.identity:
+            raise RabotaMdEgressError("candidate proof failed")
+
+    fetcher = ProxyPoolFetcher(
+        pool,  # type: ignore[arg-type]
+        lambda endpoint: (
+            first_fetcher if endpoint.identity == first.identity else second_fetcher
+        ),
+        preflight=preflight,
+        max_egress_failovers=0,
+        max_preflight_attempts=2,
+    )
+
+    assert (await fetcher.get("https://www.rabota.md/ru/")).status_code == 200
+    assert pool.dead == [first.identity]
+
+
+async def test_preflight_budget_stays_exhausted_after_caller_catches_error() -> None:
+    endpoints = [
+        ProxyEndpoint(
+            "free",
+            f"http://1.1.1.{index}:8080",
+            "free",
+            capability="waf_candidate",
+        )
+        for index in range(1, 4)
+    ]
+    pool = StubPool(endpoints)
+    fetchers = {endpoint.identity: StubFetcher([]) for endpoint in endpoints}
+
+    async def preflight(_endpoint: ProxyEndpoint, _fetcher) -> None:
+        raise RabotaMdEgressError("candidate proof failed")
+
+    fetcher = ProxyPoolFetcher(
+        pool,  # type: ignore[arg-type]
+        lambda endpoint: fetchers[endpoint.identity],
+        preflight=preflight,
+        max_preflight_attempts=2,
+    )
+
+    with pytest.raises(RabotaMdDegradedError):
+        await fetcher.get("https://www.rabota.md/ru/")
+    with pytest.raises(RabotaMdDegradedError):
+        await fetcher.get("https://www.rabota.md/ru/")
