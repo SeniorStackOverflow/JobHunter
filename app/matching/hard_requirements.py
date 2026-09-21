@@ -20,9 +20,12 @@ _MANDATORY = re.compile(
     re.IGNORECASE,
 )
 _OPTIONAL = re.compile(
-    r"preferred|advantage|nice\s+to\s+have|would\s+be\s+a\s+plus|"
-    r"constitui(?:e|\s+un)\s+avantaj|poate\s+constitui\s+un\s+avantaj|"
-    r"желательн|приветств|будет\s+преимуществ|не\s+обязател",
+    r"preferred|advantage|beneficial|great\s+asset|nice\s+to\s+have|"
+    r"would\s+be\s+a\s+plus|not\s+(?:required|mandatory)|"
+    r"\bavantaj\b|(?:ar\s+|poate\s+)?constitui(?:e)?\s+(?:un\s+)?avantaj|"
+    r"nu\s+este\s+(?:necesar[ăa]?|obligatori[ue])|"
+    r"nu\s+e\s+(?:necesar[ăa]?|obligatori[ue])|"
+    r"желательн|приветств|преимуществ|не\s+обязател|не\s+требуется|не\s+нуж",
     re.IGNORECASE,
 )
 _FORKLIFT = re.compile(
@@ -33,25 +36,79 @@ _FORKLIFT = re.compile(
 _CREDENTIAL = re.compile(
     r"licen[cs]e|certificate|certification|permit|authorization|authorisation|"
     r"permis(?:ul|ului)?|certificat(?:ul|ului)?|atestat|autoriza[țt]ie|"
-    r"прав(?:а|/удостоверени[ея])?|удостоверени[ея]|сертификат|лицензи|разрешени",  # noqa: RUF001
+    r"водительск\w*\s+прав|\bправа\b|прав[аы]/удостоверени[ея]?|"  # noqa: RUF001
+    r"удостоверени[ея]|сертификат|лицензи|разрешени",
     re.IGNORECASE,
 )
 _DRIVING = re.compile(
     r"driver'?s?\s+licen[cs]e|driving\s+licen[cs]e|"
-    r"водительск\w*\s+прав|permis\s+de\s+conducere|categoria\s+[abcd](?:\b|\d)",
+    r"водительск\w*\s+(?:прав|удостоверени[ея])|"
+    r"permis(?:ul|ului)?\s+de\s+conducere|cat(?:e|er)goria\s+[abcde](?:\b|\d)",
     re.IGNORECASE,
 )
 _DRIVING_CATEGORY = re.compile(
-    r"(?:categoria|category|категори[яи])\s*[:\-]?\s*([abcd])(?:\d|\b)",
+    r"(?:cat(?:e|er)goria|category|категори[яи])\s*[:\-]?\s*"
+    r"([abcde](?:\s*[+,/&]\s*[abcde])*)",
     re.IGNORECASE,
 )
+_PLAIN_DRIVING_CATEGORIES = re.compile(
+    r"^\s*([abcde](?:\s*[+,/&]\s*[abcde])*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _driving_categories(value: str) -> set[str]:
+    categories: set[str] = set()
+    for match in _DRIVING_CATEGORY.finditer(value):
+        categories.update(re.findall(r"[abcde]", match.group(1), flags=re.IGNORECASE))
+    plain = _PLAIN_DRIVING_CATEGORIES.match(value)
+    if plain:
+        categories.update(re.findall(r"[abcde]", plain.group(1), flags=re.IGNORECASE))
+    return {item.casefold() for item in categories}
 _EXPERIENCE = re.compile(
     r"experience|experien[țt][ăa]|опыт\s+работ|стаж",
+    re.IGNORECASE,
+)
+_ROLE_EXPERIENCE_REQUIREMENT = re.compile(
+    r"(?:work|previous|professional)\s+experience\s+(?:as|in|with)\b|"
+    r"experience\s+(?:as|in|with)\b|"
+    r"(?:minimum|at\s+least)\s+\d+\s+(?:year|years|month|months).*?experience|"
+    r"experien[țt][ăa]\s+(?:de\s+munc[ăa]\s+)?(?:în|in|ca|cu|pe)\b|"
+    r"cu\s+experien[țt][ăa]\b|"
+    r"minimum\s+\d+\s+(?:an|ani|luni).*?experien[țt][ăa]|"
+    r"опыт\s+работ[ыа]?\b|с\s+опытом\b|стаж\s+(?:работы\s+)?\d+",  # noqa: RUF001
+    re.IGNORECASE,
+)
+_MINIMUM_EXPERIENCE = re.compile(
+    r"(?:minimum|at\s+least)\s+\d+\s+(?:year|years|month|months)|"
+    r"minimum\s+\d+\s+(?:an|ani|luni)|"
+    r"(?:минимум|не\s+менее|от)\s*\d+\s*(?:год|года|лет|месяц)",
     re.IGNORECASE,
 )
 _NO_EXPERIENCE = re.compile(
     r"\bno\s+experience\b|\bwithout\s+experience\b|"
     r"без\s+опыта|f[ăa]r[ăa]\s+experien[țt][ăa]",
+    re.IGNORECASE,
+)
+_OBTAINABLE_AFTER_HIRE = re.compile(
+    r"we\s+(?:can\s+)?help\s+(?:you\s+)?(?:get|obtain)|"
+    r"company\s+(?:will\s+)?provide[s]?\s+(?:training|certification)|"
+    r"asisten[țt][ăa]\s+(?:în|in)\s+ob[țt]inerea|"
+    r"(?:v[ăa]|î[țt]i)\s+(?:ajut[ăa]m|oferim)\s+(?:s[ăa]\s+)?"
+    r"(?:(?:îl|il|o)\s+)?(?:ob[țt]ine|instruire)|"
+    r"poate\s+fi\s+ob[țt]inut|"
+    r"можно\s+(?:получить|оформить)|поможем\s+(?:получить|оформить)|"
+    r"обучени[ея]\s+(?:за\s+счет|за\s+счёт)\s+компании",
+    re.IGNORECASE,
+)
+_PROCESS_SCREENING_CREDENTIAL = re.compile(
+    r"(?:will\s+be\s+)?required\s+to\s+pass.{0,80}certification|"
+    r"pass.{0,80}(?:medical|security).{0,80}certification|"
+    r"certification\s+program|learning\s+tool.{0,40}certification",
+    re.IGNORECASE,
+)
+_DRIVER_ROLE = re.compile(
+    r"\bdriver\b|\b[șs]ofer\b|водител|conduc[ăa]tor\s+auto",
     re.IGNORECASE,
 )
 _ROLE_STOPWORDS = {
@@ -100,7 +157,12 @@ def _excerpt(text: str, start: int, end: int, radius: int = 180) -> str:
 
 
 def _requirement_clause(text: str, start: int, end: int) -> str:
-    """Return the local list item/sentence that owns a requirement mention."""
+    """Return the local list item/sentence that owns a requirement mention.
+
+    Job boards often flatten bullet lists into one punctuation-free paragraph. If
+    that pseudo-clause is huge, keep a target-centred slice so optional/mandatory
+    qualifiers immediately after the requirement cannot be truncated away.
+    """
 
     boundaries = "\n;•|.!?"
     left = max((text.rfind(char, 0, start) for char in boundaries), default=-1)
@@ -110,7 +172,26 @@ def _requirement_clause(text: str, start: int, end: int) -> str:
         if (position := text.find(char, end)) != -1
     ]
     right = min(right_values) if right_values else len(text)
-    return " ".join(text[left + 1 : right].split())[:500]
+    raw = text[left + 1 : right]
+    relative_start = start - (left + 1)
+    relative_end = end - (left + 1)
+    if len(raw) > 500:
+        slice_start = max(0, relative_start - 220)
+        slice_end = min(len(raw), relative_end + 220)
+        raw = raw[slice_start:slice_end]
+    return " ".join(raw.split())[:500]
+
+
+def _mandatory_near(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    radius: int = 100,
+) -> bool:
+    local = text[max(0, start - radius) : min(len(text), end + radius)]
+    without_optional = _OPTIONAL.sub(" ", local)
+    return bool(_MANDATORY.search(without_optional))
 
 
 def _normalized_tokens(value: str | None) -> set[str]:
@@ -219,17 +300,14 @@ def _driving_licence_evidence(
     for index, value in enumerate(profile.driving_licences or []):
         normalized_value = normalize_for_fingerprint(str(value))
         value_tokens = set(normalized_value.split())
-        value_categories = {
-            match.group(1).casefold()
-            for match in _DRIVING_CATEGORY.finditer(str(value))
-        }
+        value_categories = _driving_categories(str(value))
         value_categories.update(
             token.casefold()
             for token in value_tokens
-            if len(token) == 1 and token.casefold() in {"a", "b", "c", "d"}
+            if len(token) == 1 and token.casefold() in {"a", "b", "c", "d", "e"}
         )
         if required_categories:
-            if required_categories & value_categories:
+            if required_categories <= value_categories:
                 positive.append(f"profile.driving_licence:{index}")
         else:
             positive.append(f"profile.driving_licence:{index}")
@@ -403,7 +481,10 @@ class HardRequirementEngine:
             for match in forklift_matches:
                 clause = _requirement_clause(text, match.start(), match.end())
                 window = _excerpt(text, match.start(), match.end(), 220)
-                if _EXPERIENCE.search(clause) and not _OPTIONAL.search(clause):
+                if (
+                    _ROLE_EXPERIENCE_REQUIREMENT.search(clause)
+                    and not _OPTIONAL.search(clause)
+                ):
                     positive, negative = _forklift_experience_evidence(profile)
                     requirements.append(
                         _assessment(
@@ -425,13 +506,13 @@ class HardRequirementEngine:
                 continue
             if _OPTIONAL.search(clause):
                 continue
-            if not _MANDATORY.search(clause):
+            if not (
+                _mandatory_near(text, match.start(), match.end(), radius=90)
+                or _DRIVER_ROLE.search(job.title or "")
+            ):
                 continue
             terms = _normalized_tokens(clause)
-            required_categories = {
-                match.group(1).casefold()
-                for match in _DRIVING_CATEGORY.finditer(clause)
-            }
+            required_categories = _driving_categories(clause)
             positive, negative = _driving_licence_evidence(
                 profile, terms, required_categories
             )
@@ -453,7 +534,15 @@ class HardRequirementEngine:
         for match in _CREDENTIAL.finditer(text):
             clause = _requirement_clause(text, match.start(), match.end())
             window = _excerpt(text, match.start(), match.end(), 160)
-            if _OPTIONAL.search(clause) or not _MANDATORY.search(clause):
+            if _OPTIONAL.search(clause):
+                continue
+            if _OBTAINABLE_AFTER_HIRE.search(window):
+                continue
+            if _PROCESS_SCREENING_CREDENTIAL.search(window):
+                continue
+            if not _mandatory_near(
+                text, match.start(), match.end(), radius=100
+            ):
                 continue
             if forklift_licence_detected and _FORKLIFT.search(clause):
                 continue
@@ -481,10 +570,22 @@ class HardRequirementEngine:
         ):
             title_terms = _normalized_tokens(job.title)
             role_experience_excerpt: str | None = None
-            for match in _EXPERIENCE.finditer(text):
-                window = _excerpt(text, match.start(), match.end(), 160)
-                if title_terms & _normalized_tokens(window):
-                    role_experience_excerpt = window
+            for match in _ROLE_EXPERIENCE_REQUIREMENT.finditer(text):
+                clause = _requirement_clause(text, match.start(), match.end())
+                if _OPTIONAL.search(clause):
+                    continue
+                if not (
+                    _mandatory_near(
+                        text, match.start(), match.end(), radius=100
+                    )
+                    or _MINIMUM_EXPERIENCE.search(clause)
+                ):
+                    continue
+                clause_terms = _normalized_tokens(clause)
+                if title_terms & clause_terms:
+                    role_experience_excerpt = _excerpt(
+                        text, match.start(), match.end(), 160
+                    )
                     break
             if title_terms and role_experience_excerpt:
                 positive, negative = _generic_role_experience_evidence(profile, title_terms)

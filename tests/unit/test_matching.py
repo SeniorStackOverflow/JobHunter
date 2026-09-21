@@ -1789,3 +1789,340 @@ def test_mandatory_driving_category_accepts_matching_category_evidence() -> None
     )
     assert licence.status is HardRequirementStatus.MET
     assert result.eligible_for_ai is True
+
+
+def test_customer_experience_phrase_is_not_role_experience_requirement() -> None:
+    job = make_job(
+        title="Customer Support Agent | English",
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+        description=(
+            "Every day our team delivers next-generation customer experience and helps "
+            "transportation companies better connect with their customers."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[{"role": "Warehouse operator", "confirmed": True}]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "role_specific_experience"
+        for item in result.hard_requirements
+    )
+
+
+def test_optional_role_experience_does_not_become_hard_requirement() -> None:
+    job = make_job(
+        title="Coordonator Depozit",
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+        description=(
+            "Experiența în depozit, logistică sau coordonarea unei echipe constituie un avantaj."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[{"role": "Warehouse operator", "confirmed": True}]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "role_specific_experience"
+        for item in result.hard_requirements
+    )
+
+
+def test_russian_non_licence_words_do_not_trigger_generic_credential() -> None:
+    job = make_job(
+        title="Кладовщик",
+        description=(
+            "Обязательный опыт работы кладовщиком. Правильная организация склада, "
+            "ответственность и внимательность."
+        ),
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[{"role": "Кладовщик", "confirmed": True}]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.kind.value == "professional_credential"
+        for item in result.hard_requirements
+    )
+
+
+def test_typo_catergoria_b_is_detected_as_driving_requirement() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(
+        description="Permis de conducere catergoria B obligatoriu.",
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=[]),
+        resume_fit=80,
+    )
+    licence = next(
+        item
+        for item in result.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert licence.status is HardRequirementStatus.MISSING
+
+
+def test_multi_category_driving_requirement_needs_all_categories() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(description="Permis de conducere categoria C+E obligatoriu.")
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=["C"]),
+        resume_fit=85,
+    )
+    licence = next(
+        item for item in result.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert licence.status is HardRequirementStatus.UNKNOWN
+
+    complete = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=["C+E"]),
+        resume_fit=85,
+    )
+    complete_licence = next(
+        item for item in complete.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert complete_licence.status is HardRequirementStatus.MET
+
+
+def test_explicitly_not_required_driving_licence_is_not_hard() -> None:
+    job = make_job(description="Permisul de conducere nu este necesar.")
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=[]),
+        resume_fit=85,
+    )
+    assert not result.hard_requirements
+
+
+def test_explicit_mandatory_role_experience_is_hard() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(
+        title="Depozitar",
+        description="Experiență ca depozitar este obligatorie.",
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[]),
+        resume_fit=80,
+    )
+    req = next(
+        item for item in result.hard_requirements
+        if item.requirement_id == "role_specific_experience"
+    )
+    assert req.status is HardRequirementStatus.UNKNOWN
+
+
+def test_minimum_role_experience_is_hard_without_mandatory_word() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(
+        title="Depozitar",
+        description="Minimum 2 ani experiență ca depozitar.",
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[]),
+        resume_fit=80,
+    )
+    req = next(
+        item for item in result.hard_requirements
+        if item.requirement_id == "role_specific_experience"
+    )
+    assert req.status is HardRequirementStatus.UNKNOWN
+
+
+def test_optional_forklift_experience_is_not_hard_requirement() -> None:
+    job = make_job(
+        title="Lucrător în depozit",
+        description=(
+            "Ai experiență în domeniu (munca pe stivuitor ar constitui un avantaj)."
+        ),
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[{"role": "Warehouse operator", "confirmed": True}]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "forklift_operator_experience"
+        for item in result.hard_requirements
+    )
+
+
+def test_obtainable_after_hire_certificate_is_not_pre_hire_hard() -> None:
+    job = make_job(
+        title="Șofer de taxi",
+        description=(
+            "Certificat de taximetrist. Dacă nu îl aveți, vă ajutăm să îl obțineți."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(),
+        resume_fit=80,
+    )
+    assert not any(
+        item.kind.value == "professional_credential"
+        for item in result.hard_requirements
+    )
+
+
+def test_driver_role_with_explicit_licence_is_hard_without_mandatory_word() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(
+        title="Șofer - Expeditor",
+        description="Permis de conducere categoria B. Responsabilitate și punctualitate.",
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=[]),
+        resume_fit=80,
+    )
+    licence = next(
+        item for item in result.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert licence.status is HardRequirementStatus.MISSING
+
+
+def test_driving_licence_marked_as_advantage_is_not_hard() -> None:
+    job = make_job(
+        title="Consultant magazin",
+        description="Permis de conducere categoria B (avantaj).",
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=[]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "driving_licence"
+        for item in result.hard_requirements
+    )
+
+
+def test_nearby_not_mandatory_text_does_not_make_driving_licence_hard() -> None:
+    job = make_job(
+        title="Tehnician",
+        description=(
+            "Studii superioare приветствуются, но не обязательно; "
+            "наличие водительских прав B."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=[]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "driving_licence"
+        for item in result.hard_requirements
+    )
+
+
+def test_not_mandatory_english_experience_is_not_hard() -> None:
+    job = make_job(
+        title="Sales Freight Broker",
+        description=(
+            "Previous experience in the trucking industry is beneficial, but not mandatory."
+        ),
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[{"role": "Warehouse operator", "confirmed": True}]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "role_specific_experience"
+        for item in result.hard_requirements
+    )
+
+
+def test_flattened_long_bilingual_list_keeps_forklift_advantage_optional() -> None:
+    job = make_job(
+        title="Кладовщик, Грузчик | Depozitar",
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+        description=(
+            "Требования Опыт работы на складе или в логистике Знание складского учета "
+            "и товарных документов Уверенные навыки ПК: Excel, 1C / ERP — преимущество "
+            "Ответственность, дисциплинированность, внимание к деталям Активность и "
+            "хорошая физическая форма Владение румынским и русским языками Навык работы "
+            "на погрузчике — преимущество Мы предлагаем Стабильную занятость. "
+            "Cerințe Experiență în logistică sau activități de depozit Cunoștințe privind "
+            "documentele și evidența stocurilor Operare PC: Excel, 1C / ERP — avantaj "
+            "Seriozitate, disciplină, atenție la detalii Persoană activă și în formă "
+            "fizică bună Cunoașterea limbilor română și rusă Cunoașterea utilizării "
+            "stivuitorului — avantaj Oferim Loc de muncă stabil."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(work_experience=[{"role": "Warehouse operator", "confirmed": True}]),
+        resume_fit=80,
+    )
+    assert not any(
+        item.requirement_id == "forklift_operator_experience"
+        for item in result.hard_requirements
+    )
+
+
+def test_employer_screening_certification_is_not_preheld_credential() -> None:
+    job = make_job(
+        title="Security Guard",
+        description=(
+            "All applicants under consideration will be required to pass medical "
+            "and security certifications."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(),
+        resume_fit=80,
+    )
+    assert not any(
+        item.kind.value == "professional_credential"
+        for item in result.hard_requirements
+    )
