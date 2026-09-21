@@ -41,6 +41,10 @@ _DRIVING = re.compile(
     r"водительск\w*\s+прав|permis\s+de\s+conducere|categoria\s+[abcd](?:\b|\d)",
     re.IGNORECASE,
 )
+_DRIVING_CATEGORY = re.compile(
+    r"(?:categoria|category|категори[яи])\s*[:\-]?\s*([abcd])(?:\d|\b)",
+    re.IGNORECASE,
+)
 _EXPERIENCE = re.compile(
     r"experience|experien[țt][ăa]|опыт\s+работ|стаж",
     re.IGNORECASE,
@@ -206,14 +210,28 @@ def _forklift_experience_evidence(profile: UserProfile) -> tuple[list[str], list
 
 
 def _driving_licence_evidence(
-    profile: UserProfile, required_terms: set[str]
+    profile: UserProfile,
+    required_terms: set[str],
+    required_categories: set[str],
 ) -> tuple[list[str], list[str]]:
     positive: list[str] = []
     negative: list[str] = []
     for index, value in enumerate(profile.driving_licences or []):
-        value_tokens = _normalized_tokens(str(value))
-        category_terms = {item for item in required_terms if len(item) <= 3}
-        if not category_terms or category_terms & value_tokens:
+        normalized_value = normalize_for_fingerprint(str(value))
+        value_tokens = set(normalized_value.split())
+        value_categories = {
+            match.group(1).casefold()
+            for match in _DRIVING_CATEGORY.finditer(str(value))
+        }
+        value_categories.update(
+            token.casefold()
+            for token in value_tokens
+            if len(token) == 1 and token.casefold() in {"a", "b", "c", "d"}
+        )
+        if required_categories:
+            if required_categories & value_categories:
+                positive.append(f"profile.driving_licence:{index}")
+        else:
             positive.append(f"profile.driving_licence:{index}")
     for fact in profile.confirmed_facts or []:
         if fact.get("confirmed") is not True:
@@ -410,7 +428,13 @@ class HardRequirementEngine:
             if not _MANDATORY.search(clause):
                 continue
             terms = _normalized_tokens(clause)
-            positive, negative = _driving_licence_evidence(profile, terms)
+            required_categories = {
+                match.group(1).casefold()
+                for match in _DRIVING_CATEGORY.finditer(clause)
+            }
+            positive, negative = _driving_licence_evidence(
+                profile, terms, required_categories
+            )
             requirements.append(
                 _assessment(
                     requirement_id="driving_licence",

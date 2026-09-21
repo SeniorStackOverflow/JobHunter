@@ -31,7 +31,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision == ("9f6a2c4d8b10",)
+        assert revision == ("d1e2f3a4b5c6",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -45,9 +45,11 @@ def test_fresh_sqlite_database_migrations_round_trip(
         assert "requires_rematch" in {
             column["name"] for column in database.get_columns("job_snapshots")
         }
-        assert "source_matching_hash" in {
+        match_columns = {
             column["name"] for column in database.get_columns("match_evaluations")
         }
+        assert "source_matching_hash" in match_columns
+        assert {"hard_requirements", "hard_requirement_rules_version"} <= match_columns
         assert "profile_id" in {column["name"] for column in database.get_columns("applications")}
         assert "phonegate_generation" in {
             column["name"] for column in database.get_columns("communication_sessions")
@@ -188,4 +190,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("9f6a2c4d8b10",)
+    assert revision == ("d1e2f3a4b5c6",)

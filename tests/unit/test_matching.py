@@ -1750,3 +1750,42 @@ def test_optional_neighbour_does_not_cancel_mandatory_forklift_certificate() -> 
     )
     by_id = {item.requirement_id: item for item in result.hard_requirements}
     assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.UNKNOWN
+
+
+def test_mandatory_driving_category_requires_matching_category_evidence() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(description="Este obligatoriu permis de conducere categoria B.")
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=["A"]),
+        resume_fit=90,
+    )
+    licence = next(
+        item
+        for item in result.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert licence.status is HardRequirementStatus.UNKNOWN
+    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert result.eligible_for_ai is False
+
+
+def test_mandatory_driving_category_accepts_matching_category_evidence() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(description="Este obligatoriu permis de conducere categoria B.")
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=["Categoria B"]),
+        resume_fit=90,
+    )
+    licence = next(
+        item
+        for item in result.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert licence.status is HardRequirementStatus.MET
+    assert result.eligible_for_ai is True
