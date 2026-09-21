@@ -343,6 +343,10 @@ class MatchEvaluation(UUIDPrimaryKeyMixin, Base):
     profile_fingerprint: Mapped[str | None] = mapped_column(String(64))
     preference_fingerprint: Mapped[str | None] = mapped_column(String(64))
     confirmed_fact_hashes: Mapped[dict[str, str] | None] = mapped_column(JSON)
+    hard_requirements: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    hard_requirement_rules_version: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

@@ -67,6 +67,8 @@ _AUTO_SEND_HARD_FAILURES = {
     "source_actions_enabled",
     "match_not_blocked",
     "match_not_skipped",
+    "deterministic_hard_requirements_met",
+    "hard_requirement_binding_current",
     "vacancy_active",
     "all_claims_confirmed",
     "no_prompt_injection",

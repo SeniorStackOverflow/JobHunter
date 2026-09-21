@@ -8,6 +8,13 @@ from app.crawlers.parsing.normalization import (
     detect_scam_indicators,
     normalize_for_fingerprint,
 )
+from app.matching.hard_requirements import (
+    HARD_REQUIREMENT_RULES_VERSION,
+    HardRequirementEngine,
+    all_hard_requirements_met,
+    hard_requirements_snapshot,
+)
+from app.matching.schemas import HardRequirementStatus
 from app.models.entities import (
     Application,
     EmailDelivery,
@@ -33,7 +40,7 @@ from app.policies.schemas import PolicyResult
 from app.settings import Settings
 from app.time_utils import local_day_bounds
 
-POLICY_VERSION = "2026-08-03.1"
+POLICY_VERSION = "2026-09-21.1-hard-requirements"
 
 
 class PolicyEngine:
@@ -132,6 +139,25 @@ class PolicyEngine:
                 EmailDelivery.status == DeliveryStatus.DELIVERY_UNKNOWN,
             )
         )
+        current_hard_requirements = HardRequirementEngine().evaluate(job, profile)
+        current_hard_snapshot = hard_requirements_snapshot(current_hard_requirements)
+        hard_requirements_met = all_hard_requirements_met(current_hard_requirements)
+        hard_requirement_binding_current = (
+            not current_hard_requirements
+            or (
+                evaluation.hard_requirement_rules_version
+                == HARD_REQUIREMENT_RULES_VERSION
+                and (evaluation.hard_requirements or []) == current_hard_snapshot
+            )
+        )
+        hard_requirement_missing = any(
+            item.status is HardRequirementStatus.MISSING
+            for item in current_hard_requirements
+        )
+        hard_requirement_unknown = any(
+            item.status is HardRequirementStatus.UNKNOWN
+            for item in current_hard_requirements
+        )
 
         rule("deployment_emergency_switch_off", not self.settings.emergency_email_kill_switch)
         rule("auto_send_enabled", preferences.auto_send_enabled)
@@ -148,6 +174,8 @@ class PolicyEngine:
             minimum_catchup_active or evaluation.overall_fit >= preferences.minimum_auto_send_score,
         )
         rule("mandatory_requirements_met", not evaluation.missing_requirements)
+        rule("deterministic_hard_requirements_met", hard_requirements_met)
+        rule("hard_requirement_binding_current", hard_requirement_binding_current)
         rule(
             "match_not_blocked",
             evaluation.decision != MatchDecision.BLOCK,
@@ -204,6 +232,10 @@ class PolicyEngine:
         }
         if hard_block_rules & set(failed):
             decision = PolicyDecision.BLOCKED
+        elif hard_requirement_missing:
+            decision = PolicyDecision.SKIPPED
+        elif hard_requirement_unknown or not hard_requirement_binding_current:
+            decision = PolicyDecision.PENDING_REVIEW
         elif evaluation.decision == MatchDecision.SKIP and not minimum_catchup_active:
             decision = PolicyDecision.SKIPPED
         elif failed:

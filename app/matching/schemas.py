@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated
 
 from pydantic import (
@@ -21,6 +22,32 @@ ReasonText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
 ]
+
+
+class HardRequirementStatus(StrEnum):
+    MET = "met"
+    UNKNOWN = "unknown"
+    MISSING = "missing"
+
+
+class HardRequirementKind(StrEnum):
+    DRIVING_LICENCE = "driving_licence"
+    PROFESSIONAL_CREDENTIAL = "professional_credential"
+    ROLE_EXPERIENCE = "role_experience"
+
+
+class HardRequirementAssessment(BaseModel):
+    """Deterministic hard requirement bound only to trusted profile evidence."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    requirement_id: ShortText
+    kind: HardRequirementKind
+    label: ShortText
+    status: HardRequirementStatus
+    evidence_ids: list[ShortText] = Field(default_factory=list)
+    evidence_terms: list[ShortText] = Field(default_factory=list)
+    source_excerpt: ShortText | None = None
 
 
 class MatchResult(BaseModel):
@@ -61,6 +88,7 @@ class DeterministicFilterResult(BaseModel):
     scam_indicators: list[ShortText] = Field(default_factory=list)
     prompt_injection_indicators: list[ShortText] = Field(default_factory=list)
     reasons: list[ShortText] = Field(default_factory=list)
+    hard_requirements: list[HardRequirementAssessment] = Field(default_factory=list)
     outside_resume_allowed: bool = False
 
     @model_validator(mode="after")

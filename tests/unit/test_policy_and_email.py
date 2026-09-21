@@ -1229,3 +1229,152 @@ async def test_periodic_prepare_does_not_revive_historical_auto_skip_without_tod
         assert stored is not None
         assert stored.status == ApplicationStatus.CANCELLED
         assert stored.match_evaluation_id == old_evaluation_id
+
+
+async def test_send_time_hard_requirement_gate_ignores_fabricated_auto_apply(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.matching.hard_requirements import (
+        HARD_REQUIREMENT_RULES_VERSION,
+        HardRequirementEngine,
+        hard_requirements_snapshot,
+    )
+
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile = values[1]
+        preference = values[2]
+        resume = values[3]
+        job = values[5]
+        evaluation = values[6]
+        application = values[8]
+
+        job.title = "Șofer stivuitor / Водитель погрузчика"
+        job.description = (
+            "Cerințe Permisului/certificatului valabil pentru conducerea stivuitorului "
+            "este obligatoriu; Experiență de muncă în calitate de șofer de stivuitor. "
+            "Требования Обязательное наличие действующих прав/удостоверения на управление "
+            "погрузчиком; Опыт работы водителем погрузчика."
+        )
+        job.required_experience = "С опытом"  # noqa: RUF001
+        job.no_experience = False
+        job.matching_content_hash = compute_source_matching_hash(job)
+
+        profile.confirmed_facts = [
+            *profile.confirmed_facts,
+            {
+                "id": "forklift_operator_certificate_absent",
+                "statement": "No valid forklift operator licence or certificate.",
+                "keywords": ["forklift", "stivuitor", "погрузчик", "certificate"],
+                "confirmed": True,
+                "polarity": "absent",
+            },
+        ]
+
+        current_hard = HardRequirementEngine().evaluate(job, profile)
+        evaluation.source_matching_hash = job.matching_content_hash
+        evaluation.profile_fingerprint = profile_fingerprint(profile)
+        evaluation.preference_fingerprint = preference_fingerprint(preference)
+        evaluation.confirmed_fact_hashes = confirmed_fact_hashes(profile)
+        evaluation.resume_id = resume.id
+        evaluation.resume_sha256 = resume.sha256
+        evaluation.hard_requirements = hard_requirements_snapshot(current_hard)
+        evaluation.hard_requirement_rules_version = HARD_REQUIREMENT_RULES_VERSION
+
+        # Simulate the exact bug: matcher claims AUTO_APPLY with no missing requirements.
+        evaluation.decision = MatchDecision.AUTO_APPLY
+        evaluation.missing_requirements = []
+        evaluation.requirements_met = [
+            "Forklift operator license/certificate is mandatory",
+            "Experience as a forklift operator",
+        ]
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        await session.commit()
+
+    service = EmailService(
+        settings(tmp_path), sqlite_session_factory, FakeGmailProvider()
+    )
+    with pytest.raises(EmailSendBlocked, match="current policy no longer permits"):
+        await service.send_application(application_id)
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.BLOCKED
+        assert stored.policy_result["safe_stop_reason"] == "current_policy_hard_failure"
+        assert "deterministic_hard_requirements_met" in stored.policy_result["rules_failed"]
+        assert await session.scalar(select(EmailDelivery.id)) is None
+
+
+async def test_retro_hard_requirement_audit_downgrades_unsent_auto_approved(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.matching.audit import audit_application_hard_requirements
+
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        job = values[5]
+        application = values[8]
+        job.title = "Șofer stivuitor / Водитель погрузчика"
+        job.description = (
+            "Cerințe Permisului/certificatului valabil pentru conducerea stivuitorului "
+            "este obligatoriu; Experiență de muncă în calitate de șofer de stivuitor."
+        )
+        job.required_experience = "С опытом"  # noqa: RUF001
+        job.no_experience = False
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        await session.flush()
+
+        result = await audit_application_hard_requirements(
+            session, apply_changes=True
+        )
+        await session.commit()
+
+    assert result["findings"] == 1
+    assert result["downgraded_to_review"] == 1
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.PENDING_REVIEW
+        assert stored.policy_decision == PolicyDecision.PENDING_REVIEW
+        assert stored.policy_result["safe_stop_reason"] == "hard_requirement_retro_audit"
+        assert stored.policy_result["requires_rematch"] is True
+
+
+async def test_retro_hard_requirement_audit_flags_sent_without_rewriting_history(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.matching.audit import audit_application_hard_requirements
+
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        job = values[5]
+        application = values[8]
+        job.title = "Șofer stivuitor / Водитель погрузчика"
+        job.description = (
+            "Требования Обязательное наличие действующих прав/удостоверения "
+            "на управление погрузчиком; Опыт работы водителем погрузчика."
+        )
+        job.required_experience = "С опытом"  # noqa: RUF001
+        job.no_experience = False
+        application.status = ApplicationStatus.SENT
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        await session.flush()
+
+        result = await audit_application_hard_requirements(
+            session, apply_changes=True
+        )
+        await session.commit()
+
+    assert result["findings"] == 1
+    assert result["historical_flagged"] == 1
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.SENT
+        assert "post_send_hard_requirement_audit" in stored.policy_result

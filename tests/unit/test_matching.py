@@ -879,7 +879,7 @@ async def test_analyze_persists_match_evaluation_without_network() -> None:
         assert evaluation.source_job_id == job.id
         assert evaluation.canonical_job_id == canonical.id
         assert evaluation.model == "mock-v1"
-        assert evaluation.prompt_rules_version == "matching-v5"
+        assert evaluation.prompt_rules_version == "matching-v6-hard-evidence"
         assert evaluation.decision is MatchDecision.AUTO_APPLY
     await engine.dispose()
 
@@ -1100,7 +1100,7 @@ async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
     async with session_factory() as session:
         evaluations = list((await session.scalars(select(MatchEvaluation))).all())
         assert len(evaluations) == 2
-        assert evaluations[-1].prompt_rules_version == "matching-v5"
+        assert evaluations[-1].prompt_rules_version == "matching-v6-hard-evidence"
         stored_job = await session.get(SourceJob, job.id)
         assert stored_job is not None
         stored_job.description = "The employer added a new requirement."
@@ -1483,3 +1483,270 @@ async def test_llmrouter_exhausted_structured_pool_falls_back_to_prompt_json() -
     assert "response_format" in bodies[0]
     assert "response_format" not in bodies[1]
     assert "JSON Schema" in bodies[1]["messages"][0]["content"]
+
+
+def _radu_forklift_job() -> SourceJob:
+    return make_job(
+        title="Șofer stivuitor / Водитель погрузчика",
+        category="warehouses",
+        categories_seen=["warehouses"],
+        required_experience="С опытом",  # noqa: RUF001
+        no_experience=False,
+        description=(
+            "Cerințe Permisului/certificatului valabil pentru conducerea stivuitorului "
+            "este obligatoriu; Experiență de muncă în calitate de șofer de stivuitor. "
+            "Требования Обязательное наличие действующих прав/удостоверения на управление "
+            "погрузчиком; Опыт работы водителем погрузчика."
+        ),
+    )
+
+
+def test_real_forklift_vacancy_extracts_typed_hard_requirements() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    result = DeterministicPrefilter().evaluate(
+        _radu_forklift_job(),
+        make_preference(allowed_categories=["warehouses"]),
+        make_profile(
+            work_experience=[
+                {
+                    "role": "Operator logistic (Depozit)",
+                    "details": "Warehouse logistics.",
+                    "confirmed": True,
+                }
+            ],
+        ),
+        resume_fit=70,
+    )
+
+    by_id = {item.requirement_id: item for item in result.hard_requirements}
+    assert set(by_id) >= {
+        "forklift_operator_certificate",
+        "forklift_operator_experience",
+    }
+    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.UNKNOWN
+    assert by_id["forklift_operator_experience"].status is HardRequirementStatus.UNKNOWN
+    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert result.eligible_for_ai is False
+    assert "hard_requirement_unknown:forklift_operator_certificate" in result.risks
+    assert "hard_requirement_unknown:forklift_operator_experience" in result.risks
+
+
+def test_confirmed_absent_forklift_certificate_fails_closed() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    profile = make_profile(
+        confirmed_facts=[
+            {
+                "id": "forklift_operator_certificate_absent",
+                "statement": "No valid forklift operator licence or certificate.",
+                "keywords": ["forklift", "stivuitor", "погрузчик", "certificate"],
+                "confirmed": True,
+                "polarity": "absent",
+            }
+        ]
+    )
+    result = DeterministicPrefilter().evaluate(
+        _radu_forklift_job(),
+        make_preference(allowed_categories=["warehouses"]),
+        profile,
+        resume_fit=70,
+    )
+
+    certificate = next(
+        item
+        for item in result.hard_requirements
+        if item.requirement_id == "forklift_operator_certificate"
+    )
+    assert certificate.status is HardRequirementStatus.MISSING
+    assert certificate.evidence_ids == [
+        "profile.confirmed_fact:forklift_operator_certificate_absent"
+    ]
+    assert result.decision is MatchDecision.SKIP
+    assert result.eligible_for_ai is False
+    assert "forklift_operator_certificate" in result.missing_requirements
+
+
+def test_llm_cannot_promote_or_fabricate_unknown_forklift_requirements() -> None:
+    from app.matching.service import reconcile_match_result
+
+    deterministic = DeterministicPrefilter().evaluate(
+        _radu_forklift_job(),
+        make_preference(allowed_categories=["warehouses"], minimum_auto_send_score=70),
+        make_profile(
+            work_experience=[
+                {
+                    "role": "Operator logistic (Depozit)",
+                    "details": "Warehouse logistics",
+                    "confirmed": True,
+                }
+            ]
+        ),
+        resume_fit=70,
+    )
+    llm = make_result(
+        resume_fit=90,
+        preference_fit=95,
+        overall_fit=93,
+        requirements_met=[
+            "Forklift operator license/certificate is mandatory",
+            "Experience as a forklift operator",
+        ],
+        missing_requirements=[],
+        risks=[],
+        decision=MatchDecision.AUTO_APPLY,
+        reason="Candidate meets all forklift requirements",
+    )
+
+    result = reconcile_match_result(
+        deterministic,
+        llm,
+        minimum_auto_send_score=70,
+    )
+
+    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert not any("forklift" in item.casefold() for item in result.requirements_met)
+    assert "hard_requirement_unknown:forklift_operator_certificate" in result.risks
+
+
+def test_forklift_hard_requirements_can_be_met_only_with_trusted_evidence() -> None:
+    from app.matching.schemas import HardRequirementStatus
+    from app.matching.service import reconcile_match_result
+
+    profile = make_profile(
+        work_experience=[
+            {
+                "role": "Forklift operator",
+                "details": "Operated a forklift in a warehouse.",
+                "confirmed": True,
+            }
+        ],
+        confirmed_facts=[
+            {
+                "id": "forklift_operator_certificate",
+                "statement": "Valid forklift operator certificate.",
+                "keywords": ["forklift", "certificate"],
+                "confirmed": True,
+            }
+        ],
+    )
+    deterministic = DeterministicPrefilter().evaluate(
+        _radu_forklift_job(),
+        make_preference(allowed_categories=["warehouses"], minimum_auto_send_score=70),
+        profile,
+        resume_fit=85,
+    )
+    by_id = {item.requirement_id: item for item in deterministic.hard_requirements}
+    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.MET
+    assert by_id["forklift_operator_experience"].status is HardRequirementStatus.MET
+
+    result = reconcile_match_result(
+        deterministic,
+        make_result(
+            resume_fit=90,
+            preference_fit=95,
+            overall_fit=93,
+            decision=MatchDecision.AUTO_APPLY,
+        ),
+        minimum_auto_send_score=70,
+    )
+    assert result.decision is MatchDecision.AUTO_APPLY
+
+
+def test_same_input_skip_to_auto_apply_is_forced_to_review() -> None:
+    from app.matching.service import _apply_same_input_safety_guard
+
+    previous = MatchEvaluation(
+        profile_id=uuid4(),
+        canonical_job_id=uuid4(),
+        source_job_id=uuid4(),
+        resume_fit=10,
+        preference_fit=90,
+        overall_fit=70,
+        requirements_met=[],
+        missing_requirements=["mandatory licence"],
+        risks=[],
+        scam_indicators=[],
+        explanation="missing mandatory licence",
+        decision=MatchDecision.SKIP,
+        model="jobhunter",
+        prompt_rules_version="matching-v5",
+        source_content_hash="a" * 64,
+        source_matching_hash="b" * 64,
+        profile_fingerprint="c" * 64,
+        preference_fingerprint="d" * 64,
+        confirmed_fact_hashes={},
+        hard_requirements=[],
+        hard_requirement_rules_version="hard-requirements-v1",
+    )
+    candidate = make_result(
+        resume_fit=90,
+        preference_fit=95,
+        overall_fit=93,
+        missing_requirements=[],
+        decision=MatchDecision.AUTO_APPLY,
+    )
+
+    result = _apply_same_input_safety_guard(
+        previous,
+        candidate,
+        source_matching_hash="b" * 64,
+        profile_fingerprint_value="c" * 64,
+        preference_fingerprint_value="d" * 64,
+    )
+
+    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert "match_safety_regression:skip_to_auto_apply_same_inputs" in result.risks
+
+
+def test_matching_v5_safety_rollout_avoids_global_rematch_without_hard_requirements() -> None:
+    from app.matching.service import _matching_rules_refresh_due
+
+    evaluation = MatchEvaluation(prompt_rules_version="matching-v5")
+
+    assert (
+        _matching_rules_refresh_due(
+            evaluation,
+            hard_requirement_refresh_due=False,
+        )
+        is False
+    )
+    assert (
+        _matching_rules_refresh_due(
+            evaluation,
+            hard_requirement_refresh_due=True,
+        )
+        is True
+    )
+
+    evaluation.prompt_rules_version = "matching-v1"
+    assert (
+        _matching_rules_refresh_due(
+            evaluation,
+            hard_requirement_refresh_due=False,
+        )
+        is True
+    )
+
+
+def test_optional_neighbour_does_not_cancel_mandatory_forklift_certificate() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(
+        title="Warehouse forklift operator",
+        required_experience="1 year",
+        no_experience=False,
+        description=(
+            "Categoria C constituie un avantaj; "
+            "Permis/certificat valabil pentru conducerea stivuitorului este obligatoriu; "
+            "Experiență ca operator stivuitor."
+        ),
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(),
+        resume_fit=80,
+    )
+    by_id = {item.requirement_id: item for item in result.hard_requirements}
+    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.UNKNOWN

@@ -652,6 +652,8 @@ async def list_matches(
             "missing_requirements",
             "risks",
             "scam_indicators",
+            "hard_requirements",
+            "hard_requirement_rules_version",
             "explanation",
             "decision",
             "model",

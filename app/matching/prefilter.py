@@ -6,7 +6,12 @@ from collections.abc import Iterable
 from typing import Any
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
-from app.matching.schemas import DeterministicFilterResult
+from app.matching.hard_requirements import HardRequirementEngine
+from app.matching.schemas import (
+    DeterministicFilterResult,
+    HardRequirementKind,
+    HardRequirementStatus,
+)
 from app.models.entities import JobPreference, SourceJob, UserProfile
 from app.models.enums import JobStatus, MatchDecision
 
@@ -294,6 +299,9 @@ def _required_preference_languages(preference: JobPreference) -> set[str]:
 class DeterministicPrefilter:
     """Apply trusted user rules before any untrusted text reaches an LLM."""
 
+    def __init__(self, hard_requirements: HardRequirementEngine | None = None) -> None:
+        self.hard_requirements = hard_requirements or HardRequirementEngine()
+
     def evaluate(
         self,
         job: SourceJob,
@@ -331,6 +339,23 @@ class DeterministicPrefilter:
         risks: list[str] = []
         skip_reasons: list[str] = []
         preference_fit = 100
+        hard_requirements = self.hard_requirements.evaluate(job, profile)
+
+        for requirement in hard_requirements:
+            if requirement.status is HardRequirementStatus.MET:
+                requirements_met.append(requirement.requirement_id)
+            elif requirement.status is HardRequirementStatus.MISSING:
+                missing_requirements.append(requirement.requirement_id)
+                skip_reasons.append(
+                    f"hard_requirement_missing:{requirement.requirement_id}"
+                )
+                if requirement.requirement_id == "driving_licence":
+                    skip_reasons.append("required_driving_licence_not_confirmed")
+            else:
+                risks.append(f"hard_requirement_unknown:{requirement.requirement_id}")
+                reasons.append(
+                    f"hard requirement needs confirmed evidence:{requirement.requirement_id}"
+                )
 
         def penalize(amount: int, reason: str) -> None:
             nonlocal preference_fit
@@ -427,7 +452,11 @@ class DeterministicPrefilter:
             and not _NO_EXPERIENCE.search(required_experience)
             and job.no_experience is not True
         )
-        if experience_required:
+        has_role_specific_requirement = any(
+            requirement.kind is HardRequirementKind.ROLE_EXPERIENCE
+            for requirement in hard_requirements
+        )
+        if experience_required and not has_role_specific_requirement:
             confirmed_experience = any(
                 item.get("confirmed") is True for item in profile.work_experience or []
             )
@@ -439,13 +468,6 @@ class DeterministicPrefilter:
                 penalize(5, "experience_relevance_requires_review")
         elif job.no_experience is True:
             requirements_met.append("job_allows_no_experience")
-
-        if _driving_licence_is_hard_requirement(text):
-            if profile.driving_licences:
-                requirements_met.append("driving_licence_confirmed")
-            else:
-                missing_requirements.append("driving_licence")
-                skip_reasons.append("required_driving_licence_not_confirmed")
 
         required_languages = _required_preference_languages(preference)
         missing_languages = required_languages - _profile_language_names(profile)
@@ -460,9 +482,19 @@ class DeterministicPrefilter:
         resume_weight = 0.2 if outside_resume_allowed else 0.45
         overall_fit = round(resume_fit * resume_weight + preference_fit * (1 - resume_weight))
         reasons.extend(skip_reasons)
+        hard_requirement_unknown = any(
+            requirement.status is HardRequirementStatus.UNKNOWN
+            for requirement in hard_requirements
+        )
         if skip_reasons:
             decision = MatchDecision.SKIP
             eligible_for_ai = False
+        elif hard_requirement_unknown:
+            # An LLM cannot manufacture trusted evidence for a professional
+            # credential or role-specific experience. Keep this deterministic.
+            decision = MatchDecision.PREPARE_FOR_REVIEW
+            eligible_for_ai = False
+            reasons.append("hard_requirements_require_trusted_evidence")
         else:
             decision = MatchDecision.PREPARE_FOR_REVIEW
             eligible_for_ai = True
@@ -478,6 +510,7 @@ class DeterministicPrefilter:
             missing_requirements=_unique(missing_requirements),
             risks=_unique(risks),
             reasons=_unique(reasons),
+            hard_requirements=hard_requirements,
             outside_resume_allowed=outside_resume_allowed,
         )
 

@@ -18,6 +18,11 @@ from app.matching.bindings import (
     preference_fingerprint,
     profile_fingerprint,
 )
+from app.matching.hard_requirements import (
+    HARD_REQUIREMENT_RULES_VERSION,
+    all_hard_requirements_met,
+    hard_requirements_snapshot,
+)
 from app.matching.prefilter import DeterministicPrefilter
 from app.matching.providers import (
     MATCHING_RULES_VERSION,
@@ -28,7 +33,12 @@ from app.matching.providers import (
     MockProvider,
     OpenAIProvider,
 )
-from app.matching.schemas import DeterministicFilterResult, MatchRequest, MatchResult
+from app.matching.schemas import (
+    DeterministicFilterResult,
+    HardRequirementStatus,
+    MatchRequest,
+    MatchResult,
+)
 from app.models.entities import (
     Application,
     JobPreference,
@@ -58,6 +68,20 @@ _PRIORITY_REMATCH_SAFE_STOPS = {
     "match_evaluation_stale",
     "match_evaluation_inputs_stale",
 }
+_SAFETY_ONLY_PREVIOUS_RULES = {"matching-v5"}
+
+
+def _matching_rules_refresh_due(
+    evaluation: MatchEvaluation | None,
+    *,
+    hard_requirement_refresh_due: bool,
+) -> bool:
+    if evaluation is None or evaluation.prompt_rules_version == MATCHING_RULES_VERSION:
+        return False
+    return not (
+        evaluation.prompt_rules_version in _SAFETY_ONLY_PREVIOUS_RULES
+        and not hard_requirement_refresh_due
+    )
 
 
 def _as_aware(value: datetime) -> datetime:
@@ -418,18 +442,91 @@ async def _select_resume(session: AsyncSession, profile_id: UUID, job: SourceJob
     return choose_resume_for_job(resumes, job)
 
 
+def _requirement_claim_is_protected(
+    claim: str, deterministic: DeterministicFilterResult
+) -> bool:
+    normalized = set(normalize_for_fingerprint(claim).split())
+    if not normalized:
+        return False
+    for requirement in deterministic.hard_requirements:
+        if requirement.status is HardRequirementStatus.MET:
+            continue
+        protected = {
+            token
+            for value in (
+                requirement.requirement_id,
+                requirement.label,
+                *requirement.evidence_terms,
+            )
+            for token in normalize_for_fingerprint(str(value)).split()
+            if len(token) >= 3
+        }
+        if protected and len(normalized & protected) >= min(2, len(protected)):
+            return True
+    return False
+
+
+def _apply_same_input_safety_guard(
+    previous: MatchEvaluation | None,
+    result: MatchResult,
+    *,
+    source_matching_hash: str,
+    profile_fingerprint_value: str,
+    preference_fingerprint_value: str,
+) -> MatchResult:
+    if previous is None:
+        return result
+    same_inputs = (
+        previous.source_matching_hash == source_matching_hash
+        and previous.profile_fingerprint == profile_fingerprint_value
+        and previous.preference_fingerprint == preference_fingerprint_value
+    )
+    if not same_inputs:
+        return result
+
+    regression: str | None = None
+    if previous.decision is MatchDecision.SKIP and result.decision is MatchDecision.AUTO_APPLY:
+        regression = "skip_to_auto_apply_same_inputs"
+    elif (
+        previous.missing_requirements
+        and not result.missing_requirements
+        and result.decision is MatchDecision.AUTO_APPLY
+    ):
+        regression = "missing_requirements_disappeared_same_inputs"
+    if regression is None:
+        return result
+
+    return result.model_copy(
+        update={
+            "decision": MatchDecision.PREPARE_FOR_REVIEW,
+            "risks": _unique([*result.risks, f"match_safety_regression:{regression}"]),
+            "reason": (
+                f"{result.reason}; automatic promotion blocked because a previous evaluation "
+                f"for identical inputs had a safer decision ({regression})"
+            )[:4000],
+        }
+    )
+
+
 def reconcile_match_result(
     deterministic: DeterministicFilterResult,
     llm_result: MatchResult,
     *,
     minimum_auto_send_score: int | None = None,
 ) -> MatchResult:
-    """Preserve hard deterministic constraints while accepting advisory LLM analysis."""
+    """Preserve deterministic hard requirements while accepting advisory LLM analysis."""
 
     if not deterministic.eligible_for_ai:
         return deterministic.to_match_result()
 
-    requirements_met = _unique([*deterministic.requirements_met, *llm_result.requirements_met])
+    llm_requirements_met = [
+        item
+        for item in llm_result.requirements_met
+        if not _requirement_claim_is_protected(item, deterministic)
+    ]
+    requirements_met = _unique(
+        [*deterministic.requirements_met, *llm_requirements_met]
+    )
     missing_requirements = _unique(
         [*deterministic.missing_requirements, *llm_result.missing_requirements]
     )
@@ -442,10 +539,34 @@ def reconcile_match_result(
     decision = llm_result.decision
     reason_suffix: str | None = None
 
+    hard_missing = [
+        item
+        for item in deterministic.hard_requirements
+        if item.status is HardRequirementStatus.MISSING
+    ]
+    hard_unknown = [
+        item
+        for item in deterministic.hard_requirements
+        if item.status is HardRequirementStatus.UNKNOWN
+    ]
+    hard_requirements_clear = all_hard_requirements_met(deterministic.hard_requirements)
+
     if scam_indicators:
         decision = MatchDecision.BLOCK
         overall_fit = 0
         reason_suffix = "scam indicators force a deterministic block"
+    elif hard_missing:
+        decision = MatchDecision.SKIP
+        reason_suffix = (
+            "confirmed missing hard requirement prevents application: "
+            + ", ".join(item.requirement_id for item in hard_missing)
+        )
+    elif hard_unknown and decision not in {MatchDecision.BLOCK, MatchDecision.SKIP}:
+        decision = MatchDecision.PREPARE_FOR_REVIEW
+        reason_suffix = (
+            "hard requirement lacks trusted evidence: "
+            + ", ".join(item.requirement_id for item in hard_unknown)
+        )
     elif missing_requirements and decision is MatchDecision.AUTO_APPLY:
         decision = MatchDecision.PREPARE_FOR_REVIEW
         reason_suffix = "missing requirements prevent automatic application"
@@ -461,6 +582,7 @@ def reconcile_match_result(
         and resume_fit < 50
         and preference_fit >= 70
         and not missing_requirements
+        and hard_requirements_clear
     ):
         decision = MatchDecision.PREPARE_FOR_REVIEW
         reason_suffix = "explicit outside-resume preference overrides low resume-fit-only skip"
@@ -473,6 +595,7 @@ def reconcile_match_result(
         and not missing_requirements
         and not material_risks
         and not scam_indicators
+        and hard_requirements_clear
     ):
         decision = MatchDecision.AUTO_APPLY
         reason_suffix = (
@@ -592,6 +715,17 @@ class MatchingService:
         expected_matching_hash = job.matching_content_hash
         expected_content_hash = job.content_hash
         expected_canonical_job_id = job.canonical_job_id
+        current_profile_fingerprint = profile_fingerprint(profile)
+        current_preference_fingerprint = preference_fingerprint(preference)
+        previous_evaluation = await session.scalar(
+            select(MatchEvaluation)
+            .where(
+                MatchEvaluation.profile_id == profile.id,
+                MatchEvaluation.source_job_id == source_job_id,
+            )
+            .order_by(MatchEvaluation.created_at.desc())
+            .limit(1)
+        )
 
         resume = await _select_resume(session, profile.id, job)
         resume_category = resume.category if resume is not None else None
@@ -620,6 +754,13 @@ class MatchingService:
                 resume_fit=resume_fit,
                 resume_category=resume_category,
             )
+        result = _apply_same_input_safety_guard(
+            previous_evaluation,
+            result,
+            source_matching_hash=expected_matching_hash,
+            profile_fingerprint_value=current_profile_fingerprint,
+            preference_fingerprint_value=current_preference_fingerprint,
+        )
         if resume is not None:
             # FOR SHARE, not FOR UPDATE: analyze never writes the resume row, it
             # only needs it to stay unchanged until persist. An exclusive lock
@@ -673,9 +814,13 @@ class MatchingService:
             source_matching_hash=expected_matching_hash,
             resume_id=resume.id if resume is not None else None,
             resume_sha256=resume.sha256 if resume is not None else None,
-            profile_fingerprint=profile_fingerprint(profile),
-            preference_fingerprint=preference_fingerprint(preference),
+            profile_fingerprint=current_profile_fingerprint,
+            preference_fingerprint=current_preference_fingerprint,
             confirmed_fact_hashes=confirmed_fact_hashes(profile),
+            hard_requirements=hard_requirements_snapshot(
+                self.prefilter.hard_requirements.evaluate(job, profile)
+            ),
+            hard_requirement_rules_version=HARD_REQUIREMENT_RULES_VERSION,
         )
         session.add(evaluation)
         await session.flush()
@@ -790,9 +935,30 @@ async def process_unprocessed_jobs() -> int:
                     <= datetime.now(UTC)
                     - timedelta(seconds=settings.matching_provider_failure_retry_seconds)
                 )
+                resume_fit = _estimate_resume_fit(
+                    job, profile, resume.category if resume else None
+                )
+                deterministic = service.prefilter.evaluate(
+                    job, preference, profile, resume_fit=resume_fit
+                )
+                hard_requirement_refresh_due = bool(
+                    deterministic.hard_requirements
+                ) and (
+                    evaluation is None
+                    or evaluation.hard_requirement_rules_version
+                    != HARD_REQUIREMENT_RULES_VERSION
+                    or (evaluation.hard_requirements or [])
+                    != hard_requirements_snapshot(deterministic.hard_requirements)
+                )
+                prompt_refresh_due = _matching_rules_refresh_due(
+                    evaluation,
+                    hard_requirement_refresh_due=hard_requirement_refresh_due,
+                )
+
                 if (
                     evaluation is None
-                    or evaluation.prompt_rules_version != MATCHING_RULES_VERSION
+                    or prompt_refresh_due
+                    or hard_requirement_refresh_due
                     or evaluation.source_matching_hash is None
                     or evaluation.source_matching_hash != job.matching_content_hash
                     or (
@@ -802,13 +968,13 @@ async def process_unprocessed_jobs() -> int:
                     or not evaluation_inputs_are_current(evaluation, profile, preference, resume)
                     or retry_due
                 ):
-                    resume_fit = _estimate_resume_fit(
-                        job, profile, resume.category if resume else None
+                    candidates.append(
+                        (
+                            job.id,
+                            deterministic.eligible_for_ai,
+                            job.id in priority_source_ids,
+                        )
                     )
-                    needs_ai = service.prefilter.evaluate(
-                        job, preference, profile, resume_fit=resume_fit
-                    ).eligible_for_ai
-                    candidates.append((job.id, needs_ai, job.id in priority_source_ids))
 
             batch, ai_selected, ai_deferred, priority_selected = _select_matching_batch(
                 candidates,
