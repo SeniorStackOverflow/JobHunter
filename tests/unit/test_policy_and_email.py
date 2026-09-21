@@ -1308,7 +1308,7 @@ async def test_send_time_hard_requirement_gate_ignores_fabricated_auto_apply(
         assert await session.scalar(select(EmailDelivery.id)) is None
 
 
-async def test_retro_hard_requirement_audit_downgrades_unsent_auto_approved(
+async def test_retro_hard_requirement_audit_cancels_unsent_auto_approved_missing_requirement(
     sqlite_session_factory, tmp_path: Path
 ) -> None:
     from app.matching.audit import audit_application_hard_requirements
@@ -1335,12 +1335,13 @@ async def test_retro_hard_requirement_audit_downgrades_unsent_auto_approved(
         await session.commit()
 
     assert result["findings"] == 1
-    assert result["downgraded_to_review"] == 1
+    assert result["downgraded_to_review"] == 0
+    assert result["cancelled"] == 1
     async with sqlite_session_factory() as session:
         stored = await session.get(Application, application_id)
         assert stored is not None
-        assert stored.status == ApplicationStatus.PENDING_REVIEW
-        assert stored.policy_decision == PolicyDecision.PENDING_REVIEW
+        assert stored.status == ApplicationStatus.CANCELLED
+        assert stored.policy_decision == PolicyDecision.SKIPPED
         assert stored.policy_result["safe_stop_reason"] == "hard_requirement_retro_audit"
         assert stored.policy_result["requires_rematch"] is True
 

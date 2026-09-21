@@ -11,7 +11,7 @@ from app.matching.schemas import (
 )
 from app.models.entities import SourceJob, UserProfile
 
-HARD_REQUIREMENT_RULES_VERSION = "hard-requirements-v1"
+HARD_REQUIREMENT_RULES_VERSION = "hard-requirements-v2-closed-world"
 
 _MANDATORY = re.compile(
     r"mandatory|required|must\s+have|obligatori|este\s+obligatoriu|necesar|"
@@ -237,9 +237,12 @@ def _forklift_fact_matches(fact: dict[str, object]) -> bool:
     return fact.get("confirmed") is True and bool(_FORKLIFT.search(_confirmed_fact_text(fact)))
 
 
-def _forklift_credential_evidence(profile: UserProfile) -> tuple[list[str], list[str]]:
+def _forklift_credential_evidence(
+    profile: UserProfile,
+) -> tuple[list[str], list[str], list[str]]:
     positive: list[str] = []
     negative: list[str] = []
+    ambiguous: list[str] = []
     for index, value in enumerate(profile.driving_licences or []):
         if _FORKLIFT.search(str(value)):
             positive.append(f"profile.driving_licence:{index}")
@@ -254,12 +257,17 @@ def _forklift_credential_evidence(profile: UserProfile) -> tuple[list[str], list
             negative.append(marker)
         elif _CREDENTIAL.search(_confirmed_fact_text(fact)):
             positive.append(marker)
-    return positive, negative
+        else:
+            ambiguous.append(marker)
+    return positive, negative, ambiguous
 
 
-def _forklift_experience_evidence(profile: UserProfile) -> tuple[list[str], list[str]]:
+def _forklift_experience_evidence(
+    profile: UserProfile,
+) -> tuple[list[str], list[str], list[str]]:
     positive: list[str] = []
     negative: list[str] = []
+    ambiguous: list[str] = []
     for index, item in enumerate(profile.work_experience or []):
         if item.get("confirmed") is not True:
             continue
@@ -282,21 +290,23 @@ def _forklift_experience_evidence(profile: UserProfile) -> tuple[list[str], list
             and "opyt" not in normalized
             and "опыт" not in fact_text
         ):
+            ambiguous.append(marker)
             continue
         if _negative_fact(fact):
             negative.append(marker)
         else:
             positive.append(marker)
-    return positive, negative
+    return positive, negative, ambiguous
 
 
 def _driving_licence_evidence(
     profile: UserProfile,
     required_terms: set[str],
     required_categories: set[str],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     positive: list[str] = []
     negative: list[str] = []
+    ambiguous: list[str] = []
     for index, value in enumerate(profile.driving_licences or []):
         normalized_value = normalize_for_fingerprint(str(value))
         value_tokens = set(normalized_value.split())
@@ -306,11 +316,16 @@ def _driving_licence_evidence(
             for token in value_tokens
             if len(token) == 1 and token.casefold() in {"a", "b", "c", "d", "e"}
         )
+        marker = f"profile.driving_licence:{index}"
         if required_categories:
             if required_categories <= value_categories:
-                positive.append(f"profile.driving_licence:{index}")
+                positive.append(marker)
+            elif value_categories:
+                negative.append(marker)
+            else:
+                ambiguous.append(marker)
         else:
-            positive.append(f"profile.driving_licence:{index}")
+            positive.append(marker)
     for fact in profile.confirmed_facts or []:
         if fact.get("confirmed") is not True:
             continue
@@ -323,21 +338,28 @@ def _driving_licence_evidence(
         marker = f"profile.confirmed_fact:{fact_id}"
         if _negative_fact(fact):
             negative.append(marker)
+            continue
+        fact_categories = _driving_categories(text)
+        if required_categories:
+            if required_categories <= fact_categories:
+                positive.append(marker)
+            elif fact_categories:
+                negative.append(marker)
+            else:
+                ambiguous.append(marker)
         else:
             positive.append(marker)
-    if not positive and not negative and not (profile.driving_licences or []):
-        # Unlike generic professional certifications, driving_licences is a
-        # dedicated trusted profile field. An explicitly empty verified field is
-        # evidence that no ordinary driving licence is recorded for the profile.
-        negative.append("profile.driving_licences:empty")
-    return positive, negative
+    if not positive and not negative and not ambiguous:
+        negative.append("profile.driving_licences:absent")
+    return positive, negative, ambiguous
 
 
 def _generic_credential_evidence(
     profile: UserProfile, terms: set[str]
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     positive: list[str] = []
     negative: list[str] = []
+    ambiguous: list[str] = []
     for fact in profile.confirmed_facts or []:
         if not _fact_matches_terms(fact, terms):
             continue
@@ -353,14 +375,15 @@ def _generic_credential_evidence(
         value_tokens = _normalized_tokens(str(value))
         if terms and len(terms & value_tokens) >= min(2, len(terms)):
             positive.append(f"profile.driving_licence:{index}")
-    return positive, negative
+    return positive, negative, ambiguous
 
 
 def _generic_role_experience_evidence(
     profile: UserProfile, terms: set[str]
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     positive: list[str] = []
     negative: list[str] = []
+    ambiguous: list[str] = []
     for index, item in enumerate(profile.work_experience or []):
         if item.get("confirmed") is not True:
             continue
@@ -369,8 +392,12 @@ def _generic_role_experience_evidence(
         )
         tokens = _normalized_tokens(text)
         overlap = terms & tokens
-        if terms and len(overlap) >= max(1, min(2, len(terms))):
-            positive.append(f"profile.work_experience:{index}")
+        marker = f"profile.work_experience:{index}"
+        threshold = max(1, min(2, len(terms)))
+        if terms and len(overlap) >= threshold:
+            positive.append(marker)
+        elif overlap:
+            ambiguous.append(marker)
     for fact in profile.confirmed_facts or []:
         if not _fact_matches_terms(fact, terms):
             continue
@@ -382,19 +409,26 @@ def _generic_role_experience_evidence(
             negative.append(marker)
         else:
             positive.append(marker)
-    return positive, negative
+    return positive, negative, ambiguous
 
 
 def _status(
-    positive: Iterable[str], negative: Iterable[str]
+    positive: Iterable[str],
+    negative: Iterable[str],
+    ambiguous: Iterable[str],
 ) -> tuple[HardRequirementStatus, list[str]]:
     positive_ids = list(dict.fromkeys(positive))
     negative_ids = list(dict.fromkeys(negative))
+    ambiguous_ids = list(dict.fromkeys(ambiguous))
+    if positive_ids and negative_ids:
+        return HardRequirementStatus.UNKNOWN, [*positive_ids, *negative_ids]
     if positive_ids:
         return HardRequirementStatus.MET, positive_ids
     if negative_ids:
         return HardRequirementStatus.MISSING, negative_ids
-    return HardRequirementStatus.UNKNOWN, []
+    if ambiguous_ids:
+        return HardRequirementStatus.UNKNOWN, ambiguous_ids
+    return HardRequirementStatus.MISSING, []
 
 
 def _assessment(
@@ -406,8 +440,11 @@ def _assessment(
     evidence_terms: Iterable[str],
     positive: Iterable[str],
     negative: Iterable[str],
+    ambiguous: Iterable[str] = (),
 ) -> HardRequirementAssessment:
-    status, evidence_ids = _status(positive, negative)
+    status, evidence_ids = _status(positive, negative, ambiguous)
+    if status is HardRequirementStatus.MISSING and not evidence_ids:
+        evidence_ids = [f"trusted_profile:no_evidence:{requirement_id}"]
     return HardRequirementAssessment(
         requirement_id=requirement_id,
         kind=kind,
@@ -457,7 +494,7 @@ class HardRequirementEngine:
             if _OPTIONAL.search(clause):
                 continue
             if _CREDENTIAL.search(clause) and _MANDATORY.search(clause):
-                positive, negative = _forklift_credential_evidence(profile)
+                positive, negative, ambiguous = _forklift_credential_evidence(profile)
                 requirements.append(
                     _assessment(
                         requirement_id="forklift_operator_certificate",
@@ -467,6 +504,7 @@ class HardRequirementEngine:
                         evidence_terms=("forklift", "stivuitor", "погрузчик", "certificate"),
                         positive=positive,
                         negative=negative,
+                        ambiguous=ambiguous,
                     )
                 )
                 forklift_licence_detected = True
@@ -485,7 +523,7 @@ class HardRequirementEngine:
                     _ROLE_EXPERIENCE_REQUIREMENT.search(clause)
                     and not _OPTIONAL.search(clause)
                 ):
-                    positive, negative = _forklift_experience_evidence(profile)
+                    positive, negative, ambiguous = _forklift_experience_evidence(profile)
                     requirements.append(
                         _assessment(
                             requirement_id="forklift_operator_experience",
@@ -513,7 +551,7 @@ class HardRequirementEngine:
                 continue
             terms = _normalized_tokens(clause)
             required_categories = _driving_categories(clause)
-            positive, negative = _driving_licence_evidence(
+            positive, negative, ambiguous = _driving_licence_evidence(
                 profile, terms, required_categories
             )
             requirements.append(
@@ -525,6 +563,7 @@ class HardRequirementEngine:
                     evidence_terms=sorted(terms)[:20],
                     positive=positive,
                     negative=negative,
+                    ambiguous=ambiguous,
                 )
             )
             break
@@ -550,7 +589,7 @@ class HardRequirementEngine:
                 continue
             terms = _normalized_tokens(clause)
             identifier = stable_hash(sorted(terms))[:12]
-            positive, negative = _generic_credential_evidence(profile, terms)
+            positive, negative, ambiguous = _generic_credential_evidence(profile, terms)
             requirements.append(
                 _assessment(
                     requirement_id=f"professional_credential:{identifier}",
@@ -560,6 +599,7 @@ class HardRequirementEngine:
                     evidence_terms=sorted(terms)[:20],
                     positive=positive,
                     negative=negative,
+                    ambiguous=ambiguous,
                 )
             )
 
@@ -588,7 +628,9 @@ class HardRequirementEngine:
                     )
                     break
             if title_terms and role_experience_excerpt:
-                positive, negative = _generic_role_experience_evidence(profile, title_terms)
+                positive, negative, ambiguous = _generic_role_experience_evidence(
+                    profile, title_terms
+                )
                 requirements.append(
                     _assessment(
                         requirement_id="role_specific_experience",
@@ -598,6 +640,7 @@ class HardRequirementEngine:
                         evidence_terms=sorted(title_terms)[:20],
                         positive=positive,
                         negative=negative,
+                        ambiguous=ambiguous,
                     )
                 )
 

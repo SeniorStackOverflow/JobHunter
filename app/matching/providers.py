@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from app.matching.schemas import MatchRequest, MatchResult
 from app.models.enums import MatchDecision
 
-MATCHING_RULES_VERSION = "matching-v6-hard-evidence"
+MATCHING_RULES_VERSION = "matching-v7-closed-world-evidence"
 
 # The matching prompt is intentionally kept as reviewable prose. Reflowing it to
 # satisfy source line length would silently change the model input.
@@ -53,11 +53,12 @@ REQUIREMENTS:
   the vacancy explicitly makes them a hard condition.
 - If prior experience is not explicitly mandatory and trusted_preference_data.willing_without_experience is true, do not
   invent an experience requirement.
-- Distinguish confirmed absence from simply missing CV/profile evidence. Missing evidence for a true professional credential
-  (mandatory language level, degree, licence, certification, required technical skill) can make a hard requirement unmet.
-  Missing evidence for negotiable/personal logistics such as owning an ordinary bicycle/car/phone or availability for a
-  particular shift means UNKNOWN, not confirmed absence: choose prepare_for_review if it is mandatory and needs confirmation,
-  unless trusted data explicitly confirms the requirement is unmet or a trusted preference directly conflicts with it.
+- Professional qualifications use closed-world trusted evidence. If a mandatory licence, certification, required role
+  experience, degree, or similar qualification is not present in trusted profile/resume evidence, treat it as MISSING.
+  UNKNOWN is reserved for actual ambiguity in existing evidence, such as a driving licence being recorded without its category,
+  or contradictory trusted facts. Do not use UNKNOWN merely because a qualification could hypothetically exist off-resume.
+- Missing evidence for negotiable/personal logistics such as owning an ordinary bicycle/car/phone or availability for a
+  particular shift remains UNKNOWN when the trusted data does not answer it.
 - A low resume fit alone must not reject a category explicitly allowed outside the primary resume when
   trusted_preference_data.consider_outside_primary_resume is true. Transferable skills count when supported by trusted data.
 

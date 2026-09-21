@@ -879,7 +879,7 @@ async def test_analyze_persists_match_evaluation_without_network() -> None:
         assert evaluation.source_job_id == job.id
         assert evaluation.canonical_job_id == canonical.id
         assert evaluation.model == "mock-v1"
-        assert evaluation.prompt_rules_version == "matching-v6-hard-evidence"
+        assert evaluation.prompt_rules_version == "matching-v7-closed-world-evidence"
         assert evaluation.decision is MatchDecision.AUTO_APPLY
     await engine.dispose()
 
@@ -1100,7 +1100,7 @@ async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
     async with session_factory() as session:
         evaluations = list((await session.scalars(select(MatchEvaluation))).all())
         assert len(evaluations) == 2
-        assert evaluations[-1].prompt_rules_version == "matching-v6-hard-evidence"
+        assert evaluations[-1].prompt_rules_version == "matching-v7-closed-world-evidence"
         stored_job = await session.get(SourceJob, job.id)
         assert stored_job is not None
         stored_job.description = "The employer added a new requirement."
@@ -1524,12 +1524,12 @@ def test_real_forklift_vacancy_extracts_typed_hard_requirements() -> None:
         "forklift_operator_certificate",
         "forklift_operator_experience",
     }
-    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.UNKNOWN
-    assert by_id["forklift_operator_experience"].status is HardRequirementStatus.UNKNOWN
-    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.MISSING
+    assert by_id["forklift_operator_experience"].status is HardRequirementStatus.MISSING
+    assert result.decision is MatchDecision.SKIP
     assert result.eligible_for_ai is False
-    assert "hard_requirement_unknown:forklift_operator_certificate" in result.risks
-    assert "hard_requirement_unknown:forklift_operator_experience" in result.risks
+    assert "forklift_operator_certificate" in result.missing_requirements
+    assert "forklift_operator_experience" in result.missing_requirements
 
 
 def test_confirmed_absent_forklift_certificate_fails_closed() -> None:
@@ -1604,9 +1604,10 @@ def test_llm_cannot_promote_or_fabricate_unknown_forklift_requirements() -> None
         minimum_auto_send_score=70,
     )
 
-    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert result.decision is MatchDecision.SKIP
     assert not any("forklift" in item.casefold() for item in result.requirements_met)
-    assert "hard_requirement_unknown:forklift_operator_certificate" in result.risks
+    assert "forklift_operator_certificate" in result.missing_requirements
+    assert "forklift_operator_experience" in result.missing_requirements
 
 
 def test_forklift_hard_requirements_can_be_met_only_with_trusted_evidence() -> None:
@@ -1749,7 +1750,7 @@ def test_optional_neighbour_does_not_cancel_mandatory_forklift_certificate() -> 
         resume_fit=80,
     )
     by_id = {item.requirement_id: item for item in result.hard_requirements}
-    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.UNKNOWN
+    assert by_id["forklift_operator_certificate"].status is HardRequirementStatus.MISSING
 
 
 def test_mandatory_driving_category_requires_matching_category_evidence() -> None:
@@ -1767,8 +1768,8 @@ def test_mandatory_driving_category_requires_matching_category_evidence() -> Non
         for item in result.hard_requirements
         if item.requirement_id == "driving_licence"
     )
-    assert licence.status is HardRequirementStatus.UNKNOWN
-    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert licence.status is HardRequirementStatus.MISSING
+    assert result.decision is MatchDecision.SKIP
     assert result.eligible_for_ai is False
 
 
@@ -1890,7 +1891,7 @@ def test_multi_category_driving_requirement_needs_all_categories() -> None:
         item for item in result.hard_requirements
         if item.requirement_id == "driving_licence"
     )
-    assert licence.status is HardRequirementStatus.UNKNOWN
+    assert licence.status is HardRequirementStatus.MISSING
 
     complete = DeterministicPrefilter().evaluate(
         job,
@@ -1935,7 +1936,7 @@ def test_explicit_mandatory_role_experience_is_hard() -> None:
         item for item in result.hard_requirements
         if item.requirement_id == "role_specific_experience"
     )
-    assert req.status is HardRequirementStatus.UNKNOWN
+    assert req.status is HardRequirementStatus.MISSING
 
 
 def test_minimum_role_experience_is_hard_without_mandatory_word() -> None:
@@ -1957,7 +1958,7 @@ def test_minimum_role_experience_is_hard_without_mandatory_word() -> None:
         item for item in result.hard_requirements
         if item.requirement_id == "role_specific_experience"
     )
-    assert req.status is HardRequirementStatus.UNKNOWN
+    assert req.status is HardRequirementStatus.MISSING
 
 
 def test_optional_forklift_experience_is_not_hard_requirement() -> None:
@@ -2126,3 +2127,46 @@ def test_employer_screening_certification_is_not_preheld_credential() -> None:
         item.kind.value == "professional_credential"
         for item in result.hard_requirements
     )
+
+
+def test_driving_licence_without_category_is_unknown_for_category_requirement() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(description="Este obligatoriu permis de conducere categoria B.")
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(driving_licences=["Permis de conducere"]),
+        resume_fit=90,
+    )
+    licence = next(
+        item
+        for item in result.hard_requirements
+        if item.requirement_id == "driving_licence"
+    )
+    assert licence.status is HardRequirementStatus.UNKNOWN
+    assert licence.evidence_ids == ["profile.driving_licence:0"]
+    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert result.eligible_for_ai is False
+
+
+def test_absent_generic_professional_credential_is_missing_not_unknown() -> None:
+    from app.matching.schemas import HardRequirementStatus
+
+    job = make_job(
+        description="AWS certification is mandatory for this role.",
+    )
+    result = DeterministicPrefilter().evaluate(
+        job,
+        make_preference(),
+        make_profile(confirmed_facts=[]),
+        resume_fit=85,
+    )
+    credential = next(
+        item
+        for item in result.hard_requirements
+        if item.kind.value == "professional_credential"
+    )
+    assert credential.status is HardRequirementStatus.MISSING
+    assert credential.evidence_ids[0].startswith("trusted_profile:no_evidence:")
+    assert result.decision is MatchDecision.SKIP
