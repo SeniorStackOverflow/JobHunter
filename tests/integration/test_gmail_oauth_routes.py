@@ -6,7 +6,7 @@ import socket
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -409,19 +409,22 @@ async def test_google_login_only_forces_consent_when_gmail_needs_reauthorization
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_gmail_oauth_start_in_three_clean_browser_contexts(
+async def test_gmail_oauth_browser_roundtrip_in_three_clean_contexts(
     oauth_api: OAuthApiContext,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from playwright.async_api import async_playwright
 
     with socket.socket() as port_socket:
         port_socket.bind(("127.0.0.1", 0))
         port = int(port_socket.getsockname()[1])
-    base_url = f"http://127.0.0.1:{port}"
+    base_url = f"http://localhost:{port}"
     server = uvicorn.Server(
         uvicorn.Config(oauth_api.app, host="127.0.0.1", port=port, log_level="error")
     )
     server_task = asyncio.create_task(server.serve())
+    original_flow = GmailOAuthService._flow
+    RouteFakeFlow.fetch_count = 0
     try:
         async with httpx.AsyncClient(base_url=base_url) as readiness_client:
             for _attempt in range(100):
@@ -452,7 +455,34 @@ async def test_gmail_oauth_start_in_three_clean_browser_contexts(
                     assert query["scope"] == [" ".join(GMAIL_DELIVERY_SCOPES)]
                     assert query["access_type"] == ["offline"]
                     assert query["code_challenge_method"] == ["S256"]
+                    monkeypatch.setattr(
+                        GmailOAuthService,
+                        "_flow",
+                        lambda self, state=None, code_verifier=None: RouteFakeFlow(),
+                    )
+                    page = await context.new_page()
+                    callback = await page.goto(
+                        f"{base_url}/api/v1/oauth/gmail/callback?"
+                        + urlencode({"code": "route-code", "state": query["state"][0]}),
+                        wait_until="domcontentloaded",
+                    )
+                    assert callback is not None
+                    assert callback.status == 200, await callback.json()
+                    assert (await callback.json())["status"] == "authorized"
+                    connected = await context.request.get(
+                        f"{base_url}/api/v1/oauth/gmail/status",
+                        headers={"Authorization": f"Bearer {API_KEY}"},
+                    )
+                    assert connected.status == 200
+                    assert (await connected.json())["scopes"] == sorted(GMAIL_DELIVERY_SCOPES)
+                    disconnected = await context.request.delete(
+                        f"{base_url}/api/v1/oauth/gmail",
+                        headers={"Authorization": f"Bearer {API_KEY}"},
+                    )
+                    assert disconnected.status == 200
                     await context.close()
+                    monkeypatch.setattr(GmailOAuthService, "_flow", original_flow)
+                assert RouteFakeFlow.fetch_count == 3
             finally:
                 await browser.close()
     finally:
