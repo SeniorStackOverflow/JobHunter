@@ -12,7 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
 from app.employers.identity import EmployerIdentityService
-from app.employers.relationships import EmployerRelationshipService, classify_candidate_decline
+from app.employers.relationships import (
+    EmployerRelationshipService,
+    classify_candidate_decline,
+    role_family,
+)
 from app.models.entities import (
     Application,
     CommunicationSession,
@@ -388,8 +392,23 @@ class EmployerSafetyAuditService:
         )
         unsafe_after_decline: list[dict[str, object]] = []
         unsafe_during_conversation: list[dict[str, object]] = []
-        for application, _job in application_rows:
-            employer_id = application.employer_id
+        active_event_types = {
+            EmployerInteractionType.EMPLOYER_REPLIED,
+            EmployerInteractionType.CALL_INBOUND,
+            EmployerInteractionType.SMS_INBOUND,
+            EmployerInteractionType.INTERVIEW_PROPOSED,
+            EmployerInteractionType.INTERVIEW_CONFIRMED,
+            EmployerInteractionType.INTERVIEW_ATTENDED,
+            EmployerInteractionType.OFFER_RECEIVED,
+        }
+        decline_event_types = {
+            EmployerInteractionType.CANDIDATE_DECLINED_JOB,
+            EmployerInteractionType.CANDIDATE_DECLINED_ROLE_FAMILY,
+            EmployerInteractionType.CANDIDATE_DECLINED_EMPLOYER,
+            EmployerInteractionType.CANDIDATE_WITHDREW,
+        }
+        for application, job in application_rows:
+            employer_id = application.employer_id or job.employer_id
             when = application.sent_at
             if employer_id is None or when is None:
                 continue
@@ -399,21 +418,32 @@ class EmployerSafetyAuditService:
                 if event.profile_id == application.profile_id
                 and event.employer_id == employer_id
                 and _utc(event.occurred_at) < _utc(when)
-                and event.application_id != application.id
             ]
-            decline = next(
-                (
-                    event
-                    for event in reversed(prior)
-                    if event.event_type
-                    in {
-                        EmployerInteractionType.CANDIDATE_DECLINED_EMPLOYER,
-                        EmployerInteractionType.CANDIDATE_WITHDREW,
-                    }
-                ),
-                None,
+            decline: EmployerInteractionEvent | None = None
+            active: EmployerInteractionEvent | None = None
+            for event in prior:
+                if event.event_type is EmployerInteractionType.RELATIONSHIP_REOPENED:
+                    decline = None
+                    active = None
+                elif event.event_type in decline_event_types:
+                    decline = event
+                    active = None
+                elif event.event_type is EmployerInteractionType.EMPLOYER_REJECTED:
+                    active = None
+                elif event.event_type in active_event_types:
+                    active = event
+            decline_applies = decline is not None and (
+                decline.suppression_scope is SuppressionScope.EMPLOYER
+                or (
+                    decline.suppression_scope is SuppressionScope.JOB
+                    and decline.canonical_job_id == application.canonical_job_id
+                )
+                or (
+                    decline.suppression_scope is SuppressionScope.ROLE_FAMILY
+                    and decline.role_family == role_family(job.title)
+                )
             )
-            if decline is not None:
+            if decline_applies and decline is not None:
                 unsafe_after_decline.append(
                     {
                         "application_id": str(application.id),
@@ -422,22 +452,6 @@ class EmployerSafetyAuditService:
                         "decline_event_id": str(decline.id),
                     }
                 )
-            active = next(
-                (
-                    event
-                    for event in reversed(prior)
-                    if event.event_type
-                    in {
-                        EmployerInteractionType.EMPLOYER_REPLIED,
-                        EmployerInteractionType.CALL_INBOUND,
-                        EmployerInteractionType.SMS_INBOUND,
-                        EmployerInteractionType.INTERVIEW_PROPOSED,
-                        EmployerInteractionType.INTERVIEW_CONFIRMED,
-                        EmployerInteractionType.INTERVIEW_ATTENDED,
-                    }
-                ),
-                None,
-            )
             if active is not None:
                 unsafe_during_conversation.append(
                     {

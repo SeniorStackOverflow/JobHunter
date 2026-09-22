@@ -659,6 +659,67 @@ async def test_printerra_backfill_fixture_preserves_sent_rows_and_reports_rapid_
 
 
 @pytest.mark.asyncio
+async def test_retro_audit_uses_relationship_state_at_each_send_time(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            first_job,
+            _second_job,
+            first,
+            second,
+            *_rest,
+        ) = await _relationship_graph(session)
+        first.status = second.status = ApplicationStatus.SENT
+        first.sent_at = datetime(2026, 9, 21, 9, tzinfo=UTC)
+        service = EmployerRelationshipService()
+        for event_type, hour, scope in (
+            (EmployerInteractionType.EMPLOYER_REPLIED, 10, SuppressionScope.NONE),
+            (EmployerInteractionType.CANDIDATE_DECLINED_EMPLOYER, 11, SuppressionScope.EMPLOYER),
+            (EmployerInteractionType.RELATIONSHIP_REOPENED, 12, SuppressionScope.NONE),
+            (EmployerInteractionType.CANDIDATE_DECLINED_JOB, 13, SuppressionScope.JOB),
+        ):
+            await service.record_event(
+                session,
+                profile_id=profile.id,
+                employer_id=employer.id,
+                event_type=event_type,
+                channel=EmployerInteractionChannel.MANUAL,
+                idempotency_key=f"audit-event:{hour}",
+                occurred_at=datetime(2026, 9, 21, hour, tzinfo=UTC),
+                suppression_scope=scope,
+                canonical_job_id=(
+                    first_job.canonical_job_id if scope is SuppressionScope.JOB else None
+                ),
+            )
+
+        second.sent_at = datetime(2026, 9, 21, 10, 30, tzinfo=UTC)
+        during_reply = await EmployerSafetyAuditService().report(session)
+        assert [
+            row["application_id"] for row in during_reply["C_sent_during_active_conversation"]
+        ] == [str(second.id)]
+        assert during_reply["B_sent_after_candidate_decline"] == []
+
+        second.sent_at = datetime(2026, 9, 21, 11, 30, tzinfo=UTC)
+        after_decline = await EmployerSafetyAuditService().report(session)
+        assert [
+            row["application_id"] for row in after_decline["B_sent_after_candidate_decline"]
+        ] == [str(second.id)]
+        assert after_decline["C_sent_during_active_conversation"] == []
+
+        second.sent_at = datetime(2026, 9, 21, 12, 30, tzinfo=UTC)
+        after_reopen = await EmployerSafetyAuditService().report(session)
+        assert after_reopen["B_sent_after_candidate_decline"] == []
+        assert after_reopen["C_sent_during_active_conversation"] == []
+
+        second.sent_at = datetime(2026, 9, 21, 13, 30, tzinfo=UTC)
+        after_other_job_decline = await EmployerSafetyAuditService().report(session)
+        assert after_other_job_decline["B_sent_after_candidate_decline"] == []
+
+
+@pytest.mark.asyncio
 async def test_retro_remediation_never_mutates_historical_sent_application(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
