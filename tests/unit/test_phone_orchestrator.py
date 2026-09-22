@@ -713,13 +713,16 @@ async def test_mute_command_during_listening_records_diagnostic(
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(factory)
-    calls = {"n": 0}
+    listening = False
+    mute_sent = False
+    first_response_sent = False
 
     async def command_check() -> str | None:
-        calls["n"] += 1
-        # Call 1 = pre-answer. The new dialogue checks commands continuously while
-        # waiting for real RX, so a later call safely lands in that/listening path.
-        return "mute" if calls["n"] >= 6 else None
+        nonlocal mute_sent
+        if listening and not mute_sent:
+            mute_sent = True
+            return "mute"
+        return None
 
     async with _pg(fake) as client:
         orch = CallOrchestrator(
@@ -728,6 +731,18 @@ async def test_mute_command_during_listening_records_diagnostic(
             settings=_fast_settings(),
             command_check=command_check,
         )
+        set_stage = orch._set_stage
+
+        async def track_stage(stage: str) -> None:
+            nonlocal first_response_sent, listening
+            await set_stage(stage)
+            if stage == "waiting_first_response" and not first_response_sent:
+                first_response_sent = True
+                fake.transcript(speaker="rx", text="Да, звоню по работе")
+            if stage == "listening":
+                listening = True
+
+        orch._set_stage = track_stage  # type: ignore[method-assign]
         stage = await orch.run(session_id)
 
     assert stage == "greeting_completed"
