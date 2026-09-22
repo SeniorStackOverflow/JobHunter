@@ -98,9 +98,7 @@ class WafHttpClient:
         # the site asks for it. A14 normally receives plain 200 responses.
         token = await self._tokens.get_token()
         response = await self._send(method, url, extra_headers, token=token)
-        response = await self._retry_rate_limit(
-            method, url, extra_headers, response, token=token
-        )
+        response = await self._retry_rate_limit(method, url, extra_headers, response, token=token)
         if not self._is_challenge(response) and not self._is_token_rejection(response):
             self._reject_terminal_waf(response)
             return response

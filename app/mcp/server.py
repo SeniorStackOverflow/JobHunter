@@ -21,6 +21,8 @@ from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
 from app.crawlers.source_control import disable_source_record, enable_source_record
 from app.email.service import EmailService
+from app.employers import EmployerRelationshipService
+from app.employers.views import get_history, get_relationship, list_relationships
 from app.learning import (
     ReviewLearningService,
     ReviewLearningSummary,
@@ -31,6 +33,8 @@ from app.models.entities import (
     Alert,
     Application,
     BatchScanRun,
+    EmailDelivery,
+    EmployerContact,
     JobSource,
     MatchEvaluation,
     Resume,
@@ -39,12 +43,14 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
+    DeliveryStatus,
     JobStatus,
     ReviewOutcome,
     ReviewReason,
     RunStatus,
     ScanType,
     SourceHealth,
+    SuppressionScope,
 )
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import (
@@ -1472,6 +1478,171 @@ async def get_application_status(application_id: str) -> dict[str, Any]:
             return await get_application_detail(session, UUID(application_id))
         except LookupError as exc:
             raise ValueError("application not found") from exc
+
+
+@mcp.tool()
+async def get_employer_relationship(
+    employer_id: str, profile_id: str | None = None
+) -> dict[str, Any]:
+    """Return current employer relationship and suppression state."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        try:
+            return await get_relationship(
+                session, profile_id=profile.id, employer_id=UUID(employer_id)
+            )
+        except LookupError as exc:
+            raise ValueError("employer not found") from exc
+
+
+@mcp.tool()
+async def list_employer_relationships(
+    limit: int = 100, profile_id: str | None = None
+) -> list[dict[str, Any]]:
+    """List materialized employer relationship states for a profile."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        return await list_relationships(session, profile_id=profile.id, limit=limit)
+
+
+@mcp.tool()
+async def get_employer_history(
+    employer_id: str, profile_id: str | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    """Return safe employer interaction events without message bodies."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        return await get_history(
+            session,
+            profile_id=profile.id,
+            employer_id=UUID(employer_id),
+            limit=limit,
+        )
+
+
+@mcp.tool()
+async def suppress_employer(
+    employer_id: str,
+    reason: str,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
+    """Explicitly suppress an employer while preserving relationship history."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        relationship = await EmployerRelationshipService().suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=UUID(employer_id),
+            scope=SuppressionScope.EMPLOYER,
+            reason=reason,
+            actor="mcp",
+        )
+        await session.commit()
+        return {
+            "employer_id": employer_id,
+            "state": relationship.state.value,
+            "suppression_scope": relationship.suppression_scope.value,
+        }
+
+
+@mcp.tool()
+async def unsuppress_employer(
+    employer_id: str,
+    reason: str,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
+    """Reopen an employer relationship without deleting prior decline events."""
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        profile = await ProfileService().get_profile(
+            session, UUID(profile_id) if profile_id else None
+        )
+        if profile is None:
+            raise ValueError("profile not found")
+        relationship = await EmployerRelationshipService().reopen(
+            session,
+            profile_id=profile.id,
+            employer_id=UUID(employer_id),
+            reason=reason,
+            actor="mcp",
+        )
+        await session.commit()
+        return {
+            "employer_id": employer_id,
+            "state": relationship.state.value,
+            "suppression_scope": relationship.suppression_scope.value,
+        }
+
+
+@mcp.tool()
+async def list_delivery_failures(limit: int = 100) -> list[dict[str, Any]]:
+    """List bounced and failed delivery outcomes with safe SMTP diagnostics."""
+    from app.database.session import async_session_factory
+
+    failed_statuses = {
+        DeliveryStatus.BOUNCED_TRANSIENT,
+        DeliveryStatus.BOUNCED_PERMANENT,
+        DeliveryStatus.RECIPIENT_REJECTED,
+        DeliveryStatus.MAILBOX_FULL,
+        DeliveryStatus.DOMAIN_REJECTED,
+        DeliveryStatus.POLICY_REJECTED,
+        DeliveryStatus.SPAM_REJECTED,
+        DeliveryStatus.DELIVERY_FAILED,
+        DeliveryStatus.PERMANENT_FAILURE,
+        DeliveryStatus.TEMPORARY_FAILURE,
+    }
+    async with async_session_factory() as session:
+        rows = (
+            await session.execute(
+                select(EmailDelivery, Application, EmployerContact)
+                .join(Application, Application.id == EmailDelivery.application_id)
+                .join(EmployerContact, EmployerContact.id == Application.recipient_contact_id)
+                .where(EmailDelivery.status.in_(failed_statuses))
+                .order_by(desc(EmailDelivery.updated_at))
+                .limit(min(max(limit, 1), 500))
+            )
+        ).all()
+        return [
+            {
+                "application_id": str(application.id),
+                "employer_id": str(application.employer_id) if application.employer_id else None,
+                "delivery_id": str(delivery.id),
+                "status": delivery.status.value,
+                "attempts": delivery.attempt_count,
+                "last_attempt_at": delivery.last_attempt_at,
+                "final_recipient": delivery.final_recipient or contact.value,
+                "smtp_status": delivery.smtp_status,
+                "failure_class": delivery.failure_class,
+                "failure_reason": delivery.failure_reason,
+                "bounced_at": delivery.bounced_at,
+            }
+            for delivery, application, contact in rows
+        ]
 
 
 @mcp.tool()

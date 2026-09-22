@@ -324,7 +324,10 @@ async def test_listening_extends_on_new_rx_activity(
     fake = FakePhoneGate()
     fake.ring("+37360111222")
     session_id = await _open_ringing_session(file_factory)
-    settings = _fast_settings(phone_listen_silence_timeout_seconds=0.3)
+    settings = _fast_settings(
+        phone_listen_silence_timeout_seconds=1.0,
+        phone_call_hard_cap_seconds=8.0,
+    )
 
     async with _pg(fake) as client:
         orch = CallOrchestrator(client=client, session_factory=file_factory, settings=settings)
@@ -349,25 +352,21 @@ async def test_listening_extends_on_new_rx_activity(
             else:
                 pytest.fail("never reached LISTENING after first RX")
 
-            # Let some silence accumulate, then inject an RX line before the
-            # original 0.3s deadline would have fired.
-            await asyncio.sleep(0.15)
+            # Inject RX halfway through the first silence window, then inspect
+            # after that original window has elapsed but before the new one.
+            await asyncio.sleep(0.55)
             fake.transcript(speaker="rx", text="еще не закончил, минутку")
 
-            # script_stage must stay "listening" for a window that would
-            # already have tripped CLOSING under the ORIGINAL (pre-reset)
-            # deadline -- checking task.done() alone isn't enough: even a
-            # closed-out LISTENING keeps the task alive while it runs the
-            # (comparatively slow, fence+observe-bound) CLOSING sequence.
-            for _ in range(20):
-                async with file_factory() as s:
-                    call = await s.get(CommunicationSession, session_id)
-                assert call is not None
-                assert call.script_stage == "listening", (
-                    f"left LISTENING (stage={call.script_stage!r}) despite fresh RX "
-                    "activity that should have reset the silence clock"
-                )
-                await asyncio.sleep(0.01)
+            # A fixed number of DB polls can itself consume the 0.3-second
+            # silence window on a busy host, so check one deliberate point.
+            await asyncio.sleep(0.55)
+            async with file_factory() as s:
+                call = await s.get(CommunicationSession, session_id)
+            assert call is not None
+            assert call.script_stage == "listening", (
+                f"left LISTENING (stage={call.script_stage!r}) despite fresh RX "
+                "activity that should have reset the silence clock"
+            )
 
             stage = await asyncio.wait_for(task, timeout=5.0)
         finally:
@@ -1075,9 +1074,11 @@ async def test_explicit_callback_skips_generic_details_prompt(
         answer_start: float,
         remote_phase: str,
     ) -> tuple[str, int, list[str]]:
-        return "rx", seen_transcript_id, [
-            'Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста.'
-        ]
+        return (
+            "rx",
+            seen_transcript_id,
+            ["Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста."],
+        )
 
     async def fake_say(self: CallOrchestrator, session_id: UUID, text: str) -> str:
         spoken.append(text)

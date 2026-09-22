@@ -10,13 +10,32 @@ ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
         }
     ),
     ApplicationStatus.PENDING_REVIEW: frozenset(
-        {ApplicationStatus.APPROVED, ApplicationStatus.BLOCKED, ApplicationStatus.CANCELLED}
+        {
+            ApplicationStatus.APPROVED,
+            ApplicationStatus.DEFERRED,
+            ApplicationStatus.BLOCKED,
+            ApplicationStatus.CANCELLED,
+        }
     ),
     ApplicationStatus.APPROVED: frozenset(
         {ApplicationStatus.SENDING, ApplicationStatus.BLOCKED, ApplicationStatus.CANCELLED}
     ),
     ApplicationStatus.AUTO_APPROVED: frozenset(
-        {ApplicationStatus.SENDING, ApplicationStatus.BLOCKED, ApplicationStatus.CANCELLED}
+        {
+            ApplicationStatus.SENDING,
+            ApplicationStatus.DEFERRED,
+            ApplicationStatus.BLOCKED,
+            ApplicationStatus.CANCELLED,
+        }
+    ),
+    ApplicationStatus.DEFERRED: frozenset(
+        {
+            ApplicationStatus.PREPARED,
+            ApplicationStatus.PENDING_REVIEW,
+            ApplicationStatus.AUTO_APPROVED,
+            ApplicationStatus.BLOCKED,
+            ApplicationStatus.CANCELLED,
+        }
     ),
     ApplicationStatus.SENDING: frozenset(
         {

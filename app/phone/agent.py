@@ -206,7 +206,6 @@ async def run() -> int:
     # letting restart=unless-stopped amplify them into a restart storm.
     while True:
         sync_redis: SyncRedis = SyncRedis.from_url(settings.redis_url, decode_responses=True)
-        retry_reason: str | None = None
         try:
             try:
                 with leased_redis_lock(
@@ -215,7 +214,6 @@ async def run() -> int:
                     ttl_seconds=_SINGLETON_LOCK_TTL,
                 ) as lease:
                     if lease is None:
-                        retry_reason = "singleton_busy"
                         logger.warning(
                             "phone_agent_singleton_wait",
                             retry_seconds=_REDIS_STARTUP_RETRY_SECONDS,
@@ -224,13 +222,11 @@ async def run() -> int:
                         await _run_loop(lease_lost=lambda: lease.lease_lost)
                         if not lease.lease_lost:
                             return 0
-                        retry_reason = "lease_lost"
                         logger.warning(
                             "phone_agent_lease_lost",
                             retry_seconds=_REDIS_STARTUP_RETRY_SECONDS,
                         )
             except RedisError as exc:
-                retry_reason = "redis_unavailable"
                 logger.warning(
                     "phone_agent_redis_wait",
                     error_type=type(exc).__name__,
@@ -239,8 +235,6 @@ async def run() -> int:
         finally:
             close_redis_client(sync_redis)
 
-        if retry_reason is None:
-            return 0
         await asyncio.sleep(_REDIS_STARTUP_RETRY_SECONDS)
 
 

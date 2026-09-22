@@ -17,7 +17,11 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.email.providers import GMAIL_REAUTH_REQUIRED_CODE, GMAIL_SEND_SCOPE
+from app.email.providers import (
+    GMAIL_READONLY_SCOPE,
+    GMAIL_REAUTH_REQUIRED_CODE,
+    GMAIL_SEND_SCOPE,
+)
 from app.models.entities import (
     Application,
     EmailDelivery,
@@ -34,11 +38,16 @@ GOOGLE_ADMIN_OAUTH_ACTOR = "google-admin-login"
 GOOGLE_OPENID_SCOPE = "openid"
 GOOGLE_EMAIL_SCOPE = "email"
 GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
-GOOGLE_ADMIN_SCOPES = (GOOGLE_OPENID_SCOPE, GOOGLE_EMAIL_SCOPE, GMAIL_SEND_SCOPE)
+GMAIL_DELIVERY_SCOPES = (GMAIL_SEND_SCOPE, GMAIL_READONLY_SCOPE)
+GOOGLE_ADMIN_SCOPES = (
+    GOOGLE_OPENID_SCOPE,
+    GOOGLE_EMAIL_SCOPE,
+    *GMAIL_DELIVERY_SCOPES,
+)
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 OAUTH_REQUEST_RETENTION = timedelta(days=1)
 IDENTITY_UNVERIFIED_REASON = (
-    "The gmail.send scope does not permit an independent mailbox identity lookup."
+    "The Gmail delivery scopes do not independently prove the mailbox identity."
 )
 
 
@@ -273,7 +282,7 @@ class GmailOAuthService:
         }
         flow = Flow.from_client_config(
             config,
-            scopes=list(scopes or (GMAIL_SEND_SCOPE,)),
+            scopes=list(scopes or GMAIL_DELIVERY_SCOPES),
             state=state,
             code_verifier=code_verifier,
             autogenerate_code_verifier=code_verifier is None,
@@ -572,14 +581,14 @@ class GmailOAuthService:
             if isinstance(granted_scopes, str)
             else set(granted_scopes or [])
         )
-        if granted_scopes is not None and GMAIL_SEND_SCOPE not in normalized_scopes:
+        if granted_scopes is not None and not set(GMAIL_DELIVERY_SCOPES) <= normalized_scopes:
             raise GmailOAuthError(
-                "Google did not grant gmail.send",
+                "Google did not grant the required Gmail send and read-only scopes",
                 code="required_scope_missing",
                 actor=actor,
                 correlation_id=request_id,
             )
-        allowed_scopes = {GMAIL_SEND_SCOPE}
+        allowed_scopes = set(GMAIL_DELIVERY_SCOPES)
         if admin_login:
             allowed_scopes.update(
                 {GOOGLE_OPENID_SCOPE, GOOGLE_EMAIL_SCOPE, GOOGLE_USERINFO_EMAIL_SCOPE}
@@ -742,7 +751,12 @@ class GmailOAuthService:
             "connected": credential is not None,
             "delivery_ready": (
                 credential is not None
-                and GMAIL_SEND_SCOPE in credential.scopes
+                and set(GMAIL_DELIVERY_SCOPES) <= set(credential.scopes)
+                and not health["reauth_required"]
+            ),
+            "monitoring_ready": (
+                credential is not None
+                and GMAIL_READONLY_SCOPE in credential.scopes
                 and not health["reauth_required"]
             ),
             "reauth_required": health["reauth_required"],
@@ -775,12 +789,22 @@ class GmailOAuthService:
         await session.flush()
         return deleted_credential.scalar_one_or_none() is not None
 
-    async def get_refresh_token(self, session: AsyncSession) -> str:
+    async def get_refresh_token(
+        self,
+        session: AsyncSession,
+        *,
+        required_scopes: tuple[str, ...] = (),
+    ) -> str:
         credential = await session.scalar(
             select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
         )
         if credential is None:
             raise GmailOAuthError(
                 "Gmail authorization is not configured", code="gmail_not_connected"
+            )
+        if not set(required_scopes) <= set(credential.scopes):
+            raise GmailOAuthError(
+                "Gmail authorization is missing required scopes",
+                code="gmail_reauthorization_required",
             )
         return self._require_box().decrypt(credential.encrypted_refresh_token)

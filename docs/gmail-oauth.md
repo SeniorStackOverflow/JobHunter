@@ -46,16 +46,19 @@ localhost callback; production client не должен разрешать ли�
 
 ## Минимальные scopes
 
-Для отправки нужен единственный Gmail scope:
+Для отправки и read-only сверки результата нужны два Gmail scope:
 
 ```text
 https://www.googleapis.com/auth/gmail.send
+https://www.googleapis.com/auth/gmail.readonly
 ```
 
-Не запрашивайте чтение, изменение или полный доступ к почте. Вход в admin panel
+`gmail.readonly` используется только фоновым reconciler для DSN/bounce и ответов в
+уже известных thread; он не даёт права менять или удалять письма. Не запрашивайте
+изменение или полный доступ к почте. Вход в admin panel
 дополнительно использует стандартные OIDC scopes `openid email`: они нужны только
 для подписанного ID token и точной проверки `GOOGLE_ADMIN_EMAILS`, а не для чтения
-Google-профиля или почты. Callback требует `gmail.send`, допускает только эти
+Google-профиля. Callback требует оба Gmail scope, допускает только эти
 identity scopes и отклоняет любой неожиданный scope до сохранения refresh token.
 
 Следуйте актуальным требованиям Google к OAuth consent/verification для выбранного
@@ -106,7 +109,7 @@ OAuth callback, проверяется и сохраняется зашифро�
 
 Admin login проверяет identity server-side и сохраняет подтверждённый email как
 несекретную metadata токена для operator console. API-only подключение с одним
-`gmail.send` по-прежнему не может независимо определить mailbox и явно возвращает
+Gmail scopes по-прежнему не могут независимо определить mailbox и явно возвращают
 `identity_verified=false`; для production предпочтителен вход через Google.
 
 Для получения refresh token обычно требуется offline access; поведение выдачи
@@ -215,6 +218,25 @@ provider даёт однозначно retryable ответ.
 `delivery_unknown` автоматически не повторяется. Оператор сверяет Gmail Sent и
 сохранённые IDs. Это важнее риска пропустить одно письмо, чем отправить дубль.
 
+После provider acceptance reconciler каждые пять минут читает Gmail history с
+durable cursor. Он сначала связывает DSN по исходному RFC Message-ID, затем допускает
+только однозначный thread или recipient/time fallback. Permanent bounce инвалидирует
+конкретный `EmployerContact`, сохраняет факт первоначальной отправки и освобождает
+application slot работодателя; он не suppress-ит работодателя. Transient bounce
+получает ограниченный retry schedule, причём каждый retry повторно проверяет employer
+relationship policy. Обычный входящий ответ в известном thread создаёт
+`employer_replied` и замораживает новые отклики этому работодателю.
+
+Существующий token, выданный только с `gmail.send`, показывает
+`delivery_ready=false`/`monitoring_ready=false` и останавливает новые отправки до
+повторного OAuth consent. Без `gmail.readonly` задача безопасно завершается без
+чтения mailbox, а sender не создаёт письма без обязательного post-send monitoring.
+
+Read-only исторический отчёт запускается через `email-delivery-audit`; он не меняет
+application, delivery или contact. Employer backfill сначала запускайте командами
+`employer-identity-audit` и `employer-relationship-audit`, затем отдельно
+`employer-backfill --apply` и `employer-remediate --apply` после проверки dry-run.
+
 ## Данные EmailDelivery
 
 Храните:
@@ -293,7 +315,7 @@ key ring и транзакционной миграции; этот runbook не
 
 ## Проверочный checklist
 
-- [ ] scope ограничен `gmail.send`;
+- [ ] scope ограничен `gmail.send` и `gmail.readonly`;
 - [ ] callback — точный HTTPS URL;
 - [ ] state непрозрачный и короткоживущий, в БД хранится только его хеш;
 - [ ] state атомарно одноразовый, привязан к browser cookie/actor, PKCE verifier

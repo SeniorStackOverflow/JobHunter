@@ -261,7 +261,9 @@ sitemap и employer careers используйте зарегистрирова�
    зашифрованно и выдаст отдельную admin-session cookie.
 5. Проверьте Google identity и Gmail token в разделах `Обзор` и `Система`.
 
-Запрашиваются OIDC `openid email` и единственный Gmail scope `gmail.send`. Sender принимает только
+Запрашиваются OIDC `openid email` и Gmail scopes `gmail.send`/`gmail.readonly`.
+Read-only scope нужен для DSN/bounce и ответов в известных thread; mailbox не
+изменяется. Sender принимает только
 `application_id`; recipient, MIME, текст и verified resume выбирает сервер.
 Подробности и процедура revoke: `docs/gmail-oauth.md`.
 
@@ -386,6 +388,7 @@ restore находятся в `docs/operations.md`.
 - [Исследование Rabota.md](docs/sources/rabota-md.md)
 - [Политика auto-send](docs/auto-send-policy.md)
 - [Gmail OAuth](docs/gmail-oauth.md)
+- [Память отношений с работодателем](docs/employer-relationships.md)
 - [MCP](docs/mcp.md)
 - [Обучение на решениях review](docs/review-learning.md)
 - [Развёртывание](docs/deployment.md) и [операции](docs/operations.md)

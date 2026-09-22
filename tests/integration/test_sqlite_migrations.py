@@ -31,7 +31,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision == ("d1e2f3a4b5c6",)
+        assert revision == ("ef3a1b2c4d5e",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -39,15 +39,29 @@ def test_fresh_sqlite_database_migrations_round_trip(
         assert {"public_emails", "public_phones", "matching_content_hash"} <= {
             column["name"] for column in database.get_columns("source_jobs")
         }
+        assert {
+            "canonical_employers",
+            "employer_identifiers",
+            "employer_interaction_events",
+            "employer_relationships",
+            "email_delivery_events",
+            "email_mailbox_cursors",
+        } <= set(database.get_table_names())
+        assert {
+            "rfc_message_id",
+            "subject_fingerprint",
+            "final_recipient",
+            "smtp_status",
+            "failure_class",
+            "bounced_at",
+        } <= {column["name"] for column in database.get_columns("email_deliveries")}
         resume_columns = {column["name"]: column for column in database.get_columns("resumes")}
         assert "archived" in resume_columns
         assert resume_columns["archived"]["nullable"] is False
         assert "requires_rematch" in {
             column["name"] for column in database.get_columns("job_snapshots")
         }
-        match_columns = {
-            column["name"] for column in database.get_columns("match_evaluations")
-        }
+        match_columns = {column["name"] for column in database.get_columns("match_evaluations")}
         assert "source_matching_hash" in match_columns
         assert {"hard_requirements", "hard_requirement_rules_version"} <= match_columns
         assert "profile_id" in {column["name"] for column in database.get_columns("applications")}
@@ -190,4 +204,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("d1e2f3a4b5c6",)
+    assert revision == ("ef3a1b2c4d5e",)

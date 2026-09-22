@@ -17,9 +17,7 @@ class StubFetcher:
         self.get_urls.append(url)
         return httpx.Response(200, text="ok", request=httpx.Request("GET", url))
 
-    async def post_html_fragment(
-        self, url: str, *, referer: str | None = None
-    ) -> httpx.Response:
+    async def post_html_fragment(self, url: str, *, referer: str | None = None) -> httpx.Response:
         self.posts.append((url, referer))
         return httpx.Response(200, text="fragment", request=httpx.Request("POST", url))
 

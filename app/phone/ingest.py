@@ -664,12 +664,14 @@ class IngestLoop:
         )
         phase = str(call.diagnostics.get("remote_end_phase") or "")
         prompt_phase = phase in {
-            "intro_tts", "wait_first_rx", "retry_tts",
-            "wait_first_rx_retry", "details_tts",
+            "intro_tts",
+            "wait_first_rx",
+            "retry_tts",
+            "wait_first_rx_retry",
+            "details_tts",
         }
         quick_after_tts = (
-            delta_ms is not None
-            and delta_ms <= self._settings.phone_prompt_rejection_window_ms
+            delta_ms is not None and delta_ms <= self._settings.phone_prompt_rejection_window_ms
         )
         existing_disposition = str(call.diagnostics.get("call_disposition") or "")
         if existing_disposition == "no_employer_response_while_connected":
@@ -843,11 +845,7 @@ class IngestLoop:
                 },
             )
         appended = await self._store.append_turn(session, session_id=open_row.id, entry=entry)
-        if (
-            appended is not None
-            and open_row.ended_at is not None
-            and open_row.auto_answered
-        ):
+        if appended is not None and open_row.ended_at is not None and open_row.auto_answered:
             # A late employer turn is new verification input. Re-open a terminal
             # post-call state and invalidate an earlier "prompt rejection" guess.
             open_row.verification_revision += 1

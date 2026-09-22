@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from structlog.testing import capture_logs
 
 from app.email.oauth import GmailOAuthError, GmailOAuthService
 from app.email.providers import (
+    GMAIL_READONLY_SCOPE,
     GMAIL_REAUTH_REQUIRED_CODE,
     GMAIL_SEND_SCOPE,
     FakeGmailProvider,
@@ -18,6 +20,7 @@ from app.email.providers import (
     deterministic_message_id,
 )
 from app.email.service import EmailSendBlocked, EmailService
+from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.bindings import (
     confirmed_fact_hashes,
     preference_fingerprint,
@@ -46,6 +49,7 @@ from app.models.enums import (
     MatchDecision,
     PolicyDecision,
     SourceHealth,
+    SuppressionScope,
     VerificationStatus,
 )
 from app.policies import PolicyEngine
@@ -225,7 +229,7 @@ async def test_real_gmail_provider_rechecks_local_oauth_credential_before_each_s
             OAuthCredential(
                 provider="gmail",
                 encrypted_refresh_token=SecretBox(token_key).encrypt("refresh-token"),
-                scopes=[GMAIL_SEND_SCOPE],
+                scopes=[GMAIL_SEND_SCOPE, GMAIL_READONLY_SCOPE],
                 token_metadata={},
             )
         )
@@ -473,12 +477,106 @@ async def test_fake_gmail_is_idempotent_and_uses_persisted_recipient_and_attachm
     service = EmailService(settings(tmp_path), sqlite_session_factory, provider)
     first = await service.send_application(application_id)
     second = await service.send_application(application_id)
-    assert first.status == DeliveryStatus.SENT
+    assert first.status == DeliveryStatus.PROVIDER_ACCEPTED
+    assert (
+        first.subject_fingerprint
+        == hashlib.sha256(b"Application for Backend Developer").hexdigest()
+    )
     assert second.id == first.id
     assert len(provider.outbox) == 1
     assert provider.outbox[0].recipient == "jobs@example.com"
     assert provider.outbox[0].attachment_name == "resume.pdf"
     assert provider.outbox[0].attachment_data.startswith(b"%PDF-")
+
+
+async def test_send_time_employer_suppression_blocks_prepared_auto_approval(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile, canonical, job, contact, application = (
+            values[1],
+            values[4],
+            values[5],
+            values[7],
+            values[8],
+        )
+        identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+        application.employer_id = identity.employer.id
+        canonical.employer_id = identity.employer.id
+        contact.employer_id = identity.employer.id
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        await EmployerRelationshipService().suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=identity.employer.id,
+            scope=SuppressionScope.EMPLOYER,
+            reason="declined after interview",
+            actor="owner",
+        )
+        application_id = application.id
+        await session.commit()
+    provider = FakeGmailProvider()
+
+    with pytest.raises(EmailSendBlocked, match="current policy"):
+        await EmailService(settings(tmp_path), sqlite_session_factory, provider).send_application(
+            application_id
+        )
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None and stored.status is ApplicationStatus.BLOCKED
+        assert "employer_not_suppressed" in stored.policy_result["rules_failed"]
+    assert provider.outbox == []
+
+
+async def test_transient_retry_rechecks_employer_relationship_policy(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        profile, canonical, job, contact, application = (
+            values[1],
+            values[4],
+            values[5],
+            values[7],
+            values[8],
+        )
+        identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+        application.employer_id = identity.employer.id
+        canonical.employer_id = identity.employer.id
+        contact.employer_id = identity.employer.id
+        application.status = ApplicationStatus.FAILED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        session.add(
+            EmailDelivery(
+                application_id=application.id,
+                provider="gmail",
+                recipient=contact.value,
+                status=DeliveryStatus.BOUNCED_TRANSIENT,
+                sanitized_provider_response={},
+                attempt_count=1,
+            )
+        )
+        await EmployerRelationshipService().suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=identity.employer.id,
+            scope=SuppressionScope.EMPLOYER,
+            reason="candidate withdrew before retry",
+            actor="owner",
+        )
+        application_id = application.id
+        await session.commit()
+    provider = FakeGmailProvider()
+
+    with pytest.raises(EmailSendBlocked, match="current policy"):
+        await EmailService(settings(tmp_path), sqlite_session_factory, provider).send_application(
+            application_id
+        )
+
+    assert provider.outbox == []
 
 
 async def test_delivery_unknown_is_never_automatically_retried(
@@ -498,6 +596,33 @@ async def test_delivery_unknown_is_never_automatically_retried(
     assert first.status == DeliveryStatus.DELIVERY_UNKNOWN
     assert second.id == first.id
     assert provider.outbox == []
+
+
+async def test_temporary_provider_failure_waits_before_retry(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        application = (await make_graph(session, tmp_path))[8]
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        await session.commit()
+
+    service = EmailService(
+        settings(tmp_path), sqlite_session_factory, FakeGmailProvider(failure_mode="temporary")
+    )
+    first = await service.send_application(application_id)
+
+    assert first.status == DeliveryStatus.TEMPORARY_FAILURE
+    assert first.last_attempt_at is not None
+    assert first.next_retry_at is not None
+    assert (
+        timedelta(minutes=15)
+        <= first.next_retry_at - first.last_attempt_at
+        < timedelta(minutes=15, seconds=2)
+    )
+    with pytest.raises(EmailSendBlocked, match="not safely retryable"):
+        await service.send_application(application_id)
 
 
 async def test_email_service_rejects_resume_changed_after_verification(
@@ -1293,9 +1418,7 @@ async def test_send_time_hard_requirement_gate_ignores_fabricated_auto_apply(
         application_id = application.id
         await session.commit()
 
-    service = EmailService(
-        settings(tmp_path), sqlite_session_factory, FakeGmailProvider()
-    )
+    service = EmailService(settings(tmp_path), sqlite_session_factory, FakeGmailProvider())
     with pytest.raises(EmailSendBlocked, match="current policy no longer permits"):
         await service.send_application(application_id)
 
@@ -1329,9 +1452,7 @@ async def test_retro_hard_requirement_audit_cancels_unsent_auto_approved_missing
         application_id = application.id
         await session.flush()
 
-        result = await audit_application_hard_requirements(
-            session, apply_changes=True
-        )
+        result = await audit_application_hard_requirements(session, apply_changes=True)
         await session.commit()
 
     assert result["findings"] == 1
@@ -1367,9 +1488,7 @@ async def test_retro_hard_requirement_audit_flags_sent_without_rewriting_history
         application_id = application.id
         await session.flush()
 
-        result = await audit_application_hard_requirements(
-            session, apply_changes=True
-        )
+        result = await audit_application_hard_requirements(session, apply_changes=True)
         await session.commit()
 
     assert result["findings"] == 1

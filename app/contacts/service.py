@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import EmployerContact, SourceJob
-from app.models.enums import ContactType, VerificationStatus
+from app.models.enums import ContactDeliveryState, ContactType, VerificationStatus
 
 
 def _domain(value: str | None) -> str | None:
@@ -30,37 +30,54 @@ class ContactDiscoveryService:
     ) -> EmployerContact | None:
         if job.canonical_job_id is None:
             raise ValueError("job must be assigned to a canonical job first")
-        if job.public_email:
-            email = validate_public_email(job.public_email)
-            if email:
-                existing: EmployerContact | None = await session.scalar(
-                    select(EmployerContact)
-                    .where(
-                        EmployerContact.source_job_id == job.id,
-                        EmployerContact.contact_type == ContactType.EMAIL,
-                        EmployerContact.value == email,
-                    )
-                    .order_by(EmployerContact.confidence.desc())
-                    .limit(1)
+        email_values = [job.public_email, *(job.public_emails or [])]
+        for raw_email in dict.fromkeys(value for value in email_values if value):
+            email = validate_public_email(raw_email)
+            if not email:
+                continue
+            existing: EmployerContact | None = await session.scalar(
+                select(EmployerContact)
+                .where(
+                    EmployerContact.source_job_id == job.id,
+                    EmployerContact.contact_type == ContactType.EMAIL,
+                    EmployerContact.value == email,
                 )
-                if existing is not None:
+                .order_by(EmployerContact.confidence.desc())
+                .limit(1)
+            )
+            if existing is not None:
+                if (
+                    existing.employer_id is not None
+                    and job.employer_id is not None
+                    and existing.employer_id != job.employer_id
+                ):
+                    continue
+                if existing.employer_id is None:
+                    existing.employer_id = job.employer_id
+                if existing.delivery_state not in {
+                    ContactDeliveryState.INVALID,
+                    ContactDeliveryState.REJECTED,
+                    ContactDeliveryState.SUPPRESSED,
+                }:
                     return existing
-                email_domain = email.rsplit("@", maxsplit=1)[1]
-                employer_domain = _domain(job.employer_url)
-                contact = EmployerContact(
-                    canonical_job_id=job.canonical_job_id,
-                    source_job_id=job.id,
-                    value=email,
-                    contact_type=ContactType.EMAIL,
-                    discovery_source="job_detail_explicit_email",
-                    official_domain=employer_domain or email_domain,
-                    verification_status=VerificationStatus.VERIFIED,
-                    confidence=0.98 if employer_domain == email_domain else 0.9,
-                    evidence_url=job.canonical_url,
-                )
-                session.add(contact)
-                await session.flush()
-                return contact
+                continue
+            email_domain = email.rsplit("@", maxsplit=1)[1]
+            employer_domain = _domain(job.employer_url)
+            contact = EmployerContact(
+                canonical_job_id=job.canonical_job_id,
+                employer_id=job.employer_id,
+                source_job_id=job.id,
+                value=email,
+                contact_type=ContactType.EMAIL,
+                discovery_source="job_detail_explicit_email",
+                official_domain=employer_domain or email_domain,
+                verification_status=VerificationStatus.VERIFIED,
+                confidence=0.98 if employer_domain == email_domain else 0.9,
+                evidence_url=job.canonical_url,
+            )
+            session.add(contact)
+            await session.flush()
+            return contact
         if job.application_url:
             application_contact = await session.scalar(
                 select(EmployerContact)
@@ -76,6 +93,7 @@ class ContactDiscoveryService:
                 return application_contact
             contact = EmployerContact(
                 canonical_job_id=job.canonical_job_id,
+                employer_id=job.employer_id,
                 source_job_id=job.id,
                 value=job.application_url,
                 contact_type=ContactType.APPLICATION_URL,
@@ -102,6 +120,7 @@ class ContactDiscoveryService:
                 return existing
             contact = EmployerContact(
                 canonical_job_id=job.canonical_job_id,
+                employer_id=job.employer_id,
                 source_job_id=job.id,
                 value=job.canonical_url,
                 contact_type=ContactType.INTERNAL_JOB_BOARD,

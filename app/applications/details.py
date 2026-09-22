@@ -13,8 +13,10 @@ from app.applications.reconciliation import (
 from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
     Application,
+    CanonicalEmployer,
     EmailDelivery,
     EmployerContact,
+    EmployerRelationship,
     JobSource,
     MatchEvaluation,
     Resume,
@@ -50,6 +52,21 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
         select(EmailDelivery).where(EmailDelivery.application_id == application.id)
     )
     source = await session.get(JobSource, job.source_id) if job is not None else None
+    employer = (
+        await session.get(CanonicalEmployer, application.employer_id)
+        if application.employer_id is not None
+        else None
+    )
+    relationship = (
+        await session.scalar(
+            select(EmployerRelationship).where(
+                EmployerRelationship.profile_id == application.profile_id,
+                EmployerRelationship.employer_id == application.employer_id,
+            )
+        )
+        if application.employer_id is not None
+        else None
+    )
 
     if (
         job is None
@@ -68,6 +85,19 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
     failed_rules = policy_result.get("rules_failed", [])
     if not isinstance(failed_rules, list):
         failed_rules = []
+    safe_stop_reason = policy_result.get("safe_stop_reason")
+    if safe_stop_reason is None:
+        employer_rule_reasons = {
+            "employer_identity_resolved": "identity_unresolved",
+            "employer_not_suppressed": "previous_candidate_withdrawal_from_employer",
+            "no_candidate_withdrawal": "previous_candidate_withdrawal_from_employer",
+            "no_active_employer_conversation": "active_employer_conversation",
+            "employer_application_slot_available": "same_employer_application_deferred",
+        }
+        safe_stop_reason = next(
+            (reason for rule, reason in employer_rule_reasons.items() if rule in failed_rules),
+            None,
+        )
 
     delivery_detail = _fields(
         delivery,
@@ -75,8 +105,16 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
         "provider",
         "provider_message_id",
         "thread_id",
+        "rfc_message_id",
+        "subject_fingerprint",
         "status",
         "attempt_count",
+        "last_attempt_at",
+        "final_recipient",
+        "smtp_status",
+        "failure_class",
+        "failure_reason",
+        "bounced_at",
         "created_at",
         "updated_at",
     )
@@ -94,6 +132,7 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
                 application,
                 "id",
                 "canonical_job_id",
+                "employer_id",
                 "source_job_id",
                 "resume_id",
                 "recipient_contact_id",
@@ -157,7 +196,40 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
             "verification_status",
             "confidence",
             "evidence_url",
+            "delivery_state",
+            "last_delivery_attempt_at",
+            "last_delivery_failure_at",
+            "last_smtp_status",
+            "failure_count",
+            "last_failure_reason",
         ),
+        "employer": {
+            "id": employer.id if employer is not None else None,
+            "name": employer.normalized_name if employer is not None else None,
+            "primary_domain": employer.primary_domain if employer is not None else None,
+            "relationship": (
+                _value(relationship.state) if relationship is not None else "never_contacted"
+            ),
+            "suppression_scope": (
+                _value(relationship.suppression_scope) if relationship is not None else "none"
+            ),
+            "last_interaction_at": (
+                relationship.last_interaction_at if relationship is not None else None
+            ),
+            "policy": {
+                "allowed": not any(
+                    item
+                    in {
+                        "employer_not_suppressed",
+                        "no_candidate_withdrawal",
+                        "no_active_employer_conversation",
+                        "employer_application_slot_available",
+                    }
+                    for item in failed_rules
+                ),
+                "reason": safe_stop_reason,
+            },
+        },
         "delivery": delivery_detail,
     }
 

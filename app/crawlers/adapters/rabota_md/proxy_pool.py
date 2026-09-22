@@ -32,9 +32,7 @@ log = structlog.get_logger()
 _STATE_KEY = "crawler:rabota_md:proxy_pool:state"
 _DISCOVERY_LOCK_KEY = "crawler:rabota_md:proxy_pool:discovery_lock"
 _DISCOVERY_LOCK_TTL_SECONDS = 120
-_FREE_PROXY_SOURCES: tuple[
-    tuple[str, Literal["lines", "proxmint_json", "hproxy_json"]], ...
-] = (
+_FREE_PROXY_SOURCES: tuple[tuple[str, Literal["lines", "proxmint_json", "hproxy_json"]], ...] = (
     (
         "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/all.json",
         "proxmint_json",
@@ -184,13 +182,11 @@ class RabotaProxyPool:
         validated_capability: str | None = None,
     ) -> None:
         payload = await self._entry(endpoint.identity)
-        capability = validated_capability or endpoint.capability or payload.get(
-            "validated_capability"
+        capability = (
+            validated_capability or endpoint.capability or payload.get("validated_capability")
         )
         status = (
-            "candidate"
-            if endpoint.kind == "free" and capability == "waf_candidate"
-            else "alive"
+            "candidate" if endpoint.kind == "free" and capability == "waf_candidate" else "alive"
         )
         payload.update(
             status=status,
@@ -391,9 +387,7 @@ class RabotaProxyPool:
         endpoint = ProxyEndpoint(name="free", url=f"http://{proxy}", kind="free")
         async with semaphore:
             try:
-                timeout = httpx.Timeout(
-                    self._validation_timeout, connect=self._validation_timeout
-                )
+                timeout = httpx.Timeout(self._validation_timeout, connect=self._validation_timeout)
                 async with httpx.AsyncClient(
                     proxy=endpoint.url,
                     timeout=timeout,
@@ -403,9 +397,7 @@ class RabotaProxyPool:
                 ) as client:
                     async with client.stream("GET", self._target_url) as response:
                         status = response.status_code
-                        action = response.headers.get(
-                            "x-amzn-waf-action", ""
-                        ).casefold()
+                        action = response.headers.get("x-amzn-waf-action", "").casefold()
 
                     if status == 202 and action == "challenge":
                         await self.report_success(
@@ -417,9 +409,7 @@ class RabotaProxyPool:
 
                     if status == 200:
                         parsed = urlsplit(self._target_url)
-                        origin = urlunsplit(
-                            (parsed.scheme, parsed.netloc, "", "", "")
-                        )
+                        origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
                         locale = next(
                             (part for part in parsed.path.split("/") if part),
                             "ru",
@@ -453,10 +443,7 @@ class RabotaProxyPool:
                             # A POST-only challenge cannot bootstrap the current solver
                             # because the landing GET did not expose challenge metadata.
                             # Treat this egress as unusable for full scans.
-                            if (
-                                pagination.status_code == 202
-                                and pagination_action == "challenge"
-                            ):
+                            if pagination.status_code == 202 and pagination_action == "challenge":
                                 await self.report_dead(endpoint)
                             else:
                                 await self.report_dead(endpoint)
@@ -654,8 +641,7 @@ class ProxyPoolFetcher:
             )
         if self._preflight_attempts >= self._max_preflight_attempts:
             raise RabotaMdDegradedError(
-                "Rabota.md exhausted free-proxy preflight budget "
-                f"({self._max_preflight_attempts})"
+                f"Rabota.md exhausted free-proxy preflight budget ({self._max_preflight_attempts})"
             )
 
         while True:
@@ -728,8 +714,7 @@ class ProxyPoolFetcher:
         await self._close_active()
         if self._preflight_attempts >= self._max_preflight_attempts:
             raise RabotaMdDegradedError(
-                "Rabota.md exhausted free-proxy preflight budget "
-                f"({self._max_preflight_attempts})"
+                f"Rabota.md exhausted free-proxy preflight budget ({self._max_preflight_attempts})"
             )
 
     async def _rotate(self, endpoint: ProxyEndpoint, reason: str) -> None:

@@ -191,15 +191,13 @@ async def daily_phone_metrics(
         if tts_phase:
             remote_hangups_during_tts += 1
         prompt_phase = tts_phase or phase in {
-            "wait_first_rx", "wait_first_rx_retry",
+            "wait_first_rx",
+            "wait_first_rx_retry",
         }
         if (
             call.id not in calls_with_employer
             and diagnostics.get("call_disposition") != "no_employer_response_while_connected"
-            and (
-                diagnostics.get("call_disposition") == "probable_prompt_rejection"
-                or prompt_phase
-            )
+            and (diagnostics.get("call_disposition") == "probable_prompt_rejection" or prompt_phase)
         ):
             probable_prompt_rejections += 1
     calls_with_any_audio_evidence = calls_with_audio | calls_with_lifecycle_audio
@@ -265,9 +263,7 @@ async def daily_phone_metrics(
                         "peer_hangup_ms_after_last_tts"
                     ),
                     "rx_audio_bytes": (call.diagnostics or {}).get("rx_audio_bytes", 0),
-                    "rx_audio_duration_ms": (call.diagnostics or {}).get(
-                        "rx_audio_duration_ms", 0
-                    ),
+                    "rx_audio_duration_ms": (call.diagnostics or {}).get("rx_audio_duration_ms", 0),
                     "audio_evidence_path": (call.diagnostics or {}).get(
                         "phonegate_audio_evidence_path"
                     ),

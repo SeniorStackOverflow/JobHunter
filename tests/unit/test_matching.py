@@ -1764,9 +1764,7 @@ def test_mandatory_driving_category_requires_matching_category_evidence() -> Non
         resume_fit=90,
     )
     licence = next(
-        item
-        for item in result.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in result.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert licence.status is HardRequirementStatus.MISSING
     assert result.decision is MatchDecision.SKIP
@@ -1784,9 +1782,7 @@ def test_mandatory_driving_category_accepts_matching_category_evidence() -> None
         resume_fit=90,
     )
     licence = next(
-        item
-        for item in result.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in result.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert licence.status is HardRequirementStatus.MET
     assert result.eligible_for_ai is True
@@ -1809,8 +1805,7 @@ def test_customer_experience_phrase_is_not_role_experience_requirement() -> None
         resume_fit=80,
     )
     assert not any(
-        item.requirement_id == "role_specific_experience"
-        for item in result.hard_requirements
+        item.requirement_id == "role_specific_experience" for item in result.hard_requirements
     )
 
 
@@ -1830,8 +1825,7 @@ def test_optional_role_experience_does_not_become_hard_requirement() -> None:
         resume_fit=80,
     )
     assert not any(
-        item.requirement_id == "role_specific_experience"
-        for item in result.hard_requirements
+        item.requirement_id == "role_specific_experience" for item in result.hard_requirements
     )
 
 
@@ -1852,8 +1846,7 @@ def test_russian_non_licence_words_do_not_trigger_generic_credential() -> None:
         resume_fit=80,
     )
     assert not any(
-        item.kind.value == "professional_credential"
-        for item in result.hard_requirements
+        item.kind.value == "professional_credential" for item in result.hard_requirements
     )
 
 
@@ -1870,9 +1863,7 @@ def test_typo_catergoria_b_is_detected_as_driving_requirement() -> None:
         resume_fit=80,
     )
     licence = next(
-        item
-        for item in result.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in result.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert licence.status is HardRequirementStatus.MISSING
 
@@ -1888,8 +1879,7 @@ def test_multi_category_driving_requirement_needs_all_categories() -> None:
         resume_fit=85,
     )
     licence = next(
-        item for item in result.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in result.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert licence.status is HardRequirementStatus.MISSING
 
@@ -1900,8 +1890,7 @@ def test_multi_category_driving_requirement_needs_all_categories() -> None:
         resume_fit=85,
     )
     complete_licence = next(
-        item for item in complete.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in complete.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert complete_licence.status is HardRequirementStatus.MET
 
@@ -1933,7 +1922,8 @@ def test_explicit_mandatory_role_experience_is_hard() -> None:
         resume_fit=80,
     )
     req = next(
-        item for item in result.hard_requirements
+        item
+        for item in result.hard_requirements
         if item.requirement_id == "role_specific_experience"
     )
     assert req.status is HardRequirementStatus.MISSING
@@ -1955,7 +1945,8 @@ def test_minimum_role_experience_is_hard_without_mandatory_word() -> None:
         resume_fit=80,
     )
     req = next(
-        item for item in result.hard_requirements
+        item
+        for item in result.hard_requirements
         if item.requirement_id == "role_specific_experience"
     )
     assert req.status is HardRequirementStatus.MISSING
@@ -1964,9 +1955,7 @@ def test_minimum_role_experience_is_hard_without_mandatory_word() -> None:
 def test_optional_forklift_experience_is_not_hard_requirement() -> None:
     job = make_job(
         title="Lucrător în depozit",
-        description=(
-            "Ai experiență în domeniu (munca pe stivuitor ar constitui un avantaj)."
-        ),
+        description=("Ai experiență în domeniu (munca pe stivuitor ar constitui un avantaj)."),
         required_experience="С опытом",  # noqa: RUF001
         no_experience=False,
     )
@@ -1977,17 +1966,14 @@ def test_optional_forklift_experience_is_not_hard_requirement() -> None:
         resume_fit=80,
     )
     assert not any(
-        item.requirement_id == "forklift_operator_experience"
-        for item in result.hard_requirements
+        item.requirement_id == "forklift_operator_experience" for item in result.hard_requirements
     )
 
 
 def test_obtainable_after_hire_certificate_is_not_pre_hire_hard() -> None:
     job = make_job(
         title="Șofer de taxi",
-        description=(
-            "Certificat de taximetrist. Dacă nu îl aveți, vă ajutăm să îl obțineți."
-        ),
+        description=("Certificat de taximetrist. Dacă nu îl aveți, vă ajutăm să îl obțineți."),
     )
     result = DeterministicPrefilter().evaluate(
         job,
@@ -1996,8 +1982,7 @@ def test_obtainable_after_hire_certificate_is_not_pre_hire_hard() -> None:
         resume_fit=80,
     )
     assert not any(
-        item.kind.value == "professional_credential"
-        for item in result.hard_requirements
+        item.kind.value == "professional_credential" for item in result.hard_requirements
     )
 
 
@@ -2015,8 +2000,7 @@ def test_driver_role_with_explicit_licence_is_hard_without_mandatory_word() -> N
         resume_fit=80,
     )
     licence = next(
-        item for item in result.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in result.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert licence.status is HardRequirementStatus.MISSING
 
@@ -2032,18 +2016,14 @@ def test_driving_licence_marked_as_advantage_is_not_hard() -> None:
         make_profile(driving_licences=[]),
         resume_fit=80,
     )
-    assert not any(
-        item.requirement_id == "driving_licence"
-        for item in result.hard_requirements
-    )
+    assert not any(item.requirement_id == "driving_licence" for item in result.hard_requirements)
 
 
 def test_nearby_not_mandatory_text_does_not_make_driving_licence_hard() -> None:
     job = make_job(
         title="Tehnician",
         description=(
-            "Studii superioare приветствуются, но не обязательно; "
-            "наличие водительских прав B."
+            "Studii superioare приветствуются, но не обязательно; наличие водительских прав B."
         ),
     )
     result = DeterministicPrefilter().evaluate(
@@ -2052,10 +2032,7 @@ def test_nearby_not_mandatory_text_does_not_make_driving_licence_hard() -> None:
         make_profile(driving_licences=[]),
         resume_fit=80,
     )
-    assert not any(
-        item.requirement_id == "driving_licence"
-        for item in result.hard_requirements
-    )
+    assert not any(item.requirement_id == "driving_licence" for item in result.hard_requirements)
 
 
 def test_not_mandatory_english_experience_is_not_hard() -> None:
@@ -2074,8 +2051,7 @@ def test_not_mandatory_english_experience_is_not_hard() -> None:
         resume_fit=80,
     )
     assert not any(
-        item.requirement_id == "role_specific_experience"
-        for item in result.hard_requirements
+        item.requirement_id == "role_specific_experience" for item in result.hard_requirements
     )
 
 
@@ -2104,8 +2080,7 @@ def test_flattened_long_bilingual_list_keeps_forklift_advantage_optional() -> No
         resume_fit=80,
     )
     assert not any(
-        item.requirement_id == "forklift_operator_experience"
-        for item in result.hard_requirements
+        item.requirement_id == "forklift_operator_experience" for item in result.hard_requirements
     )
 
 
@@ -2124,8 +2099,7 @@ def test_employer_screening_certification_is_not_preheld_credential() -> None:
         resume_fit=80,
     )
     assert not any(
-        item.kind.value == "professional_credential"
-        for item in result.hard_requirements
+        item.kind.value == "professional_credential" for item in result.hard_requirements
     )
 
 
@@ -2140,9 +2114,7 @@ def test_driving_licence_without_category_is_unknown_for_category_requirement() 
         resume_fit=90,
     )
     licence = next(
-        item
-        for item in result.hard_requirements
-        if item.requirement_id == "driving_licence"
+        item for item in result.hard_requirements if item.requirement_id == "driving_licence"
     )
     assert licence.status is HardRequirementStatus.UNKNOWN
     assert licence.evidence_ids == ["profile.driving_licence:0"]
@@ -2163,9 +2135,7 @@ def test_absent_generic_professional_credential_is_missing_not_unknown() -> None
         resume_fit=85,
     )
     credential = next(
-        item
-        for item in result.hard_requirements
-        if item.kind.value == "professional_credential"
+        item for item in result.hard_requirements if item.kind.value == "professional_credential"
     )
     assert credential.status is HardRequirementStatus.MISSING
     assert credential.evidence_ids[0].startswith("trusted_profile:no_evidence:")

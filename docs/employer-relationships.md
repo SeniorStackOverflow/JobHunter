@@ -1,0 +1,52 @@
+# Employer relationship memory
+
+JobHunter resolves each source vacancy to a `CanonicalEmployer` using exact source
+profile identifiers, verified domains, public email addresses, and known phone
+numbers. A normalized company name is review evidence only and never merges two
+employers by itself. When strong identifiers disagree, the source job receives a
+separate employer and an `EmployerIdentityCandidate`; no permanent suppression is
+inferred from the ambiguity.
+
+Every application, correlated Gmail reply, PhoneGate call/SMS, interview event,
+and owner override writes an idempotent `EmployerInteractionEvent`. The event log
+is append-only. `EmployerRelationship` is rebuilt deterministically from that log
+and stores the current state plus job, role-family, or employer suppression. A
+reopen action appends `relationship_reopened`; it never deletes the original
+decline.
+
+The default policy permits one active application per profile and employer. It
+chooses the highest current match score with stable timestamp/ID tie-breakers.
+Other applications use `deferred` and become eligible after the relationship is
+closed or explicitly reopened. PostgreSQL employer-row locks serialize the final
+policy check, and the same gates run during preparation, immediately before send,
+and before every delivery retry.
+
+An employer reply or verified interview proposal/confirmation freezes new
+applications. An explicit decline is job-scoped unless stronger evidence exists.
+Employer-scoped automatic suppression requires an explicit company-level decline
+after a separately recorded `interview_attended` event. A merely scheduled or
+confirmed interview is not attendance proof.
+
+Useful operator commands are:
+
+```text
+job-agent employer-identity-audit [--company NAME]
+job-agent employer-relationship-audit [--company NAME]
+job-agent employer-backfill --apply
+job-agent employer-remediate --apply
+job-agent email-delivery-audit [--recipient EMAIL]
+```
+
+The first two commands are read-only. `email-delivery-audit` reads Gmail only when
+the stored OAuth grant includes `gmail.readonly`; it does not advance the mailbox
+cursor or update delivery/contact state. Apply commands are deliberately separate
+so identity and safety reports can be reviewed first.
+
+Production rollout keeps automatic sending paused through migration and backfill.
+Run the identity dry-run first and stop if it proposes broad merges through shared
+agency contacts. Apply the additive migration through the migrator role, recreate
+application containers on one image digest, reauthorize Gmail for both send and
+read-only scopes, apply the employer backfill, add any owner-confirmed suppression
+through the audited override, then run unsent remediation. Historical `sent`
+applications remain historical send attempts even when a later DSN changes their
+`EmailDelivery` outcome.

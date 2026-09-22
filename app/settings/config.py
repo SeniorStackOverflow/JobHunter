@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     gmail_client_id: SecretStr | None = None
     gmail_client_secret: SecretStr | None = None
     google_admin_emails: list[str] = Field(default_factory=list)
+    gmail_delivery_reconciliation_enabled: bool = True
+    gmail_delivery_reconciliation_batch: int = Field(default=100, ge=1, le=500)
+    gmail_delivery_monitor_days: int = Field(default=14, ge=1, le=90)
+    email_delivery_max_attempts: int = Field(default=4, ge=1, le=10)
+    employer_max_active_applications: int = Field(default=1, ge=1, le=10)
+    freeze_new_applications_to_active_employer: bool = True
 
     llm_provider: Literal["mock", "openai", "gemini", "llmrouter"] = "mock"
     openai_api_key: SecretStr | None = None

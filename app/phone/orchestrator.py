@@ -446,9 +446,7 @@ class CallOrchestrator:
                 return "timeout", seen_transcript_id, []
             await asyncio.sleep(self._s.phone_orchestrator_poll_seconds)
 
-    async def _poll_phonegate(
-        self, seen_transcript_id: int
-    ) -> tuple[DeviceStatus, TranscriptPage]:
+    async def _poll_phonegate(self, seen_transcript_id: int) -> tuple[DeviceStatus, TranscriptPage]:
         try:
             status = await self._client.device_status()
         except (PhoneGateUnavailable, PhoneGateError) as exc:
@@ -460,9 +458,11 @@ class CallOrchestrator:
         return status, page
 
     def _poll_retry_delay(self, failure_count: int) -> float:
-        return min(
-            1.0,
-            self._s.phone_orchestrator_poll_seconds * (2 ** max(0, failure_count - 1)),
+        return float(
+            min(
+                1.0,
+                self._s.phone_orchestrator_poll_seconds * (2 ** max(0, failure_count - 1)),
+            )
         )
 
     @staticmethod
@@ -652,7 +652,11 @@ class CallOrchestrator:
                 await db.commit()
 
     async def _finish_error(
-        self, reason: str, *, error_type: str | None = None, endpoint: str | None = None,
+        self,
+        reason: str,
+        *,
+        error_type: str | None = None,
+        endpoint: str | None = None,
         consecutive_failures: int | None = None,
     ) -> None:
         async with self._sf() as db:

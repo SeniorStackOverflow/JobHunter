@@ -654,7 +654,7 @@ def test_vague_time_remains_unknown() -> None:
 
 
 def test_company_prefix_and_quotes_do_not_create_fake_conflict() -> None:
-    text = 'Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста.'
+    text = "Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста."
     extracted = FactCandidate(
         field="company",
         raw_expression="Компетенс Маркетинг",
@@ -665,8 +665,8 @@ def test_company_prefix_and_quotes_do_not_create_fake_conflict() -> None:
     )
     verified = FactCandidate(
         field="company",
-        raw_expression='Компания «Компетенс Маркетинг»',
-        normalized_value='Компания «Компетенс Маркетинг»',
+        raw_expression="Компания «Компетенс Маркетинг»",
+        normalized_value="Компания «Компетенс Маркетинг»",
         quote=text,
         turn_seq=1,
         confidence=0.99,
@@ -677,7 +677,7 @@ def test_company_prefix_and_quotes_do_not_create_fake_conflict() -> None:
         arbitration=[
             ArbitrationItem(
                 field="company",
-                accepted_value='Компания «Компетенс Маркетинг»',
+                accepted_value="Компания «Компетенс Маркетинг»",
                 supporting_quote=text,
                 accepted=True,
                 reason="одна и та же компания",
@@ -700,7 +700,7 @@ def test_company_prefix_and_quotes_do_not_create_fake_conflict() -> None:
 
 
 def test_callback_request_can_be_high_confidence_without_interview_facts() -> None:
-    text = 'Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста.'
+    text = "Добрый день. Компания «Компетенс Маркетинг». Перезвоните, пожалуйста."
     context = VerificationContext(
         call_id="call",
         call_started_at=datetime(2026, 9, 15, 11, tzinfo=UTC),

@@ -131,9 +131,7 @@ async def test_evidence_capture_then_finalize_links_and_summarizes(
         )
         task = asyncio.create_task(orchestrator.run(session_id))
         try:
-            await _wait_for_stage(
-                phone_e2e_factory, session_id, "waiting_first_response"
-            )
+            await _wait_for_stage(phone_e2e_factory, session_id, "waiting_first_response")
             transcript_id = fake.transcript(
                 speaker="rx", text="в четверг в 14:00 на Индустриальной 12"
             )

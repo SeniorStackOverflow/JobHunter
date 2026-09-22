@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -8,11 +8,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import (
+    Alert,
     Application,
     CanonicalJob,
     DailyReport,
     EmailDelivery,
     EmployerContact,
+    EmployerIdentityCandidate,
+    EmployerRelationship,
     JobSource,
     MatchEvaluation,
     Resume,
@@ -22,6 +25,7 @@ from app.models.entities import (
 from app.models.enums import (
     ApplicationStatus,
     DeliveryStatus,
+    EmployerRelationshipState,
     MatchDecision,
     PolicyDecision,
     RunStatus,
@@ -169,6 +173,8 @@ async def _daily_limit_metrics(
                 EmailDelivery.status.in_(
                     {
                         DeliveryStatus.SENT,
+                        DeliveryStatus.PROVIDER_ACCEPTED,
+                        DeliveryStatus.DELIVERED,
                         DeliveryStatus.SENDING,
                         DeliveryStatus.DELIVERY_UNKNOWN,
                     }
@@ -233,7 +239,14 @@ async def _generate(session: AsyncSession) -> DailyReport:
                 .join(Resume, Resume.id == Application.resume_id)
                 .join(EmployerContact, EmployerContact.id == Application.recipient_contact_id)
                 .where(
-                    EmailDelivery.status == DeliveryStatus.SENT,
+                    EmailDelivery.status.in_(
+                        {
+                            DeliveryStatus.SENT,
+                            DeliveryStatus.PROVIDER_ACCEPTED,
+                            DeliveryStatus.DELIVERED,
+                            DeliveryStatus.DELIVERY_UNKNOWN,
+                        }
+                    ),
                     Application.sent_at >= start,
                     Application.sent_at < end,
                 )
@@ -268,6 +281,10 @@ async def _generate(session: AsyncSession) -> DailyReport:
                 "application_id": str(application.id),
                 "provider_message_id": delivery.provider_message_id,
                 "thread_id": delivery.thread_id,
+                "delivery_status": delivery.status.value,
+                "smtp_status": delivery.smtp_status,
+                "failure_class": delivery.failure_class,
+                "bounced_at": delivery.bounced_at.isoformat() if delivery.bounced_at else None,
                 "automatic": automatic,
             }
         )
@@ -294,7 +311,14 @@ async def _generate(session: AsyncSession) -> DailyReport:
             select(func.count(EmailDelivery.id))
             .join(Application, Application.id == EmailDelivery.application_id)
             .where(
-                EmailDelivery.status == DeliveryStatus.SENT,
+                EmailDelivery.status.in_(
+                    {
+                        DeliveryStatus.SENT,
+                        DeliveryStatus.PROVIDER_ACCEPTED,
+                        DeliveryStatus.DELIVERED,
+                        DeliveryStatus.DELIVERY_UNKNOWN,
+                    }
+                ),
                 Application.sent_at >= start,
                 Application.sent_at < end,
                 Application.created_at >= start,
@@ -308,7 +332,14 @@ async def _generate(session: AsyncSession) -> DailyReport:
             select(func.count(EmailDelivery.id))
             .join(Application, Application.id == EmailDelivery.application_id)
             .where(
-                EmailDelivery.status == DeliveryStatus.SENT,
+                EmailDelivery.status.in_(
+                    {
+                        DeliveryStatus.SENT,
+                        DeliveryStatus.PROVIDER_ACCEPTED,
+                        DeliveryStatus.DELIVERED,
+                        DeliveryStatus.DELIVERY_UNKNOWN,
+                    }
+                ),
                 Application.sent_at >= start,
                 Application.sent_at < end,
                 Application.created_at < start,
@@ -346,6 +377,14 @@ async def _generate(session: AsyncSession) -> DailyReport:
                         DeliveryStatus.DELIVERY_UNKNOWN,
                         DeliveryStatus.TEMPORARY_FAILURE,
                         DeliveryStatus.PERMANENT_FAILURE,
+                        DeliveryStatus.BOUNCED_TRANSIENT,
+                        DeliveryStatus.BOUNCED_PERMANENT,
+                        DeliveryStatus.RECIPIENT_REJECTED,
+                        DeliveryStatus.MAILBOX_FULL,
+                        DeliveryStatus.DOMAIN_REJECTED,
+                        DeliveryStatus.POLICY_REJECTED,
+                        DeliveryStatus.SPAM_REJECTED,
+                        DeliveryStatus.DELIVERY_FAILED,
                     ]
                 ),
             )
@@ -357,6 +396,209 @@ async def _generate(session: AsyncSession) -> DailyReport:
     external_metrics = await external_call_metrics(session, start, end)
     limit_metrics = await _daily_limit_metrics(session, start, end)
     phone_metrics = await daily_phone_metrics(session, start, end)
+    delivery_rows = (
+        await session.execute(
+            select(
+                EmailDelivery.status,
+                EmailDelivery.smtp_status,
+                EmailDelivery.failure_class,
+                func.count(EmailDelivery.id),
+            )
+            .where(EmailDelivery.updated_at >= start, EmailDelivery.updated_at < end)
+            .group_by(
+                EmailDelivery.status,
+                EmailDelivery.smtp_status,
+                EmailDelivery.failure_class,
+            )
+        )
+    ).all()
+    delivery_status_counts: dict[str, int] = {}
+    permanent_breakdown: dict[str, int] = {}
+    for status, smtp_status, failure_class, count in delivery_rows:
+        delivery_status_counts[status.value] = delivery_status_counts.get(status.value, 0) + int(
+            count
+        )
+        if status in {
+            DeliveryStatus.BOUNCED_PERMANENT,
+            DeliveryStatus.RECIPIENT_REJECTED,
+            DeliveryStatus.DOMAIN_REJECTED,
+            DeliveryStatus.POLICY_REJECTED,
+            DeliveryStatus.SPAM_REJECTED,
+            DeliveryStatus.PERMANENT_FAILURE,
+        }:
+            key = f"{smtp_status or 'unknown'}:{failure_class or 'other'}"
+            permanent_breakdown[key] = permanent_breakdown.get(key, 0) + int(count)
+    submitted_count = int(
+        await session.scalar(
+            select(func.count(EmailDelivery.id)).where(
+                EmailDelivery.submitted_at >= start,
+                EmailDelivery.submitted_at < end,
+            )
+        )
+        or 0
+    )
+    provider_accepted_count = int(
+        await session.scalar(
+            select(func.count(EmailDelivery.id)).where(
+                EmailDelivery.provider_accepted_at >= start,
+                EmailDelivery.provider_accepted_at < end,
+            )
+        )
+        or 0
+    )
+    permanent_count = sum(permanent_breakdown.values())
+    delivery_alerts: list[dict[str, object]] = []
+    if submitted_count >= 10 and permanent_count / submitted_count > 0.10:
+        delivery_alerts.append(
+            {
+                "severity": "warning",
+                "code": "email_permanent_bounce_rate",
+                "permanent_bounces": permanent_count,
+                "submitted": submitted_count,
+                "rate": round(permanent_count / submitted_count, 4),
+            }
+        )
+    auth_failures = sum(
+        count
+        for key, count in permanent_breakdown.items()
+        if key.endswith(":authentication_failure")
+    )
+    if auth_failures:
+        delivery_alerts.append(
+            {
+                "severity": "high",
+                "code": "email_authentication_failures",
+                "count": auth_failures,
+            }
+        )
+    permanent_deliveries = list(
+        (
+            await session.scalars(
+                select(EmailDelivery).where(
+                    EmailDelivery.updated_at >= start,
+                    EmailDelivery.updated_at < end,
+                    EmailDelivery.status.in_(
+                        {
+                            DeliveryStatus.BOUNCED_PERMANENT,
+                            DeliveryStatus.RECIPIENT_REJECTED,
+                            DeliveryStatus.DOMAIN_REJECTED,
+                            DeliveryStatus.POLICY_REJECTED,
+                            DeliveryStatus.SPAM_REJECTED,
+                            DeliveryStatus.PERMANENT_FAILURE,
+                        }
+                    ),
+                )
+            )
+        ).all()
+    )
+    rejected_by_domain: dict[str, int] = {}
+    for delivery in permanent_deliveries:
+        domain = delivery.recipient.rsplit("@", maxsplit=1)[-1].casefold()
+        rejected_by_domain[domain] = rejected_by_domain.get(domain, 0) + 1
+    for domain, count in sorted(rejected_by_domain.items()):
+        if count >= 3:
+            delivery_alerts.append(
+                {
+                    "severity": "warning",
+                    "code": f"email_domain_mass_rejection:{domain}"[:128],
+                    "domain": domain,
+                    "count": count,
+                }
+            )
+    policy_failures = sum(
+        delivery.status in {DeliveryStatus.POLICY_REJECTED, DeliveryStatus.SPAM_REJECTED}
+        for delivery in permanent_deliveries
+    )
+    if policy_failures >= 3:
+        delivery_alerts.append(
+            {
+                "severity": "high",
+                "code": "email_policy_rejection_spike",
+                "count": policy_failures,
+            }
+        )
+    retry_stuck = int(
+        await session.scalar(
+            select(func.count(EmailDelivery.id)).where(
+                EmailDelivery.status.in_(
+                    {DeliveryStatus.BOUNCED_TRANSIENT, DeliveryStatus.TEMPORARY_FAILURE}
+                ),
+                EmailDelivery.next_retry_at < datetime.now(UTC),
+            )
+        )
+        or 0
+    )
+    if retry_stuck >= 3:
+        delivery_alerts.append(
+            {
+                "severity": "warning",
+                "code": "email_retry_queue_stuck",
+                "count": retry_stuck,
+            }
+        )
+    for alert_data in delivery_alerts:
+        code = str(alert_data["code"])
+        existing_alert = await session.scalar(
+            select(Alert.id).where(
+                Alert.code == code,
+                Alert.created_at >= start,
+                Alert.acknowledged.is_(False),
+            )
+        )
+        if existing_alert is None:
+            session.add(
+                Alert(
+                    severity=str(alert_data["severity"]),
+                    code=code,
+                    message="Email delivery health requires operator attention",
+                    safe_diagnostics=alert_data,
+                    acknowledged=False,
+                )
+            )
+    relationship_applications = list(
+        (
+            await session.scalars(
+                select(Application).where(
+                    Application.created_at >= start,
+                    Application.created_at < end,
+                )
+            )
+        ).all()
+    )
+    suppressed_applications = sum(
+        bool(
+            {"employer_not_suppressed", "no_candidate_withdrawal"}
+            & {
+                item
+                for item in (application.policy_result or {}).get("rules_failed", [])
+                if isinstance(item, str)
+            }
+        )
+        for application in relationship_applications
+    )
+    active_employers = int(
+        await session.scalar(
+            select(func.count(EmployerRelationship.id)).where(
+                EmployerRelationship.state.in_(
+                    {
+                        EmployerRelationshipState.APPLICATION_ACTIVE,
+                        EmployerRelationshipState.EMPLOYER_REPLIED,
+                        EmployerRelationshipState.INTERVIEW_PENDING,
+                        EmployerRelationshipState.INTERVIEWED,
+                    }
+                )
+            )
+        )
+        or 0
+    )
+    relationship_review_count = int(
+        await session.scalar(
+            select(func.count(EmployerIdentityCandidate.id)).where(
+                EmployerIdentityCandidate.status == "needs_review"
+            )
+        )
+        or 0
+    )
     summary = {
         "calendar_date": start_local.date().isoformat(),
         "timezone": LOCAL_TIMEZONE_NAME,
@@ -381,6 +623,25 @@ async def _generate(session: AsyncSession) -> DailyReport:
         **matching_metrics,
         "external_calls": external_metrics,
         "phone_calls": phone_metrics,
+        "employer_safety": {
+            "employers_with_active_conversation": active_employers,
+            "employer_suppressed_applications": suppressed_applications,
+            "same_employer_applications_deferred": sum(
+                application.status is ApplicationStatus.DEFERRED
+                for application in relationship_applications
+            ),
+            "relationship_review_count": relationship_review_count,
+        },
+        "email_delivery": {
+            "submitted": submitted_count,
+            "provider_accepted": provider_accepted_count,
+            "delivery_unknown": delivery_status_counts.get("delivery_unknown", 0),
+            "bounced_transient": delivery_status_counts.get("bounced_transient", 0),
+            "bounced_permanent": permanent_count,
+            "by_status": delivery_status_counts,
+            "permanent_failure_breakdown": permanent_breakdown,
+            "alerts": delivery_alerts,
+        },
         # Legacy counters are retained for compatibility. The explicit fields below
         # distinguish today's application cohort from send events that may drain
         # applications created on earlier days.

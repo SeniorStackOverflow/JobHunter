@@ -1,4 +1,4 @@
-"""Read-only PhoneGate SMS import and conservative call correlation."""
+"""Read-only PhoneGate SMS import and conservative employer/call correlation."""
 
 from __future__ import annotations
 
@@ -19,13 +19,27 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import async_session_factory
-from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
+from app.employers import EmployerRelationshipService, classify_candidate_decline
+from app.models.entities import (
+    CallFact,
+    CommunicationSession,
+    CommunicationTurn,
+    EmployerRelationship,
+    InterviewAppointment,
+    SourceJob,
+    UserProfile,
+)
 from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    EmployerInteractionChannel,
+    EmployerInteractionType,
+    EmployerRelationshipState,
+    InterviewStatus,
     PhoneSummaryState,
     PhoneVerificationStatus,
+    SuppressionScope,
     TurnDeliveryStatus,
     TurnSpeaker,
 )
@@ -343,7 +357,7 @@ async def _ensure_turn(
         session_id=sms_session.id,
         phonegate_transcript_id=None,
         seq=1,
-        speaker=TurnSpeaker.EMPLOYER,
+        speaker=(TurnSpeaker.EMPLOYER if message.direction == "incoming" else TurnSpeaker.OPERATOR),
         text=message.text,
         raw_text=message.text,
         delivery_status=TurnDeliveryStatus.NOT_APPLICABLE,
@@ -922,6 +936,33 @@ async def process_sms_confirmation(
             call.processing_started_at = None
             await db.commit()
             return None
+        if call.employer_id is not None and status in {
+            PhoneVerificationStatus.CONFIRMED,
+            PhoneVerificationStatus.HIGH_CONFIDENCE,
+        }:
+            appointment = await db.scalar(
+                select(InterviewAppointment).where(
+                    InterviewAppointment.communication_session_id == call.id
+                )
+            )
+            if appointment is not None and appointment.status is InterviewStatus.PROPOSED:
+                appointment.status = InterviewStatus.CONFIRMED
+                appointment.confirmed_at = turn.occurred_at
+                await EmployerRelationshipService().record_event(
+                    db,
+                    profile_id=call.profile_id,
+                    employer_id=call.employer_id,
+                    event_type=EmployerInteractionType.INTERVIEW_CONFIRMED,
+                    channel=EmployerInteractionChannel.SMS,
+                    idempotency_key=f"sms-interview-confirmed:{turn.id}",
+                    occurred_at=turn.occurred_at,
+                    application_id=call.application_id,
+                    canonical_job_id=call.canonical_job_id,
+                    source_job_id=call.source_job_id,
+                    communication_session_id=sms_session.id,
+                    turn_id=turn.id,
+                    event_metadata={"verification_status": status.value},
+                )
         verification = dict((call.summary or {}).get("verification", {}))
         verification["sms_pending"] = [
             value for value in _pending_ids(call) if value != str(turn.id)
@@ -1023,7 +1064,11 @@ async def _persist_message(
             profile_id=profile.id,
             channel=CommunicationChannel.SMS,
             transport="phonegate",
-            direction=CommunicationDirection.INBOUND,
+            direction=(
+                CommunicationDirection.INBOUND
+                if message.direction == "incoming"
+                else CommunicationDirection.OUTBOUND
+            ),
             remote_address=normalized_number or "",
             remote_raw=message.address,
             phonegate_event_id_start=None,
@@ -1066,6 +1111,91 @@ async def _persist_message(
         if turn is None:
             raise
     return sms_session, duplicate
+
+
+async def _record_sms_relationship_events(
+    db: AsyncSession,
+    *,
+    sms_session: CommunicationSession,
+    call: CommunicationSession,
+    message: PhoneSmsMessage,
+    occurred_at: datetime,
+) -> None:
+    if message.direction == "outgoing":
+        sms_session.related_session_id = call.id
+    sms_session.employer_id = call.employer_id
+    sms_session.application_id = call.application_id
+    sms_session.canonical_job_id = call.canonical_job_id
+    sms_session.source_job_id = call.source_job_id
+    sms_session.contact_id = call.contact_id
+    if call.employer_id is None:
+        return
+    turn = await db.scalar(
+        select(CommunicationTurn).where(
+            CommunicationTurn.session_id == sms_session.id,
+            CommunicationTurn.seq == 1,
+        )
+    )
+    event_type = (
+        EmployerInteractionType.SMS_INBOUND
+        if message.direction == "incoming"
+        else EmployerInteractionType.SMS_OUTBOUND
+    )
+    service = EmployerRelationshipService()
+    await service.record_event(
+        db,
+        profile_id=sms_session.profile_id,
+        employer_id=call.employer_id,
+        event_type=event_type,
+        channel=EmployerInteractionChannel.SMS,
+        idempotency_key=f"phonegate-sms:{message.id}",
+        occurred_at=occurred_at,
+        application_id=call.application_id,
+        canonical_job_id=call.canonical_job_id,
+        source_job_id=call.source_job_id,
+        communication_session_id=sms_session.id,
+        turn_id=turn.id if turn is not None else None,
+        event_metadata={"direction": message.direction},
+    )
+    if message.direction != "outgoing":
+        return
+    relationship = await db.scalar(
+        select(EmployerRelationship).where(
+            EmployerRelationship.profile_id == sms_session.profile_id,
+            EmployerRelationship.employer_id == call.employer_id,
+        )
+    )
+    scope = classify_candidate_decline(
+        message.text,
+        interview_attended=(
+            relationship is not None and relationship.state is EmployerRelationshipState.INTERVIEWED
+        ),
+    )
+    if scope is None or (scope is SuppressionScope.JOB and call.canonical_job_id is None):
+        return
+    job = await db.get(SourceJob, call.source_job_id) if call.source_job_id is not None else None
+    decline_type = (
+        EmployerInteractionType.CANDIDATE_DECLINED_EMPLOYER
+        if scope is SuppressionScope.EMPLOYER
+        else EmployerInteractionType.CANDIDATE_DECLINED_JOB
+    )
+    await service.record_event(
+        db,
+        profile_id=sms_session.profile_id,
+        employer_id=call.employer_id,
+        event_type=decline_type,
+        channel=EmployerInteractionChannel.SMS,
+        idempotency_key=f"phonegate-sms-decline:{message.id}",
+        occurred_at=occurred_at,
+        application_id=call.application_id,
+        canonical_job_id=call.canonical_job_id,
+        source_job_id=call.source_job_id,
+        communication_session_id=sms_session.id,
+        turn_id=turn.id if turn is not None else None,
+        suppression_scope=scope,
+        event_metadata={"evidence": "explicit_outgoing_decline"},
+        role=job.title if job is not None else None,
+    )
 
 
 def _is_sms_external_id_conflict(exc: IntegrityError) -> bool:
@@ -1152,9 +1282,7 @@ async def _ingest_with_client(
         profile = await _profile_for_sms(db)
         if profile is None:
             raise PhoneSmsProfileUnavailable("No local profile is available for SMS import")
-        incoming_messages = [
-            message for message in page.messages if message.direction == "incoming"
-        ]
+        incoming_messages = list(page.messages)
         existing_sms_by_id: dict[str, CommunicationSession] = {}
         if incoming_messages:
             external_ids = {message.id for message in incoming_messages}
@@ -1178,9 +1306,6 @@ async def _ingest_with_client(
         # begin. The unique constraint still arbitrates a true race.
         await db.commit()
         for message in page.messages:
-            if message.direction != "incoming":
-                result["outgoing_ignored"] += 1
-                continue
             sms_session, duplicate = await _persist_message(
                 db,
                 profile=profile,
@@ -1203,6 +1328,16 @@ async def _ingest_with_client(
                 settings=settings,
             )
             if len(matches) == 1:
+                if message.direction == "outgoing":
+                    await _record_sms_relationship_events(
+                        db,
+                        sms_session=sms_session,
+                        call=matches[0],
+                        message=message,
+                        occurred_at=occurred_at,
+                    )
+                    result["correlated"] += 1
+                    continue
                 if (
                     sms_session.related_session_id is not None
                     and sms_session.related_session_id != matches[0].id
@@ -1221,6 +1356,13 @@ async def _ingest_with_client(
                         db, call=matches[0], sms_session=sms_session
                     )
                     if sms_session.related_session_id == matches[0].id:
+                        await _record_sms_relationship_events(
+                            db,
+                            sms_session=sms_session,
+                            call=matches[0],
+                            message=message,
+                            occurred_at=occurred_at,
+                        )
                         sms_session.needs_review = False
                         sms_session.diagnostics = {
                             **sms_session.diagnostics,

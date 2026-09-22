@@ -1373,9 +1373,7 @@ async def test_late_asr_call_id_beats_new_open_call_session(
             new_session_id = open_call.id
 
         old_ended_aware = (
-            old_ended_at
-            if old_ended_at.tzinfo is not None
-            else old_ended_at.replace(tzinfo=UTC)
+            old_ended_at if old_ended_at.tzinfo is not None else old_ended_at.replace(tzinfo=UTC)
         )
         event_at = old_ended_aware + timedelta(seconds=6)
         event = PhoneEvent(
@@ -1403,18 +1401,14 @@ async def test_late_asr_call_id_beats_new_open_call_session(
         old_turns = list(
             (
                 await db.scalars(
-                    select(CommunicationTurn).where(
-                        CommunicationTurn.session_id == old_session_id
-                    )
+                    select(CommunicationTurn).where(CommunicationTurn.session_id == old_session_id)
                 )
             ).all()
         )
         new_turns = list(
             (
                 await db.scalars(
-                    select(CommunicationTurn).where(
-                        CommunicationTurn.session_id == new_session_id
-                    )
+                    select(CommunicationTurn).where(CommunicationTurn.session_id == new_session_id)
                 )
             ).all()
         )

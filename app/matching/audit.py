@@ -66,11 +66,7 @@ async def audit_application_hard_requirements(
     for application, job, profile in rows:
         counts["checked"] += 1
         requirements = engine.evaluate(job, profile)
-        unresolved = [
-            item
-            for item in requirements
-            if item.status is not HardRequirementStatus.MET
-        ]
+        unresolved = [item for item in requirements if item.status is not HardRequirementStatus.MET]
         if not unresolved:
             continue
 
@@ -98,9 +94,7 @@ async def audit_application_hard_requirements(
             continue
 
         policy_result = (
-            dict(application.policy_result)
-            if isinstance(application.policy_result, dict)
-            else {}
+            dict(application.policy_result) if isinstance(application.policy_result, dict) else {}
         )
         audit_payload = {
             "rules_version": HARD_REQUIREMENT_RULES_VERSION,
@@ -141,9 +135,7 @@ async def audit_application_hard_requirements(
                 sanitized_details={
                     "source_job_id": str(job.id),
                     "status": application.status.value,
-                    "requirement_ids": [
-                        item.requirement_id for item in unresolved
-                    ],
+                    "requirement_ids": [item.requirement_id for item in unresolved],
                     "rules_version": HARD_REQUIREMENT_RULES_VERSION,
                 },
                 correlation_id=str(uuid4()),

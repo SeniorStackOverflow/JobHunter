@@ -346,9 +346,7 @@ class DeterministicPrefilter:
                 requirements_met.append(requirement.requirement_id)
             elif requirement.status is HardRequirementStatus.MISSING:
                 missing_requirements.append(requirement.requirement_id)
-                skip_reasons.append(
-                    f"hard_requirement_missing:{requirement.requirement_id}"
-                )
+                skip_reasons.append(f"hard_requirement_missing:{requirement.requirement_id}")
                 if requirement.requirement_id == "driving_licence":
                     skip_reasons.append("required_driving_licence_not_confirmed")
             else:
@@ -483,8 +481,7 @@ class DeterministicPrefilter:
         overall_fit = round(resume_fit * resume_weight + preference_fit * (1 - resume_weight))
         reasons.extend(skip_reasons)
         hard_requirement_unknown = any(
-            requirement.status is HardRequirementStatus.UNKNOWN
-            for requirement in hard_requirements
+            requirement.status is HardRequirementStatus.UNKNOWN for requirement in hard_requirements
         )
         if skip_reasons:
             decision = MatchDecision.SKIP

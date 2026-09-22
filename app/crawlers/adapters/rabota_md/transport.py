@@ -236,9 +236,7 @@ async def _prove_free_waf_candidate(
 
         script_hash = solver.last_script_hash
         if not script_hash:
-            raise RabotaMdEgressError(
-                "Rabota.md free-proxy protocol proof produced no script hash"
-            )
+            raise RabotaMdEgressError("Rabota.md free-proxy protocol proof produced no script hash")
 
         class _ProofTokenBackend:
             async def mint(self) -> MintedWafToken:

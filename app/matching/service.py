@@ -442,9 +442,7 @@ async def _select_resume(session: AsyncSession, profile_id: UUID, job: SourceJob
     return choose_resume_for_job(resumes, job)
 
 
-def _requirement_claim_is_protected(
-    claim: str, deterministic: DeterministicFilterResult
-) -> bool:
+def _requirement_claim_is_protected(claim: str, deterministic: DeterministicFilterResult) -> bool:
     normalized = set(normalize_for_fingerprint(claim).split())
     if not normalized:
         return False
@@ -524,9 +522,7 @@ def reconcile_match_result(
         for item in llm_result.requirements_met
         if not _requirement_claim_is_protected(item, deterministic)
     ]
-    requirements_met = _unique(
-        [*deterministic.requirements_met, *llm_requirements_met]
-    )
+    requirements_met = _unique([*deterministic.requirements_met, *llm_requirements_met])
     missing_requirements = _unique(
         [*deterministic.missing_requirements, *llm_result.missing_requirements]
     )
@@ -557,15 +553,13 @@ def reconcile_match_result(
         reason_suffix = "scam indicators force a deterministic block"
     elif hard_missing:
         decision = MatchDecision.SKIP
-        reason_suffix = (
-            "confirmed missing hard requirement prevents application: "
-            + ", ".join(item.requirement_id for item in hard_missing)
+        reason_suffix = "confirmed missing hard requirement prevents application: " + ", ".join(
+            item.requirement_id for item in hard_missing
         )
     elif hard_unknown and decision not in {MatchDecision.BLOCK, MatchDecision.SKIP}:
         decision = MatchDecision.PREPARE_FOR_REVIEW
-        reason_suffix = (
-            "hard requirement lacks trusted evidence: "
-            + ", ".join(item.requirement_id for item in hard_unknown)
+        reason_suffix = "hard requirement lacks trusted evidence: " + ", ".join(
+            item.requirement_id for item in hard_unknown
         )
     elif missing_requirements and decision is MatchDecision.AUTO_APPLY:
         decision = MatchDecision.PREPARE_FOR_REVIEW
@@ -935,18 +929,13 @@ async def process_unprocessed_jobs() -> int:
                     <= datetime.now(UTC)
                     - timedelta(seconds=settings.matching_provider_failure_retry_seconds)
                 )
-                resume_fit = _estimate_resume_fit(
-                    job, profile, resume.category if resume else None
-                )
+                resume_fit = _estimate_resume_fit(job, profile, resume.category if resume else None)
                 deterministic = service.prefilter.evaluate(
                     job, preference, profile, resume_fit=resume_fit
                 )
-                hard_requirement_refresh_due = bool(
-                    deterministic.hard_requirements
-                ) and (
+                hard_requirement_refresh_due = bool(deterministic.hard_requirements) and (
                     evaluation is None
-                    or evaluation.hard_requirement_rules_version
-                    != HARD_REQUIREMENT_RULES_VERSION
+                    or evaluation.hard_requirement_rules_version != HARD_REQUIREMENT_RULES_VERSION
                     or (evaluation.hard_requirements or [])
                     != hard_requirements_snapshot(deterministic.hard_requirements)
                 )

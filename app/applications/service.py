@@ -9,6 +9,7 @@ from app.applications.availability import block_closed_vacancy_applications
 from app.applications.states import ensure_transition
 from app.contacts import ContactDiscoveryService
 from app.crawlers.parsing.normalization import detect_prompt_injection, stable_hash
+from app.employers import EmployerIdentityService
 from app.matching.bindings import evaluation_inputs_are_current
 from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
@@ -51,6 +52,11 @@ _POLICY_ONLY_REFRESH_RULES = {
     "contact_verified",
     "resume_active_verified",
     "daily_limit",
+    "employer_identity_resolved",
+    "employer_not_suppressed",
+    "no_candidate_withdrawal",
+    "no_active_employer_conversation",
+    "employer_application_slot_available",
 }
 
 
@@ -160,6 +166,7 @@ class ApplicationService:
         self.profile_service = ProfileService()
         self.resume_service = ResumeService(settings)
         self.contact_service = ContactDiscoveryService()
+        self.employer_identity = EmployerIdentityService()
         self.policy_engine = PolicyEngine(settings)
 
     async def prepare(
@@ -270,6 +277,7 @@ class ApplicationService:
                 resume,
             ):
                 continue
+            await self.employer_identity.resolve_for_source_job(session, source_job)
             contact = await self.contact_service.discover_from_source_job(session, source_job)
             if contact is None:
                 continue
@@ -288,6 +296,7 @@ class ApplicationService:
             application = Application(
                 profile_id=profile_id,
                 canonical_job_id=canonical_job_id,
+                employer_id=source_job.employer_id,
                 source_job_id=source_job.id,
                 match_evaluation_id=evaluation.id,
                 resume_id=resume.id,
@@ -307,6 +316,7 @@ class ApplicationService:
             # append-only history. Manual approval never carries over implicitly.
             application = existing
             application.source_job_id = source_job.id
+            application.employer_id = source_job.employer_id
             application.match_evaluation_id = evaluation.id
             application.resume_id = resume.id
             application.recipient_contact_id = contact.id
@@ -423,6 +433,7 @@ async def prepare_pending_applications() -> int:
         ApplicationStatus.PREPARED,
         ApplicationStatus.PENDING_REVIEW,
         ApplicationStatus.BLOCKED,
+        ApplicationStatus.DEFERRED,
     }
     async with async_session_factory() as session:
         _start_local, recovery_start, recovery_end = local_day_bounds()
@@ -437,6 +448,7 @@ async def prepare_pending_applications() -> int:
                 MatchEvaluation.id.label("evaluation_id"),
                 MatchEvaluation.decision.label("decision"),
                 MatchEvaluation.created_at.label("evaluation_created_at"),
+                MatchEvaluation.overall_fit.label("overall_fit"),
                 func.row_number()
                 .over(
                     partition_by=(
@@ -483,6 +495,11 @@ async def prepare_pending_applications() -> int:
                             .exists(),
                         ),
                     ),
+                )
+                .order_by(
+                    ranked.c.overall_fit.desc(),
+                    ranked.c.evaluation_created_at,
+                    ranked.c.evaluation_id,
                 )
             )
         ).all()

@@ -8,6 +8,7 @@ from app.crawlers.parsing.normalization import (
     detect_scam_indicators,
     normalize_for_fingerprint,
 )
+from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.hard_requirements import (
     HARD_REQUIREMENT_RULES_VERSION,
     HardRequirementEngine,
@@ -28,6 +29,7 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
+    ContactDeliveryState,
     ContactType,
     DeliveryStatus,
     JobStatus,
@@ -36,16 +38,21 @@ from app.models.enums import (
     SourceHealth,
     VerificationStatus,
 )
+from app.observability.metrics import (
+    APPLICATIONS_BLOCKED_EMPLOYER_SUPPRESSION,
+    APPLICATIONS_DEFERRED_SAME_EMPLOYER,
+)
 from app.policies.schemas import PolicyResult
 from app.settings import Settings
 from app.time_utils import local_day_bounds
 
-POLICY_VERSION = "2026-09-21.1-hard-requirements"
+POLICY_VERSION = "2026-09-22.1-employer-relationship"
 
 
 class PolicyEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.employer_relationships = EmployerRelationshipService()
 
     async def evaluate(
         self,
@@ -65,6 +72,18 @@ class PolicyEngine:
             (passed if condition else failed).append(name)
 
         source = await session.get(JobSource, job.source_id)
+        if job.employer_id is None:
+            identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+        else:
+            identity = None
+        if application.employer_id is None and job.employer_id is not None:
+            application.employer_id = job.employer_id
+        if contact.employer_id is None and job.employer_id is not None:
+            contact.employer_id = job.employer_id
+        if identity is not None and application.employer_id is None:
+            application.employer_id = identity.employer.id
+        if identity is not None and contact.employer_id is None:
+            contact.employer_id = identity.employer.id
         category = (job.category or "").casefold()
         auto_categories = {item.casefold() for item in preferences.auto_send_categories}
         additional_rules = preferences.additional_rules or {}
@@ -111,6 +130,8 @@ class PolicyEngine:
                 EmailDelivery.status.in_(
                     {
                         DeliveryStatus.SENT,
+                        DeliveryStatus.PROVIDER_ACCEPTED,
+                        DeliveryStatus.DELIVERED,
                         DeliveryStatus.SENDING,
                         DeliveryStatus.DELIVERY_UNKNOWN,
                     }
@@ -142,21 +163,23 @@ class PolicyEngine:
         current_hard_requirements = HardRequirementEngine().evaluate(job, profile)
         current_hard_snapshot = hard_requirements_snapshot(current_hard_requirements)
         hard_requirements_met = all_hard_requirements_met(current_hard_requirements)
-        hard_requirement_binding_current = (
-            not current_hard_requirements
-            or (
-                evaluation.hard_requirement_rules_version
-                == HARD_REQUIREMENT_RULES_VERSION
-                and (evaluation.hard_requirements or []) == current_hard_snapshot
-            )
+        hard_requirement_binding_current = not current_hard_requirements or (
+            evaluation.hard_requirement_rules_version == HARD_REQUIREMENT_RULES_VERSION
+            and (evaluation.hard_requirements or []) == current_hard_snapshot
         )
         hard_requirement_missing = any(
-            item.status is HardRequirementStatus.MISSING
-            for item in current_hard_requirements
+            item.status is HardRequirementStatus.MISSING for item in current_hard_requirements
         )
         hard_requirement_unknown = any(
-            item.status is HardRequirementStatus.UNKNOWN
-            for item in current_hard_requirements
+            item.status is HardRequirementStatus.UNKNOWN for item in current_hard_requirements
+        )
+        employer_policy = await self.employer_relationships.policy_outcome(
+            session,
+            application=application,
+            evaluation=evaluation,
+            job=job,
+            max_active_applications=self.settings.employer_max_active_applications,
+            freeze_active_conversation=self.settings.freeze_new_applications_to_active_employer,
         )
 
         rule("deployment_emergency_switch_off", not self.settings.emergency_email_kill_switch)
@@ -190,6 +213,25 @@ class PolicyEngine:
         )
         rule("verified_email_contact", contact.contact_type == ContactType.EMAIL)
         rule("contact_verified", contact.verification_status == VerificationStatus.VERIFIED)
+        rule(
+            "contact_delivery_usable",
+            contact.delivery_state
+            not in {
+                ContactDeliveryState.INVALID,
+                ContactDeliveryState.REJECTED,
+                ContactDeliveryState.SUPPRESSED,
+            },
+        )
+        rule(
+            "contact_same_employer",
+            application.employer_id is not None
+            and application.employer_id == job.employer_id == contact.employer_id,
+        )
+        rule("employer_identity_resolved", employer_policy.employer_resolved)
+        rule("employer_not_suppressed", employer_policy.not_suppressed)
+        rule("no_candidate_withdrawal", employer_policy.no_candidate_withdrawal)
+        rule("no_active_employer_conversation", employer_policy.no_active_conversation)
+        rule("employer_application_slot_available", employer_policy.slot_available)
         rule("vacancy_active", job.status == JobStatus.ACTIVE)
         rule(
             "profile_binding_valid",
@@ -229,9 +271,18 @@ class PolicyEngine:
             "no_scam_indicators",
             "not_previously_sent",
             "no_delivery_unknown",
+            "contact_delivery_usable",
+            "contact_same_employer",
+            "employer_not_suppressed",
+            "no_candidate_withdrawal",
         }
         if hard_block_rules & set(failed):
             decision = PolicyDecision.BLOCKED
+        elif {
+            "no_active_employer_conversation",
+            "employer_application_slot_available",
+        } & set(failed):
+            decision = PolicyDecision.DEFERRED
         elif hard_requirement_missing:
             decision = PolicyDecision.SKIPPED
         elif hard_requirement_unknown or not hard_requirement_binding_current:
@@ -268,9 +319,15 @@ class PolicyEngine:
         status_map = {
             PolicyDecision.AUTO_APPROVED: ApplicationStatus.AUTO_APPROVED,
             PolicyDecision.PENDING_REVIEW: ApplicationStatus.PENDING_REVIEW,
+            PolicyDecision.DEFERRED: ApplicationStatus.DEFERRED,
             PolicyDecision.BLOCKED: ApplicationStatus.BLOCKED,
             PolicyDecision.SKIPPED: ApplicationStatus.CANCELLED,
         }
         application.status = status_map[result.decision]
+        failed = set(result.rules_failed)
+        if result.decision is PolicyDecision.DEFERRED:
+            APPLICATIONS_DEFERRED_SAME_EMPLOYER.inc()
+        if {"employer_not_suppressed", "no_candidate_withdrawal"} & failed:
+            APPLICATIONS_BLOCKED_EMPLOYER_SUPPRESSION.inc()
         await session.flush()
         return result

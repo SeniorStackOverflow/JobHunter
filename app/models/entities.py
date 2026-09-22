@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,8 +32,13 @@ from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    ContactDeliveryState,
     ContactType,
     DeliveryStatus,
+    EmployerIdentifierType,
+    EmployerInteractionChannel,
+    EmployerInteractionType,
+    EmployerRelationshipState,
     InterviewFormat,
     InterviewStatus,
     JobStatus,
@@ -47,6 +53,7 @@ from app.models.enums import (
     ScanType,
     ShadowDecision,
     SourceHealth,
+    SuppressionScope,
     TurnDeliveryStatus,
     TurnSpeaker,
     VerificationStatus,
@@ -153,6 +160,62 @@ class JobSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     automatic_actions_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+class CanonicalEmployer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "canonical_employers"
+
+    normalized_name: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    primary_domain: Mapped[str | None] = mapped_column(String(255), index=True)
+
+
+class EmployerIdentifier(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "employer_identifiers"
+    __table_args__ = (
+        Index("ix_employer_identifiers_employer", "employer_id"),
+        Index("ix_employer_identifiers_lookup", "identifier_type", "normalized_value"),
+        Index(
+            "uq_employer_identifiers_strong",
+            "identifier_type",
+            "namespace",
+            "normalized_value",
+            unique=True,
+            postgresql_where=text("identifier_type <> 'normalized_name'"),
+            sqlite_where=text("identifier_type <> 'normalized_name'"),
+        ),
+    )
+
+    employer_id: Mapped[UUID] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="CASCADE"), nullable=False
+    )
+    identifier_type: Mapped[EmployerIdentifierType] = mapped_column(
+        enum_column(EmployerIdentifierType), nullable=False
+    )
+    namespace: Mapped[str] = mapped_column(String(128), default="global", nullable=False)
+    normalized_value: Mapped[str] = mapped_column(String(2048), nullable=False)
+    raw_value: Mapped[str | None] = mapped_column(String(2048))
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class EmployerIdentityCandidate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "employer_identity_candidates"
+    __table_args__ = (
+        UniqueConstraint("source_job_id", name="uq_employer_identity_candidate_source_job"),
+    )
+
+    source_job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    assigned_employer_id: Mapped[UUID] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="CASCADE"), nullable=False
+    )
+    candidate_employer_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="needs_review", nullable=False)
+
+
 class SourceCategory(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "source_categories"
     __table_args__ = (
@@ -179,6 +242,9 @@ class CanonicalJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     normalized_company: Mapped[str] = mapped_column(String(255), nullable=False)
     normalized_title: Mapped[str] = mapped_column(String(255), nullable=False)
     normalized_location: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    employer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
+    )
     canonical_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     primary_source_job_id: Mapped[UUID | None] = mapped_column(nullable=True)
     status: Mapped[JobStatus] = mapped_column(
@@ -199,6 +265,9 @@ class SourceJob(UUIDPrimaryKeyMixin, Base):
     source_id: Mapped[UUID] = mapped_column(ForeignKey("job_sources.id", ondelete="CASCADE"))
     canonical_job_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("canonical_jobs.id", ondelete="SET NULL")
+    )
+    employer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
     )
     external_job_id: Mapped[str] = mapped_column(String(255), nullable=False)
     canonical_url: Mapped[str] = mapped_column(String(2048), nullable=False)
@@ -358,6 +427,9 @@ class EmployerContact(UUIDPrimaryKeyMixin, Base):
     canonical_job_id: Mapped[UUID] = mapped_column(
         ForeignKey("canonical_jobs.id", ondelete="CASCADE")
     )
+    employer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
+    )
     source_job_id: Mapped[UUID] = mapped_column(ForeignKey("source_jobs.id", ondelete="CASCADE"))
     value: Mapped[str] = mapped_column(String(2048), nullable=False)
     contact_type: Mapped[ContactType] = mapped_column(enum_column(ContactType), nullable=False)
@@ -368,6 +440,14 @@ class EmployerContact(UUIDPrimaryKeyMixin, Base):
     )
     confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     evidence_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    delivery_state: Mapped[ContactDeliveryState] = mapped_column(
+        enum_column(ContactDeliveryState), default=ContactDeliveryState.UNKNOWN, nullable=False
+    )
+    last_delivery_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_delivery_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_smtp_status: Mapped[str | None] = mapped_column(String(32))
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_failure_reason: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -387,6 +467,9 @@ class Application(UUIDPrimaryKeyMixin, Base):
     )
     canonical_job_id: Mapped[UUID] = mapped_column(
         ForeignKey("canonical_jobs.id", ondelete="CASCADE")
+    )
+    employer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
     )
     source_job_id: Mapped[UUID] = mapped_column(ForeignKey("source_jobs.id", ondelete="CASCADE"))
     # The policy decision is bound to one immutable evaluation record. Keeping
@@ -414,6 +497,92 @@ class Application(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), default=utcnow, nullable=False
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EmployerInteractionEvent(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "employer_interaction_events"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_employer_interaction_event_idempotency"),
+        Index(
+            "ix_employer_interaction_events_relationship",
+            "profile_id",
+            "employer_id",
+            "occurred_at",
+        ),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    employer_id: Mapped[UUID] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="CASCADE"), nullable=False
+    )
+    application_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL")
+    )
+    canonical_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_jobs.id", ondelete="SET NULL")
+    )
+    source_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("source_jobs.id", ondelete="SET NULL")
+    )
+    communication_session_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("communication_sessions.id", ondelete="SET NULL")
+    )
+    turn_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("communication_turns.id", ondelete="SET NULL")
+    )
+    channel: Mapped[EmployerInteractionChannel] = mapped_column(
+        enum_column(EmployerInteractionChannel), nullable=False
+    )
+    event_type: Mapped[EmployerInteractionType] = mapped_column(
+        enum_column(EmployerInteractionType), nullable=False
+    )
+    suppression_scope: Mapped[SuppressionScope] = mapped_column(
+        enum_column(SuppressionScope), default=SuppressionScope.NONE, nullable=False
+    )
+    role_family: Mapped[str | None] = mapped_column(String(255))
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class EmployerRelationship(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "employer_relationships"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "employer_id", name="uq_employer_relationship"),
+        Index("ix_employer_relationship_state", "state"),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    employer_id: Mapped[UUID] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="CASCADE"), nullable=False
+    )
+    state: Mapped[EmployerRelationshipState] = mapped_column(
+        enum_column(EmployerRelationshipState),
+        default=EmployerRelationshipState.NEVER_CONTACTED,
+        nullable=False,
+    )
+    last_interaction_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_application_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_interview_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    suppression_scope: Mapped[SuppressionScope] = mapped_column(
+        enum_column(SuppressionScope), default=SuppressionScope.NONE, nullable=False
+    )
+    suppression_reason: Mapped[str | None] = mapped_column(String(255))
+    suppressed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    suppressed_by_event_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("employer_interaction_events.id", ondelete="SET NULL")
+    )
+    suppressed_canonical_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_jobs.id", ondelete="SET NULL")
+    )
+    suppressed_role_family: Mapped[str | None] = mapped_column(String(255))
 
 
 class ReviewFeedbackEvent(UUIDPrimaryKeyMixin, Base):
@@ -570,6 +739,8 @@ class EmailDelivery(UUIDPrimaryKeyMixin, Base):
     recipient: Mapped[str] = mapped_column(String(320), nullable=False)
     provider_message_id: Mapped[str | None] = mapped_column(String(255))
     thread_id: Mapped[str | None] = mapped_column(String(255))
+    rfc_message_id: Mapped[str | None] = mapped_column(String(998), index=True)
+    subject_fingerprint: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[DeliveryStatus] = mapped_column(enum_column(DeliveryStatus), nullable=False)
     sanitized_provider_response: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=dict, nullable=False
@@ -577,9 +748,59 @@ class EmailDelivery(UUIDPrimaryKeyMixin, Base):
     error: Mapped[str | None] = mapped_column(Text)
     error_code: Mapped[str | None] = mapped_column(String(128), index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    final_recipient: Mapped[str | None] = mapped_column(String(320))
+    smtp_status: Mapped[str | None] = mapped_column(String(32), index=True)
+    failure_class: Mapped[str | None] = mapped_column(String(64), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(500))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    bounced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class EmailDeliveryEvent(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "email_delivery_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "provider_message_id", name="uq_email_delivery_event_provider_message"
+        ),
+        Index("ix_email_delivery_events_delivery_occurred", "delivery_id", "occurred_at"),
+    )
+
+    delivery_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("email_deliveries.id", ondelete="SET NULL"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_thread_id: Mapped[str | None] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    original_message_id: Mapped[str | None] = mapped_column(String(998), index=True)
+    final_recipient: Mapped[str | None] = mapped_column(String(320), index=True)
+    smtp_status: Mapped[str | None] = mapped_column(String(32))
+    failure_class: Mapped[str | None] = mapped_column(String(64))
+    failure_reason: Mapped[str | None] = mapped_column(String(500))
+    permanent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    retryable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    safe_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class EmailMailboxCursor(Base):
+    __tablename__ = "email_mailbox_cursors"
+
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    history_id: Mapped[str | None] = mapped_column(String(64))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
@@ -668,6 +889,9 @@ class CommunicationSession(UUIDPrimaryKeyMixin, Base):
 
     profile_id: Mapped[UUID] = mapped_column(
         ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True
+    )
+    employer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
     )
     application_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("applications.id", ondelete="SET NULL")
@@ -799,6 +1023,9 @@ class InterviewAppointment(UUIDPrimaryKeyMixin, Base):
 
     profile_id: Mapped[UUID] = mapped_column(
         ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True
+    )
+    employer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
     )
     application_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("applications.id", ondelete="SET NULL")

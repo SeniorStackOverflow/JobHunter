@@ -309,6 +309,10 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             "application_id": str(application.id),
             "provider_message_id": "message-1",
             "thread_id": "thread-1",
+            "delivery_status": "sent",
+            "smtp_status": None,
+            "failure_class": None,
+            "bounced_at": None,
             "automatic": True,
         }
 

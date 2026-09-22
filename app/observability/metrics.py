@@ -53,6 +53,32 @@ EMAIL_DELIVERIES = Counter(
     "Email delivery outcomes.",
     ("provider", "state"),
 )
+APPLICATIONS_DEFERRED_SAME_EMPLOYER = Counter(
+    "job_agent_applications_deferred_same_employer_total",
+    "Applications deferred because another relationship/application owns the employer slot.",
+)
+APPLICATIONS_BLOCKED_EMPLOYER_SUPPRESSION = Counter(
+    "job_agent_applications_blocked_employer_suppression_total",
+    "Applications blocked by deterministic employer suppression.",
+)
+EMPLOYER_RELATIONSHIP_EVENTS_CREATED = Counter(
+    "job_agent_employer_relationship_events_created_total",
+    "Append-only employer relationship events by bounded event type.",
+    ("event_type",),
+)
+EMPLOYER_IDENTITY_MERGES = Counter(
+    "job_agent_employer_identity_merges_total",
+    "Source jobs attached to an existing canonical employer using strong identifiers.",
+)
+EMPLOYER_IDENTITY_AMBIGUOUS = Counter(
+    "job_agent_employer_identity_ambiguous_total",
+    "Employer identities left separate for manual review because strong identifiers conflict.",
+)
+SEND_BLOCKED_RELATIONSHIP_CHANGED = Counter(
+    "job_agent_send_blocked_relationship_changed_total",
+    "Send-time blocks after employer relationship state changed.",
+    ("reason",),
+)
 RABOTA_WAF_TOKEN_REFRESH = Counter(
     "job_agent_rabota_md_waf_token_refresh_total",
     "aws-waf-token refreshes by backend outcome.",
@@ -119,9 +145,14 @@ def metrics_response() -> Response:
 
 __all__ = [
     "APPLICATIONS",
+    "APPLICATIONS_BLOCKED_EMPLOYER_SUPPRESSION",
+    "APPLICATIONS_DEFERRED_SAME_EMPLOYER",
     "CELERY_TASKS",
     "CELERY_TASK_DURATION",
     "EMAIL_DELIVERIES",
+    "EMPLOYER_IDENTITY_AMBIGUOUS",
+    "EMPLOYER_IDENTITY_MERGES",
+    "EMPLOYER_RELATIONSHIP_EVENTS_CREATED",
     "HTTP_REQUESTS",
     "HTTP_REQUEST_DURATION",
     "RABOTA_HTTP_WITHOUT_BROWSER_RATIO",
@@ -135,6 +166,7 @@ __all__ = [
     "SCAN_ERRORS",
     "SCAN_JOBS",
     "SCAN_RUNS",
+    "SEND_BLOCKED_RELATIONSHIP_CHANGED",
     "SOURCE_HEALTH",
     "WAF_SOLVER_ATTEMPTS",
     "WAF_SOLVER_CANARY",

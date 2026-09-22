@@ -696,6 +696,17 @@ def retry_temporary_failures_task() -> int | dict[str, str]:
     )
 
 
+@celery_app.task(name="job_agent.scheduler.reconcile_email_delivery_status")
+def reconcile_email_delivery_status_task() -> dict[str, int | str] | dict[str, str]:
+    from app.email.delivery import EmailDeliveryReconciliationService
+
+    return _run_locked_periodic(
+        "reconcile-email-delivery",
+        EmailDeliveryReconciliationService(get_settings(), async_session_factory).reconcile(),
+        ttl_seconds=600,
+    )
+
+
 @celery_app.task(name="job_agent.scheduler.generate_daily_report")
 def generate_daily_report_task() -> dict[str, Any]:
     from app.reports.service import generate_daily_report
@@ -782,6 +793,7 @@ __all__ = [
     "prune_phone_evidence_task",
     "rabota_md_waf_canary_task",
     "recheck_source_task",
+    "reconcile_email_delivery_status_task",
     "reconcile_phone_sms_task",
     "record_learning_shadow_task",
     "retry_temporary_failures_task",

@@ -11,11 +11,14 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import utcnow
+from app.employers import EmployerRelationshipService
 from app.models.entities import CommunicationSession, CommunicationTurn
 from app.models.enums import (
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    EmployerInteractionChannel,
+    EmployerInteractionType,
     PhoneSummaryState,
     TurnDeliveryStatus,
     TurnSpeaker,
@@ -132,6 +135,7 @@ class SessionStore:
 
         call = CommunicationSession(
             profile_id=correlation.profile_id,
+            employer_id=correlation.employer_id,
             application_id=correlation.application_id,
             canonical_job_id=correlation.canonical_job_id,
             source_job_id=correlation.source_job_id,
@@ -152,6 +156,25 @@ class SessionStore:
         )
         session.add(call)
         await session.flush()
+        if call.employer_id is not None:
+            await EmployerRelationshipService().record_event(
+                session,
+                profile_id=call.profile_id,
+                employer_id=call.employer_id,
+                event_type=EmployerInteractionType.CALL_INBOUND,
+                channel=EmployerInteractionChannel.CALL,
+                idempotency_key=(
+                    f"phonegate-call:{transport_external_id}"
+                    if transport_external_id
+                    else f"phonegate-event:{generation}:{event_id}"
+                ),
+                occurred_at=opened_at,
+                application_id=call.application_id,
+                canonical_job_id=call.canonical_job_id,
+                source_job_id=call.source_job_id,
+                communication_session_id=call.id,
+                event_metadata={"correlation_ambiguous": correlation.ambiguous},
+            )
         return call
 
     async def touch_ringing(self, call: CommunicationSession, when: datetime) -> None:

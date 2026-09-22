@@ -11,11 +11,44 @@ import yaml
 from sqlalchemy import select
 
 from app.database.session import async_session_factory
+from app.email.delivery import EmailDeliveryReconciliationService
+from app.employers import EmployerBackfillService, EmployerSafetyAuditService
 from app.models.entities import JobSource
 from app.models.enums import SourceHealth
 from app.profiles import ProfileService
 from app.profiles.schemas import UserProfileInput
 from app.security.auth import hash_api_key, hash_password
+from app.settings import get_settings
+
+
+async def employer_identity_preview(company: str | None) -> dict[str, Any]:
+    async with async_session_factory() as session:
+        return await EmployerBackfillService().preview_identity(session, company_filter=company)
+
+
+async def employer_relationship_audit(company: str | None) -> dict[str, Any]:
+    async with async_session_factory() as session:
+        return await EmployerSafetyAuditService().report(session, company_filter=company)
+
+
+async def apply_employer_backfill() -> dict[str, int]:
+    async with async_session_factory() as session:
+        result = await EmployerBackfillService().apply(session)
+        await session.commit()
+        return result
+
+
+async def apply_employer_remediation() -> dict[str, int]:
+    async with async_session_factory() as session:
+        result = await EmployerSafetyAuditService().remediate_unsent(session)
+        await session.commit()
+        return result
+
+
+async def email_delivery_audit(recipient: str | None) -> dict[str, object]:
+    return await EmailDeliveryReconciliationService(
+        get_settings(), async_session_factory
+    ).audit_mailbox(recipient_filter=recipient)
 
 
 async def seed_defaults(include_fixture: bool) -> None:
@@ -157,6 +190,26 @@ def build_parser() -> argparse.ArgumentParser:
         "phone-agent",
         help="run the read-only PhoneGate call observer",
     )
+    identity_audit = subparsers.add_parser(
+        "employer-identity-audit", help="preview canonical-employer identity evidence"
+    )
+    identity_audit.add_argument("--company")
+    relationship_audit = subparsers.add_parser(
+        "employer-relationship-audit", help="run the read-only A-E safety audit"
+    )
+    relationship_audit.add_argument("--company")
+    employer_backfill = subparsers.add_parser(
+        "employer-backfill", help="reconstruct canonical employers and relationship events"
+    )
+    employer_backfill.add_argument("--apply", action="store_true", required=True)
+    employer_remediation = subparsers.add_parser(
+        "employer-remediate", help="cancel/defer unsafe unsent applications"
+    )
+    employer_remediation.add_argument("--apply", action="store_true", required=True)
+    delivery_audit = subparsers.add_parser(
+        "email-delivery-audit", help="read recent Gmail DSNs without mutating state"
+    )
+    delivery_audit.add_argument("--recipient")
     return parser
 
 
@@ -180,6 +233,34 @@ def main() -> None:
         from app.phone.agent import main as phone_agent_main
 
         phone_agent_main()
+    elif args.command == "employer-identity-audit":
+        print(
+            json.dumps(
+                asyncio.run(employer_identity_preview(args.company)),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif args.command == "employer-relationship-audit":
+        print(
+            json.dumps(
+                asyncio.run(employer_relationship_audit(args.company)),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif args.command == "employer-backfill":
+        print(json.dumps(asyncio.run(apply_employer_backfill()), indent=2))
+    elif args.command == "employer-remediate":
+        print(json.dumps(asyncio.run(apply_employer_remediation()), indent=2))
+    elif args.command == "email-delivery-audit":
+        print(
+            json.dumps(
+                asyncio.run(email_delivery_audit(args.recipient)),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -986,7 +986,7 @@ async def test_admin_application_detail_approval_and_policy_gated_send(
         assert stored is not None
         assert delivery is not None
         assert stored.status == ApplicationStatus.SENT
-        assert delivery.status == DeliveryStatus.SENT
+        assert delivery.status == DeliveryStatus.PROVIDER_ACCEPTED
         assert delivery.provider_message_id == f"fake-{application_id}"
         assert feedback is not None
         assert feedback.outcome == ReviewOutcome.APPROVED
@@ -2368,6 +2368,12 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "set_review_learning_influence",
             "get_application_status",
             "reconcile_stale_application_delivery",
+            "get_employer_relationship",
+            "list_employer_relationships",
+            "get_employer_history",
+            "suppress_employer",
+            "unsuppress_employer",
+            "list_delivery_failures",
             "get_run_summary",
             "get_daily_report",
             "pause_auto_send",

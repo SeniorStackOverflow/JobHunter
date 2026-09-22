@@ -261,20 +261,34 @@ async def test_pool_prefers_direct_200_free_proxy_over_waf_candidate() -> None:
     await redis.hset(
         state_key,
         challenged.identity,
-        json.dumps({
-            "status": "alive", "kind": "free", "url": challenged.url,
-            "cooldown_until": 0, "last_used": 0, "last_check": time.time(),
-            "last_http_status": 202, "validated_capability": "waf_candidate",
-        }),
+        json.dumps(
+            {
+                "status": "alive",
+                "kind": "free",
+                "url": challenged.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": time.time(),
+                "last_http_status": 202,
+                "validated_capability": "waf_candidate",
+            }
+        ),
     )
     await redis.hset(
         state_key,
         direct.identity,
-        json.dumps({
-            "status": "alive", "kind": "free", "url": direct.url,
-            "cooldown_until": 0, "last_used": 9999, "last_check": time.time(),
-            "last_http_status": 200, "validated_capability": "direct_pagination",
-        }),
+        json.dumps(
+            {
+                "status": "alive",
+                "kind": "free",
+                "url": direct.url,
+                "cooldown_until": 0,
+                "last_used": 9999,
+                "last_check": time.time(),
+                "last_http_status": 200,
+                "validated_capability": "direct_pagination",
+            }
+        ),
     )
 
     selected = await pool.next_endpoint(set())
@@ -409,9 +423,7 @@ async def test_stale_free_proxy_is_not_selected() -> None:
         free_fallback_enabled=False,
         candidate_ttl_seconds=60,
     )
-    stale = ProxyEndpoint(
-        "free", "http://1.1.1.1:8080", "free", capability="waf_candidate"
-    )
+    stale = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="waf_candidate")
     await redis.hset(
         "crawler:rabota_md:proxy_pool:state",
         stale.identity,
@@ -431,12 +443,8 @@ async def test_stale_free_proxy_is_not_selected() -> None:
 
 
 async def test_candidate_preflight_failures_do_not_consume_egress_failover_budget() -> None:
-    first = ProxyEndpoint(
-        "free", "http://1.1.1.1:8080", "free", capability="waf_candidate"
-    )
-    second = ProxyEndpoint(
-        "free", "http://8.8.8.8:3128", "free", capability="waf_candidate"
-    )
+    first = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="waf_candidate")
+    second = ProxyEndpoint("free", "http://8.8.8.8:3128", "free", capability="waf_candidate")
     pool = StubPool([first, second])
     first_fetcher = StubFetcher([])
     second_fetcher = StubFetcher([httpx.Response(200, text="ok")])
@@ -447,9 +455,7 @@ async def test_candidate_preflight_failures_do_not_consume_egress_failover_budge
 
     fetcher = ProxyPoolFetcher(
         pool,  # type: ignore[arg-type]
-        lambda endpoint: (
-            first_fetcher if endpoint.identity == first.identity else second_fetcher
-        ),
+        lambda endpoint: first_fetcher if endpoint.identity == first.identity else second_fetcher,
         preflight=preflight,
         max_egress_failovers=0,
         max_preflight_attempts=2,

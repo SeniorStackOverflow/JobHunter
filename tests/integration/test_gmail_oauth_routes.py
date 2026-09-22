@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 import pytest_asyncio
+import uvicorn
 from fastapi import FastAPI
 from oauthlib.oauth2 import WebApplicationClient
 from sqlalchemy import select
@@ -19,12 +22,12 @@ from app.api import dependencies as api_dependencies
 from app.api import routes as api_routes
 from app.database.session import get_session
 from app.email.oauth import (
+    GMAIL_DELIVERY_SCOPES,
     GMAIL_OAUTH_BINDING_COOKIE,
     GOOGLE_ADMIN_SCOPES,
     GOOGLE_USERINFO_EMAIL_SCOPE,
     GmailOAuthService,
 )
-from app.email.providers import GMAIL_SEND_SCOPE
 from app.models.entities import AuditEvent, OAuthAuthorizationRequest, OAuthCredential
 from app.security.auth import SessionSigner, hash_api_key
 from app.settings import Settings
@@ -47,8 +50,8 @@ class RouteFakeFlow:
     def __init__(self) -> None:
         self.credentials = SimpleNamespace(
             refresh_token="route-private-refresh-token",
-            scopes=[GMAIL_SEND_SCOPE],
-            granted_scopes=[GMAIL_SEND_SCOPE],
+            scopes=list(GMAIL_DELIVERY_SCOPES),
+            granted_scopes=list(GMAIL_DELIVERY_SCOPES),
         )
 
     def fetch_token(self, *, code: str) -> None:
@@ -159,7 +162,7 @@ async def test_gmail_oauth_rest_lifecycle_is_bound_audited_and_disconnectable(
     assert "Secure" in cookie_header
     location_query = parse_qs(urlsplit(started.headers["location"]).query)
     state = location_query["state"][0]
-    assert location_query["scope"] == [GMAIL_SEND_SCOPE]
+    assert location_query["scope"] == [" ".join(GMAIL_DELIVERY_SCOPES)]
     assert "api-key" not in state
 
     async with oauth_api.session_factory() as session:
@@ -210,7 +213,7 @@ async def test_gmail_oauth_rest_lifecycle_is_bound_audited_and_disconnectable(
     connected = await oauth_api.client.get("/api/v1/oauth/gmail/status", headers=headers)
     assert connected.status_code == 200
     assert connected.json()["connected"] is True
-    assert connected.json()["scopes"] == [GMAIL_SEND_SCOPE]
+    assert connected.json()["scopes"] == sorted(GMAIL_DELIVERY_SCOPES)
     assert connected.json()["identity_verified"] is False
     assert connected.json()["pending_authorizations"] == 0
 
@@ -402,3 +405,56 @@ async def test_google_login_only_forces_consent_when_gmail_needs_reauthorization
     recovery_login = await oauth_api.client.get("/admin/auth/google")
     recovery_query = parse_qs(urlsplit(recovery_login.headers["location"]).query)
     assert recovery_query["prompt"] == ["consent select_account"]
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_gmail_oauth_start_in_three_clean_browser_contexts(
+    oauth_api: OAuthApiContext,
+) -> None:
+    from playwright.async_api import async_playwright
+
+    with socket.socket() as port_socket:
+        port_socket.bind(("127.0.0.1", 0))
+        port = int(port_socket.getsockname()[1])
+    base_url = f"http://127.0.0.1:{port}"
+    server = uvicorn.Server(
+        uvicorn.Config(oauth_api.app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as readiness_client:
+            for _attempt in range(100):
+                try:
+                    response = await readiness_client.get("/api/v1/oauth/gmail/status")
+                    if response.status_code == 401:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("local OAuth browser test server did not start")
+
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch(headless=True)
+            try:
+                for _attempt in range(3):
+                    context = await browser.new_context()
+                    response = await context.request.get(
+                        f"{base_url}/api/v1/oauth/gmail/start",
+                        headers={"Authorization": f"Bearer {API_KEY}"},
+                        max_redirects=0,
+                    )
+                    assert response.status == 302
+                    provider_url = response.headers["location"]
+                    query = parse_qs(urlsplit(provider_url).query)
+                    assert urlsplit(provider_url).netloc == "accounts.google.com"
+                    assert query["scope"] == [" ".join(GMAIL_DELIVERY_SCOPES)]
+                    assert query["access_type"] == ["offline"]
+                    assert query["code_challenge_method"] == ["S256"]
+                    await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await server_task

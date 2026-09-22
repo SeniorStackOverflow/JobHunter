@@ -514,7 +514,7 @@ async def test_stale_auto_approved_application_is_rematched_prepared_and_sent(
         assert sent is not None
         assert sent.status == ApplicationStatus.SENT
         assert delivery is not None
-        assert delivery.status == DeliveryStatus.SENT
+        assert delivery.status == DeliveryStatus.PROVIDER_ACCEPTED
 
 
 @pytest.mark.asyncio

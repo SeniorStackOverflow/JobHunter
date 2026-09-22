@@ -137,9 +137,7 @@ def test_runtime_none_override_disables_source_browser_fallback(
         rabota_proxy_pool_enabled=False,
         redis_url="redis://localhost:6379/0",
     )
-    monkeypatch.setattr(
-        "app.crawlers.adapters.rabota_md.transport.get_settings", lambda: settings
-    )
+    monkeypatch.setattr("app.crawlers.adapters.rabota_md.transport.get_settings", lambda: settings)
     fetcher = build_waf_fetcher(
         base_url="https://www.rabota.md",
         user_agent="job-agent/test",
@@ -160,9 +158,7 @@ def test_runtime_browser_override_enables_emergency_fallback(
         rabota_proxy_pool_enabled=False,
         redis_url="redis://localhost:6379/0",
     )
-    monkeypatch.setattr(
-        "app.crawlers.adapters.rabota_md.transport.get_settings", lambda: settings
-    )
+    monkeypatch.setattr("app.crawlers.adapters.rabota_md.transport.get_settings", lambda: settings)
     fetcher = build_waf_fetcher(
         base_url="https://www.rabota.md",
         user_agent="job-agent/test",

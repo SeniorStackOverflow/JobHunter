@@ -15,16 +15,21 @@ from sqlalchemy import case, exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import utcnow
+from app.employers import EmployerRelationshipService
 from app.models.entities import (
     Application,
     CallFact,
     CanonicalJob,
     CommunicationSession,
     CommunicationTurn,
+    InterviewAppointment,
     UserProfile,
 )
 from app.models.enums import (
     CommunicationChannel,
+    EmployerInteractionChannel,
+    EmployerInteractionType,
+    InterviewStatus,
     PhoneSummaryState,
     PhoneVerificationStatus,
     TurnSpeaker,
@@ -765,12 +770,14 @@ async def _finalize_claimed_call(
                             and 0 <= raw_delta <= settings.phone_prompt_rejection_window_ms
                         )
                         prompt_phase = phase in {
-                            "intro_tts", "wait_first_rx", "retry_tts",
-                            "wait_first_rx_retry", "details_tts",
+                            "intro_tts",
+                            "wait_first_rx",
+                            "retry_tts",
+                            "wait_first_rx_retry",
+                            "details_tts",
                         }
                         remote_observed = (
-                            diagnostics.get("phonegate_end_reason")
-                            == "remote_or_network_hangup"
+                            diagnostics.get("phonegate_end_reason") == "remote_or_network_hangup"
                             or call.script_stage == "remote_ended"
                         )
                         probable_rejection = (
@@ -947,6 +954,40 @@ async def _finalize_claimed_call(
         call.summary_state = PhoneSummaryState.DONE
         call.processing_started_at = None
         call.claim_token = None
+        if (
+            extracted.outcome_guess == "interview_proposed"
+            and call.employer_id is not None
+            and call.verification_status
+            in {PhoneVerificationStatus.CONFIRMED, PhoneVerificationStatus.HIGH_CONFIDENCE}
+        ):
+            appointment = await db.scalar(
+                select(InterviewAppointment).where(
+                    InterviewAppointment.communication_session_id == call.id
+                )
+            )
+            if appointment is None:
+                appointment = InterviewAppointment(
+                    profile_id=call.profile_id,
+                    employer_id=call.employer_id,
+                    application_id=call.application_id,
+                    communication_session_id=call.id,
+                    status=InterviewStatus.PROPOSED,
+                )
+                db.add(appointment)
+            await EmployerRelationshipService().record_event(
+                db,
+                profile_id=call.profile_id,
+                employer_id=call.employer_id,
+                event_type=EmployerInteractionType.INTERVIEW_PROPOSED,
+                channel=EmployerInteractionChannel.CALL,
+                idempotency_key=f"call-interview-proposed:{call.id}",
+                occurred_at=call.ended_at or utcnow(),
+                application_id=call.application_id,
+                canonical_job_id=call.canonical_job_id,
+                source_job_id=call.source_job_id,
+                communication_session_id=call.id,
+                event_metadata={"verification_status": call.verification_status.value},
+            )
         await db.commit()
     return "done"
 

@@ -186,9 +186,7 @@ async def test_persistent_browser_normalizes_fragment_evaluate_error(
     monkeypatch.setattr(browser, "_validated_url", _same_url)
 
     with pytest.raises(BrowserNavigationError, match="browser fragment fetch failed: TypeError"):
-        await browser.post_html_fragment(
-            "https://www.rabota.md/ru/vacancies/category/operating/2"
-        )
+        await browser.post_html_fragment("https://www.rabota.md/ru/vacancies/category/operating/2")
 
 
 async def test_persistent_browser_rejects_invalid_fragment_payload(

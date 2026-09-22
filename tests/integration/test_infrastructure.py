@@ -78,6 +78,7 @@ def test_celery_beat_and_worker_safety_configuration() -> None:
         "job_agent.scheduler.prepare_pending_applications",
         "job_agent.scheduler.send_auto_approved_applications",
         "job_agent.scheduler.retry_temporary_failures",
+        "job_agent.scheduler.reconcile_email_delivery_status",
         "job_agent.scheduler.generate_daily_report",
         "job_agent.scheduler.train_learning_models",
         "job_agent.scheduler.record_learning_shadow",

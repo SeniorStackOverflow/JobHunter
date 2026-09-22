@@ -83,6 +83,11 @@ celery_app.conf.update(
             "schedule": 900.0,
             "options": {"queue": "email", "expires": 840},
         },
+        "reconcile-email-delivery-status": {
+            "task": "job_agent.scheduler.reconcile_email_delivery_status",
+            "schedule": 300.0,
+            "options": {"queue": "email", "expires": 270},
+        },
         "daily-report": {
             "task": "job_agent.scheduler.generate_daily_report",
             "schedule": crontab(minute=15, hour=21),
@@ -137,6 +142,7 @@ celery_app.conf.update(
         "job_agent.scheduler.prepare_pending_applications": {"queue": "applications"},
         "job_agent.scheduler.send_auto_approved_applications": {"queue": "email"},
         "job_agent.scheduler.retry_temporary_failures": {"queue": "email"},
+        "job_agent.scheduler.reconcile_email_delivery_status": {"queue": "email"},
         "job_agent.scheduler.generate_daily_report": {"queue": "reports"},
         "job_agent.scheduler.train_learning_models": {"queue": "matching"},
         "job_agent.scheduler.record_learning_shadow": {"queue": "matching"},

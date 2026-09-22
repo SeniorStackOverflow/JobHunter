@@ -1,0 +1,690 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.employers import (
+    EmployerBackfillService,
+    EmployerIdentityService,
+    EmployerRelationshipService,
+    EmployerSafetyAuditService,
+    classify_candidate_decline,
+)
+from app.models.entities import (
+    Application,
+    CanonicalEmployer,
+    CanonicalJob,
+    EmailDelivery,
+    EmployerIdentityCandidate,
+    EmployerInteractionEvent,
+    JobSource,
+    MatchEvaluation,
+    SourceJob,
+    UserProfile,
+)
+from app.models.enums import (
+    ApplicationStatus,
+    DeliveryStatus,
+    EmployerInteractionChannel,
+    EmployerInteractionType,
+    JobStatus,
+    MatchDecision,
+    SuppressionScope,
+)
+
+
+async def _job(
+    session: AsyncSession,
+    source: JobSource,
+    *,
+    key: str,
+    company: str,
+    email: str | None = None,
+    phone: str | None = None,
+    employer_url: str | None = None,
+    title: str = "Engineer",
+) -> SourceJob:
+    canonical = CanonicalJob(
+        normalized_company=company.casefold(),
+        normalized_title=title.casefold(),
+        normalized_location="",
+        canonical_fingerprint=key * 64,
+        status=JobStatus.ACTIVE,
+    )
+    session.add(canonical)
+    await session.flush()
+    job = SourceJob(
+        source_id=source.id,
+        canonical_job_id=canonical.id,
+        external_job_id=key,
+        canonical_url=f"https://jobs.example/{key}",
+        localized_urls={},
+        title=title,
+        company=company,
+        employer_url=employer_url,
+        categories_seen=[],
+        cities=[],
+        public_email=email,
+        public_emails=[email] if email else [],
+        public_phone=phone,
+        public_phones=[phone] if phone else [],
+        content_hash=key * 64,
+        matching_content_hash=key * 64,
+        source_fingerprint=key * 64,
+        status=JobStatus.ACTIVE,
+        raw_metadata={},
+    )
+    session.add(job)
+    await session.flush()
+    return job
+
+
+def test_decline_scope_requires_explicit_attendance_for_employer_suppression() -> None:
+    text = "Спасибо, я решил отказаться от вакансии в этой компании."
+
+    assert classify_candidate_decline(text, interview_attended=False) is SuppressionScope.JOB
+    assert classify_candidate_decline(text, interview_attended=True) is SuppressionScope.EMPLOYER
+    assert classify_candidate_decline("Я пока подумаю", interview_attended=True) is None
+
+
+async def _source(session: AsyncSession, *, adapter: str = "fixture_source") -> JobSource:
+    source = JobSource(
+        name="Fixture",
+        base_url="https://jobs.example",
+        adapter_type=adapter,
+        configuration={},
+    )
+    session.add(source)
+    await session.flush()
+    return source
+
+
+@pytest.mark.asyncio
+async def test_exact_domain_merges_different_spellings(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        first = await _job(
+            session, source, key="a", company="Print Terra", email="jobs@printterra.md"
+        )
+        second = await _job(
+            session, source, key="b", company="PRINTTERRA SRL", email="hr@printterra.md"
+        )
+        service = EmployerIdentityService()
+        first_result = await service.resolve_for_source_job(session, first)
+        second_result = await service.resolve_for_source_job(session, second)
+
+        assert first_result.employer.id == second_result.employer.id
+        assert second_result.matched_existing is True
+
+
+@pytest.mark.asyncio
+async def test_source_employer_id_merges_rabota_jobs(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session, adapter="rabota_md")
+        first = await _job(
+            session,
+            source,
+            key="c",
+            company="Alpha",
+            employer_url="https://www.rabota.md/ru/companies/alpha-42",
+        )
+        second = await _job(
+            session,
+            source,
+            key="d",
+            company="Alpha SRL",
+            employer_url="https://www.rabota.md/ro/companies/alpha-42/",
+        )
+        service = EmployerIdentityService()
+        one = await service.resolve_for_source_job(session, first)
+        two = await service.resolve_for_source_job(session, second)
+
+        assert one.employer.id == two.employer.id
+
+
+@pytest.mark.asyncio
+async def test_different_source_profiles_sharing_recruiter_contact_do_not_merge(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session, adapter="rabota_md")
+        first = await _job(
+            session,
+            source,
+            key="p",
+            company="Client One",
+            email="recruiter@agency.example",
+            phone="+373 60 999 888",
+            employer_url="https://www.rabota.md/ru/companies/client-one",
+        )
+        second = await _job(
+            session,
+            source,
+            key="q",
+            company="Client Two",
+            email="recruiter@agency.example",
+            phone="+373 60 999 888",
+            employer_url="https://www.rabota.md/ru/companies/client-two",
+        )
+        service = EmployerIdentityService()
+        first_result = await service.resolve_for_source_job(session, first)
+        second_result = await service.resolve_for_source_job(session, second)
+
+        assert first_result.employer.id != second_result.employer.id
+
+
+@pytest.mark.asyncio
+async def test_similar_name_without_strong_identifier_never_merges(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        first = await _job(session, source, key="e", company="Victoria")
+        second = await _job(session, source, key="f", company="VICTORIA")
+        service = EmployerIdentityService()
+
+        assert (await service.resolve_for_source_job(session, first)).employer.id != (
+            await service.resolve_for_source_job(session, second)
+        ).employer.id
+
+
+@pytest.mark.asyncio
+async def test_same_name_different_domains_do_not_merge(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        first = await _job(
+            session, source, key="g", company="Victoria", email="hr@victoria-bank.md"
+        )
+        second = await _job(
+            session, source, key="h", company="Victoria", email="jobs@victoria-shop.md"
+        )
+        service = EmployerIdentityService()
+
+        assert (await service.resolve_for_source_job(session, first)).employer.id != (
+            await service.resolve_for_source_job(session, second)
+        ).employer.id
+
+
+@pytest.mark.asyncio
+async def test_conflicting_strong_identity_is_review_candidate_without_merge(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        email_job = await _job(session, source, key="i", company="One", email="jobs@one.example")
+        phone_job = await _job(session, source, key="j", company="Two", phone="+373 60 111 222")
+        service = EmployerIdentityService()
+        one = await service.resolve_for_source_job(session, email_job)
+        two = await service.resolve_for_source_job(session, phone_job)
+        conflict = await _job(
+            session,
+            source,
+            key="k",
+            company="Uncertain",
+            email="other@one.example",
+            phone="+373 60 111 222",
+        )
+        result = await service.resolve_for_source_job(session, conflict)
+        candidate = await session.scalar(
+            select(EmployerIdentityCandidate).where(
+                EmployerIdentityCandidate.source_job_id == conflict.id
+            )
+        )
+
+        assert result.ambiguous is True
+        assert result.employer.id not in {one.employer.id, two.employer.id}
+        assert candidate is not None
+        assert (
+            await session.scalar(
+                select(func.count(EmployerInteractionEvent.id)).where(
+                    EmployerInteractionEvent.employer_id == result.employer.id
+                )
+            )
+            == 0
+        )
+
+
+async def _relationship_graph(
+    session: AsyncSession,
+) -> tuple[
+    UserProfile,
+    CanonicalEmployer,
+    SourceJob,
+    SourceJob,
+    Application,
+    Application,
+    MatchEvaluation,
+    MatchEvaluation,
+]:
+    source = await _source(session)
+    employer = CanonicalEmployer(normalized_name="printterra", primary_domain="printterra.md")
+    profile = UserProfile(name="Candidate", is_default=True)
+    session.add_all([employer, profile])
+    await session.flush()
+    first_job = await _job(session, source, key="l", company="Printterra", title="Receptionist")
+    second_job = await _job(session, source, key="m", company="Printterra", title="Engineer")
+    first_job.employer_id = employer.id
+    second_job.employer_id = employer.id
+    first_canonical = await session.get(CanonicalJob, first_job.canonical_job_id)
+    second_canonical = await session.get(CanonicalJob, second_job.canonical_job_id)
+    assert first_canonical is not None and second_canonical is not None
+    first_canonical.employer_id = employer.id
+    second_canonical.employer_id = employer.id
+    evaluations = [
+        MatchEvaluation(
+            profile_id=profile.id,
+            canonical_job_id=job.canonical_job_id,
+            source_job_id=job.id,
+            resume_fit=score,
+            preference_fit=score,
+            overall_fit=score,
+            requirements_met=[],
+            missing_requirements=[],
+            risks=[],
+            scam_indicators=[],
+            explanation="fixture",
+            decision=MatchDecision.AUTO_APPLY,
+            model="fixture",
+            prompt_rules_version="fixture",
+        )
+        for job, score in ((first_job, 90), (second_job, 80))
+    ]
+    session.add_all(evaluations)
+    await session.flush()
+    applications = [
+        Application(
+            profile_id=profile.id,
+            canonical_job_id=job.canonical_job_id,
+            employer_id=employer.id,
+            source_job_id=job.id,
+            match_evaluation_id=evaluation.id,
+            resume_id=profile.id,
+            recipient_contact_id=profile.id,
+            subject="fixture",
+            body="fixture",
+            language="en",
+            status=ApplicationStatus.PREPARED,
+            idempotency_key=key * 64,
+        )
+        for job, evaluation, key in (
+            (first_job, evaluations[0], "n"),
+            (second_job, evaluations[1], "o"),
+        )
+    ]
+    # The policy-only tests never dereference resume/contact, and SQLite keeps
+    # foreign-key enforcement disabled for this in-memory unit fixture.
+    session.add_all(applications)
+    await session.flush()
+    return (
+        profile,
+        employer,
+        first_job,
+        second_job,
+        applications[0],
+        applications[1],
+        evaluations[0],
+        evaluations[1],
+    )
+
+
+@pytest.mark.asyncio
+async def test_best_vacancy_gets_only_employer_slot_and_reply_freezes_all(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            first_job,
+            second_job,
+            first,
+            second,
+            first_eval,
+            second_eval,
+        ) = await _relationship_graph(session)
+        service = EmployerRelationshipService()
+        assert (
+            await service.policy_outcome(
+                session, application=first, evaluation=first_eval, job=first_job
+            )
+        ).slot_available is True
+        assert (
+            await service.policy_outcome(
+                session, application=second, evaluation=second_eval, job=second_job
+            )
+        ).slot_available is False
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.EMPLOYER_REPLIED,
+            channel=EmployerInteractionChannel.EMAIL,
+            idempotency_key="reply-1",
+        )
+        assert (
+            await service.policy_outcome(
+                session, application=first, evaluation=first_eval, job=first_job
+            )
+        ).no_active_conversation is False
+
+
+@pytest.mark.asyncio
+async def test_job_decline_is_narrow_employer_decline_is_global_and_reopen_preserves_history(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            first_job,
+            second_job,
+            first,
+            second,
+            first_eval,
+            second_eval,
+        ) = await _relationship_graph(session)
+        service = EmployerRelationshipService()
+        await service.suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            scope=SuppressionScope.JOB,
+            canonical_job_id=first.canonical_job_id,
+            reason="not this vacancy",
+            actor="owner",
+        )
+        first_outcome = await service.policy_outcome(
+            session, application=first, evaluation=first_eval, job=first_job
+        )
+        second_outcome = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert first_outcome.not_suppressed is False
+        assert second_outcome.not_suppressed is True
+
+        await service.suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            scope=SuppressionScope.EMPLOYER,
+            reason="declined after interview",
+            actor="owner",
+        )
+        assert (
+            await service.policy_outcome(
+                session, application=second, evaluation=second_eval, job=second_job
+            )
+        ).not_suppressed is False
+        await service.reopen(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            reason="owner reopened",
+            actor="owner",
+        )
+        assert (
+            await service.policy_outcome(
+                session, application=second, evaluation=second_eval, job=second_job
+            )
+        ).not_suppressed is True
+        assert (
+            await session.scalar(
+                select(func.count(EmployerInteractionEvent.id)).where(
+                    EmployerInteractionEvent.employer_id == employer.id,
+                    EmployerInteractionEvent.event_type
+                    == EmployerInteractionType.CANDIDATE_DECLINED_EMPLOYER,
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_relationship_event_ingestion_is_idempotent(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        profile, employer, *_rest = await _relationship_graph(session)
+        service = EmployerRelationshipService()
+        first, created = await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.INTERVIEW_CONFIRMED,
+            channel=EmployerInteractionChannel.CALL,
+            idempotency_key="appointment:stable-id",
+            occurred_at=datetime(2026, 9, 20, tzinfo=UTC),
+        )
+        second, duplicate_created = await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.INTERVIEW_CONFIRMED,
+            channel=EmployerInteractionChannel.CALL,
+            idempotency_key="appointment:stable-id",
+            occurred_at=datetime(2026, 9, 20, tzinfo=UTC),
+        )
+
+        assert created is True
+        assert duplicate_created is False
+        assert first.id == second.id
+
+
+@pytest.mark.asyncio
+async def test_role_family_suppression_ignores_seniority_but_allows_other_occupation(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            first_job,
+            second_job,
+            _first,
+            second,
+            first_eval,
+            second_eval,
+        ) = await _relationship_graph(session)
+        first_job.title = "Senior Receptionist"
+        second_job.title = "Receptionist full time"
+        service = EmployerRelationshipService()
+        await service.suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            scope=SuppressionScope.ROLE_FAMILY,
+            role=first_job.title,
+            reason="no receptionist roles",
+            actor="owner",
+        )
+        blocked = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert blocked.not_suppressed is False
+
+        second_job.title = "Engineer"
+        unrelated = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert unrelated.not_suppressed is True
+        assert first_eval.id != second_eval.id
+
+
+@pytest.mark.asyncio
+async def test_interview_freezes_then_employer_rejection_releases_deferred_slot(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            _first_job,
+            second_job,
+            _first,
+            second,
+            _first_eval,
+            second_eval,
+        ) = await _relationship_graph(session)
+        service = EmployerRelationshipService()
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.INTERVIEW_CONFIRMED,
+            channel=EmployerInteractionChannel.CALL,
+            idempotency_key="interview-confirmed",
+        )
+        frozen = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert frozen.no_active_conversation is False
+
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.EMPLOYER_REJECTED,
+            channel=EmployerInteractionChannel.EMAIL,
+            idempotency_key="employer-rejected",
+        )
+        released = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert released.no_active_conversation is True
+
+
+@pytest.mark.asyncio
+async def test_permanent_delivery_failure_releases_slot_without_rewriting_sent_fact(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            first_job,
+            second_job,
+            first,
+            second,
+            _first_eval,
+            second_eval,
+        ) = await _relationship_graph(session)
+        first.status = ApplicationStatus.SENT
+        first.sent_at = datetime(2026, 9, 16, 21, 4, 49, tzinfo=UTC)
+        delivery = EmailDelivery(
+            application_id=first.id,
+            provider="gmail",
+            recipient="redacted@sincer.md",
+            status=DeliveryStatus.RECIPIENT_REJECTED,
+            sanitized_provider_response={},
+            attempt_count=1,
+        )
+        session.add(delivery)
+        service = EmployerRelationshipService()
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.APPLICATION_SENT,
+            channel=EmployerInteractionChannel.EMAIL,
+            idempotency_key="historical-send",
+            application_id=first.id,
+            occurred_at=first.sent_at,
+        )
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.APPLICATION_DELIVERY_FAILED,
+            channel=EmployerInteractionChannel.EMAIL,
+            idempotency_key="historical-bounce",
+            application_id=first.id,
+            occurred_at=datetime(2026, 9, 17, tzinfo=UTC),
+        )
+        outcome = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert outcome.slot_available is True
+        assert first.status is ApplicationStatus.SENT
+        assert first_job.employer_id == employer.id
+
+
+@pytest.mark.asyncio
+async def test_printerra_backfill_fixture_preserves_sent_rows_and_reports_rapid_sends(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            _profile,
+            _employer,
+            first_job,
+            second_job,
+            first,
+            second,
+            *_rest,
+        ) = await _relationship_graph(session)
+        first_job.company = "Printerra"
+        second_job.company = "Printerra"
+        first_job.employer_url = "https://www.rabota.md/ru/companies/printerra"
+        second_job.employer_url = "https://www.rabota.md/ru/companies/printerra"
+        first.status = ApplicationStatus.SENT
+        second.status = ApplicationStatus.SENT
+        first.sent_at = datetime(2026, 9, 21, 21, 0, 45, tzinfo=UTC)
+        second.sent_at = datetime(2026, 9, 21, 21, 0, 46, tzinfo=UTC)
+        before = [
+            (first.id, first.status, first.sent_at),
+            (second.id, second.status, second.sent_at),
+        ]
+
+        result = await EmployerBackfillService().apply(session)
+        audit = await EmployerSafetyAuditService().report(session, company_filter="Printerra")
+        after = [
+            (first.id, first.status, first.sent_at),
+            (second.id, second.status, second.sent_at),
+        ]
+
+        assert result["events_created"] == 2
+        assert before == after
+        assert audit["historical_sent_mutations"] == 0
+        assert audit["A_same_employer_within_24h"][0]["window_seconds"] == 1
+        assert audit["focused_evidence"]["communications"] == []
+
+
+@pytest.mark.asyncio
+async def test_retro_remediation_never_mutates_historical_sent_application(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            _first_job,
+            _second_job,
+            first,
+            second,
+            *_rest,
+        ) = await _relationship_graph(session)
+        first.status = ApplicationStatus.SENT
+        first.sent_at = datetime(2026, 9, 2, 21, 0, 47, tzinfo=UTC)
+        await EmployerRelationshipService().suppress(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            scope=SuppressionScope.EMPLOYER,
+            reason="declined after interview",
+            actor="owner",
+        )
+        result = await EmployerSafetyAuditService().remediate_unsent(session)
+
+        assert result == {"cancelled": 1, "deferred": 0, "historical_sent_mutations": 0}
+        assert first.status is ApplicationStatus.SENT
+        assert first.sent_at == datetime(2026, 9, 2, 21, 0, 47, tzinfo=UTC)
+        assert second.status is ApplicationStatus.CANCELLED

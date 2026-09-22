@@ -65,6 +65,8 @@ def _driving_categories(value: str) -> set[str]:
     if plain:
         categories.update(re.findall(r"[abcde]", plain.group(1), flags=re.IGNORECASE))
     return {item.casefold() for item in categories}
+
+
 _EXPERIENCE = re.compile(
     r"experience|experien[țt][ăa]|опыт\s+работ|стаж",
     re.IGNORECASE,
@@ -166,11 +168,7 @@ def _requirement_clause(text: str, start: int, end: int) -> str:
 
     boundaries = "\n;•|.!?"
     left = max((text.rfind(char, 0, start) for char in boundaries), default=-1)
-    right_values = [
-        position
-        for char in boundaries
-        if (position := text.find(char, end)) != -1
-    ]
+    right_values = [position for char in boundaries if (position := text.find(char, end)) != -1]
     right = min(right_values) if right_values else len(text)
     raw = text[left + 1 : right]
     relative_start = start - (left + 1)
@@ -221,9 +219,11 @@ def _confirmed_fact_text(fact: dict[str, object]) -> str:
 def _negative_fact(fact: dict[str, object]) -> bool:
     polarity = str(fact.get("polarity") or "").casefold()
     identifier = _confirmed_fact_id(fact).casefold()
-    return polarity in {"absent", "missing", "false", "negative"} or identifier.startswith(
-        "no_"
-    ) or identifier.endswith("_absent")
+    return (
+        polarity in {"absent", "missing", "false", "negative"}
+        or identifier.startswith("no_")
+        or identifier.endswith("_absent")
+    )
 
 
 def _fact_matches_terms(fact: dict[str, object], terms: set[str]) -> bool:
@@ -271,9 +271,7 @@ def _forklift_experience_evidence(
     for index, item in enumerate(profile.work_experience or []):
         if item.get("confirmed") is not True:
             continue
-        text = " ".join(
-            str(item.get(key) or "") for key in ("role", "title", "details", "company")
-        )
+        text = " ".join(str(item.get(key) or "") for key in ("role", "title", "details", "company"))
         if _FORKLIFT.search(text):
             positive.append(f"profile.work_experience:{index}")
     for fact in profile.confirmed_facts or []:
@@ -285,11 +283,7 @@ def _forklift_experience_evidence(
         marker = f"profile.confirmed_fact:{fact_id}"
         normalized = normalize_for_fingerprint(_confirmed_fact_text(fact))
         fact_text = _confirmed_fact_text(fact).casefold()
-        if (
-            "experien" not in normalized
-            and "opyt" not in normalized
-            and "опыт" not in fact_text
-        ):
+        if "experien" not in normalized and "opyt" not in normalized and "опыт" not in fact_text:
             ambiguous.append(marker)
             continue
         if _negative_fact(fact):
@@ -387,9 +381,7 @@ def _generic_role_experience_evidence(
     for index, item in enumerate(profile.work_experience or []):
         if item.get("confirmed") is not True:
             continue
-        text = " ".join(
-            str(item.get(key) or "") for key in ("role", "title", "details", "company")
-        )
+        text = " ".join(str(item.get(key) or "") for key in ("role", "title", "details", "company"))
         tokens = _normalized_tokens(text)
         overlap = terms & tokens
         marker = f"profile.work_experience:{index}"
@@ -480,9 +472,7 @@ class HardRequirementEngine:
 
     rules_version = HARD_REQUIREMENT_RULES_VERSION
 
-    def evaluate(
-        self, job: SourceJob, profile: UserProfile
-    ) -> list[HardRequirementAssessment]:
+    def evaluate(self, job: SourceJob, profile: UserProfile) -> list[HardRequirementAssessment]:
         text = _job_text(job)
         requirements: list[HardRequirementAssessment] = []
 
@@ -519,10 +509,7 @@ class HardRequirementEngine:
             for match in forklift_matches:
                 clause = _requirement_clause(text, match.start(), match.end())
                 window = _excerpt(text, match.start(), match.end(), 220)
-                if (
-                    _ROLE_EXPERIENCE_REQUIREMENT.search(clause)
-                    and not _OPTIONAL.search(clause)
-                ):
+                if _ROLE_EXPERIENCE_REQUIREMENT.search(clause) and not _OPTIONAL.search(clause):
                     positive, negative, ambiguous = _forklift_experience_evidence(profile)
                     requirements.append(
                         _assessment(
@@ -579,9 +566,7 @@ class HardRequirementEngine:
                 continue
             if _PROCESS_SCREENING_CREDENTIAL.search(window):
                 continue
-            if not _mandatory_near(
-                text, match.start(), match.end(), radius=100
-            ):
+            if not _mandatory_near(text, match.start(), match.end(), radius=100):
                 continue
             if forklift_licence_detected and _FORKLIFT.search(clause):
                 continue
@@ -615,17 +600,13 @@ class HardRequirementEngine:
                 if _OPTIONAL.search(clause):
                     continue
                 if not (
-                    _mandatory_near(
-                        text, match.start(), match.end(), radius=100
-                    )
+                    _mandatory_near(text, match.start(), match.end(), radius=100)
                     or _MINIMUM_EXPERIENCE.search(clause)
                 ):
                     continue
                 clause_terms = _normalized_tokens(clause)
                 if title_terms & clause_terms:
-                    role_experience_excerpt = _excerpt(
-                        text, match.start(), match.end(), 160
-                    )
+                    role_experience_excerpt = _excerpt(text, match.start(), match.end(), 160)
                     break
             if title_terms and role_experience_excerpt:
                 positive, negative, ambiguous = _generic_role_experience_evidence(

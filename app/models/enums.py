@@ -43,6 +43,7 @@ class MatchDecision(StrEnum):
 class PolicyDecision(StrEnum):
     AUTO_APPROVED = "auto_approved"
     PENDING_REVIEW = "pending_review"
+    DEFERRED = "deferred"
     BLOCKED = "blocked"
     SKIPPED = "skipped"
 
@@ -55,6 +56,7 @@ class ApplicationStatus(StrEnum):
     SENDING = "sending"
     SENT = "sent"
     DELIVERY_UNKNOWN = "delivery_unknown"
+    DEFERRED = "deferred"
     FAILED = "failed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
@@ -78,10 +80,87 @@ class ReviewReason(StrEnum):
 
 class DeliveryStatus(StrEnum):
     SENDING = "sending"
+    SUBMITTED = "submitted"
+    PROVIDER_ACCEPTED = "provider_accepted"
+    DELIVERED = "delivered"
     SENT = "sent"
     DELIVERY_UNKNOWN = "delivery_unknown"
+    BOUNCED_TRANSIENT = "bounced_transient"
+    BOUNCED_PERMANENT = "bounced_permanent"
+    RECIPIENT_REJECTED = "recipient_rejected"
+    MAILBOX_FULL = "mailbox_full"
+    DOMAIN_REJECTED = "domain_rejected"
+    POLICY_REJECTED = "policy_rejected"
+    SPAM_REJECTED = "spam_rejected"
+    DELIVERY_FAILED = "delivery_failed"
     TEMPORARY_FAILURE = "temporary_failure"
     PERMANENT_FAILURE = "permanent_failure"
+
+
+class ContactDeliveryState(StrEnum):
+    UNKNOWN = "unknown"
+    HEALTHY = "healthy"
+    TRANSIENT_FAILURE = "transient_failure"
+    INVALID = "invalid"
+    REJECTED = "rejected"
+    SUPPRESSED = "suppressed"
+
+
+class EmployerIdentifierType(StrEnum):
+    RABOTA_EMPLOYER_ID = "rabota_employer_id"
+    EMPLOYER_PROFILE_URL = "employer_profile_url"
+    DOMAIN = "domain"
+    EMAIL = "email"
+    PHONE = "phone"
+    NORMALIZED_NAME = "normalized_name"
+
+
+class EmployerRelationshipState(StrEnum):
+    NEVER_CONTACTED = "never_contacted"
+    APPLICATION_ACTIVE = "application_active"
+    EMPLOYER_REPLIED = "employer_replied"
+    INTERVIEW_PENDING = "interview_pending"
+    INTERVIEWED = "interviewed"
+    CANDIDATE_DECLINED = "candidate_declined"
+    EMPLOYER_REJECTED = "employer_rejected"
+    HIRED = "hired"
+
+
+class SuppressionScope(StrEnum):
+    NONE = "none"
+    JOB = "job"
+    ROLE_FAMILY = "role_family"
+    EMPLOYER = "employer"
+
+
+class EmployerInteractionChannel(StrEnum):
+    APPLICATION = "application"
+    EMAIL = "email"
+    CALL = "call"
+    SMS = "sms"
+    MANUAL = "manual"
+    SYSTEM = "system"
+
+
+class EmployerInteractionType(StrEnum):
+    APPLICATION_SENT = "application_sent"
+    APPLICATION_DELIVERY_FAILED = "application_delivery_failed"
+    EMPLOYER_REPLIED = "employer_replied"
+    CALL_INBOUND = "call_inbound"
+    CALL_OUTBOUND = "call_outbound"
+    SMS_INBOUND = "sms_inbound"
+    SMS_OUTBOUND = "sms_outbound"
+    INTERVIEW_PROPOSED = "interview_proposed"
+    INTERVIEW_CONFIRMED = "interview_confirmed"
+    INTERVIEW_ATTENDED = "interview_attended"
+    CANDIDATE_DECLINED_JOB = "candidate_declined_job"
+    CANDIDATE_DECLINED_ROLE_FAMILY = "candidate_declined_role_family"
+    CANDIDATE_DECLINED_EMPLOYER = "candidate_declined_employer"
+    CANDIDATE_WITHDREW = "candidate_withdrew"
+    EMPLOYER_REJECTED = "employer_rejected"
+    OFFER_RECEIVED = "offer_received"
+    HIRED = "hired"
+    RELATIONSHIP_REOPENED = "relationship_reopened"
 
 
 class VerificationStatus(StrEnum):

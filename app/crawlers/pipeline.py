@@ -24,6 +24,7 @@ from app.crawlers.schemas import (
     ScanCheckpoint,
 )
 from app.deduplication import DeduplicationService
+from app.employers import EmployerIdentityService
 from app.matching.source_version import (
     changes_require_rematch,
     compute_source_matching_hash,
@@ -205,10 +206,12 @@ class ScanService:
         session_factory: async_sessionmaker[AsyncSession],
         registry: JobSourceAdapterRegistry,
         deduplication: DeduplicationService | None = None,
+        employer_identity: EmployerIdentityService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.registry = registry
         self.deduplication = deduplication or DeduplicationService()
+        self.employer_identity = employer_identity or EmployerIdentityService()
 
     async def _refresh_canonical_status(
         self,
@@ -977,6 +980,7 @@ class ScanService:
             session.add(job)
             await session.flush()
             result = await self.deduplication.assign(session, job)
+            await self.employer_identity.resolve_for_source_job(session, job)
             await self._refresh_canonical_status(session, {result.canonical_job.id})
             return "new"
 
@@ -1001,6 +1005,7 @@ class ScanService:
             existing.status = JobStatus.ACTIVE
         if not changed:
             existing.matching_content_hash = compute_source_matching_hash(existing)
+            await self.employer_identity.resolve_for_source_job(session, existing)
             if existing.canonical_job_id is not None:
                 await self._refresh_canonical_status(session, {existing.canonical_job_id})
             await session.flush()
@@ -1028,6 +1033,7 @@ class ScanService:
                 setattr(existing, field, new_value)
         existing.matching_content_hash = compute_source_matching_hash(existing)
         if _hash_version_migration_only(previous_hash_version, next_hash_version, changed_fields):
+            await self.employer_identity.resolve_for_source_job(session, existing)
             if existing.canonical_job_id is not None:
                 await self._refresh_canonical_status(session, {existing.canonical_job_id})
             await session.flush()
@@ -1060,6 +1066,7 @@ class ScanService:
         )
         if existing.canonical_job_id is not None:
             await self._refresh_canonical_status(session, {existing.canonical_job_id})
+        await self.employer_identity.resolve_for_source_job(session, existing)
         await session.flush()
         return "updated"
 

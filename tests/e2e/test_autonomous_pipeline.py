@@ -253,11 +253,11 @@ async def test_autonomous_fixture_pipeline_is_safe_and_idempotent(
     email_service = EmailService(settings, sqlite_session_factory, fake_gmail)
     for application_id in auto_ids:
         delivery = await email_service.send_application(application_id)
-        assert delivery.status == DeliveryStatus.SENT
+        assert delivery.status == DeliveryStatus.PROVIDER_ACCEPTED
     sent_count = len(fake_gmail.outbox)
     assert sent_count == len(auto_ids)
     repeat = await email_service.send_application(auto_ids[0])
-    assert repeat.status == DeliveryStatus.SENT
+    assert repeat.status == DeliveryStatus.PROVIDER_ACCEPTED
     assert len(fake_gmail.outbox) == sent_count
 
     await fixture_site_client.post("/__control__/phase/2")

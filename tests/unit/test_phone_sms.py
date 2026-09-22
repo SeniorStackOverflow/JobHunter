@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.phone.sms as sms_module
-from app.models.entities import CallFact, CommunicationSession, CommunicationTurn, UserProfile
+from app.models.entities import (
+    CallFact,
+    CanonicalEmployer,
+    CommunicationSession,
+    CommunicationTurn,
+    EmployerInteractionEvent,
+    UserProfile,
+)
 from app.models.enums import (
     CallFactState,
     CommunicationChannel,
     CommunicationDirection,
     CommunicationOutcome,
+    EmployerInteractionType,
     PhoneSummaryState,
     PhoneVerificationStatus,
     TurnSpeaker,
@@ -136,9 +145,13 @@ async def add_call(
     *,
     ended_at: datetime,
     number: str = "+37360000000",
+    employer_id: UUID | None = None,
+    application_id: UUID | None = None,
 ) -> CommunicationSession:
     call = CommunicationSession(
         profile_id=profile.id,
+        employer_id=employer_id,
+        application_id=application_id,
         channel=CommunicationChannel.CALL,
         transport="phonegate",
         direction=CommunicationDirection.INBOUND,
@@ -247,6 +260,48 @@ async def test_ingest_correlates_only_single_completed_call_in_window(
         linked_call = await db.get(CommunicationSession, call.id)
     assert linked_call is not None
     assert linked_call.verification_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_sms_correlation_carries_application_employer_into_relationship_event(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
+    profile = UserProfile(name="p", is_default=True, phone="+37360000000")
+    employer = CanonicalEmployer(normalized_name="printerra")
+    application_id = uuid4()
+    async with sqlite_session_factory() as db:
+        db.add_all([profile, employer])
+        await db.flush()
+        call = await add_call(
+            db,
+            profile,
+            ended_at=ended,
+            employer_id=employer.id,
+            application_id=application_id,
+        )
+        await db.commit()
+    gateway = StubPhoneGate([sms(ident="employer-linked", timestamp=int(ended.timestamp() * 1000))])
+
+    result = await ingest_phonegate_sms(client=gateway, session_factory=sqlite_session_factory)
+
+    async with sqlite_session_factory() as db:
+        imported = await db.scalar(
+            select(CommunicationSession).where(
+                CommunicationSession.transport_external_id == "employer-linked"
+            )
+        )
+        event = await db.scalar(
+            select(EmployerInteractionEvent).where(
+                EmployerInteractionEvent.event_type == EmployerInteractionType.SMS_INBOUND
+            )
+        )
+    assert result["correlated"] == 1
+    assert imported is not None and imported.related_session_id == call.id
+    assert imported.employer_id == employer.id
+    assert imported.application_id == application_id
+    assert event is not None and event.application_id == application_id
+    assert event.employer_id == employer.id
 
 
 @pytest.mark.asyncio
@@ -556,7 +611,7 @@ async def test_missing_sms_source_after_claim_clears_owned_lease(
 
 
 @pytest.mark.asyncio
-async def test_outgoing_sms_is_ignored_and_ambiguous_calls_are_unlinked(
+async def test_outgoing_sms_is_persisted_and_ambiguous_calls_are_unlinked(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     ended = datetime(2024, 7, 3, 10, 0, tzinfo=UTC)
@@ -582,8 +637,8 @@ async def test_outgoing_sms_is_ignored_and_ambiguous_calls_are_unlinked(
                 CommunicationSession.channel == CommunicationChannel.SMS
             )
         )
-    assert result["outgoing_ignored"] == 1
-    assert result["ambiguous"] == 1
+    assert result["outgoing_ignored"] == 0
+    assert result["ambiguous"] == 2
     assert imported is not None
     assert imported.related_session_id is None
     assert "Собеседование" not in str(imported.diagnostics)

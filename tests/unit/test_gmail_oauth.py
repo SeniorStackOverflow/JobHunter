@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.email.oauth import (
+    GMAIL_DELIVERY_SCOPES,
     IDENTITY_UNVERIFIED_REASON,
     GmailOAuthError,
     GmailOAuthService,
@@ -35,7 +36,7 @@ class FakeOAuthFlow:
         granted_scopes: list[str] | None = None,
         fail_exchange: bool = False,
     ) -> None:
-        scopes = [GMAIL_SEND_SCOPE] if granted_scopes is None else granted_scopes
+        scopes = list(GMAIL_DELIVERY_SCOPES) if granted_scopes is None else granted_scopes
         self.credentials = FakeCredentials(
             refresh_token=refresh_token,
             scopes=scopes,
@@ -85,7 +86,7 @@ async def test_authorization_request_uses_exact_scope_opaque_state_and_server_si
         stored = await session.scalar(select(OAuthAuthorizationRequest))
 
     query = parse_qs(urlsplit(started.authorization_url).query)
-    assert query["scope"] == [GMAIL_SEND_SCOPE]
+    assert query["scope"] == [" ".join(GMAIL_DELIVERY_SCOPES)]
     assert query["code_challenge_method"] == ["S256"]
     assert query["code_challenge"][0]
     assert query["state"] == ["opaque-state"]
@@ -127,7 +128,7 @@ async def test_oauth_callback_consumes_state_and_encrypts_refresh_token(
         stored_request = await session.get(OAuthAuthorizationRequest, started.request_id)
         assert isinstance(result.credential, OAuthCredential)
         assert result.actor == "api-key"
-        assert result.credential.scopes == [GMAIL_SEND_SCOPE]
+        assert result.credential.scopes == sorted(GMAIL_DELIVERY_SCOPES)
         assert result.credential.token_metadata["identity_verified"] is False
         assert b"private-refresh-token" not in result.credential.encrypted_refresh_token
         assert await service.get_refresh_token(session) == "private-refresh-token"
@@ -139,10 +140,38 @@ async def test_oauth_callback_consumes_state_and_encrypts_refresh_token(
     assert fake_flow.authorization_code == "fake-code"
     assert fake_flow.fetch_count == 1
     assert status["connected"] is True
-    assert status["scopes"] == [GMAIL_SEND_SCOPE]
+    assert status["scopes"] == sorted(GMAIL_DELIVERY_SCOPES)
     assert status["identity_verified"] is False
     assert status["identity_verification_reason"] == IDENTITY_UNVERIFIED_REASON
     assert status["pending_authorizations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_send_only_grant_blocks_delivery_until_monitoring_consent(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = oauth_settings()
+    service = GmailOAuthService(settings)
+    async with sqlite_session_factory() as session:
+        session.add(
+            OAuthCredential(
+                provider="gmail",
+                encrypted_refresh_token=SecretBox(settings.token_encryption_key or "").encrypt(
+                    "refresh-token"
+                ),
+                scopes=[GMAIL_SEND_SCOPE],
+                token_metadata={},
+            )
+        )
+        await session.commit()
+        status = await service.get_status(session)
+        with pytest.raises(GmailOAuthError) as missing_scope:
+            await service.get_refresh_token(session, required_scopes=GMAIL_DELIVERY_SCOPES)
+
+    assert status["connected"] is True
+    assert status["delivery_ready"] is False
+    assert status["monitoring_ready"] is False
+    assert missing_scope.value.code == "gmail_reauthorization_required"
 
 
 @pytest.mark.asyncio
@@ -289,7 +318,7 @@ async def test_unexpected_scope_grant_is_rejected_and_not_persisted(
     state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
     fake_flow = FakeOAuthFlow(
         "private-refresh-token",
-        granted_scopes=[GMAIL_SEND_SCOPE, "openid"],
+        granted_scopes=[*GMAIL_DELIVERY_SCOPES, "openid"],
     )
     monkeypatch.setattr(service, "_flow", lambda state=None, code_verifier=None: fake_flow)
 

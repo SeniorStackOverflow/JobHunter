@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -11,7 +13,9 @@ from app.audit import record_audit_event
 from app.contacts import validate_public_email
 from app.email.oauth import GmailOAuthService
 from app.email.providers import (
+    GMAIL_READONLY_SCOPE,
     GMAIL_REAUTH_REQUIRED_CODE,
+    GMAIL_SEND_SCOPE,
     DeliveryUnknownError,
     EmailProvider,
     FakeGmailProvider,
@@ -22,6 +26,8 @@ from app.email.providers import (
     TemporaryDeliveryError,
     deterministic_message_id,
 )
+from app.email.retries import retry_delay
+from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.bindings import (
     evaluation_inputs_are_current,
     used_confirmed_facts_are_current,
@@ -39,12 +45,16 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
+    ContactDeliveryState,
     ContactType,
     DeliveryStatus,
+    EmployerInteractionChannel,
+    EmployerInteractionType,
     JobStatus,
     PolicyDecision,
     VerificationStatus,
 )
+from app.observability.metrics import EMAIL_DELIVERIES, SEND_BLOCKED_RELATIONSHIP_CHANGED
 from app.policies import PolicyEngine
 from app.policies.schemas import PolicyResult
 from app.profiles.service import choose_resume_for_job
@@ -76,6 +86,10 @@ _AUTO_SEND_HARD_FAILURES = {
     "no_scam_indicators",
     "not_previously_sent",
     "no_delivery_unknown",
+    "contact_delivery_usable",
+    "contact_same_employer",
+    "employer_not_suppressed",
+    "no_candidate_withdrawal",
 }
 _AUTO_SEND_TRANSIENT_FAILURES = {
     "deployment_emergency_switch_off",
@@ -83,6 +97,8 @@ _AUTO_SEND_TRANSIENT_FAILURES = {
     "global_pause_off",
     "daily_limit",
     "source_healthy",
+    "no_active_employer_conversation",
+    "employer_application_slot_available",
 }
 
 
@@ -96,6 +112,7 @@ class EmailService:
         self.settings = settings
         self.session_factory = session_factory
         self._provider = provider
+        self.employer_relationships = EmployerRelationshipService()
 
     @staticmethod
     def _apply_safe_stop(
@@ -113,6 +130,7 @@ class EmailService:
             policy_result = dict(application.policy_result)
         decision = {
             ApplicationStatus.PENDING_REVIEW: PolicyDecision.PENDING_REVIEW,
+            ApplicationStatus.DEFERRED: PolicyDecision.DEFERRED,
             ApplicationStatus.BLOCKED: PolicyDecision.BLOCKED,
         }[status]
         passed = [
@@ -203,6 +221,10 @@ class EmailService:
                         and_(
                             Application.status == ApplicationStatus.PENDING_REVIEW,
                             Application.policy_decision == PolicyDecision.AUTO_APPROVED,
+                        ),
+                        and_(
+                            Application.status == ApplicationStatus.DEFERRED,
+                            Application.policy_decision == PolicyDecision.DEFERRED,
                         ),
                     )
                 )
@@ -302,15 +324,17 @@ class EmailService:
                     failed_rules = ("match_evaluation_inputs_current",)
                     requires_rematch = True
                 else:
-                    current_public_email = (
-                        validate_public_email(job.public_email) if job.public_email else None
-                    )
+                    current_public_emails = {
+                        normalized
+                        for value in [job.public_email, *(job.public_emails or [])]
+                        if value and (normalized := validate_public_email(value))
+                    }
                     if (
                         contact.source_job_id != application.source_job_id
                         or contact.canonical_job_id != application.canonical_job_id
                         or contact.contact_type != ContactType.EMAIL
                         or contact.verification_status != VerificationStatus.VERIFIED
-                        or current_public_email != contact.value
+                        or contact.value not in current_public_emails
                     ):
                         status = ApplicationStatus.BLOCKED
                         reason = "recipient_not_verified"
@@ -334,6 +358,17 @@ class EmailService:
                         if _AUTO_SEND_HARD_FAILURES & current_failed:
                             status = ApplicationStatus.BLOCKED
                             reason = "current_policy_hard_failure"
+                            failed_rules = tuple(policy.rules_failed)
+                        elif {
+                            "no_active_employer_conversation",
+                            "employer_application_slot_available",
+                        } & current_failed:
+                            status = ApplicationStatus.DEFERRED
+                            reason = (
+                                "active_employer_conversation"
+                                if "no_active_employer_conversation" in current_failed
+                                else "same_employer_application_deferred"
+                            )
                             failed_rules = tuple(policy.rules_failed)
                         elif current_failed - _AUTO_SEND_TRANSIENT_FAILURES:
                             status = ApplicationStatus.PENDING_REVIEW
@@ -391,7 +426,10 @@ class EmailService:
         if not self.settings.real_email_delivery_enabled:
             raise EmailSendBlocked("real email delivery is disabled at deployment level")
         oauth = GmailOAuthService(self.settings)
-        refresh_token = await oauth.get_refresh_token(session)
+        refresh_token = await oauth.get_refresh_token(
+            session,
+            required_scopes=(GMAIL_SEND_SCOPE, GMAIL_READONLY_SCOPE),
+        )
         if self.settings.gmail_client_id is None or self.settings.gmail_client_secret is None:
             raise EmailSendBlocked("Gmail OAuth client is incomplete")
         # Do not cache a real provider. Every logical send must re-read the current
@@ -414,8 +452,16 @@ class EmailService:
             )
             if existing is not None and existing.status in {
                 DeliveryStatus.SENT,
+                DeliveryStatus.PROVIDER_ACCEPTED,
+                DeliveryStatus.DELIVERED,
                 DeliveryStatus.DELIVERY_UNKNOWN,
                 DeliveryStatus.SENDING,
+                DeliveryStatus.BOUNCED_PERMANENT,
+                DeliveryStatus.RECIPIENT_REJECTED,
+                DeliveryStatus.DOMAIN_REJECTED,
+                DeliveryStatus.POLICY_REJECTED,
+                DeliveryStatus.SPAM_REJECTED,
+                DeliveryStatus.DELIVERY_FAILED,
             }:
                 return existing
             if application.status not in {
@@ -426,9 +472,23 @@ class EmailService:
                 raise EmailSendBlocked("application is not approved for delivery")
             if application.status == ApplicationStatus.FAILED and (
                 existing is None
-                or existing.status != DeliveryStatus.TEMPORARY_FAILURE
+                or existing.status
+                not in {
+                    DeliveryStatus.TEMPORARY_FAILURE,
+                    DeliveryStatus.BOUNCED_TRANSIENT,
+                    DeliveryStatus.MAILBOX_FULL,
+                }
                 or existing.error_code == GMAIL_REAUTH_REQUIRED_CODE
-                or existing.attempt_count >= 3
+                or existing.attempt_count >= self.settings.email_delivery_max_attempts
+                or (
+                    existing.next_retry_at is not None
+                    and (
+                        existing.next_retry_at.replace(tzinfo=UTC)
+                        if existing.next_retry_at.tzinfo is None
+                        else existing.next_retry_at.astimezone(UTC)
+                    )
+                    > datetime.now(UTC)
+                )
             ):
                 raise EmailSendBlocked("failed application is not safely retryable")
 
@@ -452,6 +512,23 @@ class EmailService:
                 )
                 .with_for_update()
             )
+            if job is not None and application.employer_id is None:
+                identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+                application.employer_id = identity.employer.id
+            if application.employer_id is None:
+                await self._persist_safe_stop(
+                    session,
+                    application,
+                    status=ApplicationStatus.PENDING_REVIEW,
+                    reason="employer_identity_unresolved",
+                    failed_rules=("employer_identity_resolved",),
+                )
+                raise EmailSendBlocked(
+                    "application has no canonical employer",
+                    reason="employer_identity_unresolved",
+                )
+            await self.employer_relationships.lock_employer(session, application.employer_id)
+
             resume = await session.get(Resume, application.resume_id)
             contact = await session.get(EmployerContact, application.recipient_contact_id)
             preferences = await session.scalar(
@@ -552,15 +629,17 @@ class EmailService:
                     "profile, preferences, resume, or confirmed facts changed after matching",
                     reason="match_evaluation_inputs_stale",
                 )
-            current_public_email = (
-                validate_public_email(job.public_email) if job.public_email else None
-            )
+            current_public_emails = {
+                normalized
+                for value in [job.public_email, *(job.public_emails or [])]
+                if value and (normalized := validate_public_email(value))
+            }
             if (
                 contact.source_job_id != application.source_job_id
                 or contact.canonical_job_id != application.canonical_job_id
                 or contact.contact_type != ContactType.EMAIL
                 or contact.verification_status != VerificationStatus.VERIFIED
-                or current_public_email != contact.value
+                or contact.value not in current_public_emails
             ):
                 await self._persist_safe_stop(
                     session,
@@ -601,10 +680,15 @@ class EmailService:
                 session, application, preferences, evaluation, job, resume, contact, profile
             )
             failed_rules = set(policy.rules_failed)
-            if (
-                application.status == ApplicationStatus.AUTO_APPROVED
-                and policy.decision != PolicyDecision.AUTO_APPROVED
-            ):
+            auto_send_authority = application.status is ApplicationStatus.AUTO_APPROVED or (
+                application.status is ApplicationStatus.FAILED
+                and application.policy_decision is PolicyDecision.AUTO_APPROVED
+            )
+            manual_send_authority = application.status is ApplicationStatus.APPROVED or (
+                application.status is ApplicationStatus.FAILED
+                and application.policy_decision is not PolicyDecision.AUTO_APPROVED
+            )
+            if auto_send_authority and policy.decision != PolicyDecision.AUTO_APPROVED:
                 safe_stop_reason: str | None = None
                 if _AUTO_SEND_HARD_FAILURES & failed_rules:
                     safe_stop_reason = "current_policy_hard_failure"
@@ -616,6 +700,8 @@ class EmailService:
                         failed_rules=tuple(policy.rules_failed),
                         policy=policy,
                     )
+                    if {"employer_not_suppressed", "no_candidate_withdrawal"} & failed_rules:
+                        SEND_BLOCKED_RELATIONSHIP_CHANGED.labels(reason="employer_suppressed").inc()
                 elif failed_rules - _AUTO_SEND_TRANSIENT_FAILURES:
                     safe_stop_reason = "current_policy_requires_review"
                     await self._persist_safe_stop(
@@ -626,16 +712,36 @@ class EmailService:
                         failed_rules=tuple(policy.rules_failed),
                         policy=policy,
                     )
+                elif {
+                    "no_active_employer_conversation",
+                    "employer_application_slot_available",
+                } & failed_rules:
+                    safe_stop_reason = (
+                        "active_employer_conversation"
+                        if "no_active_employer_conversation" in failed_rules
+                        else "same_employer_application_deferred"
+                    )
+                    await self._persist_safe_stop(
+                        session,
+                        application,
+                        status=ApplicationStatus.DEFERRED,
+                        reason=safe_stop_reason,
+                        failed_rules=tuple(policy.rules_failed),
+                        policy=policy,
+                    )
+                    SEND_BLOCKED_RELATIONSHIP_CHANGED.labels(reason=safe_stop_reason).inc()
                 raise EmailSendBlocked(
                     "current policy no longer permits automatic delivery",
                     reason=safe_stop_reason or "current_policy_transient_failure",
                 )
-            if application.status == ApplicationStatus.APPROVED:
+            if manual_send_authority:
                 manual_required = _AUTO_SEND_HARD_FAILURES | {
                     "deployment_emergency_switch_off",
                     "global_pause_off",
                     "daily_limit",
                     "source_healthy",
+                    "no_active_employer_conversation",
+                    "employer_application_slot_available",
                 }
                 if manual_required & failed_rules:
                     if _AUTO_SEND_HARD_FAILURES & failed_rules:
@@ -647,6 +753,24 @@ class EmailService:
                             failed_rules=tuple(policy.rules_failed),
                             policy=policy,
                         )
+                    elif {
+                        "no_active_employer_conversation",
+                        "employer_application_slot_available",
+                    } & failed_rules:
+                        reason = (
+                            "active_employer_conversation"
+                            if "no_active_employer_conversation" in failed_rules
+                            else "same_employer_application_deferred"
+                        )
+                        await self._persist_safe_stop(
+                            session,
+                            application,
+                            status=ApplicationStatus.DEFERRED,
+                            reason=reason,
+                            failed_rules=tuple(policy.rules_failed),
+                            policy=policy,
+                        )
+                        SEND_BLOCKED_RELATIONSHIP_CHANGED.labels(reason=reason).inc()
                     raise EmailSendBlocked(
                         "manual approval cannot override delivery safety rules",
                         reason="manual_approval_policy_failure",
@@ -692,6 +816,10 @@ class EmailService:
                     status=DeliveryStatus.SENDING,
                     sanitized_provider_response={},
                     attempt_count=1,
+                    rfc_message_id=message.message_id,
+                    subject_fingerprint=hashlib.sha256(
+                        message.subject.encode("utf-8", errors="replace")
+                    ).hexdigest(),
                 )
                 session.add(delivery)
             else:
@@ -700,6 +828,14 @@ class EmailService:
                 delivery.attempt_count += 1
                 delivery.error = None
                 delivery.error_code = None
+                delivery.rfc_message_id = message.message_id
+                delivery.subject_fingerprint = hashlib.sha256(
+                    message.subject.encode("utf-8", errors="replace")
+                ).hexdigest()
+            from app.database.base import utcnow
+
+            delivery.last_attempt_at = utcnow()
+            contact.last_delivery_attempt_at = delivery.last_attempt_at
             application.status = ApplicationStatus.SENDING
             await session.commit()
 
@@ -726,23 +862,49 @@ class EmailService:
                 delivery.status = DeliveryStatus.TEMPORARY_FAILURE
                 delivery.error = str(exc)
                 delivery.error_code = None
+                delivery.next_retry_at = (
+                    utcnow() + retry_delay(delivery.attempt_count)
+                    if delivery.attempt_count < self.settings.email_delivery_max_attempts
+                    else None
+                )
                 application.status = ApplicationStatus.FAILED
+                contact.delivery_state = ContactDeliveryState.TRANSIENT_FAILURE
+                contact.last_delivery_failure_at = utcnow()
+                contact.failure_count += 1
             except PermanentDeliveryError as exc:
                 delivery.status = DeliveryStatus.PERMANENT_FAILURE
                 delivery.error = str(exc)
                 delivery.error_code = None
                 application.status = ApplicationStatus.FAILED
+                contact.delivery_state = ContactDeliveryState.REJECTED
+                contact.last_delivery_failure_at = utcnow()
+                contact.failure_count += 1
             else:
-                delivery.status = DeliveryStatus.SENT
+                delivery.status = DeliveryStatus.PROVIDER_ACCEPTED
                 delivery.provider_message_id = result.message_id
                 delivery.thread_id = result.thread_id
                 delivery.sanitized_provider_response = result.sanitized_response
                 delivery.error = None
                 delivery.error_code = None
                 application.status = ApplicationStatus.SENT
-                from app.database.base import utcnow
-
                 application.sent_at = utcnow()
+                delivery.submitted_at = application.sent_at
+                delivery.provider_accepted_at = application.sent_at
+                delivery.final_recipient = contact.value
+                await self.employer_relationships.record_event(
+                    session,
+                    profile_id=application.profile_id,
+                    employer_id=application.employer_id,
+                    event_type=EmployerInteractionType.APPLICATION_SENT,
+                    channel=EmployerInteractionChannel.EMAIL,
+                    idempotency_key=f"application-sent:{application.id}",
+                    occurred_at=application.sent_at,
+                    application_id=application.id,
+                    canonical_job_id=application.canonical_job_id,
+                    source_job_id=application.source_job_id,
+                    event_metadata={"delivery_id": str(delivery.id)},
+                    role=job.title,
+                )
                 if provider.name == "gmail":
                     await GmailOAuthService(self.settings).mark_refresh_ok(session)
             await record_audit_event(
@@ -759,6 +921,10 @@ class EmailService:
                     "attempt": delivery.attempt_count,
                 },
             )
+            EMAIL_DELIVERIES.labels(
+                provider=provider.name,
+                state=delivery.status.value,
+            ).inc()
             await session.commit()
             return delivery
 
@@ -799,6 +965,8 @@ async def send_auto_approved_applications() -> int:
                     EmailDelivery.status.in_(
                         {
                             DeliveryStatus.SENT,
+                            DeliveryStatus.PROVIDER_ACCEPTED,
+                            DeliveryStatus.DELIVERED,
                             DeliveryStatus.SENDING,
                             DeliveryStatus.DELIVERY_UNKNOWN,
                         }
@@ -877,7 +1045,7 @@ async def send_auto_approved_applications() -> int:
                 reason="application_missing",
             )
             continue
-        if delivery.status == DeliveryStatus.SENT:
+        if delivery.status in {DeliveryStatus.PROVIDER_ACCEPTED, DeliveryStatus.DELIVERED}:
             sent += 1
         if delivery.error_code == GMAIL_REAUTH_REQUIRED_CODE:
             logger.warning("automatic_email_batch_stopped", reason=GMAIL_REAUTH_REQUIRED_CODE)
@@ -906,12 +1074,22 @@ async def retry_temporary_failures() -> int:
                     select(EmailDelivery.application_id)
                     .join(Application, Application.id == EmailDelivery.application_id)
                     .where(
-                        EmailDelivery.status == DeliveryStatus.TEMPORARY_FAILURE,
+                        EmailDelivery.status.in_(
+                            {
+                                DeliveryStatus.TEMPORARY_FAILURE,
+                                DeliveryStatus.BOUNCED_TRANSIENT,
+                                DeliveryStatus.MAILBOX_FULL,
+                            }
+                        ),
                         or_(
                             EmailDelivery.error_code.is_(None),
                             EmailDelivery.error_code != GMAIL_REAUTH_REQUIRED_CODE,
                         ),
-                        EmailDelivery.attempt_count < 3,
+                        EmailDelivery.attempt_count < settings.email_delivery_max_attempts,
+                        or_(
+                            EmailDelivery.next_retry_at.is_(None),
+                            EmailDelivery.next_retry_at <= datetime.now(UTC),
+                        ),
                         Application.status.in_(
                             {
                                 ApplicationStatus.AUTO_APPROVED,
@@ -943,7 +1121,7 @@ async def retry_temporary_failures() -> int:
                 reason="application_missing",
             )
             continue
-        if delivery.status == DeliveryStatus.SENT:
+        if delivery.status in {DeliveryStatus.PROVIDER_ACCEPTED, DeliveryStatus.DELIVERED}:
             retried += 1
         if delivery.error_code == GMAIL_REAUTH_REQUIRED_CODE:
             logger.warning("temporary_email_retry_stopped", reason=GMAIL_REAUTH_REQUIRED_CODE)

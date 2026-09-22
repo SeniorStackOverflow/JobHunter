@@ -19,6 +19,7 @@ class CorrelationResult:
     canonical_job_id: UUID | None
     source_job_id: UUID | None
     contact_id: UUID | None
+    employer_id: UUID | None = None
     ambiguous: bool = False
 
 
@@ -32,6 +33,7 @@ def _contact_from_job(
     *,
     canonical_job_id: UUID,
     source_job_id: UUID,
+    employer_id: UUID | None,
     e164: str,
     official_domain: str | None,
     evidence_url: str,
@@ -39,6 +41,7 @@ def _contact_from_job(
     return EmployerContact(
         canonical_job_id=canonical_job_id,
         source_job_id=source_job_id,
+        employer_id=employer_id,
         value=e164,
         contact_type=ContactType.PHONE,
         discovery_source="inbound_call_match_public_phone",
@@ -75,7 +78,8 @@ class CallerCorrelation:
                 .order_by(EmployerContact.confidence.desc(), EmployerContact.created_at.desc())
             )
         )
-        if len({c.canonical_job_id for c in contacts}) > 1:
+        contact_employers = {c.employer_id for c in contacts if c.employer_id is not None}
+        if len({c.canonical_job_id for c in contacts}) > 1 and len(contact_employers) != 1:
             # One number, several vacancies (agency line) — the call cannot be attributed.
             return CorrelationResult(default_profile_id, None, None, None, None, ambiguous=True)
         contact = contacts[0] if contacts else None
@@ -93,6 +97,7 @@ class CallerCorrelation:
                     select(
                         SourceJob.id,
                         SourceJob.canonical_job_id,
+                        SourceJob.employer_id,
                         SourceJob.public_phone,
                         SourceJob.public_phones,
                         SourceJob.employer_url,
@@ -107,13 +112,25 @@ class CallerCorrelation:
                 for r in rows
                 if r.public_phone == e164 or (r.public_phones and e164 in r.public_phones)
             ]
-            if len({r.canonical_job_id for r in matches}) > 1:
+            match_employers = {r.employer_id for r in matches if r.employer_id is not None}
+            if len({r.canonical_job_id for r in matches}) > 1 and len(match_employers) != 1:
                 return CorrelationResult(default_profile_id, None, None, None, None, ambiguous=True)
+            if len({r.canonical_job_id for r in matches}) > 1 and len(match_employers) == 1:
+                return CorrelationResult(
+                    default_profile_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    employer_id=next(iter(match_employers)),
+                    ambiguous=True,
+                )
             if matches:
                 r = matches[0]  # rows are already newest-first
                 contact = _contact_from_job(
                     canonical_job_id=r.canonical_job_id,
                     source_job_id=r.id,
+                    employer_id=r.employer_id,
                     e164=e164,
                     official_domain=_domain(r.employer_url or r.canonical_url),
                     evidence_url=r.canonical_url,
@@ -140,6 +157,7 @@ class CallerCorrelation:
                 canonical_job_id=contact.canonical_job_id,
                 source_job_id=contact.source_job_id,
                 contact_id=contact.id,
+                employer_id=contact.employer_id,
                 ambiguous=True,
             )
         application = applications[0] if applications else None
@@ -150,4 +168,7 @@ class CallerCorrelation:
             canonical_job_id=contact.canonical_job_id,
             source_job_id=contact.source_job_id,
             contact_id=contact.id,
+            employer_id=(
+                application.employer_id if application is not None else contact.employer_id
+            ),
         )
