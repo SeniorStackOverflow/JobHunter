@@ -608,6 +608,66 @@ async def test_interview_freezes_then_employer_rejection_releases_deferred_slot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("closing_event", "scope"),
+    [
+        (EmployerInteractionType.EMPLOYER_REJECTED, SuppressionScope.NONE),
+        (EmployerInteractionType.RELATIONSHIP_REOPENED, SuppressionScope.NONE),
+        (EmployerInteractionType.CANDIDATE_DECLINED_JOB, SuppressionScope.JOB),
+    ],
+)
+async def test_finished_relationship_releases_prior_sent_application_slot(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    closing_event: EmployerInteractionType,
+    scope: SuppressionScope,
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            _first_job,
+            second_job,
+            first,
+            second,
+            _first_eval,
+            second_eval,
+        ) = await _relationship_graph(session)
+        first.status = ApplicationStatus.SENT
+        first.sent_at = datetime(2026, 9, 21, 9, tzinfo=UTC)
+        service = EmployerRelationshipService()
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.APPLICATION_SENT,
+            channel=EmployerInteractionChannel.APPLICATION,
+            idempotency_key="first-sent-before-rejection",
+            application_id=first.id,
+            occurred_at=first.sent_at,
+        )
+        pending = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert pending.slot_available is False
+
+        await service.record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=closing_event,
+            channel=EmployerInteractionChannel.EMAIL,
+            idempotency_key=f"first-closed-before-second:{closing_event.value}",
+            suppression_scope=scope,
+            canonical_job_id=first.canonical_job_id if scope is SuppressionScope.JOB else None,
+        )
+        released = await service.policy_outcome(
+            session, application=second, evaluation=second_eval, job=second_job
+        )
+        assert released.slot_available is True
+        assert first.status is ApplicationStatus.SENT
+
+
+@pytest.mark.asyncio
 async def test_permanent_delivery_failure_releases_slot_without_rewriting_sent_fact(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

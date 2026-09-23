@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -229,6 +230,17 @@ async def test_two_workers_competing_for_one_employer_slot_only_authorize_one() 
             )
             if outcome.slot_available:
                 application.status = ApplicationStatus.SENT
+                application.sent_at = datetime.now(UTC)
+                await service.record_event(
+                    session,
+                    profile_id=application.profile_id,
+                    employer_id=application.employer_id,
+                    event_type=EmployerInteractionType.APPLICATION_SENT,
+                    channel=EmployerInteractionChannel.APPLICATION,
+                    idempotency_key=f"concurrent-application-sent:{application.id}",
+                    application_id=application.id,
+                    occurred_at=application.sent_at,
+                )
             await session.commit()
             return outcome.slot_available
 
@@ -278,4 +290,24 @@ async def test_two_workers_competing_for_one_employer_slot_only_authorize_one() 
             )
         )
         assert event_count == 1
+
+    async with factory() as session:
+        second = await session.get(Application, second_id)
+        assert second is not None and second.employer_id is not None
+        await service.record_event(
+            session,
+            profile_id=second.profile_id,
+            employer_id=second.employer_id,
+            event_type=EmployerInteractionType.EMPLOYER_REJECTED,
+            channel=EmployerInteractionChannel.EMAIL,
+            idempotency_key=f"concurrent-employer-rejected:{first_id}",
+            application_id=first_id,
+        )
+        evaluation = await session.get(MatchEvaluation, second.match_evaluation_id)
+        job = await session.get(SourceJob, second.source_job_id)
+        assert evaluation is not None and job is not None
+        released = await service.policy_outcome(
+            session, application=second, evaluation=evaluation, job=job
+        )
+        assert released.slot_available is True
     await engine.dispose()

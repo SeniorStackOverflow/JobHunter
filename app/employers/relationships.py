@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import record_audit_event
@@ -461,26 +461,40 @@ class EmployerRelationshipService:
                 ):
                     active_conversation = False
 
-        active_other = await session.scalar(
-            select(func.count(Application.id)).where(
-                Application.profile_id == application.profile_id,
-                Application.employer_id == employer_id,
-                Application.id != application.id,
-                Application.status.in_(
-                    {
-                        ApplicationStatus.SENDING,
-                        ApplicationStatus.SENT,
-                        ApplicationStatus.DELIVERY_UNKNOWN,
-                    }
-                ),
-                ~select(EmailDelivery.id)
-                .where(
-                    EmailDelivery.application_id == Application.id,
-                    EmailDelivery.status.in_(_PERMANENT_DELIVERY_FAILURES),
-                )
-                .exists(),
+        active_other_query = select(func.count(Application.id)).where(
+            Application.profile_id == application.profile_id,
+            Application.employer_id == employer_id,
+            Application.id != application.id,
+            Application.status.in_(
+                {
+                    ApplicationStatus.SENDING,
+                    ApplicationStatus.SENT,
+                    ApplicationStatus.DELIVERY_UNKNOWN,
+                }
+            ),
+            ~select(EmailDelivery.id)
+            .where(
+                EmailDelivery.application_id == Application.id,
+                EmailDelivery.status.in_(_PERMANENT_DELIVERY_FAILURES),
             )
+            .exists(),
         )
+        if (
+            relationship is not None
+            and relationship.last_application_at is not None
+            and relationship.last_interaction_at is not None
+            and relationship.state not in _ACTIVE_CONVERSATION_STATES
+        ):
+            # A completed relationship releases its historical SENT slot, while
+            # an in-flight or later send still counts if an event was missed.
+            active_other_query = active_other_query.where(
+                or_(
+                    Application.status == ApplicationStatus.SENDING,
+                    Application.sent_at.is_(None),
+                    Application.sent_at >= relationship.last_interaction_at,
+                )
+            )
+        active_other = await session.scalar(active_other_query)
         ranked_rows = (
             await session.execute(
                 select(Application.id)
