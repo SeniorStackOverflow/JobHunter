@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,7 @@ from app.employers.relationships import (
 )
 from app.models.entities import (
     Application,
+    AuditEvent,
     CommunicationSession,
     CommunicationTurn,
     EmployerContact,
@@ -328,6 +329,48 @@ class EmployerBackfillService:
 
 
 class EmployerSafetyAuditService:
+    async def record_historical_incidents(self, session: AsyncSession) -> dict[str, int]:
+        """Persist audited send incidents without changing historical applications."""
+        report = await self.report(session)
+        incidents = (
+            ("rapid_same_employer_send", report["A_same_employer_within_24h"]),
+            ("sent_after_candidate_decline", report["B_sent_after_candidate_decline"]),
+            ("sent_during_active_conversation", report["C_sent_during_active_conversation"]),
+        )
+        created: dict[str, int] = {}
+        for incident_type, rows in incidents:
+            created[incident_type] = 0
+            for row in rows:
+                application_id = (
+                    row["application_ids"][-1]
+                    if incident_type == "rapid_same_employer_send"
+                    else row["application_id"]
+                )
+                evidence_id = (
+                    ":".join(row["application_ids"])
+                    if incident_type == "rapid_same_employer_send"
+                    else row.get("decline_event_id") or row.get("active_event_id")
+                )
+                correlation_id = f"employer-retro:{incident_type}:{application_id}:{evidence_id}"
+                event_id = uuid5(NAMESPACE_URL, correlation_id)
+                if await session.get(AuditEvent, event_id) is not None:
+                    continue
+                session.add(
+                    AuditEvent(
+                        id=event_id,
+                        actor="employer_retro_audit",
+                        action="employer.historical_send_incident",
+                        entity_type="application",
+                        entity_id=application_id,
+                        decision=incident_type,
+                        correlation_id=correlation_id,
+                        sanitized_details=dict(row),
+                    )
+                )
+                created[incident_type] += 1
+        await session.flush()
+        return created
+
     async def report(
         self, session: AsyncSession, *, company_filter: str | None = None
     ) -> dict[str, Any]:

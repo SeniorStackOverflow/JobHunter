@@ -45,6 +45,13 @@ async def apply_employer_remediation() -> dict[str, int]:
         return result
 
 
+async def record_employer_historical_incidents() -> dict[str, int]:
+    async with async_session_factory() as session:
+        result = await EmployerSafetyAuditService().record_historical_incidents(session)
+        await session.commit()
+        return result
+
+
 async def email_delivery_audit(recipient: str | None) -> dict[str, object]:
     return await EmailDeliveryReconciliationService(
         get_settings(), async_session_factory
@@ -206,6 +213,11 @@ def build_parser() -> argparse.ArgumentParser:
         "employer-remediate", help="cancel/defer unsafe unsent applications"
     )
     employer_remediation.add_argument("--apply", action="store_true", required=True)
+    historical_incidents = subparsers.add_parser(
+        "employer-historical-incidents",
+        help="record audited historical send incidents without changing applications",
+    )
+    historical_incidents.add_argument("--apply", action="store_true", required=True)
     delivery_audit = subparsers.add_parser(
         "email-delivery-audit", help="read recent Gmail DSNs without mutating state"
     )
@@ -253,6 +265,8 @@ def main() -> None:
         print(json.dumps(asyncio.run(apply_employer_backfill()), indent=2))
     elif args.command == "employer-remediate":
         print(json.dumps(asyncio.run(apply_employer_remediation()), indent=2))
+    elif args.command == "employer-historical-incidents":
+        print(json.dumps(asyncio.run(record_employer_historical_incidents()), indent=2))
     elif args.command == "email-delivery-audit":
         print(
             json.dumps(

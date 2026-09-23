@@ -15,6 +15,7 @@ from app.employers import (
 )
 from app.models.entities import (
     Application,
+    AuditEvent,
     CanonicalEmployer,
     CanonicalJob,
     EmailDelivery,
@@ -822,6 +823,84 @@ async def test_retro_audit_uses_relationship_state_at_each_send_time(
         second.sent_at = datetime(2026, 9, 21, 13, 30, tzinfo=UTC)
         after_other_job_decline = await EmployerSafetyAuditService().report(session)
         assert after_other_job_decline["B_sent_after_candidate_decline"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "scope", "incident_type"),
+    [
+        (
+            EmployerInteractionType.EMPLOYER_REPLIED,
+            SuppressionScope.NONE,
+            "sent_during_active_conversation",
+        ),
+        (
+            EmployerInteractionType.CANDIDATE_DECLINED_EMPLOYER,
+            SuppressionScope.EMPLOYER,
+            "sent_after_candidate_decline",
+        ),
+    ],
+)
+async def test_historical_send_incidents_are_persistent_idempotent_and_preserve_sent(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    event_type: EmployerInteractionType,
+    scope: SuppressionScope,
+    incident_type: str,
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            profile,
+            employer,
+            _first_job,
+            _second_job,
+            first,
+            second,
+            *_rest,
+        ) = await _relationship_graph(session)
+        first.status = second.status = ApplicationStatus.SENT
+        first.sent_at = datetime(2026, 9, 21, 9, tzinfo=UTC)
+        second.sent_at = datetime(2026, 9, 21, 11, tzinfo=UTC)
+        await EmployerRelationshipService().record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=event_type,
+            channel=EmployerInteractionChannel.MANUAL,
+            idempotency_key=f"historical-incident:{event_type.value}",
+            occurred_at=datetime(2026, 9, 21, 10, tzinfo=UTC),
+            suppression_scope=scope,
+        )
+        service = EmployerSafetyAuditService()
+        first_result = await service.record_historical_incidents(session)
+        first_id, second_id = first.id, second.id
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        second_result = await service.record_historical_incidents(session)
+        incidents = (
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "employer.historical_send_incident")
+            )
+        ).all()
+
+        assert first_result["rapid_same_employer_send"] == 1
+        assert first_result[incident_type] == 1
+        assert all(count == 0 for count in second_result.values())
+        assert {incident.decision for incident in incidents} == {
+            "rapid_same_employer_send",
+            incident_type,
+        }
+        assert {incident.entity_id for incident in incidents} == {str(second_id)}
+        first = await session.get(Application, first_id)
+        second = await session.get(Application, second_id)
+        assert first is not None and second is not None
+        assert first.status is second.status is ApplicationStatus.SENT
+        assert first.sent_at is not None and first.sent_at.replace(tzinfo=UTC) == datetime(
+            2026, 9, 21, 9, tzinfo=UTC
+        )
+        assert second.sent_at is not None and second.sent_at.replace(tzinfo=UTC) == datetime(
+            2026, 9, 21, 11, tzinfo=UTC
+        )
 
 
 @pytest.mark.asyncio

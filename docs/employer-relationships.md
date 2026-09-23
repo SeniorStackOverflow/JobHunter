@@ -34,6 +34,7 @@ job-agent employer-identity-audit [--company NAME]
 job-agent employer-relationship-audit [--company NAME]
 job-agent employer-backfill --apply
 job-agent employer-remediate --apply
+job-agent employer-historical-incidents --apply
 job-agent email-delivery-audit [--recipient EMAIL]
 ```
 
@@ -41,6 +42,11 @@ The first two commands are read-only. `email-delivery-audit` reads Gmail only wh
 the stored OAuth grant includes `gmail.readonly`; it does not advance the mailbox
 cursor or update delivery/contact state. Apply commands are deliberately separate
 so identity and safety reports can be reviewed first.
+After reviewing the A/B/C relationship audit, `employer-historical-incidents`
+records each historical rapid send, post-decline send, or send during an active
+conversation as an idempotent `AuditEvent`. It leaves the original `SENT`
+applications untouched. Run it again after reconciling older Gmail replies if
+the new evidence reveals additional historical incidents.
 
 Production rollout keeps automatic sending paused through migration and backfill.
 Run the identity dry-run first and stop if it proposes broad merges through shared
