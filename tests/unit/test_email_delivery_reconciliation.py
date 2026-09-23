@@ -223,6 +223,24 @@ def _dsn(
     return message.as_bytes()
 
 
+def _structured_dsn(*, action: str, status: str, diagnostic: str, when: datetime) -> bytes:
+    return (
+        "From: MAILER-DAEMON@example.net\r\n"
+        "Subject: Delivery Status Notification\r\n"
+        f"Date: {when.strftime('%a, %d %b %Y %H:%M:%S +0000')}\r\n"
+        "MIME-Version: 1.0\r\n"
+        "Content-Type: multipart/report; report-type=delivery-status; boundary=dsn\r\n\r\n"
+        "--dsn\r\nContent-Type: text/plain\r\n\r\nDelivery status update.\r\n"
+        "--dsn\r\nContent-Type: message/delivery-status\r\n\r\n"
+        "Reporting-MTA: dns; mx.example.net\r\n\r\n"
+        "Final-Recipient: rfc822; job@sincer.md\r\n"
+        f"Action: {action}\r\nStatus: {status}\r\n"
+        f"Diagnostic-Code: smtp; {diagnostic}\r\n"
+        "Original-Message-ID: <application-fixture@job-agent.invalid>\r\n\r\n"
+        "--dsn--\r\n"
+    ).encode()
+
+
 async def _delivery_graph(
     session: AsyncSession, *, attempts: int = 1
 ) -> tuple[Application, EmailDelivery, EmployerContact, CanonicalEmployer]:
@@ -407,6 +425,29 @@ def test_structured_dsn_fields_are_parsed() -> None:
     assert parsed.original_message_id == "<application-fixture@job-agent.invalid>"
     assert parsed.status == "5.4.1"
     assert parsed.reporting_mta == "dns; mx.example.net"
+    assert parsed.structured is True
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_status", "retryable"),
+    [
+        ("failed", DeliveryStatus.BOUNCED_TRANSIENT, True),
+        ("delayed", DeliveryStatus.PROVIDER_ACCEPTED, False),
+    ],
+)
+def test_structured_status_overrides_unrelated_diagnostic_number(
+    action: str, expected_status: DeliveryStatus, retryable: bool
+) -> None:
+    result = classify_smtp_failure("smtp; 201 4.4.1 remote timeout", status="4.4.1", action=action)
+    assert result.status is expected_status
+    assert result.smtp_status == "4.4.1"
+    assert result.retryable is retryable
+
+
+def test_bare_positive_smtp_code_does_not_confirm_delivery() -> None:
+    result = classify_smtp_failure("250 2.0.0 delivered")
+    assert result.status is DeliveryStatus.PROVIDER_ACCEPTED
+    assert result.retryable is False
 
 
 @pytest.mark.asyncio
@@ -662,9 +703,9 @@ async def test_late_positive_notice_cannot_revive_permanently_rejected_recipient
         message_id="gmail-late-positive",
         thread_id="thread-1",
         history_id="late-positive-history",
-        raw=_dsn(
-            original_message_id="<application-fixture@job-agent.invalid>",
-            recipient="job@sincer.md",
+        raw=_structured_dsn(
+            action="delivered",
+            status="2.0.0",
             diagnostic="250 2.0.0 delivered",
             when=datetime(2026, 9, 20, tzinfo=UTC),
         ),
@@ -687,6 +728,69 @@ async def test_late_positive_notice_cannot_revive_permanently_rejected_recipient
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected_status", "expected_contact_state", "retry_scheduled"),
+    [
+        ("failed", DeliveryStatus.BOUNCED_TRANSIENT, ContactDeliveryState.TRANSIENT_FAILURE, True),
+        ("delayed", DeliveryStatus.PROVIDER_ACCEPTED, ContactDeliveryState.UNKNOWN, False),
+    ],
+)
+async def test_structured_dsn_reconciliation_preserves_action_semantics(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    action: str,
+    expected_status: DeliveryStatus,
+    expected_contact_state: ContactDeliveryState,
+    retry_scheduled: bool,
+) -> None:
+    async with sqlite_session_factory() as session:
+        application, delivery, contact, _employer = await _delivery_graph(session)
+        application_id, delivery_id, contact_id = application.id, delivery.id, contact.id
+    when = datetime(2026, 9, 21, 9, tzinfo=UTC)
+    message = MailboxMessage(
+        message_id=f"gmail-{action}-201-4.4.1",
+        thread_id="thread-1",
+        history_id="dsn-history",
+        raw=_structured_dsn(
+            action=action,
+            status="4.4.1",
+            diagnostic="201 4.4.1 remote timeout",
+            when=when,
+        ),
+        inbox=True,
+    )
+    service = EmailDeliveryReconciliationService(
+        _settings(), sqlite_session_factory, StaticMailbox(message)
+    )
+    audit = await service.audit_mailbox()
+    assert audit["matches"][0]["proposed_delivery_status"] == expected_status.value
+    assert audit["matches"][0]["retryable"] is retry_scheduled
+    assert audit["matches"][0]["action"] == action
+
+    first = await service.reconcile()
+    second = await service.reconcile()
+    assert first["correlated"] == 1
+    assert second["processed"] == 0
+    async with sqlite_session_factory() as session:
+        refreshed_delivery = await session.get(EmailDelivery, delivery_id)
+        refreshed_contact = await session.get(EmployerContact, contact_id)
+        refreshed_application = await session.get(Application, application_id)
+        events = (await session.scalars(select(EmailDeliveryEvent))).all()
+        assert refreshed_delivery is not None
+        assert refreshed_delivery.status is expected_status
+        assert (refreshed_delivery.next_retry_at is not None) is retry_scheduled
+        assert refreshed_contact is not None
+        assert refreshed_contact.delivery_state is expected_contact_state
+        assert refreshed_application is not None
+        assert refreshed_application.status is (
+            ApplicationStatus.FAILED if retry_scheduled else ApplicationStatus.SENT
+        )
+        assert len(events) == 1
+        assert events[0].event_type == ("bounce" if retry_scheduled else "delivery_notice")
+        assert events[0].smtp_status == "4.4.1"
+        assert events[0].safe_metadata["structured"] is True
+
+
+@pytest.mark.asyncio
 async def test_positive_delivery_confirmation_marks_contact_healthy(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -701,9 +805,9 @@ async def test_positive_delivery_confirmation_marks_contact_healthy(
         message_id="gmail-delivered",
         thread_id="thread-1",
         history_id="delivered-history",
-        raw=_dsn(
-            original_message_id="<application-fixture@job-agent.invalid>",
-            recipient="job@sincer.md",
+        raw=_structured_dsn(
+            action="delivered",
+            status="2.0.0",
             diagnostic="250 2.0.0 delivered",
             when=when,
         ),

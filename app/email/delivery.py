@@ -68,6 +68,7 @@ class BounceClassification:
 @dataclass(frozen=True)
 class ParsedDeliveryNotice:
     is_dsn: bool
+    structured: bool
     original_message_id: str | None
     final_recipient: str | None
     diagnostic: str
@@ -113,29 +114,51 @@ def classify_smtp_failure(
     diagnostic: str,
     *,
     status: str | None = None,
+    action: str | None = None,
 ) -> BounceClassification:
     text = " ".join((status or "", diagnostic)).strip()
     folded = text.casefold()
-    match = _STATUS_RE.search(text)
-    enhanced = _ENHANCED_STATUS_RE.search(text)
-    smtp_status = (
-        " ".join(
-            value
-            for value in (
-                match.group(1) if match else None,
-                enhanced.group(1) if enhanced else None,
-            )
-            if value
-        )
-        or None
-    )
-    leading = match.group(1)[0] if match else (enhanced.group(1)[0] if enhanced else "")
+    match = _STATUS_RE.search(status or "") or _STATUS_RE.search(diagnostic)
+    enhanced = _ENHANCED_STATUS_RE.search(status or "") or _ENHANCED_STATUS_RE.search(diagnostic)
+    basic_code = match.group(1) if match else None
+    enhanced_code = enhanced.group(1) if enhanced else None
+    # A diagnostic can contain an unrelated 3-digit number. A structured DSN
+    # Status or enhanced status code takes precedence over a conflicting number.
+    if basic_code and enhanced_code and basic_code[0] != enhanced_code[0]:
+        basic_code = None
+    smtp_status = " ".join(value for value in (basic_code, enhanced_code) if value) or None
+    leading = enhanced_code[0] if enhanced_code else (basic_code[0] if basic_code else "")
+    normalized_action = (action or "").strip().casefold()
     permanent = leading == "5"
     retryable = leading == "4"
 
+    if normalized_action in {"delayed", "relayed", "expanded"}:
+        return BounceClassification(
+            DeliveryStatus.PROVIDER_ACCEPTED,
+            f"delivery_{normalized_action}",
+            False,
+            False,
+            smtp_status,
+            text[:500] or normalized_action,
+        )
+    if (normalized_action == "delivered" and leading != "2") or (
+        normalized_action == "failed" and leading == "2"
+    ):
+        return BounceClassification(
+            DeliveryStatus.PROVIDER_ACCEPTED,
+            "inconsistent_delivery_notice",
+            False,
+            False,
+            smtp_status,
+            text[:500] or "inconsistent_delivery_notice",
+        )
     if leading == "2":
         failure_class = "accepted"
-        delivery_status = DeliveryStatus.DELIVERED
+        delivery_status = (
+            DeliveryStatus.DELIVERED
+            if normalized_action == "delivered"
+            else DeliveryStatus.PROVIDER_ACCEPTED
+        )
         permanent = False
         retryable = False
     elif any(marker in folded for marker in ("mailbox full", "quota exceeded", "5.2.2", "4.2.2")):
@@ -310,6 +333,7 @@ def parse_delivery_notice(
             pass
     return ParsedDeliveryNotice(
         is_dsn=is_dsn,
+        structured=structured,
         original_message_id=original_message_id,
         final_recipient=final_recipient,
         diagnostic=diagnostic,
@@ -555,7 +579,7 @@ class EmailDeliveryReconciliationService:
             else None
         )
         classification = (
-            classify_smtp_failure(notice.diagnostic, status=notice.status)
+            classify_smtp_failure(notice.diagnostic, status=notice.status, action=notice.action)
             if notice.is_dsn
             else None
         )
@@ -567,6 +591,9 @@ class EmailDeliveryReconciliationService:
             event_type=(
                 "delivery_confirmation"
                 if classification is not None and classification.status is DeliveryStatus.DELIVERED
+                else "delivery_notice"
+                if classification is not None
+                and classification.status is DeliveryStatus.PROVIDER_ACCEPTED
                 else "bounce"
                 if notice.is_dsn
                 else "employer_reply"
@@ -582,7 +609,7 @@ class EmailDeliveryReconciliationService:
             retryable=classification.retryable if classification else False,
             occurred_at=notice.occurred_at,
             safe_metadata={
-                "structured": notice.is_dsn,
+                "structured": notice.structured,
                 "action": notice.action,
                 "reporting_mta": notice.reporting_mta,
                 "remote_mta": notice.remote_mta,
@@ -621,6 +648,12 @@ class EmailDeliveryReconciliationService:
         if delivery is None or classification is None:
             await session.flush()
             return True, False
+
+        if classification.status is DeliveryStatus.PROVIDER_ACCEPTED:
+            # A delayed/relayed notice or bare 2xx acknowledgment is not proof
+            # of final delivery and must not schedule a duplicate send.
+            await session.flush()
+            return True, True
 
         terminal_statuses = {
             DeliveryStatus.BOUNCED_PERMANENT,
@@ -845,7 +878,9 @@ class EmailDeliveryReconciliationService:
                 delivery = await self._correlate(
                     session, notice, thread_id=mailbox_message.thread_id
                 )
-                classification = classify_smtp_failure(notice.diagnostic, status=notice.status)
+                classification = classify_smtp_failure(
+                    notice.diagnostic, status=notice.status, action=notice.action
+                )
                 application = (
                     await session.get(Application, delivery.application_id)
                     if delivery is not None
@@ -868,10 +903,16 @@ class EmailDeliveryReconciliationService:
                         ),
                         "bounce_timestamp": notice.occurred_at.isoformat(),
                         "smtp_status": classification.smtp_status,
+                        "action": notice.action,
+                        "structured": notice.structured,
                         "classification": classification.failure_class,
                         "proposed_delivery_status": classification.status.value,
                         "proposed_contact_state": (
-                            "invalid"
+                            "healthy"
+                            if classification.status is DeliveryStatus.DELIVERED
+                            else "unchanged"
+                            if classification.status is DeliveryStatus.PROVIDER_ACCEPTED
+                            else "invalid"
                             if classification.failure_class
                             in {"recipient_not_found", "recipient_rejected"}
                             else "rejected"
