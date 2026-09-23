@@ -428,6 +428,48 @@ def test_structured_dsn_fields_are_parsed() -> None:
     assert parsed.structured is True
 
 
+@pytest.mark.asyncio
+async def test_structured_dsn_does_not_correlate_from_human_readable_prose(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        _application, delivery, _contact, _employer = await _delivery_graph(session)
+        delivery_id = delivery.id
+    raw = (
+        b"From: MAILER-DAEMON@example.net\r\n"
+        b"Subject: Delivery Status Notification\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/report; report-type=delivery-status; boundary=dsn\r\n\r\n"
+        b"--dsn\r\nContent-Type: text/plain\r\n\r\n"
+        b"Original-Message-ID: <application-fixture@job-agent.invalid>\r\n"
+        b"Final-Recipient: rfc822; job@sincer.md\r\n"
+        b"Diagnostic-Code: smtp; 550 5.1.1 User unknown\r\n"
+        b"--dsn\r\nContent-Type: message/delivery-status\r\n\r\n"
+        b"Reporting-MTA: dns; mx.example.net\r\n\r\n"
+        b"Action: failed\r\nStatus: 4.4.1\r\n\r\n"
+        b"--dsn--\r\n"
+    )
+    notice = parse_delivery_notice(raw)
+    assert notice.structured is True
+    assert notice.original_message_id is None
+    assert notice.final_recipient is None
+    assert notice.diagnostic == ""
+    assert notice.status == "4.4.1"
+
+    result = await EmailDeliveryReconciliationService(
+        _settings(),
+        sqlite_session_factory,
+        StaticMailbox(MailboxMessage("gmail-prose-only", "thread-1", "dsn-prose", raw, True)),
+    ).reconcile()
+    assert result["correlated"] == 0
+    async with sqlite_session_factory() as session:
+        refreshed = await session.get(EmailDelivery, delivery_id)
+        event = await session.scalar(select(EmailDeliveryEvent))
+        assert refreshed is not None and refreshed.status is DeliveryStatus.PROVIDER_ACCEPTED
+        assert event is not None and event.delivery_id is None
+        assert event.smtp_status == "4.4.1"
+
+
 @pytest.mark.parametrize(
     ("action", "expected_status", "retryable"),
     [

@@ -298,7 +298,10 @@ def parse_delivery_notice(
             if isinstance(original, Message):
                 original_message_id = original_message_id or original.get("Message-ID")
                 final_recipient = final_recipient or _normalized_recipient(original.get("To"))
-    fallback = _message_text(message)
+    # Structured DSN fields are authoritative. Prose in the human-readable
+    # part can mention a different recipient or message and must not supply
+    # correlation identifiers when the delivery-status part omits them.
+    fallback = "" if structured else _message_text(message)
     if not original_message_id:
         match = _MESSAGE_ID_RE.search(fallback)
         original_message_id = match.group(0) if match else None
@@ -522,7 +525,9 @@ class EmailDeliveryReconciliationService:
             )
             if delivery is not None:
                 return delivery
-        if thread_id:
+        # A DSN needs its recipient to disambiguate an outbound Gmail thread.
+        # A human reply is linked by thread even though it has no DSN recipient.
+        if thread_id and (notice.final_recipient or not notice.is_dsn):
             rows = list(
                 (
                     await session.scalars(
