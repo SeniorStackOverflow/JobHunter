@@ -108,8 +108,8 @@ OAuth callback, проверяется и сохраняется зашифро�
     verifier, authorization code и token.
 
 Admin login проверяет identity server-side и сохраняет подтверждённый email как
-несекретную metadata токена для operator console. API-only подключение с одним
-Gmail scopes по-прежнему не могут независимо определить mailbox и явно возвращают
+несекретную metadata токена для operator console. API-only подключение с двумя
+Gmail scopes по-прежнему не может независимо определить mailbox и явно возвращает
 `identity_verified=false`; для production предпочтителен вход через Google.
 
 Для получения refresh token обычно требуется offline access; поведение выдачи
@@ -205,9 +205,9 @@ Celery redelivery и двойной клик видят существующую
 
 ## Ошибки и retry
 
-Retry ограничен по количеству, использует exponential backoff+jitter и применяется
-только когда можно безопасно утверждать, что Gmail не принял сообщение, либо
-provider даёт однозначно retryable ответ.
+Retry ограничен по количеству и использует задержки 15 минут, 1 час и 6 часов.
+Он допустим при однозначной временной ошибке provider или подтверждённом
+временном DSN; при неизвестном исходе отправки повтор запрещён.
 
 - 429/некоторые 5xx: уважать `Retry-After`, ограниченно повторять;
 - refresh access token: выполнять внутри provider, refresh token не логировать;
@@ -254,15 +254,19 @@ application, delivery или contact. Employer backfill сначала запу�
 ## Подключение в staging
 
 1. Оставьте server-side real send выключенным.
-2. Прогоните полный E2E с fake provider.
-3. Создайте отдельный staging OAuth client/test user.
-4. Пройдите consent через защищённую панель.
-5. Проверьте audit и зашифрованное хранение без вывода ciphertext/token.
-6. Если предусмотрен dry-run, проверьте MIME без provider send; не добавляйте
-   произвольный recipient.
-7. Выполните единичную контролируемую отправку только на явно разрешённый тестовый
-   адрес после отдельного operator review.
-8. Удалите тестовые Application и токены согласно retention, не подменяя audit.
+2. Прогоните локальный браузерный roundtrip с fake token exchange. Он проверяет
+   `Secure` cookie, state и callback, но не заменяет настоящий Google consent.
+3. Создайте отдельный staging OAuth client и тестовый Google account с точным HTTPS
+   callback. Не используйте production client или mailbox.
+4. В чистом Playwright browser context пройдите реальный Google consent, callback и
+   вход в панель. Проверьте, что выданы оба Gmail scope, `delivery_ready=true`,
+   `monitoring_ready=true`, а read-only mailbox audit может получить профиль и
+   сообщения. Не включайте отправку писем.
+5. Отключите локальное staging-подключение и повторите пункт 4 ещё два раза в
+   новых чистых browser contexts. Все три последовательных прохода должны
+   завершиться успешно.
+6. Проверьте audit и зашифрованное хранение без вывода ciphertext/token. Тестовые
+   Application и токены удаляйте согласно retention, сохраняя audit trail.
 
 Автоматические тесты никогда не используют реальный Gmail.
 
@@ -270,8 +274,8 @@ application, delivery или contact. Employer backfill сначала запу�
 
 1. Настройте отдельный production OAuth client и HTTPS callback.
 2. Проверьте consent/verification requirements Google.
-3. На экране Google consent вручную проверьте ожидаемый аккаунт; сервер пока не
-   сохраняет и не валидирует его email/tenant.
+3. На экране Google consent вручную проверьте ожидаемый аккаунт; при admin login
+   сервер проверяет подписанный ID token и точное совпадение email с allowlist.
 4. Настройте verified resumes/contacts и консервативную policy.
 5. Проверьте глобальную паузу.
 6. Явно включите real Gmail provider/server-side switch.
@@ -322,13 +326,14 @@ key ring и транзакционной миграции; этот runbook не
   зашифрован server-side и удаляется до token exchange;
 - [ ] token не появляется в браузере/API/MCP/логах;
 - [ ] refresh token защищён Fernet, единственный ключ находится вне БД;
-- [ ] выбранный Google account проверен оператором; server-side identity check
-  пока отсутствует;
+- [ ] выбранный Google account проверен оператором; admin login подтвердил
+  подписанный ID token и email allowlist;
 - [ ] sender принимает только application ID;
 - [ ] recipient и Resume выбирает сервер;
 - [ ] финальная policy/limit/pause проверяется перед вызовом;
 - [ ] двойной запуск идемпотентен;
 - [ ] `delivery_unknown` не retry-ится;
-- [ ] CI/E2E использует fake provider;
+- [ ] CI использует fake provider; реальный staging OAuth прошёл три раза в чистых
+  Playwright contexts без отправки писем;
 - [ ] real send по умолчанию выключен;
 - [ ] revoke/reconnect и incident runbook проверены.
