@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.employers import EmployerRelationshipService
+from app.employers import EmployerBackfillService, EmployerRelationshipService
 from app.models.entities import (
     Application,
     CanonicalEmployer,
@@ -146,6 +146,55 @@ async def _seed_graph(session: AsyncSession) -> tuple[UUID, UUID]:
         applications.append(application)
     await session.commit()
     return applications[0].id, applications[1].id
+
+
+@pytest.mark.asyncio
+async def test_long_employer_profile_keeps_contact_namespace_within_postgres_limit() -> None:
+    engine = create_async_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    suffix = uuid4().hex
+    async with factory() as session:
+        source = JobSource(
+            name=f"Long profile {suffix}",
+            base_url="https://www.rabota.md",
+            adapter_type="rabota_md",
+            configuration={},
+        )
+        canonical = CanonicalJob(
+            normalized_company="long profile",
+            normalized_title="engineer",
+            normalized_location="",
+            canonical_fingerprint=suffix.ljust(64, "0"),
+            status=JobStatus.ACTIVE,
+        )
+        session.add_all([source, canonical])
+        await session.flush()
+        job = SourceJob(
+            source_id=source.id,
+            canonical_job_id=canonical.id,
+            external_job_id=suffix,
+            canonical_url=f"https://www.rabota.md/ru/job/{suffix}",
+            localized_urls={},
+            title="Engineer",
+            company="Long Profile",
+            employer_url=("https://www.rabota.md/ru/companies/" + "long-profile-" * 12 + suffix),
+            categories_seen=[],
+            cities=[],
+            public_phone="+373 60 999 888",
+            public_phones=["+373 60 999 888"],
+            content_hash=suffix.ljust(64, "0"),
+            matching_content_hash=suffix.ljust(64, "0"),
+            source_fingerprint=suffix.ljust(64, "0"),
+            status=JobStatus.ACTIVE,
+            raw_metadata={},
+        )
+        session.add(job)
+        await session.flush()
+        result = await EmployerBackfillService().apply(session)
+        assert result["jobs_resolved"] == 1
+        assert job.employer_id is not None
+        # The session rolls back, so this regression check leaves no fixture data.
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

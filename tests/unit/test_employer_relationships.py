@@ -181,6 +181,51 @@ async def test_different_source_profiles_sharing_recruiter_contact_do_not_merge(
 
 
 @pytest.mark.asyncio
+async def test_long_profile_urls_keep_contact_namespace_bounded_and_distinct(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session, adapter="rabota_md")
+        prefix = "https://www.rabota.md/ru/companies/" + "long-company-name-" * 10
+        first = await _job(
+            session,
+            source,
+            key="x",
+            company="One",
+            phone="+373 60 999 888",
+            employer_url=prefix + "one",
+        )
+        same = await _job(
+            session,
+            source,
+            key="y",
+            company="One SRL",
+            phone="+373 60 999 888",
+            employer_url=prefix + "one",
+        )
+        other = await _job(
+            session,
+            source,
+            key="z",
+            company="Two",
+            phone="+373 60 999 888",
+            employer_url=prefix + "two",
+        )
+        service = EmployerIdentityService()
+        namespaces = [
+            signal.namespace
+            for job in (first, same, other)
+            for signal in await service.signals_for_source_job(session, job)
+        ]
+        assert all(len(value) <= 128 for value in namespaces)
+        one = await service.resolve_for_source_job(session, first)
+        same_result = await service.resolve_for_source_job(session, same)
+        two = await service.resolve_for_source_job(session, other)
+        assert one.employer.id == same_result.employer.id
+        assert one.employer.id != two.employer.id
+
+
+@pytest.mark.asyncio
 async def test_similar_name_without_strong_identifier_never_merges(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

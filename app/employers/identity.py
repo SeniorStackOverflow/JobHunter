@@ -122,7 +122,10 @@ class EmployerIdentityService:
         employer_url = _normalized_url(job.employer_url or "") if job.employer_url else None
         contact_namespace = "global"
         if employer_url:
-            contact_namespace = f"profile:{namespace}:{employer_url}"
+            # Keep contact identifiers scoped to this exact source profile without
+            # putting an unbounded profile URL in the indexed namespace column.
+            profile_digest = hashlib.sha256(employer_url.encode("utf-8")).hexdigest()
+            contact_namespace = f"profile:{namespace}:{profile_digest}"
             signals.append(
                 IdentitySignal(
                     EmployerIdentifierType.EMPLOYER_PROFILE_URL,
