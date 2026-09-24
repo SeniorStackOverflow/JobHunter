@@ -194,6 +194,9 @@ def classify_smtp_failure(
             "recipient does not exist",
             "unknown recipient",
             "recipient not found",
+            "invalid mailbox",
+            "account is disabled",
+            "mailbox is unavailable",
             "5.1.1",
         )
     ):

@@ -419,6 +419,22 @@ def test_real_world_no_such_person_beats_generic_5_7_0() -> None:
     assert classification.smtp_status == "550 5.7.0"
 
 
+def test_mail_ru_disabled_mailbox_is_not_authentication_failure() -> None:
+    classification = classify_smtp_failure(
+        (
+            "smtp; 550 Message was not accepted -- invalid mailbox. "
+            "Local mailbox hr.draft@mail.ru is unavailable: account is disabled"
+        ),
+        status="5.7.0",
+        action="failed",
+    )
+
+    assert classification.status is DeliveryStatus.RECIPIENT_REJECTED
+    assert classification.failure_class == "recipient_not_found"
+    assert classification.permanent is True
+    assert classification.retryable is False
+
+
 def test_structured_dsn_fields_are_parsed() -> None:
     raw = (
         b"From: MAILER-DAEMON@example.net\r\n"
