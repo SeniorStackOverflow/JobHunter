@@ -60,7 +60,8 @@ async def block_closed_vacancy_applications(
             CanonicalJob.status == JobStatus.CLOSED,
             Application.status.in_(_BLOCKABLE_APPLICATION_STATUSES),
         )
-        .with_for_update()
+        .order_by(Application.id)
+        .with_for_update(skip_locked=True)
     )
     if canonical_job_ids is not None:
         if not canonical_job_ids:

@@ -53,6 +53,7 @@ from app.models.enums import (
     VerificationStatus,
 )
 from app.policies import PolicyEngine
+from app.policies.schemas import PolicyResult
 from app.security.crypto import SecretBox
 from app.settings import Settings
 
@@ -1498,3 +1499,79 @@ async def test_retro_hard_requirement_audit_flags_sent_without_rewriting_history
         assert stored is not None
         assert stored.status == ApplicationStatus.SENT
         assert "post_send_hard_requirement_audit" in stored.policy_result
+
+
+async def test_delivery_preflight_noop_does_not_duplicate_audit(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with sqlite_session_factory() as session:
+        application = (await make_graph(session, tmp_path))[8]
+        application.status = ApplicationStatus.DEFERRED
+        application.policy_decision = PolicyDecision.DEFERRED
+        application.policy_result = {
+            "decision": "deferred",
+            "rules_passed": [],
+            "rules_failed": ["employer_application_slot_available"],
+            "policy_version": "test-noop",
+            "safe_stop_reason": "same_employer_application_deferred",
+            "requires_rematch": False,
+        }
+        await session.commit()
+
+        async def stable_deferred_policy(*_args, **_kwargs) -> PolicyResult:
+            return PolicyResult(
+                decision=PolicyDecision.DEFERRED,
+                rules_passed=[],
+                rules_failed=["employer_application_slot_available"],
+                policy_version="test-noop",
+            )
+
+        monkeypatch.setattr(PolicyEngine, "evaluate", stable_deferred_policy)
+        counts = await EmailService(
+            settings(tmp_path), sqlite_session_factory, FakeGmailProvider()
+        ).reconcile_auto_approved_applications(session)
+        await session.commit()
+
+    assert counts == {}
+    async with sqlite_session_factory() as session:
+        audits = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "application.delivery_preflight_reconciled"
+                )
+            )
+        ).all()
+        assert audits == []
+
+
+async def test_periodic_application_reconciliation_runs_in_batches(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.email import service as email_service
+
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        job = values[5]
+        application = values[8]
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        job.content_hash = "a" * 64
+        job.matching_content_hash = "1" * 64
+        application_id = application.id
+        await session.commit()
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(email_service, "get_settings", lambda: settings(tmp_path))
+
+    counts = await email_service.reconcile_auto_approved_application_states(batch_size=1)
+
+    assert counts == {"match_evaluation_stale": 1}
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.PENDING_REVIEW
+        assert stored.policy_result["safe_stop_reason"] == "match_evaluation_stale"

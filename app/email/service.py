@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -123,7 +124,7 @@ class EmailService:
         failed_rules: tuple[str, ...] = (),
         policy: PolicyResult | None = None,
         requires_rematch: bool = False,
-    ) -> None:
+    ) -> bool:
         if policy is not None:
             policy_result = policy.model_dump(mode="json")
         else:
@@ -151,9 +152,17 @@ class EmailService:
                 "requires_rematch": requires_rematch,
             }
         )
+        changed = (
+            application.status != status
+            or application.policy_decision != decision
+            or application.policy_result != policy_result
+        )
+        if not changed:
+            return False
         application.status = status
         application.policy_decision = decision
         application.policy_result = policy_result
+        return True
 
     @staticmethod
     async def _persist_safe_stop(
@@ -193,44 +202,52 @@ class EmailService:
     async def reconcile_auto_approved_applications(
         self,
         session: AsyncSession,
+        *,
+        application_ids: Collection[UUID] | None = None,
     ) -> dict[str, int]:
         """Reconcile unsafe current and legacy auto-approval states before delivery."""
 
-        rows = (
-            await session.execute(
-                select(Application, SourceJob, MatchEvaluation)
-                .outerjoin(
-                    SourceJob,
-                    and_(
-                        SourceJob.id == Application.source_job_id,
-                        SourceJob.canonical_job_id == Application.canonical_job_id,
-                    ),
-                )
-                .outerjoin(
-                    MatchEvaluation,
-                    and_(
-                        MatchEvaluation.id == Application.match_evaluation_id,
-                        MatchEvaluation.profile_id == Application.profile_id,
-                        MatchEvaluation.source_job_id == Application.source_job_id,
-                        MatchEvaluation.canonical_job_id == Application.canonical_job_id,
-                    ),
-                )
-                .where(
-                    or_(
-                        Application.status == ApplicationStatus.AUTO_APPROVED,
-                        and_(
-                            Application.status == ApplicationStatus.PENDING_REVIEW,
-                            Application.policy_decision == PolicyDecision.AUTO_APPROVED,
-                        ),
-                        and_(
-                            Application.status == ApplicationStatus.DEFERRED,
-                            Application.policy_decision == PolicyDecision.DEFERRED,
-                        ),
-                    )
-                )
-                .with_for_update(of=Application)
+        query = (
+            select(Application, SourceJob, MatchEvaluation)
+            .outerjoin(
+                SourceJob,
+                and_(
+                    SourceJob.id == Application.source_job_id,
+                    SourceJob.canonical_job_id == Application.canonical_job_id,
+                ),
             )
-        ).all()
+            .outerjoin(
+                MatchEvaluation,
+                and_(
+                    MatchEvaluation.id == Application.match_evaluation_id,
+                    MatchEvaluation.profile_id == Application.profile_id,
+                    MatchEvaluation.source_job_id == Application.source_job_id,
+                    MatchEvaluation.canonical_job_id == Application.canonical_job_id,
+                ),
+            )
+            .where(
+                or_(
+                    Application.status == ApplicationStatus.AUTO_APPROVED,
+                    and_(
+                        Application.status == ApplicationStatus.PENDING_REVIEW,
+                        Application.policy_decision == PolicyDecision.AUTO_APPROVED,
+                    ),
+                    and_(
+                        Application.status == ApplicationStatus.DEFERRED,
+                        Application.policy_decision == PolicyDecision.DEFERRED,
+                    ),
+                )
+            )
+        )
+        if application_ids is not None:
+            if not application_ids:
+                return {}
+            query = query.where(Application.id.in_(application_ids))
+        query = query.order_by(Application.id).with_for_update(
+            of=Application,
+            skip_locked=True,
+        )
+        rows = (await session.execute(query)).all()
         if not rows:
             return {}
         profile_ids = {application.profile_id for application, _job, _evaluation in rows}
@@ -377,7 +394,7 @@ class EmailService:
 
             if status is None or reason is None:
                 continue
-            self._apply_safe_stop(
+            changed = self._apply_safe_stop(
                 application,
                 status=status,
                 reason=reason,
@@ -385,6 +402,8 @@ class EmailService:
                 policy=policy,
                 requires_rematch=requires_rematch,
             )
+            if not changed:
+                continue
             await record_audit_event(
                 session,
                 actor="email_scheduler",
@@ -929,6 +948,73 @@ class EmailService:
             return delivery
 
 
+async def reconcile_auto_approved_application_states(
+    *,
+    batch_size: int = 50,
+) -> dict[str, int]:
+    """Reconcile auto-send states in short deterministic transactions."""
+    from app.database.session import async_session_factory
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    service = EmailService(get_settings(), async_session_factory)
+    totals: dict[str, int] = {}
+    last_id: UUID | None = None
+    scanned = 0
+    batches = 0
+
+    while True:
+        async with async_session_factory() as session:
+            candidate_query = select(Application.id).where(
+                or_(
+                    Application.status == ApplicationStatus.AUTO_APPROVED,
+                    and_(
+                        Application.status == ApplicationStatus.PENDING_REVIEW,
+                        Application.policy_decision == PolicyDecision.AUTO_APPROVED,
+                    ),
+                    and_(
+                        Application.status == ApplicationStatus.DEFERRED,
+                        Application.policy_decision == PolicyDecision.DEFERRED,
+                    ),
+                )
+            )
+            if last_id is not None:
+                candidate_query = candidate_query.where(Application.id > last_id)
+            application_ids = list(
+                (
+                    await session.scalars(
+                        candidate_query.order_by(Application.id).limit(batch_size)
+                    )
+                ).all()
+            )
+            if not application_ids:
+                break
+
+            counts = await service.reconcile_auto_approved_applications(
+                session,
+                application_ids=application_ids,
+            )
+            await session.commit()
+
+        batches += 1
+        scanned += len(application_ids)
+        last_id = application_ids[-1]
+        for reason, count in counts.items():
+            totals[reason] = totals.get(reason, 0) + count
+        if len(application_ids) < batch_size:
+            break
+
+    logger.info(
+        "automatic_email_reconciliation_completed",
+        scanned=scanned,
+        changed=sum(totals.values()),
+        batches=batches,
+        reasons=totals,
+    )
+    return totals
+
+
 async def send_auto_approved_applications() -> int:
     from app.database.session import async_session_factory
 
@@ -948,14 +1034,6 @@ async def send_auto_approved_applications() -> int:
             )
             logger.warning("automatic_email_deferred", reason=reason)
             return 0
-        reconciled = await service.reconcile_auto_approved_applications(session)
-        await session.commit()
-        if reconciled:
-            logger.info(
-                "automatic_email_reconciled",
-                total=sum(reconciled.values()),
-                reasons=reconciled,
-            )
         attempt_rows = (
             await session.execute(
                 select(Application.profile_id, func.count(EmailDelivery.id))

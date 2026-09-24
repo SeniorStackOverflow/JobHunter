@@ -76,6 +76,7 @@ def test_celery_beat_and_worker_safety_configuration() -> None:
         "job_agent.scheduler.dispatch_due_sources",
         "job_agent.scheduler.process_unprocessed_jobs",
         "job_agent.scheduler.prepare_pending_applications",
+        "job_agent.scheduler.reconcile_auto_approved_applications",
         "job_agent.scheduler.send_auto_approved_applications",
         "job_agent.scheduler.retry_temporary_failures",
         "job_agent.scheduler.reconcile_email_delivery_status",

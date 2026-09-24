@@ -668,8 +668,19 @@ def prepare_pending_applications_task() -> int | dict[str, str]:
     from app.applications.service import prepare_pending_applications
 
     return _run_locked_periodic(
-        "prepare-applications",
+        "applications-state-mutation",
         prepare_pending_applications(),
+        ttl_seconds=900,
+    )
+
+
+@celery_app.task(name="job_agent.scheduler.reconcile_auto_approved_applications")
+def reconcile_auto_approved_applications_task() -> dict[str, int] | dict[str, str]:
+    from app.email.service import reconcile_auto_approved_application_states
+
+    return _run_locked_periodic(
+        "applications-state-mutation",
+        reconcile_auto_approved_application_states(),
         ttl_seconds=900,
     )
 
@@ -793,6 +804,7 @@ __all__ = [
     "prune_phone_evidence_task",
     "rabota_md_waf_canary_task",
     "recheck_source_task",
+    "reconcile_auto_approved_applications_task",
     "reconcile_email_delivery_status_task",
     "reconcile_phone_sms_task",
     "record_learning_shadow_task",

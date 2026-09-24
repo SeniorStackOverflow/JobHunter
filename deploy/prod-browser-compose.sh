@@ -2,6 +2,10 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
+if [ "$(pwd -P)" != "/srv/jobhunter-prod" ]; then
+  echo "Production compose may only run from /srv/jobhunter-prod (got $(pwd -P))" >&2
+  exit 64
+fi
 HEAD=$(git rev-parse --verify HEAD)
 SHORT_HEAD=$(printf '%s' "$HEAD" | cut -c1-12)
 if [ -n "${JOBHUNTER_IMAGE_TAG:-}" ] && [ "$JOBHUNTER_IMAGE_TAG" != "$SHORT_HEAD" ]; then
