@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
@@ -201,6 +202,54 @@ async def get_system_status() -> dict[str, Any]:
             ).all()
         )
         preferences = await ProfileService().get_preferences(session)
+        since = datetime.now(UTC) - timedelta(hours=24)
+        failed_delivery_statuses = {
+            DeliveryStatus.BOUNCED_TRANSIENT,
+            DeliveryStatus.BOUNCED_PERMANENT,
+            DeliveryStatus.RECIPIENT_REJECTED,
+            DeliveryStatus.MAILBOX_FULL,
+            DeliveryStatus.DOMAIN_REJECTED,
+            DeliveryStatus.POLICY_REJECTED,
+            DeliveryStatus.SPAM_REJECTED,
+            DeliveryStatus.DELIVERY_FAILED,
+            DeliveryStatus.TEMPORARY_FAILURE,
+            DeliveryStatus.PERMANENT_FAILURE,
+        }
+        permanent_delivery_statuses = {
+            DeliveryStatus.BOUNCED_PERMANENT,
+            DeliveryStatus.RECIPIENT_REJECTED,
+            DeliveryStatus.DOMAIN_REJECTED,
+            DeliveryStatus.POLICY_REJECTED,
+            DeliveryStatus.SPAM_REJECTED,
+            DeliveryStatus.PERMANENT_FAILURE,
+        }
+        delivery_failures_24h = int(
+            await session.scalar(
+                select(func.count(EmailDelivery.id)).where(
+                    EmailDelivery.updated_at >= since,
+                    EmailDelivery.status.in_(failed_delivery_statuses),
+                )
+            )
+            or 0
+        )
+        permanent_delivery_failures_24h = int(
+            await session.scalar(
+                select(func.count(EmailDelivery.id)).where(
+                    EmailDelivery.updated_at >= since,
+                    EmailDelivery.status.in_(permanent_delivery_statuses),
+                )
+            )
+            or 0
+        )
+        unacknowledged_delivery_alerts = int(
+            await session.scalar(
+                select(func.count(Alert.id)).where(
+                    Alert.code.like("email_permanent_delivery_failure:%"),
+                    Alert.acknowledged.is_(False),
+                )
+            )
+            or 0
+        )
         return {
             "sources": len(sources),
             "healthy_sources": sum(item.health_status == SourceHealth.HEALTHY for item in sources),
@@ -209,6 +258,9 @@ async def get_system_status() -> dict[str, Any]:
             "global_pause": preferences.global_pause,
             "real_delivery_enabled": get_settings().real_email_delivery_enabled,
             "emergency_kill_switch": get_settings().emergency_email_kill_switch,
+            "delivery_failures_24h": delivery_failures_24h,
+            "permanent_delivery_failures_24h": permanent_delivery_failures_24h,
+            "unacknowledged_delivery_alerts": unacknowledged_delivery_alerts,
         }
 
 

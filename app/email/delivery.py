@@ -19,21 +19,25 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
+from app.contacts import select_best_email_contact, validate_public_email
 from app.email.oauth import GmailOAuthService
 from app.email.providers import GMAIL_READONLY_SCOPE
 from app.email.retries import retry_delay
 from app.employers import EmployerRelationshipService
 from app.models.entities import (
+    Alert,
     Application,
     EmailDelivery,
     EmailDeliveryEvent,
     EmailMailboxCursor,
     EmployerContact,
     OAuthCredential,
+    SourceJob,
 )
 from app.models.enums import (
     ApplicationStatus,
     ContactDeliveryState,
+    ContactType,
     DeliveryStatus,
     EmployerInteractionChannel,
     EmployerInteractionType,
@@ -181,7 +185,17 @@ def classify_smtp_failure(
         retryable = False if permanent else retryable
     elif any(
         marker in folded
-        for marker in ("user unknown", "address not found", "no such user", "5.1.1")
+        for marker in (
+            "user unknown",
+            "address not found",
+            "no such user",
+            "no such person",
+            "no such mailbox",
+            "recipient does not exist",
+            "unknown recipient",
+            "recipient not found",
+            "5.1.1",
+        )
     ):
         failure_class = "recipient_not_found"
         delivery_status = (
@@ -213,7 +227,21 @@ def classify_smtp_failure(
         delivery_status = (
             DeliveryStatus.BOUNCED_TRANSIENT if retryable else DeliveryStatus.POLICY_REJECTED
         )
-    elif any(marker in folded for marker in ("authentication", "not authenticated", "5.7.0")):
+    elif any(
+        marker in folded
+        for marker in (
+            "authentication required",
+            "authentication failed",
+            "not authenticated",
+            "sender not authenticated",
+            "spf failed",
+            "spf failure",
+            "dkim failed",
+            "dkim failure",
+            "dmarc failed",
+            "dmarc failure",
+        )
+    ):
         failure_class = "authentication_failure"
         delivery_status = (
             DeliveryStatus.BOUNCED_TRANSIENT if retryable else DeliveryStatus.POLICY_REJECTED
@@ -729,13 +757,16 @@ class EmailDeliveryReconciliationService:
             if application is not None
             else None
         )
+        if application is not None:
+            # SENT records preserve sent_at, but the current application outcome
+            # must reflect that the provider did not deliver the message.
+            application.status = ApplicationStatus.FAILED
+
         if classification.retryable:
             if delivery.attempt_count < self.settings.email_delivery_max_attempts:
                 delivery.next_retry_at = notice.occurred_at + retry_delay(delivery.attempt_count)
             else:
                 delivery.next_retry_at = None
-            if application is not None:
-                application.status = ApplicationStatus.FAILED
             if contact is not None:
                 contact.delivery_state = ContactDeliveryState.TRANSIENT_FAILURE
         else:
@@ -773,6 +804,109 @@ class EmailDeliveryReconciliationService:
                         "failure_class": classification.failure_class,
                     },
                 )
+
+                alternate = None
+                alternate_recipient: str | None = None
+                if contact is not None:
+                    alternate_query = select(EmployerContact).where(
+                        EmployerContact.source_job_id == application.source_job_id,
+                        EmployerContact.contact_type == ContactType.EMAIL,
+                        EmployerContact.id != contact.id,
+                    )
+                    if application.employer_id is not None:
+                        alternate_query = alternate_query.where(
+                            EmployerContact.employer_id == application.employer_id
+                        )
+                    alternate_contacts = list((await session.scalars(alternate_query)).all())
+                    source_job = await session.get(SourceJob, application.source_job_id)
+                    current_public_emails = (
+                        {
+                            normalized
+                            for value in [
+                                source_job.public_email,
+                                *(source_job.public_emails or []),
+                            ]
+                            if value and (normalized := validate_public_email(value))
+                        }
+                        if source_job is not None
+                        else set()
+                    )
+                    alternate_contacts = [
+                        candidate
+                        for candidate in alternate_contacts
+                        if candidate.value in current_public_emails
+                    ]
+                    alternate = select_best_email_contact(alternate_contacts)
+                    alternate_recipient = alternate.value if alternate is not None else None
+
+                fallback_metadata = dict(delivery.sanitized_provider_response)
+                fallback_already_used = bool(
+                    fallback_metadata.get("recipient_fallback_used")
+                    or fallback_metadata.get("recipient_fallback_pending")
+                )
+                fallback_allowed = (
+                    self.settings.email_recipient_fallback_enabled
+                    and classification.failure_class
+                    in {"recipient_not_found", "recipient_rejected"}
+                    and alternate is not None
+                    and not fallback_already_used
+                    and delivery.attempt_count < self.settings.email_delivery_max_attempts
+                )
+                if fallback_allowed and alternate is not None:
+                    previous_recipient = delivery.final_recipient or delivery.recipient
+                    application.recipient_contact_id = alternate.id
+                    delivery.next_retry_at = notice.occurred_at + retry_delay(
+                        delivery.attempt_count
+                    )
+                    delivery.sanitized_provider_response = {
+                        **fallback_metadata,
+                        "recipient_fallback_pending": True,
+                        "recipient_fallback_used": False,
+                        "recipient_fallback_from": previous_recipient,
+                        "recipient_fallback_to": alternate.value,
+                    }
+                    await record_audit_event(
+                        session,
+                        actor="email_reconciler",
+                        action="email.recipient_fallback_scheduled",
+                        entity_type="email_delivery",
+                        entity_id=str(delivery.id),
+                        correlation_id=str(application.id),
+                        decision="scheduled",
+                        details={
+                            "from": previous_recipient,
+                            "to": alternate.value,
+                            "next_retry_at": delivery.next_retry_at.isoformat(),
+                        },
+                    )
+
+                alert_code = f"email_permanent_delivery_failure:{delivery.id}"
+                existing_alert = await session.scalar(
+                    select(Alert.id).where(Alert.code == alert_code)
+                )
+                if existing_alert is None:
+                    systemic_failure = classification.failure_class in {
+                        "authentication_failure",
+                        "spam_policy",
+                        "policy_rejected",
+                    }
+                    session.add(
+                        Alert(
+                            severity="high" if systemic_failure else "warning",
+                            code=alert_code,
+                            message="Permanent email delivery failure",
+                            safe_diagnostics={
+                                "application_id": str(application.id),
+                                "delivery_id": str(delivery.id),
+                                "recipient": delivery.final_recipient or delivery.recipient,
+                                "smtp_status": classification.smtp_status,
+                                "failure_class": classification.failure_class,
+                                "alternate_recipient": alternate_recipient,
+                                "fallback_scheduled": fallback_allowed,
+                            },
+                            acknowledged=False,
+                        )
+                    )
         if contact is not None:
             contact.last_delivery_failure_at = notice.occurred_at
             contact.last_smtp_status = classification.smtp_status

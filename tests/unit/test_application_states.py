@@ -8,6 +8,7 @@ def test_valid_application_transitions() -> None:
     ensure_transition(ApplicationStatus.PREPARED, ApplicationStatus.AUTO_APPROVED)
     ensure_transition(ApplicationStatus.AUTO_APPROVED, ApplicationStatus.SENDING)
     ensure_transition(ApplicationStatus.SENDING, ApplicationStatus.SENT)
+    ensure_transition(ApplicationStatus.SENT, ApplicationStatus.FAILED)
 
 
 @pytest.mark.parametrize(

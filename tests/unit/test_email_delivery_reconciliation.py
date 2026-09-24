@@ -17,6 +17,7 @@ from app.email.delivery import (
     parse_delivery_notice,
 )
 from app.models.entities import (
+    Alert,
     Application,
     CanonicalEmployer,
     CanonicalJob,
@@ -287,7 +288,7 @@ async def _delivery_graph(
         categories_seen=[],
         cities=[],
         public_email="job@sincer.md",
-        public_emails=["job@sincer.md"],
+        public_emails=["job@sincer.md", "hr@sincer.md"],
         content_hash="c" * 64,
         matching_content_hash="c" * 64,
         source_fingerprint="c" * 64,
@@ -402,6 +403,20 @@ def test_smtp_classifier(
     assert result.failure_class == failure_class
     assert result.permanent is permanent
     assert result.retryable is retryable
+
+
+def test_real_world_no_such_person_beats_generic_5_7_0() -> None:
+    classification = classify_smtp_failure(
+        'smtp; 550 No such person at this address."',
+        status="5.7.0",
+        action="failed",
+    )
+
+    assert classification.status is DeliveryStatus.RECIPIENT_REJECTED
+    assert classification.failure_class == "recipient_not_found"
+    assert classification.permanent is True
+    assert classification.retryable is False
+    assert classification.smtp_status == "550 5.7.0"
 
 
 def test_structured_dsn_fields_are_parsed() -> None:
@@ -548,21 +563,103 @@ async def test_sincer_bounce_correlates_updates_contact_and_is_idempotent(
         )
         assert refreshed_delivery is not None
         assert refreshed_delivery.status is DeliveryStatus.RECIPIENT_REJECTED
-        assert refreshed_delivery.next_retry_at is None
+        assert refreshed_delivery.next_retry_at is not None
         assert refreshed_delivery.bounced_at == bounce_at.replace(tzinfo=None)
+        assert refreshed_delivery.sanitized_provider_response["recipient_fallback_pending"] is True
+        assert refreshed_delivery.sanitized_provider_response["recipient_fallback_used"] is False
+        assert (
+            refreshed_delivery.sanitized_provider_response["recipient_fallback_from"]
+            == "job@sincer.md"
+        )
+        assert (
+            refreshed_delivery.sanitized_provider_response["recipient_fallback_to"]
+            == "hr@sincer.md"
+        )
         assert refreshed_contact is not None
         assert refreshed_contact.delivery_state is ContactDeliveryState.INVALID
         assert refreshed_contact.failure_count == 1
         assert refreshed_application is not None
-        assert refreshed_application.status is ApplicationStatus.SENT
-        assert refreshed_application.recipient_contact_id == contact_id
+        assert refreshed_application.status is ApplicationStatus.FAILED
+        assert refreshed_application.recipient_contact_id == alternate_id
         assert alternate_contact is not None
         assert alternate_contact.delivery_state is ContactDeliveryState.UNKNOWN
+        alert = await session.scalar(
+            select(Alert).where(
+                Alert.code == f"email_permanent_delivery_failure:{delivery_id}"
+            )
+        )
+        assert alert is not None
+        assert alert.severity == "warning"
+        assert alert.safe_diagnostics["alternate_recipient"] == "hr@sincer.md"
+        assert alert.safe_diagnostics["failure_class"] == "recipient_rejected"
+        assert alert.safe_diagnostics["fallback_scheduled"] is True
         assert await session.scalar(select(func.count(EmailDelivery.id))) == 1
         assert relationship is not None
         assert relationship.state is EmployerRelationshipState.NEVER_CONTACTED
         assert relationship.suppression_scope.value == "none"
         assert await session.scalar(select(func.count(EmailDeliveryEvent.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_permanent_bounce_never_schedules_a_second_recipient_fallback(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        application, delivery, contact, employer = await _delivery_graph(session)
+        alternate = EmployerContact(
+            canonical_job_id=contact.canonical_job_id,
+            employer_id=employer.id,
+            source_job_id=contact.source_job_id,
+            value="hr@sincer.md",
+            contact_type=ContactType.EMAIL,
+            discovery_source="job_detail_explicit_email",
+            verification_status=VerificationStatus.SOURCE_VERIFIED,
+            confidence=1,
+            evidence_url="https://jobs.example/sincer-1",
+        )
+        session.add(alternate)
+        delivery.sanitized_provider_response = {
+            "recipient_fallback_used": True,
+            "recipient_fallback_pending": False,
+        }
+        await session.commit()
+        application_id = application.id
+        delivery_id = delivery.id
+        contact_id = contact.id
+
+    when = datetime(2026, 9, 21, 8, 30, tzinfo=UTC)
+    message = MailboxMessage(
+        message_id="gmail-bounce-after-fallback",
+        thread_id="thread-1",
+        history_id="fallback-used-history",
+        raw=_dsn(
+            original_message_id="<application-fixture@job-agent.invalid>",
+            recipient="job@sincer.md",
+            diagnostic="550 5.1.1 User unknown",
+            when=when,
+        ),
+        inbox=True,
+    )
+    await EmailDeliveryReconciliationService(
+        _settings(), sqlite_session_factory, StaticMailbox(message)
+    ).reconcile()
+
+    async with sqlite_session_factory() as session:
+        refreshed_delivery = await session.get(EmailDelivery, delivery_id)
+        refreshed_application = await session.get(Application, application_id)
+        alert = await session.scalar(
+            select(Alert).where(
+                Alert.code == f"email_permanent_delivery_failure:{delivery_id}"
+            )
+        )
+        assert refreshed_delivery is not None
+        assert refreshed_delivery.next_retry_at is None
+        assert refreshed_delivery.sanitized_provider_response["recipient_fallback_used"] is True
+        assert refreshed_application is not None
+        assert refreshed_application.recipient_contact_id == contact_id
+        assert refreshed_application.status is ApplicationStatus.FAILED
+        assert alert is not None
+        assert alert.safe_diagnostics["fallback_scheduled"] is False
 
 
 @pytest.mark.asyncio

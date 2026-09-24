@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -1619,3 +1619,169 @@ async def test_policy_apply_persists_stable_deferred_reason(
         assert application.policy_decision == PolicyDecision.DEFERRED
         assert application.policy_result["safe_stop_reason"] == "same_employer_application_deferred"
         assert application.policy_result["requires_rematch"] is False
+
+
+async def test_recipient_fallback_retry_uses_alternate_email_once(
+    sqlite_session_factory,
+    tmp_path: Path,
+) -> None:
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        canonical, job, original_contact, application = (
+            values[4],
+            values[5],
+            values[7],
+            values[8],
+        )
+        identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+        canonical.employer_id = identity.employer.id
+        job.employer_id = identity.employer.id
+        original_contact.employer_id = identity.employer.id
+        job.public_emails = ["jobs@example.com", "hr@example.com"]
+        alternate = EmployerContact(
+            canonical_job_id=canonical.id,
+            employer_id=identity.employer.id,
+            source_job_id=job.id,
+            value="hr@example.com",
+            contact_type=ContactType.EMAIL,
+            discovery_source="job_detail_explicit_email",
+            official_domain="example.com",
+            verification_status=VerificationStatus.SOURCE_VERIFIED,
+            confidence=0.9,
+            evidence_url=job.canonical_url,
+        )
+        session.add(alternate)
+        await session.flush()
+
+        application.employer_id = identity.employer.id
+        application.recipient_contact_id = alternate.id
+        application.status = ApplicationStatus.FAILED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        original_sent_at = datetime(2026, 9, 20, 10, 0, tzinfo=UTC)
+        application.sent_at = original_sent_at
+        delivery = EmailDelivery(
+            application_id=application.id,
+            provider="fake",
+            recipient=original_contact.value,
+            status=DeliveryStatus.RECIPIENT_REJECTED,
+            sanitized_provider_response={
+                "recipient_fallback_pending": True,
+                "recipient_fallback_used": False,
+                "recipient_fallback_from": original_contact.value,
+                "recipient_fallback_to": alternate.value,
+            },
+            attempt_count=1,
+            next_retry_at=None,
+            final_recipient=original_contact.value,
+            bounced_at=datetime.now(UTC),
+            failure_class="recipient_not_found",
+            error_code="recipient_not_found",
+        )
+        session.add(delivery)
+        application_id = application.id
+        alternate_id = alternate.id
+        original_message_id = deterministic_message_id(str(application.id))
+        await session.commit()
+
+    provider = FakeGmailProvider()
+    service = EmailService(settings(tmp_path), sqlite_session_factory, provider)
+    first = await service.send_application(application_id)
+    second = await service.send_application(application_id)
+
+    assert first.status is DeliveryStatus.PROVIDER_ACCEPTED
+    assert second.id == first.id
+    assert len(provider.outbox) == 1
+    assert provider.outbox[0].recipient == "hr@example.com"
+    assert provider.outbox[0].message_id != original_message_id
+    assert first.recipient == "hr@example.com"
+    assert first.attempt_count == 2
+    assert first.sanitized_provider_response["recipient_fallback_pending"] is False
+    assert first.sanitized_provider_response["recipient_fallback_used"] is True
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status is ApplicationStatus.SENT
+        assert stored.recipient_contact_id == alternate_id
+        assert stored.sent_at is not None
+        assert stored.sent_at.replace(tzinfo=UTC) == original_sent_at
+
+
+async def test_retry_scheduler_picks_due_recipient_fallback(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.email import service as email_service
+
+    current_settings = settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        canonical, job, original_contact, application = (
+            values[4],
+            values[5],
+            values[7],
+            values[8],
+        )
+        identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+        canonical.employer_id = identity.employer.id
+        job.employer_id = identity.employer.id
+        original_contact.employer_id = identity.employer.id
+        job.public_emails = ["jobs@example.com", "hr@example.com"]
+        alternate = EmployerContact(
+            canonical_job_id=canonical.id,
+            employer_id=identity.employer.id,
+            source_job_id=job.id,
+            value="hr@example.com",
+            contact_type=ContactType.EMAIL,
+            discovery_source="job_detail_explicit_email",
+            official_domain="example.com",
+            verification_status=VerificationStatus.SOURCE_VERIFIED,
+            confidence=0.9,
+            evidence_url=job.canonical_url,
+        )
+        session.add(alternate)
+        await session.flush()
+
+        application.employer_id = identity.employer.id
+        application.recipient_contact_id = alternate.id
+        application.status = ApplicationStatus.FAILED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        session.add(
+            EmailDelivery(
+                application_id=application.id,
+                provider="fake",
+                recipient=original_contact.value,
+                status=DeliveryStatus.RECIPIENT_REJECTED,
+                sanitized_provider_response={
+                    "recipient_fallback_pending": True,
+                    "recipient_fallback_used": False,
+                    "recipient_fallback_from": original_contact.value,
+                    "recipient_fallback_to": alternate.value,
+                },
+                attempt_count=1,
+                next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+                final_recipient=original_contact.value,
+                failure_class="recipient_not_found",
+                error_code="recipient_not_found",
+            )
+        )
+        application_id = application.id
+        await session.commit()
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(email_service, "get_settings", lambda: current_settings)
+
+    assert await email_service.retry_temporary_failures() == 1
+
+    async with sqlite_session_factory() as session:
+        stored_application = await session.get(Application, application_id)
+        stored_delivery = await session.scalar(
+            select(EmailDelivery).where(EmailDelivery.application_id == application_id)
+        )
+        assert stored_application is not None
+        assert stored_application.status is ApplicationStatus.SENT
+        assert stored_delivery is not None
+        assert stored_delivery.status is DeliveryStatus.PROVIDER_ACCEPTED
+        assert stored_delivery.recipient == "hr@example.com"
+        assert stored_delivery.attempt_count == 2
+        assert stored_delivery.sanitized_provider_response["recipient_fallback_used"] is True

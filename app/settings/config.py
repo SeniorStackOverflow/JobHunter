@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     gmail_delivery_reconciliation_batch: int = Field(default=100, ge=1, le=500)
     gmail_delivery_monitor_days: int = Field(default=14, ge=1, le=90)
     email_delivery_max_attempts: int = Field(default=4, ge=1, le=10)
+    email_recipient_fallback_enabled: bool = True
     employer_max_active_applications: int = Field(default=1, ge=1, le=10)
     freeze_new_applications_to_active_employer: bool = True
 

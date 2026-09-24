@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.contacts import contact_is_source_verified
 from app.crawlers.parsing.normalization import (
     detect_prompt_injection,
     detect_scam_indicators,
@@ -36,7 +37,6 @@ from app.models.enums import (
     MatchDecision,
     PolicyDecision,
     SourceHealth,
-    VerificationStatus,
 )
 from app.observability.metrics import (
     APPLICATIONS_BLOCKED_EMPLOYER_SUPPRESSION,
@@ -212,7 +212,7 @@ class PolicyEngine:
             minimum_catchup_active or evaluation.decision == MatchDecision.AUTO_APPLY,
         )
         rule("verified_email_contact", contact.contact_type == ContactType.EMAIL)
-        rule("contact_verified", contact.verification_status == VerificationStatus.VERIFIED)
+        rule("contact_verified", contact_is_source_verified(contact))
         rule(
             "contact_delivery_usable",
             contact.delivery_state

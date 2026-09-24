@@ -165,6 +165,7 @@ class EmployerInteractionType(StrEnum):
 
 class VerificationStatus(StrEnum):
     UNVERIFIED = "unverified"
+    SOURCE_VERIFIED = "source_verified"
     VERIFIED = "verified"
     REJECTED = "rejected"
 

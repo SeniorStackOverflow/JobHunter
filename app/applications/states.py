@@ -45,7 +45,7 @@ ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
         }
     ),
     ApplicationStatus.FAILED: frozenset({ApplicationStatus.SENDING, ApplicationStatus.CANCELLED}),
-    ApplicationStatus.SENT: frozenset(),
+    ApplicationStatus.SENT: frozenset({ApplicationStatus.FAILED}),
     ApplicationStatus.DELIVERY_UNKNOWN: frozenset(),
     ApplicationStatus.BLOCKED: frozenset(),
     ApplicationStatus.CANCELLED: frozenset(),

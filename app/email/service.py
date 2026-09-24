@@ -11,7 +11,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
-from app.contacts import validate_public_email
+from app.contacts import contact_is_source_verified, validate_public_email
 from app.email.oauth import GmailOAuthService
 from app.email.providers import (
     GMAIL_READONLY_SCOPE,
@@ -53,7 +53,6 @@ from app.models.enums import (
     EmployerInteractionType,
     JobStatus,
     PolicyDecision,
-    VerificationStatus,
 )
 from app.observability.metrics import EMAIL_DELIVERIES, SEND_BLOCKED_RELATIONSHIP_CHANGED
 from app.policies import PolicyEngine
@@ -350,7 +349,7 @@ class EmailService:
                         contact.source_job_id != application.source_job_id
                         or contact.canonical_job_id != application.canonical_job_id
                         or contact.contact_type != ContactType.EMAIL
-                        or contact.verification_status != VerificationStatus.VERIFIED
+                        or not contact_is_source_verified(contact)
                         or contact.value not in current_public_emails
                     ):
                         status = ApplicationStatus.BLOCKED
@@ -469,19 +468,31 @@ class EmailService:
             existing = await session.scalar(
                 select(EmailDelivery).where(EmailDelivery.application_id == application_id)
             )
-            if existing is not None and existing.status in {
-                DeliveryStatus.SENT,
-                DeliveryStatus.PROVIDER_ACCEPTED,
-                DeliveryStatus.DELIVERED,
-                DeliveryStatus.DELIVERY_UNKNOWN,
-                DeliveryStatus.SENDING,
-                DeliveryStatus.BOUNCED_PERMANENT,
-                DeliveryStatus.RECIPIENT_REJECTED,
-                DeliveryStatus.DOMAIN_REJECTED,
-                DeliveryStatus.POLICY_REJECTED,
-                DeliveryStatus.SPAM_REJECTED,
-                DeliveryStatus.DELIVERY_FAILED,
-            }:
+            fallback_pending = bool(
+                existing is not None
+                and dict(existing.sanitized_provider_response).get("recipient_fallback_pending")
+            )
+            if (
+                existing is not None
+                and existing.status
+                in {
+                    DeliveryStatus.SENT,
+                    DeliveryStatus.PROVIDER_ACCEPTED,
+                    DeliveryStatus.DELIVERED,
+                    DeliveryStatus.DELIVERY_UNKNOWN,
+                    DeliveryStatus.SENDING,
+                    DeliveryStatus.BOUNCED_PERMANENT,
+                    DeliveryStatus.RECIPIENT_REJECTED,
+                    DeliveryStatus.DOMAIN_REJECTED,
+                    DeliveryStatus.POLICY_REJECTED,
+                    DeliveryStatus.SPAM_REJECTED,
+                    DeliveryStatus.DELIVERY_FAILED,
+                }
+                and not (
+                    fallback_pending
+                    and existing.status is DeliveryStatus.RECIPIENT_REJECTED
+                )
+            ):
                 return existing
             if application.status not in {
                 ApplicationStatus.AUTO_APPROVED,
@@ -489,14 +500,24 @@ class EmailService:
                 ApplicationStatus.FAILED,
             }:
                 raise EmailSendBlocked("application is not approved for delivery")
+            retryable_failure = (
+                existing is not None
+                and (
+                    existing.status
+                    in {
+                        DeliveryStatus.TEMPORARY_FAILURE,
+                        DeliveryStatus.BOUNCED_TRANSIENT,
+                        DeliveryStatus.MAILBOX_FULL,
+                    }
+                    or (
+                        fallback_pending
+                        and existing.status is DeliveryStatus.RECIPIENT_REJECTED
+                    )
+                )
+            )
             if application.status == ApplicationStatus.FAILED and (
                 existing is None
-                or existing.status
-                not in {
-                    DeliveryStatus.TEMPORARY_FAILURE,
-                    DeliveryStatus.BOUNCED_TRANSIENT,
-                    DeliveryStatus.MAILBOX_FULL,
-                }
+                or not retryable_failure
                 or existing.error_code == GMAIL_REAUTH_REQUIRED_CODE
                 or existing.attempt_count >= self.settings.email_delivery_max_attempts
                 or (
@@ -657,7 +678,7 @@ class EmailService:
                 contact.source_job_id != application.source_job_id
                 or contact.canonical_job_id != application.canonical_job_id
                 or contact.contact_type != ContactType.EMAIL
-                or contact.verification_status != VerificationStatus.VERIFIED
+                or not contact_is_source_verified(contact)
                 or contact.value not in current_public_emails
             ):
                 await self._persist_safe_stop(
@@ -815,6 +836,11 @@ class EmailService:
                     "verified resume failed the final integrity check",
                     reason="resume_integrity_failure",
                 ) from exc
+            message_id_key = (
+                f"{application.id}:recipient-fallback:{contact.id}"
+                if fallback_pending
+                else str(application.id)
+            )
             message = PreparedEmail(
                 application_id=str(application.id),
                 recipient=contact.value,
@@ -823,7 +849,7 @@ class EmailService:
                 attachment_name=Path(resume.original_filename).name,
                 attachment_mime_type=resume.mime_type,
                 attachment_data=attachment_data,
-                message_id=deterministic_message_id(str(application.id)),
+                message_id=deterministic_message_id(message_id_key),
             )
             authorized_status = application.status
             provider = await self._provider_for(session)
@@ -843,6 +869,22 @@ class EmailService:
                 session.add(delivery)
             else:
                 delivery = existing
+                if fallback_pending:
+                    fallback_metadata = dict(delivery.sanitized_provider_response)
+                    delivery.recipient = contact.value
+                    delivery.final_recipient = None
+                    delivery.provider_message_id = None
+                    delivery.thread_id = None
+                    delivery.bounced_at = None
+                    delivery.smtp_status = None
+                    delivery.failure_class = None
+                    delivery.failure_reason = None
+                    delivery.next_retry_at = None
+                    delivery.sanitized_provider_response = {
+                        **fallback_metadata,
+                        "recipient_fallback_pending": False,
+                        "recipient_fallback_used": True,
+                    }
                 delivery.status = DeliveryStatus.SENDING
                 delivery.attempt_count += 1
                 delivery.error = None
@@ -902,13 +944,18 @@ class EmailService:
                 delivery.status = DeliveryStatus.PROVIDER_ACCEPTED
                 delivery.provider_message_id = result.message_id
                 delivery.thread_id = result.thread_id
-                delivery.sanitized_provider_response = result.sanitized_response
+                delivery.sanitized_provider_response = {
+                    **dict(delivery.sanitized_provider_response),
+                    **result.sanitized_response,
+                }
                 delivery.error = None
                 delivery.error_code = None
                 application.status = ApplicationStatus.SENT
-                application.sent_at = utcnow()
-                delivery.submitted_at = application.sent_at
-                delivery.provider_accepted_at = application.sent_at
+                accepted_at = utcnow()
+                if application.sent_at is None:
+                    application.sent_at = accepted_at
+                delivery.submitted_at = accepted_at
+                delivery.provider_accepted_at = accepted_at
                 delivery.final_recipient = contact.value
                 await self.employer_relationships.record_event(
                     session,
@@ -1152,22 +1199,31 @@ async def retry_temporary_failures() -> int:
                     select(EmailDelivery.application_id)
                     .join(Application, Application.id == EmailDelivery.application_id)
                     .where(
-                        EmailDelivery.status.in_(
-                            {
-                                DeliveryStatus.TEMPORARY_FAILURE,
-                                DeliveryStatus.BOUNCED_TRANSIENT,
-                                DeliveryStatus.MAILBOX_FULL,
-                            }
+                        or_(
+                            and_(
+                                EmailDelivery.status.in_(
+                                    {
+                                        DeliveryStatus.TEMPORARY_FAILURE,
+                                        DeliveryStatus.BOUNCED_TRANSIENT,
+                                        DeliveryStatus.MAILBOX_FULL,
+                                    }
+                                ),
+                                or_(
+                                    EmailDelivery.next_retry_at.is_(None),
+                                    EmailDelivery.next_retry_at <= datetime.now(UTC),
+                                ),
+                            ),
+                            and_(
+                                EmailDelivery.status == DeliveryStatus.RECIPIENT_REJECTED,
+                                EmailDelivery.next_retry_at.is_not(None),
+                                EmailDelivery.next_retry_at <= datetime.now(UTC),
+                            ),
                         ),
                         or_(
                             EmailDelivery.error_code.is_(None),
                             EmailDelivery.error_code != GMAIL_REAUTH_REQUIRED_CODE,
                         ),
                         EmailDelivery.attempt_count < settings.email_delivery_max_attempts,
-                        or_(
-                            EmailDelivery.next_retry_at.is_(None),
-                            EmailDelivery.next_retry_at <= datetime.now(UTC),
-                        ),
                         Application.status.in_(
                             {
                                 ApplicationStatus.AUTO_APPROVED,
