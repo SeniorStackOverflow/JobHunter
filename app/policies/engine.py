@@ -315,7 +315,21 @@ class PolicyEngine:
             session, application, preferences, evaluation, job, resume, contact, profile
         )
         application.policy_decision = result.decision
-        application.policy_result = result.model_dump(mode="json")
+        failed = set(result.rules_failed)
+        policy_result = result.model_dump(mode="json")
+        if result.decision is PolicyDecision.DEFERRED:
+            reason = (
+                "active_employer_conversation"
+                if "no_active_employer_conversation" in failed
+                else "same_employer_application_deferred"
+            )
+            policy_result.update(
+                {
+                    "safe_stop_reason": reason,
+                    "requires_rematch": False,
+                }
+            )
+        application.policy_result = policy_result
         status_map = {
             PolicyDecision.AUTO_APPROVED: ApplicationStatus.AUTO_APPROVED,
             PolicyDecision.PENDING_REVIEW: ApplicationStatus.PENDING_REVIEW,
@@ -324,7 +338,6 @@ class PolicyEngine:
             PolicyDecision.SKIPPED: ApplicationStatus.CANCELLED,
         }
         application.status = status_map[result.decision]
-        failed = set(result.rules_failed)
         if result.decision is PolicyDecision.DEFERRED:
             APPLICATIONS_DEFERRED_SAME_EMPLOYER.inc()
         if {"employer_not_suppressed", "no_candidate_withdrawal"} & failed:

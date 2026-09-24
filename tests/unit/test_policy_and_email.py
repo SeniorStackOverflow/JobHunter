@@ -1575,3 +1575,47 @@ async def test_periodic_application_reconciliation_runs_in_batches(
         assert stored is not None
         assert stored.status == ApplicationStatus.PENDING_REVIEW
         assert stored.policy_result["safe_stop_reason"] == "match_evaluation_stale"
+
+
+async def test_policy_apply_persists_stable_deferred_reason(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            _source,
+            profile,
+            preference,
+            resume,
+            _canonical,
+            job,
+            evaluation,
+            contact,
+            application,
+        ) = await make_graph(session, tmp_path)
+
+        async def stable_deferred_policy(*_args, **_kwargs) -> PolicyResult:
+            return PolicyResult(
+                decision=PolicyDecision.DEFERRED,
+                rules_passed=["no_active_employer_conversation"],
+                rules_failed=["employer_application_slot_available"],
+                policy_version="test-stable-deferred",
+            )
+
+        monkeypatch.setattr(PolicyEngine, "evaluate", stable_deferred_policy)
+        await PolicyEngine(settings(tmp_path)).apply(
+            session,
+            application,
+            preference,
+            evaluation,
+            job,
+            resume,
+            contact,
+            profile,
+        )
+
+        assert application.status == ApplicationStatus.DEFERRED
+        assert application.policy_decision == PolicyDecision.DEFERRED
+        assert application.policy_result["safe_stop_reason"] == "same_employer_application_deferred"
+        assert application.policy_result["requires_rematch"] is False
