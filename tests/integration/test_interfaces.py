@@ -2106,6 +2106,30 @@ def _tool_payload(response: httpx.Response) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+async def test_mcp_list_recent_jobs_serializes_source_job(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+    from app.mcp import server as mcp_server
+
+    _application, settings = interface_app
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="mcp-list-recent-jobs"
+    )
+
+    result = await mcp_server.list_recent_jobs(limit=5)
+    item = next(row for row in result if row["id"] == seeded["source_job_id"])
+
+    assert "profile_id" not in item
+    assert item["canonical_job_id"] == seeded["canonical_job_id"]
+    assert item["source_id"] == seeded["source_id"]
+    assert item["status"] == JobStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
 async def test_mcp_delete_resume_removes_unreferenced_and_guards_referenced(
     interface_app: tuple[FastAPI, Settings],
     sqlite_session_factory: Any,

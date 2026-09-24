@@ -159,6 +159,24 @@ def _public(obj: Any, *fields: str) -> dict[str, Any]:
     return result
 
 
+def _source_job_summary(job: SourceJob) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "canonical_job_id": job.canonical_job_id,
+        "source_id": job.source_id,
+        "title": job.title,
+        "company": job.company,
+        "category": job.category,
+        "salary_text": job.salary_text,
+        "location": job.location,
+        "canonical_url": job.canonical_url,
+        "status": job.status.value,
+        "published_at": job.published_at,
+        "source_updated_at": job.source_updated_at,
+        "last_seen_at": job.last_seen_at,
+    }
+
+
 async def _audit_write(
     session: Any,
     action: str,
@@ -991,26 +1009,7 @@ async def list_recent_jobs(limit: int = 50) -> list[dict[str, Any]]:
                 )
             ).all()
         )
-        return [
-            _public(
-                job,
-                "id",
-                "profile_id",
-                "canonical_job_id",
-                "source_id",
-                "title",
-                "company",
-                "category",
-                "salary_text",
-                "location",
-                "canonical_url",
-                "status",
-                "published_at",
-                "source_updated_at",
-                "last_seen_at",
-            )
-            for job in jobs
-        ]
+        return [_source_job_summary(job) for job in jobs]
 
 
 @mcp.tool()
