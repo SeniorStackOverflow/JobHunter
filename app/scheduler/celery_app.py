@@ -75,8 +75,13 @@ celery_app.conf.update(
         },
         "reconcile-auto-approved-applications": {
             "task": "job_agent.scheduler.reconcile_auto_approved_applications",
-            "schedule": 900.0,
-            "options": {"queue": "applications", "expires": 840},
+            "schedule": 60.0,
+            "options": {"queue": "applications", "expires": 55},
+        },
+        "refresh-dirty-deferred-applications": {
+            "task": "job_agent.scheduler.refresh_dirty_deferred_applications",
+            "schedule": 60.0,
+            "options": {"queue": "applications", "expires": 55},
         },
         "send-auto-approved-applications": {
             "task": "job_agent.scheduler.send_auto_approved_applications",
@@ -151,6 +156,7 @@ celery_app.conf.update(
         "job_agent.scheduler.process_unprocessed_jobs": {"queue": "matching"},
         "job_agent.scheduler.prepare_pending_applications": {"queue": "applications"},
         "job_agent.scheduler.reconcile_auto_approved_applications": {"queue": "applications"},
+        "job_agent.scheduler.refresh_dirty_deferred_applications": {"queue": "applications"},
         "job_agent.scheduler.send_auto_approved_applications": {"queue": "email"},
         "job_agent.scheduler.retry_temporary_failures": {"queue": "email"},
         "job_agent.scheduler.reconcile_email_delivery_status": {"queue": "email"},

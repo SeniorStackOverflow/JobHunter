@@ -1,6 +1,7 @@
 from app.models.entities import (
     Alert,
     Application,
+    ApplicationPolicyRefreshQueue,
     AuditEvent,
     BatchScanRun,
     CallFact,
@@ -41,6 +42,7 @@ from app.models.entities import (
 __all__ = [
     "Alert",
     "Application",
+    "ApplicationPolicyRefreshQueue",
     "AuditEvent",
     "BatchScanRun",
     "CallFact",

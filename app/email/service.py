@@ -231,10 +231,6 @@ class EmailService:
                         Application.status == ApplicationStatus.PENDING_REVIEW,
                         Application.policy_decision == PolicyDecision.AUTO_APPROVED,
                     ),
-                    and_(
-                        Application.status == ApplicationStatus.DEFERRED,
-                        Application.policy_decision == PolicyDecision.DEFERRED,
-                    ),
                 )
             )
         )
@@ -1019,10 +1015,6 @@ async def reconcile_auto_approved_application_states(
                     and_(
                         Application.status == ApplicationStatus.PENDING_REVIEW,
                         Application.policy_decision == PolicyDecision.AUTO_APPROVED,
-                    ),
-                    and_(
-                        Application.status == ApplicationStatus.DEFERRED,
-                        Application.policy_decision == PolicyDecision.DEFERRED,
                     ),
                 )
             )

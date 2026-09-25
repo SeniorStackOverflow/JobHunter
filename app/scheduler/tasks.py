@@ -694,6 +694,17 @@ def reconcile_auto_approved_applications_task() -> dict[str, int] | dict[str, st
     )
 
 
+@celery_app.task(name="job_agent.scheduler.refresh_dirty_deferred_applications")
+def refresh_dirty_deferred_applications_task() -> dict[str, int] | dict[str, str]:
+    from app.applications.service import refresh_dirty_deferred_applications
+
+    return _run_locked_periodic(
+        "deferred-policy-refresh",
+        refresh_dirty_deferred_applications(),
+        ttl_seconds=120,
+    )
+
+
 @celery_app.task(name="job_agent.scheduler.send_auto_approved_applications")
 def send_auto_approved_applications_task() -> int | dict[str, str]:
     from app.email.service import send_auto_approved_applications
@@ -818,6 +829,7 @@ __all__ = [
     "reconcile_email_delivery_status_task",
     "reconcile_phone_sms_task",
     "record_learning_shadow_task",
+    "refresh_dirty_deferred_applications_task",
     "retry_temporary_failures_task",
     "run_scan_task",
     "send_auto_approved_applications_task",

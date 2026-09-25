@@ -15,6 +15,7 @@ from app.matching.bindings import evaluation_inputs_are_current
 from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
     Application,
+    ApplicationPolicyRefreshQueue,
     CanonicalJob,
     EmailDelivery,
     EmployerContact,
@@ -31,6 +32,7 @@ from app.models.enums import (
     PolicyDecision,
 )
 from app.policies import PolicyEngine
+from app.policy_refresh_queue import enqueue_employer_policy_refresh
 from app.profiles import ProfileService, ResumeService
 from app.settings import Settings, get_settings
 from app.time_utils import local_day_bounds
@@ -342,6 +344,13 @@ class ApplicationService:
             contact,
             profile,
         )
+        if application.employer_id is not None:
+            await enqueue_employer_policy_refresh(
+                session,
+                profile_id=application.profile_id,
+                employer_id=application.employer_id,
+                reason="application_prepared",
+            )
         return application
 
     async def reevaluate_policy(
@@ -407,6 +416,13 @@ class ApplicationService:
             raise ApplicationPreparationError("match evaluation is stale")
         ensure_transition(application.status, ApplicationStatus.APPROVED)
         application.status = ApplicationStatus.APPROVED
+        if application.employer_id is not None:
+            await enqueue_employer_policy_refresh(
+                session,
+                profile_id=application.profile_id,
+                employer_id=application.employer_id,
+                reason="application_approved",
+            )
         await session.flush()
         return application
 
@@ -420,6 +436,13 @@ class ApplicationService:
         except ValueError as exc:
             raise ApplicationPreparationError("only an unsent application can be rejected") from exc
         application.status = ApplicationStatus.CANCELLED
+        if application.employer_id is not None:
+            await enqueue_employer_policy_refresh(
+                session,
+                profile_id=application.profile_id,
+                employer_id=application.employer_id,
+                reason="application_cancelled",
+            )
         await session.flush()
         return application
 
@@ -536,6 +559,13 @@ async def prepare_pending_applications() -> int:
                 await service.reevaluate_policy(session, application)
                 if before_policy != application.policy_decision:
                     prepared += 1
+                    if application.employer_id is not None:
+                        await enqueue_employer_policy_refresh(
+                            session,
+                            profile_id=application.profile_id,
+                            employer_id=application.employer_id,
+                            reason="application_policy_changed",
+                        )
             except ApplicationPreparationError:
                 continue
 
@@ -558,3 +588,60 @@ async def prepare_pending_applications() -> int:
                 continue
         await session.commit()
     return prepared
+
+
+async def refresh_dirty_deferred_applications(
+    *,
+    employer_batch_size: int = 50,
+) -> dict[str, int]:
+    """Re-evaluate one bounded batch of deferred applications for dirty employers."""
+    from app.database.session import async_session_factory
+
+    if employer_batch_size <= 0:
+        raise ValueError("employer_batch_size must be positive")
+
+    service = ApplicationService(get_settings())
+    totals = {"employers": 0, "applications": 0, "changed": 0, "errors": 0}
+    async with async_session_factory() as session:
+        dirty = list(
+            (
+                await session.scalars(
+                    select(ApplicationPolicyRefreshQueue)
+                    .order_by(
+                        ApplicationPolicyRefreshQueue.enqueued_at,
+                        ApplicationPolicyRefreshQueue.id,
+                    )
+                    .limit(employer_batch_size)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+        )
+        for marker in dirty:
+            applications = list(
+                (
+                    await session.scalars(
+                        select(Application)
+                        .where(
+                            Application.profile_id == marker.profile_id,
+                            Application.employer_id == marker.employer_id,
+                            Application.status == ApplicationStatus.DEFERRED,
+                            Application.policy_decision == PolicyDecision.DEFERRED,
+                        )
+                        .order_by(Application.id)
+                    )
+                ).all()
+            )
+            for application in applications:
+                before = (application.status, application.policy_decision)
+                try:
+                    await service.reevaluate_policy(session, application)
+                except ApplicationPreparationError:
+                    totals["errors"] += 1
+                    continue
+                totals["applications"] += 1
+                if before != (application.status, application.policy_decision):
+                    totals["changed"] += 1
+            await session.delete(marker)
+            totals["employers"] += 1
+        await session.commit()
+    return totals

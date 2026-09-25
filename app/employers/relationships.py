@@ -28,6 +28,7 @@ from app.models.enums import (
     SuppressionScope,
 )
 from app.observability.metrics import EMPLOYER_RELATIONSHIP_EVENTS_CREATED
+from app.policy_refresh_queue import enqueue_employer_policy_refresh
 
 _ACTIVE_CONVERSATION_STATES = {
     EmployerRelationshipState.APPLICATION_ACTIVE,
@@ -291,6 +292,12 @@ class EmployerRelationshipService:
         session.add(event)
         await session.flush()
         await self._rebuild_relationship(session, relationship)
+        await enqueue_employer_policy_refresh(
+            session,
+            profile_id=profile_id,
+            employer_id=employer_id,
+            reason=f"employer_event:{event_type.value}",
+        )
         await session.flush()
         EMPLOYER_RELATIONSHIP_EVENTS_CREATED.labels(event_type=event_type.value).inc()
         return event, True

@@ -515,6 +515,29 @@ class Application(UUIDPrimaryKeyMixin, Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ApplicationPolicyRefreshQueue(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "application_policy_refresh_queue"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "employer_id",
+            name="uq_application_policy_refresh_profile_employer",
+        ),
+        Index("ix_application_policy_refresh_enqueued", "enqueued_at", "id"),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    employer_id: Mapped[UUID] = mapped_column(
+        ForeignKey("canonical_employers.id", ondelete="CASCADE"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    enqueued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class EmployerInteractionEvent(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "employer_interaction_events"
     __table_args__ = (

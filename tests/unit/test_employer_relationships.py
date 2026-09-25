@@ -15,6 +15,7 @@ from app.employers import (
 )
 from app.models.entities import (
     Application,
+    ApplicationPolicyRefreshQueue,
     AuditEvent,
     CanonicalEmployer,
     CanonicalJob,
@@ -933,3 +934,27 @@ async def test_retro_remediation_never_mutates_historical_sent_application(
         assert first.status is ApplicationStatus.SENT
         assert first.sent_at == datetime(2026, 9, 2, 21, 0, 47, tzinfo=UTC)
         assert second.status is ApplicationStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_relationship_event_enqueues_policy_refresh(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        profile, employer, *_ = await _relationship_graph(session)
+        await EmployerRelationshipService().record_event(
+            session,
+            profile_id=profile.id,
+            employer_id=employer.id,
+            event_type=EmployerInteractionType.INTERVIEW_CONFIRMED,
+            channel=EmployerInteractionChannel.CALL,
+            idempotency_key="dirty-refresh:test",
+        )
+        marker = await session.scalar(
+            select(ApplicationPolicyRefreshQueue).where(
+                ApplicationPolicyRefreshQueue.profile_id == profile.id,
+                ApplicationPolicyRefreshQueue.employer_id == employer.id,
+            )
+        )
+        assert marker is not None
+        assert marker.reason == "employer_event:interview_confirmed"

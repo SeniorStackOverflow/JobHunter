@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from structlog.testing import capture_logs
 
 from app.email.oauth import GmailOAuthError, GmailOAuthService
@@ -29,6 +29,7 @@ from app.matching.bindings import (
 from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
+    ApplicationPolicyRefreshQueue,
     AuditEvent,
     CanonicalJob,
     EmailDelivery,
@@ -1785,3 +1786,62 @@ async def test_retry_scheduler_picks_due_recipient_fallback(
         assert stored_delivery.recipient == "hr@example.com"
         assert stored_delivery.attempt_count == 2
         assert stored_delivery.sanitized_provider_response["recipient_fallback_used"] is True
+
+async def test_periodic_reconciliation_skips_deferred(sqlite_session_factory,tmp_path,monkeypatch):
+    from app.email import service as es
+    async with sqlite_session_factory() as s:
+        a=(await make_graph(s,tmp_path))[8]
+        a.status=ApplicationStatus.DEFERRED
+        a.policy_decision=PolicyDecision.DEFERRED
+        aid=a.id
+        await s.commit()
+    monkeypatch.setattr("app.database.session.async_session_factory",sqlite_session_factory)
+    monkeypatch.setattr(es,"get_settings",lambda:settings(tmp_path))
+    assert await es.reconcile_auto_approved_application_states()=={}
+    async with sqlite_session_factory() as s:
+        a=await s.get(Application,aid)
+        assert a is not None and a.status==ApplicationStatus.DEFERRED
+
+
+async def test_dirty_deferred_refresh_processes_marked_employer(
+    sqlite_session_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.applications import service as application_service
+
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        job = values[5]
+        application = values[8]
+        identity = await EmployerIdentityService().resolve_for_source_job(session, job)
+        application.employer_id = identity.employer.id
+        application.status = ApplicationStatus.DEFERRED
+        application.policy_decision = PolicyDecision.DEFERRED
+        application_id = application.id
+        session.add(
+            ApplicationPolicyRefreshQueue(
+                profile_id=application.profile_id,
+                employer_id=identity.employer.id,
+                reason="test",
+            )
+        )
+        await session.commit()
+
+    async def auto_policy(*_args, **_kwargs) -> PolicyResult:
+        return PolicyResult(
+            decision=PolicyDecision.AUTO_APPROVED,
+            rules_passed=[],
+            rules_failed=[],
+            policy_version="test-dirty-refresh",
+        )
+
+    monkeypatch.setattr(PolicyEngine, "evaluate", auto_policy)
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(application_service, "get_settings", lambda: settings(tmp_path))
+    result = await application_service.refresh_dirty_deferred_applications()
+    assert result == {"employers": 1, "applications": 1, "changed": 1, "errors": 0}
+
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        marker_count = await session.scalar(select(func.count(ApplicationPolicyRefreshQueue.id)))
+        assert stored is not None and stored.status == ApplicationStatus.AUTO_APPROVED
+        assert marker_count == 0
