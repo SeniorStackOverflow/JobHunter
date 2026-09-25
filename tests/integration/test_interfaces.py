@@ -2130,6 +2130,83 @@ async def test_mcp_list_recent_jobs_serializes_source_job(
 
 
 @pytest.mark.asyncio
+async def test_mcp_system_status_uses_delivery_event_time_and_filters_historical_alerts(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database.session as database_session
+    from app.mcp import server as mcp_server
+
+    _application, settings = interface_app
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    seeded = await _seed_review_application(
+        sqlite_session_factory,
+        settings,
+        suffix="mcp-delivery-health",
+        status=ApplicationStatus.SENT,
+    )
+    now = datetime.now(UTC)
+    old = now - timedelta(days=7)
+    async with sqlite_session_factory() as session:
+        session.add(
+            EmailDelivery(
+                application_id=seeded["application_id"],
+                provider="fake",
+                recipient="jobs@example.test",
+                status=DeliveryStatus.RECIPIENT_REJECTED,
+                sanitized_provider_response={},
+                submitted_at=old,
+                last_attempt_at=old,
+                bounced_at=old,
+                updated_at=now,
+                smtp_status="550 5.1.1",
+                failure_class="recipient_not_found",
+            )
+        )
+        session.add_all(
+            [
+                Alert(
+                    severity="warning",
+                    code="email_permanent_delivery_failure:historical-test",
+                    message="historical",
+                    safe_diagnostics={"historical_repair": True},
+                    acknowledged=False,
+                    created_at=now,
+                ),
+                Alert(
+                    severity="warning",
+                    code="email_permanent_delivery_failure:live-test",
+                    message="live",
+                    safe_diagnostics={"failure_class": "recipient_not_found"},
+                    acknowledged=False,
+                    created_at=now,
+                ),
+                AuditEvent(
+                    actor="delivery_repair",
+                    action="email.historical_delivery_repaired",
+                    entity_type="email_delivery",
+                    entity_id="historical-test",
+                    correlation_id="historical-test",
+                    decision="recipient_rejected",
+                    sanitized_details={"historical_repair_no_retry": True},
+                    timestamp=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+    result = await mcp_server.get_system_status()
+
+    assert result["delivery_failures_24h"] == 0
+    assert result["permanent_delivery_failures_24h"] == 0
+    assert result["unacknowledged_delivery_alerts"] == 1
+    assert result["new_delivery_alerts_24h"] == 1
+    assert result["historical_delivery_repairs_total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_mcp_delete_resume_removes_unreferenced_and_guards_referenced(
     interface_app: tuple[FastAPI, Settings],
     sqlite_session_factory: Any,

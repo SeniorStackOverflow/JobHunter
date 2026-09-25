@@ -396,6 +396,11 @@ async def _generate(session: AsyncSession) -> DailyReport:
     external_metrics = await external_call_metrics(session, start, end)
     limit_metrics = await _daily_limit_metrics(session, start, end)
     phone_metrics = await daily_phone_metrics(session, start, end)
+    delivery_event_at = func.coalesce(
+        EmailDelivery.bounced_at,
+        EmailDelivery.last_attempt_at,
+        EmailDelivery.submitted_at,
+    )
     delivery_rows = (
         await session.execute(
             select(
@@ -404,7 +409,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
                 EmailDelivery.failure_class,
                 func.count(EmailDelivery.id),
             )
-            .where(EmailDelivery.updated_at >= start, EmailDelivery.updated_at < end)
+            .where(delivery_event_at >= start, delivery_event_at < end)
             .group_by(
                 EmailDelivery.status,
                 EmailDelivery.smtp_status,
@@ -447,15 +452,33 @@ async def _generate(session: AsyncSession) -> DailyReport:
         or 0
     )
     permanent_count = sum(permanent_breakdown.values())
+    permanent_statuses = {
+        DeliveryStatus.BOUNCED_PERMANENT,
+        DeliveryStatus.RECIPIENT_REJECTED,
+        DeliveryStatus.DOMAIN_REJECTED,
+        DeliveryStatus.POLICY_REJECTED,
+        DeliveryStatus.SPAM_REJECTED,
+        DeliveryStatus.PERMANENT_FAILURE,
+    }
+    permanent_cohort_count = int(
+        await session.scalar(
+            select(func.count(EmailDelivery.id)).where(
+                EmailDelivery.submitted_at >= start,
+                EmailDelivery.submitted_at < end,
+                EmailDelivery.status.in_(permanent_statuses),
+            )
+        )
+        or 0
+    )
     delivery_alerts: list[dict[str, object]] = []
-    if submitted_count >= 10 and permanent_count / submitted_count > 0.10:
+    if submitted_count >= 10 and permanent_cohort_count / submitted_count > 0.10:
         delivery_alerts.append(
             {
                 "severity": "warning",
                 "code": "email_permanent_bounce_rate",
-                "permanent_bounces": permanent_count,
+                "permanent_bounces": permanent_cohort_count,
                 "submitted": submitted_count,
-                "rate": round(permanent_count / submitted_count, 4),
+                "rate": round(permanent_cohort_count / submitted_count, 4),
             }
         )
     auth_failures = sum(
@@ -475,18 +498,9 @@ async def _generate(session: AsyncSession) -> DailyReport:
         (
             await session.scalars(
                 select(EmailDelivery).where(
-                    EmailDelivery.updated_at >= start,
-                    EmailDelivery.updated_at < end,
-                    EmailDelivery.status.in_(
-                        {
-                            DeliveryStatus.BOUNCED_PERMANENT,
-                            DeliveryStatus.RECIPIENT_REJECTED,
-                            DeliveryStatus.DOMAIN_REJECTED,
-                            DeliveryStatus.POLICY_REJECTED,
-                            DeliveryStatus.SPAM_REJECTED,
-                            DeliveryStatus.PERMANENT_FAILURE,
-                        }
-                    ),
+                    delivery_event_at >= start,
+                    delivery_event_at < end,
+                    EmailDelivery.status.in_(permanent_statuses),
                 )
             )
         ).all()
@@ -638,6 +652,11 @@ async def _generate(session: AsyncSession) -> DailyReport:
             "delivery_unknown": delivery_status_counts.get("delivery_unknown", 0),
             "bounced_transient": delivery_status_counts.get("bounced_transient", 0),
             "bounced_permanent": permanent_count,
+            "permanent_bounce_events": permanent_count,
+            "submitted_cohort_permanent_failures": permanent_cohort_count,
+            "known_permanent_bounce_rate": (
+                round(permanent_cohort_count / submitted_count, 4) if submitted_count else 0.0
+            ),
             "by_status": delivery_status_counts,
             "permanent_failure_breakdown": permanent_breakdown,
             "alerts": delivery_alerts,

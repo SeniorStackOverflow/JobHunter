@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
+
 from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
@@ -329,6 +331,24 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         assert backlog_report.summary["sent_today_from_backlog"] == 1
         assert backlog_report.summary["sent_today_unclassified_origin"] == 0
         assert backlog_report.summary["data_integrity"] == {"status": "ok", "issues": []}
+
+        delivery = await session.scalar(
+            select(EmailDelivery).where(EmailDelivery.application_id == application.id)
+        )
+        assert delivery is not None
+        delivery.status = DeliveryStatus.RECIPIENT_REJECTED
+        delivery.smtp_status = "550 5.1.1"
+        delivery.failure_class = "recipient_not_found"
+        delivery.bounced_at = now - timedelta(days=7)
+        delivery.last_attempt_at = now - timedelta(days=7)
+        delivery.submitted_at = now - timedelta(days=7)
+        delivery.updated_at = now
+        await session.flush()
+        historical_report = await _generate(session)
+        email_health = historical_report.summary["email_delivery"]
+        assert email_health["permanent_bounce_events"] == 0
+        assert email_health["submitted_cohort_permanent_failures"] == 0
+        assert email_health["known_permanent_bounce_rate"] == 0.0
 
 
 async def test_daily_report_includes_learning_shadow_block(

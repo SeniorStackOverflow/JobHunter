@@ -86,3 +86,57 @@ async def test_waf_canary_uses_proxy_pool_mode_when_enabled(monkeypatch) -> None
     assert result == {"outcome": "success", "mode": "proxy_pool"}
     assert len(calls) == 1
     assert calls[0].startswith("Mozilla/5.0")
+
+
+async def test_proxy_reserve_maintenance_warms_before_primary_probe(monkeypatch) -> None:
+    source = SimpleNamespace(
+        base_url="https://www.rabota.md",
+        rate_limit=50,
+        enabled=True,
+        configuration={
+            "transport": "waf_http",
+            "locale_priority": ["ru"],
+            "incremental_scan": {"category_slugs": ["others"]},
+        },
+    )
+
+    async def source_stub():
+        return source
+
+    warmed: list[str] = []
+    probed: list[str] = []
+
+    async def warm_stub(**kwargs):
+        warmed.append(kwargs["base_url"])
+        return {"ready": 3, "candidates": 2}
+
+    async def probe_stub(_source, *, user_agent: str) -> dict[str, object]:
+        probed.append(user_agent)
+        return {"outcome": "success", "http_status": 200}
+
+    monkeypatch.setattr(tasks, "_rabota_md_waf_canary_source", source_stub)
+    monkeypatch.setattr(tasks, "_rabota_md_primary_egress_probe", probe_stub)
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.transport.warm_rabota_proxy_reserve",
+        warm_stub,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: SimpleNamespace(
+            crawler_user_agent="job-agent/test",
+            rabota_proxy_pool_enabled=True,
+            rabota_proxy_free_fallback_enabled=True,
+        ),
+    )
+
+    result = await tasks._rabota_md_proxy_reserve_maintenance()
+
+    assert result == {
+        "outcome": "ok",
+        "ready": 3,
+        "candidates": 2,
+        "primary_probe": "success",
+    }
+    assert warmed == ["https://www.rabota.md"]
+    assert len(probed) == 1

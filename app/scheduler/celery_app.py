@@ -123,6 +123,11 @@ celery_app.conf.update(
             "schedule": crontab(minute=40, hour=3),
             "options": {"queue": "phone"},
         },
+        "rabota-md-proxy-reserve-maintenance": {
+            "task": "job_agent.scheduler.rabota_md_proxy_reserve_maintenance",
+            "schedule": 300.0,
+            "options": {"queue": "maintenance", "expires": 270},
+        },
         "rabota-md-waf-canary": {
             "task": "job_agent.scheduler.rabota_md_waf_canary",
             "schedule": crontab(minute=22, hour=4),

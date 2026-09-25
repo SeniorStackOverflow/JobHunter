@@ -7,7 +7,12 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 
 from app.audit import record_audit_event
-from app.contacts import ContactDiscoveryService, select_best_email_contact, validate_public_email
+from app.contacts import (
+    ContactDiscoveryService,
+    propagate_email_delivery_failure,
+    select_best_email_contact,
+    validate_public_email,
+)
 from app.database.session import async_session_factory
 from app.models.entities import Alert, Application, EmailDelivery, EmployerContact, SourceJob
 from app.models.enums import (
@@ -40,7 +45,8 @@ async def repair(*, before: datetime, apply: bool) -> dict[str, int]:
         "already_repaired": 0,
         "applications_failed": 0,
         "contacts_backfilled": 0,
-        "alerts_created": 0,
+        "audits_recorded": 0,
+        "historical_alerts_acknowledged": 0,
     }
     async with async_session_factory() as session:
         deliveries = list(
@@ -60,13 +66,45 @@ async def repair(*, before: datetime, apply: bool) -> dict[str, int]:
 
         for delivery in deliveries:
             metadata = dict(delivery.sanitized_provider_response or {})
+            application = await session.get(Application, delivery.application_id)
+            if application is None:
+                continue
+
+            if apply:
+                historical_alert = await session.scalar(
+                    select(Alert).where(
+                        Alert.code == f"email_permanent_delivery_failure:{delivery.id}",
+                        Alert.acknowledged.is_(False),
+                    )
+                )
+                if historical_alert is not None and bool(
+                    (historical_alert.safe_diagnostics or {}).get("historical_repair")
+                ):
+                    historical_alert.acknowledged = True
+                    stats["historical_alerts_acknowledged"] += 1
+
+                if delivery.bounced_at is not None and delivery.failure_class in {
+                    "recipient_not_found",
+                    "recipient_rejected",
+                }:
+                    await propagate_email_delivery_failure(
+                        session,
+                        email=delivery.final_recipient or delivery.recipient,
+                        employer_id=application.employer_id,
+                        state=(
+                            ContactDeliveryState.INVALID
+                            if delivery.failure_class == "recipient_not_found"
+                            else ContactDeliveryState.REJECTED
+                        ),
+                        occurred_at=delivery.bounced_at,
+                        smtp_status=delivery.smtp_status,
+                        failure_reason=delivery.failure_class,
+                    )
+
             if metadata.get("historical_repair_no_retry") is True:
                 stats["already_repaired"] += 1
                 continue
 
-            application = await session.get(Application, delivery.application_id)
-            if application is None:
-                continue
             source_job = await session.get(SourceJob, application.source_job_id)
 
             alternate_recipient: str | None = None
@@ -121,36 +159,13 @@ async def repair(*, before: datetime, apply: bool) -> dict[str, int]:
 
             contact = await session.get(EmployerContact, application.recipient_contact_id)
             if contact is not None:
-                if delivery.status is DeliveryStatus.RECIPIENT_REJECTED:
+                if delivery.failure_class == "recipient_not_found":
                     contact.delivery_state = ContactDeliveryState.INVALID
                 elif contact.delivery_state not in {
                     ContactDeliveryState.INVALID,
                     ContactDeliveryState.SUPPRESSED,
                 }:
                     contact.delivery_state = ContactDeliveryState.REJECTED
-
-            code = f"email_permanent_delivery_failure:{delivery.id}"
-            existing_alert = await session.scalar(select(Alert.id).where(Alert.code == code))
-            if existing_alert is None:
-                session.add(
-                    Alert(
-                        severity="warning",
-                        code=code,
-                        message="Permanent email delivery failure",
-                        safe_diagnostics={
-                            "application_id": str(application.id),
-                            "delivery_id": str(delivery.id),
-                            "recipient": delivery.final_recipient or delivery.recipient,
-                            "smtp_status": delivery.smtp_status,
-                            "failure_class": delivery.failure_class,
-                            "alternate_recipient": alternate_recipient,
-                            "fallback_scheduled": False,
-                            "historical_repair": True,
-                        },
-                        acknowledged=False,
-                    )
-                )
-                stats["alerts_created"] += 1
 
             await record_audit_event(
                 session,
@@ -165,6 +180,7 @@ async def repair(*, before: datetime, apply: bool) -> dict[str, int]:
                     "alternate_recipient": alternate_recipient,
                 },
             )
+            stats["audits_recorded"] += 1
 
         if apply:
             await session.commit()

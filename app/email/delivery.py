@@ -19,7 +19,11 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
-from app.contacts import select_best_email_contact, validate_public_email
+from app.contacts import (
+    propagate_email_delivery_failure,
+    select_best_email_contact,
+    validate_public_email,
+)
 from app.email.oauth import GmailOAuthService
 from app.email.providers import GMAIL_READONLY_SCOPE
 from app.email.retries import retry_delay
@@ -778,8 +782,7 @@ class EmailDeliveryReconciliationService:
                 if classification.permanent:
                     contact.delivery_state = (
                         ContactDeliveryState.INVALID
-                        if classification.failure_class
-                        in {"recipient_not_found", "recipient_rejected"}
+                        if classification.failure_class == "recipient_not_found"
                         else ContactDeliveryState.REJECTED
                     )
                 else:
@@ -915,6 +918,23 @@ class EmailDeliveryReconciliationService:
             contact.last_smtp_status = classification.smtp_status
             contact.last_failure_reason = classification.failure_class
             contact.failure_count += 1
+            if classification.permanent and classification.failure_class in {
+                "recipient_not_found",
+                "recipient_rejected",
+            }:
+                await propagate_email_delivery_failure(
+                    session,
+                    email=delivery.final_recipient or delivery.recipient,
+                    employer_id=application.employer_id if application is not None else None,
+                    state=(
+                        ContactDeliveryState.INVALID
+                        if classification.failure_class == "recipient_not_found"
+                        else ContactDeliveryState.REJECTED
+                    ),
+                    occurred_at=notice.occurred_at,
+                    smtp_status=classification.smtp_status,
+                    failure_reason=classification.failure_class,
+                )
         await record_audit_event(
             session,
             actor="email_reconciler",

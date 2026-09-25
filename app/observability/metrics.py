@@ -105,7 +105,19 @@ RABOTA_PROXY_FAILOVER = Counter(
 )
 RABOTA_PROXY_POOL_ALIVE = Gauge(
     "job_agent_rabota_md_proxy_pool_alive",
-    "Fresh free-proxy reserve entries; WAF candidates are not yet full-protocol ready.",
+    "Compatibility gauge for fully ready free-proxy reserve entries.",
+)
+RABOTA_PROXY_POOL_CANDIDATES = Gauge(
+    "job_agent_rabota_md_proxy_pool_candidates",
+    "Fresh free-proxy candidates that still require full production-protocol proof.",
+)
+RABOTA_PROXY_POOL_READY = Gauge(
+    "job_agent_rabota_md_proxy_pool_ready",
+    "Fresh free-proxy reserve entries proven against the full Rabota.md protocol.",
+)
+RABOTA_PROXY_PRIMARY_REACHABLE = Gauge(
+    "job_agent_rabota_md_proxy_primary_reachable",
+    "Whether the configured Rabota.md primary egress is network-reachable (1=yes, 0=no).",
 )
 WAF_SOLVER_ATTEMPTS = Counter(
     "job_agent_waf_solver_attempts_total",
@@ -159,6 +171,9 @@ __all__ = [
     "RABOTA_PROXY_EGRESS",
     "RABOTA_PROXY_FAILOVER",
     "RABOTA_PROXY_POOL_ALIVE",
+    "RABOTA_PROXY_POOL_CANDIDATES",
+    "RABOTA_PROXY_POOL_READY",
+    "RABOTA_PROXY_PRIMARY_REACHABLE",
     "RABOTA_TRANSPORT_FALLBACK",
     "RABOTA_TRANSPORT_REQUESTS",
     "RABOTA_WAF_CHALLENGE",

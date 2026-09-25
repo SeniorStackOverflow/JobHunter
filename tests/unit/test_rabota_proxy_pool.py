@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -151,15 +152,49 @@ async def test_pool_prefers_a14_then_uses_known_free_when_primary_cools_down() -
     assert primary.kind == "primary"
 
     await pool.report_dead(primary)
-    free = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="waf_candidate")
+    free = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="full_waf")
     await redis.hset(
         "crawler:rabota_md:proxy_pool:state",
         free.identity,
         json.dumps(
             {
-                "status": "alive",
+                "status": "ready",
                 "kind": "free",
                 "url": free.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": time.time(),
+                "validated_capability": "full_waf",
+            }
+        ),
+    )
+    selected = await pool.next_endpoint(set())
+    assert selected == free
+
+
+async def test_pool_never_serves_unproven_waf_candidate() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
+    )
+    candidate = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="waf_candidate",
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        candidate.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": candidate.url,
                 "cooldown_until": 0,
                 "last_used": 0,
                 "last_check": time.time(),
@@ -167,8 +202,179 @@ async def test_pool_prefers_a14_then_uses_known_free_when_primary_cools_down() -
             }
         ),
     )
-    selected = await pool.next_endpoint(set())
-    assert selected == free
+
+    assert await pool.next_endpoint(set()) is None
+    assert await pool.candidate_endpoints(set(), limit=1) == [candidate]
+    assert await pool.reserve_counts() == {"ready": 0, "candidates": 1}
+
+
+async def test_fetcher_promotes_candidate_before_emergency_takeover() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
+    )
+    candidate = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="waf_candidate",
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        candidate.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": candidate.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": time.time(),
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+    created: list[StubFetcher] = []
+
+    def factory(_endpoint: ProxyEndpoint) -> StubFetcher:
+        fetcher = StubFetcher([httpx.Response(200, text="ready")])
+        created.append(fetcher)
+        return fetcher
+
+    async def preflight(_endpoint: ProxyEndpoint, _fetcher: StubFetcher) -> None:
+        return None
+
+    fetcher = ProxyPoolFetcher(
+        pool,
+        factory,  # type: ignore[arg-type]
+        preflight=preflight,  # type: ignore[arg-type]
+        max_preflight_attempts=1,
+        promotion_concurrency=1,
+    )
+    response = await fetcher.get("https://www.rabota.md/ru/")
+
+    assert response.text == "ready"
+    assert await pool.reserve_counts() == {"ready": 1, "candidates": 0}
+    assert len(created) == 2
+    assert created[0].closed == 1
+    await fetcher.aclose()
+
+
+async def test_emergency_promotion_stops_after_first_ready_proxy() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
+    )
+    fast = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="waf_candidate")
+    slow = ProxyEndpoint("free", "http://8.8.8.8:3128", "free", capability="waf_candidate")
+    for endpoint in (fast, slow):
+        await redis.hset(
+            "crawler:rabota_md:proxy_pool:state",
+            endpoint.identity,
+            json.dumps(
+                {
+                    "status": "candidate",
+                    "kind": "free",
+                    "url": endpoint.url,
+                    "cooldown_until": 0,
+                    "last_used": 0,
+                    "last_check": time.time(),
+                    "validated_capability": "waf_candidate",
+                }
+            ),
+        )
+
+    slow_started = asyncio.Event()
+    slow_cancelled = asyncio.Event()
+
+    async def preflight(endpoint: ProxyEndpoint, _fetcher: StubFetcher) -> None:
+        if endpoint.identity == fast.identity:
+            await slow_started.wait()
+            return
+        slow_started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            slow_cancelled.set()
+            raise
+
+    fetcher = ProxyPoolFetcher(
+        pool,
+        lambda _endpoint: StubFetcher([]),  # type: ignore[arg-type]
+        preflight=preflight,  # type: ignore[arg-type]
+        max_preflight_attempts=2,
+        promotion_concurrency=2,
+    )
+
+    promoted = await fetcher._promote_candidates(2, target_successes=1)
+
+    assert promoted == 1
+    assert slow_cancelled.is_set()
+    assert await pool.reserve_counts() == {"ready": 1, "candidates": 1}
+    await fetcher.aclose()
+
+
+async def test_warm_reserve_promotes_candidates_while_primary_is_healthy() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url="socks5://100.106.163.104:18080",
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
+    )
+    candidate = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="waf_candidate",
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        candidate.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": candidate.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": time.time(),
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+    created: list[StubFetcher] = []
+
+    def factory(_endpoint: ProxyEndpoint) -> StubFetcher:
+        fetcher = StubFetcher([])
+        created.append(fetcher)
+        return fetcher
+
+    async def preflight(_endpoint: ProxyEndpoint, _fetcher: StubFetcher) -> None:
+        return None
+
+    fetcher = ProxyPoolFetcher(
+        pool,
+        factory,  # type: ignore[arg-type]
+        preflight=preflight,  # type: ignore[arg-type]
+        max_preflight_attempts=2,
+        promotion_concurrency=1,
+    )
+    counts = await fetcher.warm_reserve(target_ready=1)
+
+    assert counts == {"ready": 1, "candidates": 0}
+    assert len(created) == 1
+    assert created[0].closed == 1
+    await fetcher.aclose()
 
 
 async def test_fetcher_fails_over_from_a14_and_stays_on_free_proxy() -> None:
@@ -346,7 +552,7 @@ async def test_direct_200_validation_keeps_client_open_for_ajax_post(monkeypatch
     raw = await redis.hget("crawler:rabota_md:proxy_pool:state", endpoint.identity)
     assert raw is not None
     state = json.loads(raw)
-    assert state["status"] == "alive"
+    assert state["status"] == "ready"
     assert state["validated_capability"] == "direct_pagination"
 
 

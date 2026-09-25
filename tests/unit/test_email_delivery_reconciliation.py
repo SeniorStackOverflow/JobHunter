@@ -592,7 +592,7 @@ async def test_sincer_bounce_correlates_updates_contact_and_is_idempotent(
             == "hr@sincer.md"
         )
         assert refreshed_contact is not None
-        assert refreshed_contact.delivery_state is ContactDeliveryState.INVALID
+        assert refreshed_contact.delivery_state is ContactDeliveryState.REJECTED
         assert refreshed_contact.failure_count == 1
         assert refreshed_application is not None
         assert refreshed_application.status is ApplicationStatus.FAILED
@@ -600,9 +600,7 @@ async def test_sincer_bounce_correlates_updates_contact_and_is_idempotent(
         assert alternate_contact is not None
         assert alternate_contact.delivery_state is ContactDeliveryState.UNKNOWN
         alert = await session.scalar(
-            select(Alert).where(
-                Alert.code == f"email_permanent_delivery_failure:{delivery_id}"
-            )
+            select(Alert).where(Alert.code == f"email_permanent_delivery_failure:{delivery_id}")
         )
         assert alert is not None
         assert alert.severity == "warning"
@@ -664,9 +662,7 @@ async def test_permanent_bounce_never_schedules_a_second_recipient_fallback(
         refreshed_delivery = await session.get(EmailDelivery, delivery_id)
         refreshed_application = await session.get(Application, application_id)
         alert = await session.scalar(
-            select(Alert).where(
-                Alert.code == f"email_permanent_delivery_failure:{delivery_id}"
-            )
+            select(Alert).where(Alert.code == f"email_permanent_delivery_failure:{delivery_id}")
         )
         assert refreshed_delivery is not None
         assert refreshed_delivery.next_retry_at is None

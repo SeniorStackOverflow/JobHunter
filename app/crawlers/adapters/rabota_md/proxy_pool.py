@@ -25,6 +25,8 @@ from app.observability.metrics import (
     RABOTA_PROXY_EGRESS,
     RABOTA_PROXY_FAILOVER,
     RABOTA_PROXY_POOL_ALIVE,
+    RABOTA_PROXY_POOL_CANDIDATES,
+    RABOTA_PROXY_POOL_READY,
 )
 
 log = structlog.get_logger()
@@ -88,8 +90,8 @@ class ProxyEndpoint:
 class RabotaProxyPool:
     """Primary A14 egress with bounded public-proxy fallback.
 
-    Free proxies are discovered lazily only after the primary path becomes unusable.
-    State lives in Redis so a worker restart keeps cooldowns and known-good fallbacks.
+    Candidate discovery and fully-proven ready reserve state are kept separate.
+    State lives in Redis so workers can maintain a hot reserve before primary failure.
     """
 
     def __init__(
@@ -159,20 +161,14 @@ class RabotaProxyPool:
         if not self._free_enabled:
             return None
 
-        # Refill before the reserve collapses. Stale entries do not count as usable.
-        if await self._known_free_count() < self._min_fresh_free:
+        counts = await self.reserve_counts()
+        if counts["ready"] < self._min_fresh_free and counts["candidates"] == 0:
             await self.discover()
 
-        candidate = await self._known_free_endpoint(excluded)
-        if candidate is not None:
-            await self._touch(candidate)
-            return candidate
-
-        await self.discover()
-        candidate = await self._known_free_endpoint(excluded)
-        if candidate is not None:
-            await self._touch(candidate)
-        return candidate
+        endpoint = await self._known_free_endpoint(excluded)
+        if endpoint is not None:
+            await self._touch(endpoint)
+        return endpoint
 
     async def report_success(
         self,
@@ -186,7 +182,7 @@ class RabotaProxyPool:
             validated_capability or endpoint.capability or payload.get("validated_capability")
         )
         status = (
-            "candidate" if endpoint.kind == "free" and capability == "waf_candidate" else "alive"
+            "candidate" if endpoint.kind == "free" and capability == "waf_candidate" else "ready"
         )
         payload.update(
             status=status,
@@ -246,9 +242,9 @@ class RabotaProxyPool:
         )
         if not acquired:
             await asyncio.sleep(1.0)
-            alive = await self._known_free_count()
-            RABOTA_PROXY_POOL_ALIVE.set(alive)
-            return alive
+            ready = await self._known_free_count()
+            await self._update_reserve_metrics()
+            return ready
 
         try:
             candidates = await self._fetch_candidates()
@@ -267,15 +263,15 @@ class RabotaProxyPool:
             await asyncio.gather(
                 *(self._validate_free_proxy(proxy, semaphore) for proxy in selected)
             )
-            alive = await self._known_free_count()
-            RABOTA_PROXY_POOL_ALIVE.set(alive)
+            counts = await self.reserve_counts()
             log.info(
                 "rabota_proxy_discovery_finished",
                 candidates=len(candidates),
                 validated=len(selected),
-                alive=alive,
+                ready=counts["ready"],
+                waf_candidates=counts["candidates"],
             )
-            return alive
+            return counts["ready"]
         finally:
             await self._redis.delete(_DISCOVERY_LOCK_KEY)
 
@@ -456,27 +452,27 @@ class RabotaProxyPool:
             except httpx.TransportError:
                 await self.report_dead(endpoint)
 
-    def _fresh_free_state(self, payload: dict[str, object], now: float) -> bool:
+    def _fresh_candidate_state(self, payload: dict[str, object], now: float) -> bool:
         if self._as_float(payload.get("cooldown_until", 0)) > now:
             return False
         last_check = self._as_float(payload.get("last_check", 0))
-        if last_check <= 0:
+        if last_check <= 0 or now - last_check > self._candidate_ttl:
             return False
-        capability = payload.get("validated_capability")
-        if capability not in {"waf_candidate", "direct_pagination", "full_waf"}:
+        return payload.get("validated_capability") == "waf_candidate" and payload.get("status") in {
+            "candidate",
+            "alive",
+        }
+
+    def _fresh_ready_state(self, payload: dict[str, object], now: float) -> bool:
+        if self._as_float(payload.get("cooldown_until", 0)) > now:
             return False
-        status = payload.get("status")
-        if capability == "waf_candidate":
-            # Accept legacy "alive" entries during rollout, but new candidates are
-            # explicitly marked as candidates until full protocol proof succeeds.
-            if status not in {"candidate", "alive"}:
-                return False
-            ttl = self._candidate_ttl
-        else:
-            if status != "alive":
-                return False
-            ttl = self._ready_ttl
-        return now - last_check <= ttl
+        last_check = self._as_float(payload.get("last_check", 0))
+        if last_check <= 0 or now - last_check > self._ready_ttl:
+            return False
+        return payload.get("validated_capability") in {
+            "direct_pagination",
+            "full_waf",
+        } and payload.get("status") in {"ready", "alive"}
 
     async def _known_free_endpoint(self, excluded: set[str]) -> ProxyEndpoint | None:
         now = time.time()
@@ -490,21 +486,15 @@ class RabotaProxyPool:
                 payload = json.loads(self._decode(raw_payload))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if not self._fresh_free_state(payload, now):
+            if not self._fresh_ready_state(payload, now):
                 continue
             url = payload.get("url")
             if not isinstance(url, str) or not url.startswith("http://"):
                 continue
             capability = payload.get("validated_capability")
-            if capability not in {"direct_pagination", "waf_candidate", "full_waf"}:
+            if capability not in {"direct_pagination", "full_waf"}:
                 continue
-            # Direct pagination and previously proven WAF sessions are preferred over
-            # raw challenge candidates that still need a production-stack preflight.
-            priority = {
-                "direct_pagination": 0,
-                "full_waf": 1,
-                "waf_candidate": 2,
-            }[capability]
+            priority = {"direct_pagination": 0, "full_waf": 1}[capability]
             candidates.append(
                 (
                     priority,
@@ -523,9 +513,13 @@ class RabotaProxyPool:
         return candidates[0][2]
 
     async def _known_free_count(self) -> int:
+        return (await self.reserve_counts())["ready"]
+
+    async def reserve_counts(self) -> dict[str, int]:
         now = time.time()
         entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
-        count = 0
+        ready = 0
+        candidates = 0
         for raw_identity, raw_payload in entries.items():
             identity = self._decode(raw_identity)
             if not identity.startswith("free:"):
@@ -534,9 +528,48 @@ class RabotaProxyPool:
                 payload = json.loads(self._decode(raw_payload))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if self._fresh_free_state(payload, now):
-                count += 1
-        return count
+            if self._fresh_ready_state(payload, now):
+                ready += 1
+            elif self._fresh_candidate_state(payload, now):
+                candidates += 1
+        RABOTA_PROXY_POOL_ALIVE.set(ready)
+        RABOTA_PROXY_POOL_READY.set(ready)
+        RABOTA_PROXY_POOL_CANDIDATES.set(candidates)
+        return {"ready": ready, "candidates": candidates}
+
+    async def _update_reserve_metrics(self) -> None:
+        await self.reserve_counts()
+
+    async def candidate_endpoints(self, excluded: set[str], *, limit: int) -> list[ProxyEndpoint]:
+        now = time.time()
+        entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
+        candidates: list[tuple[float, ProxyEndpoint]] = []
+        for raw_identity, raw_payload in entries.items():
+            identity = self._decode(raw_identity)
+            if identity in excluded or not identity.startswith("free:"):
+                continue
+            try:
+                payload = json.loads(self._decode(raw_payload))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not self._fresh_candidate_state(payload, now):
+                continue
+            url = payload.get("url")
+            if not isinstance(url, str) or not url.startswith("http://"):
+                continue
+            candidates.append(
+                (
+                    self._as_float(payload.get("last_used", 0)),
+                    ProxyEndpoint(
+                        name="free",
+                        url=url,
+                        kind="free",
+                        capability="waf_candidate",
+                    ),
+                )
+            )
+        candidates.sort(key=lambda item: item[0])
+        return [endpoint for _, endpoint in candidates[:limit]]
 
     async def _touch(self, endpoint: ProxyEndpoint) -> None:
         payload = await self._entry(endpoint.identity)
@@ -582,17 +615,20 @@ class ProxyPoolFetcher:
         preflight: PreflightProbe | None = None,
         max_egress_failovers: int = 4,
         max_preflight_attempts: int = 8,
+        promotion_concurrency: int = 3,
     ) -> None:
         self._pool = pool
         self._factory = factory
         self._preflight = preflight
         self._max_failovers = max_egress_failovers
         self._max_preflight_attempts = max_preflight_attempts
+        self._promotion_concurrency = promotion_concurrency
         self._active_endpoint: ProxyEndpoint | None = None
         self._active_fetcher: RabotaMdFetcher | None = None
         self._excluded: set[str] = set()
         self._failovers = 0
         self._preflight_attempts = 0
+        self._emergency_discovery_attempted = False
 
     async def get(self, url: str) -> httpx.Response:
         return await self._request("get", url)
@@ -647,7 +683,26 @@ class ProxyPoolFetcher:
         while True:
             endpoint = await self._pool.next_endpoint(self._excluded)
             if endpoint is None:
-                raise RabotaMdDegradedError("Rabota.md proxy pool has no usable egress")
+                remaining = self._max_preflight_attempts - self._preflight_attempts
+                if remaining <= 0 or self._preflight is None:
+                    raise RabotaMdDegradedError(
+                        f"Rabota.md exhausted free-proxy preflight budget "
+                        f"({self._max_preflight_attempts})"
+                    )
+                promoted_count = await self._promote_candidates(
+                    remaining,
+                    target_successes=1,
+                )
+                if promoted_count == 0:
+                    if not self._emergency_discovery_attempted and remaining > 0:
+                        self._emergency_discovery_attempted = True
+                        await self._pool.discover()
+                        continue
+                    raise RabotaMdDegradedError(
+                        f"Rabota.md exhausted free-proxy preflight budget "
+                        f"({self._max_preflight_attempts})"
+                    )
+                continue
             self._active_endpoint = endpoint
             self._active_fetcher = self._factory(endpoint)
             RABOTA_PROXY_EGRESS.labels(kind=endpoint.kind, outcome="selected").inc()
@@ -700,6 +755,104 @@ class ProxyPoolFetcher:
             self._active_endpoint = promoted
             log.info("rabota_proxy_preflight_ok", kind=endpoint.kind)
             return promoted, self._active_fetcher
+
+    async def warm_reserve(self, *, target_ready: int) -> dict[str, int]:
+        counts = await self._pool.reserve_counts()
+        if counts["ready"] >= target_ready:
+            return counts
+        if counts["candidates"] == 0:
+            await self._pool.discover()
+        counts = await self._pool.reserve_counts()
+        needed = max(0, target_ready - counts["ready"])
+        if needed and self._preflight is not None:
+            await self._promote_candidates(
+                self._max_preflight_attempts,
+                target_successes=needed,
+            )
+        return await self._pool.reserve_counts()
+
+    async def _promote_candidates(
+        self,
+        max_candidates: int,
+        *,
+        target_successes: int | None = None,
+    ) -> int:
+        preflight = self._preflight
+        if preflight is None or max_candidates <= 0:
+            return 0
+        candidates = await self._pool.candidate_endpoints(
+            self._excluded,
+            limit=max_candidates,
+        )
+        if not candidates:
+            return 0
+        semaphore = asyncio.Semaphore(self._promotion_concurrency)
+
+        async def probe(endpoint: ProxyEndpoint) -> bool:
+            async with semaphore:
+                fetcher = self._factory(endpoint)
+                try:
+                    await preflight(endpoint, fetcher)
+                except RabotaMdWafFailClosedError as exc:
+                    await self._pool.report_access_rejected(endpoint)
+                    reason = type(exc).__name__
+                except RabotaMdEgressError as exc:
+                    if exc.access_rejected:
+                        await self._pool.report_access_rejected(endpoint)
+                    else:
+                        await self._pool.report_dead(endpoint)
+                    reason = type(exc).__name__
+                except httpx.TransportError as exc:
+                    await self._pool.report_dead(endpoint)
+                    reason = type(exc).__name__
+                except Exception as exc:
+                    await self._pool.report_dead(endpoint)
+                    reason = type(exc).__name__
+                else:
+                    await self._pool.report_success(
+                        endpoint,
+                        200,
+                        validated_capability="full_waf",
+                    )
+                    RABOTA_PROXY_EGRESS.labels(
+                        kind=endpoint.kind,
+                        outcome="promotion_success",
+                    ).inc()
+                    log.info("rabota_proxy_preflight_ok", kind=endpoint.kind)
+                    return True
+                finally:
+                    await fetcher.aclose()
+
+                self._excluded.add(endpoint.identity)
+                self._preflight_attempts += 1
+                RABOTA_PROXY_EGRESS.labels(
+                    kind=endpoint.kind,
+                    outcome="preflight_rejected",
+                ).inc()
+                log.warning(
+                    "rabota_proxy_candidate_rejected",
+                    reason=reason,
+                    attempts=self._preflight_attempts,
+                    max_attempts=self._max_preflight_attempts,
+                )
+                return False
+
+        tasks = [asyncio.create_task(probe(endpoint)) for endpoint in candidates]
+        target = len(tasks) if target_successes is None else max(1, target_successes)
+        successes = 0
+        try:
+            for completed in asyncio.as_completed(tasks):
+                if await completed:
+                    successes += 1
+                    if successes >= target:
+                        break
+        finally:
+            if successes >= target:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return successes
 
     async def _reject_candidate(self, endpoint: ProxyEndpoint, reason: str) -> None:
         self._excluded.add(endpoint.identity)

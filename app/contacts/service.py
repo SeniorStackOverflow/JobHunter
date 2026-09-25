@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
 from sqlalchemy import select
@@ -110,6 +112,101 @@ def select_best_email_contact(contacts: list[EmployerContact]) -> EmployerContac
     return max(usable, key=lambda contact: (_recipient_score(contact), contact.value))
 
 
+async def _delivery_history_source(
+    session: AsyncSession,
+    *,
+    email: str,
+    employer_id: UUID | None,
+) -> EmployerContact | None:
+    invalid = await session.scalar(
+        select(EmployerContact)
+        .where(
+            EmployerContact.contact_type == ContactType.EMAIL,
+            EmployerContact.value == email,
+            EmployerContact.delivery_state == ContactDeliveryState.INVALID,
+            EmployerContact.last_failure_reason == "recipient_not_found",
+        )
+        .order_by(
+            EmployerContact.last_delivery_failure_at.desc(),
+            EmployerContact.created_at.desc(),
+        )
+        .limit(1)
+    )
+    if invalid is not None:
+        return invalid
+    if employer_id is None:
+        return None
+    rejected: EmployerContact | None = await session.scalar(
+        select(EmployerContact)
+        .where(
+            EmployerContact.contact_type == ContactType.EMAIL,
+            EmployerContact.value == email,
+            EmployerContact.employer_id == employer_id,
+            EmployerContact.delivery_state == ContactDeliveryState.REJECTED,
+        )
+        .order_by(
+            EmployerContact.last_delivery_failure_at.desc(),
+            EmployerContact.created_at.desc(),
+        )
+        .limit(1)
+    )
+    return rejected
+
+
+def _inherit_delivery_history(target: EmployerContact, source: EmployerContact) -> None:
+    if target.delivery_state in {ContactDeliveryState.INVALID, ContactDeliveryState.SUPPRESSED}:
+        return
+    target.delivery_state = source.delivery_state
+    target.last_delivery_failure_at = source.last_delivery_failure_at
+    target.last_smtp_status = source.last_smtp_status
+    target.last_failure_reason = source.last_failure_reason
+
+
+async def propagate_email_delivery_failure(
+    session: AsyncSession,
+    *,
+    email: str,
+    employer_id: UUID | None,
+    state: ContactDeliveryState,
+    occurred_at: datetime,
+    smtp_status: str | None,
+    failure_reason: str,
+) -> None:
+    normalized = validate_public_email(email)
+    if normalized is None or state not in {
+        ContactDeliveryState.INVALID,
+        ContactDeliveryState.REJECTED,
+    }:
+        return
+    query = select(EmployerContact).where(
+        EmployerContact.contact_type == ContactType.EMAIL,
+        EmployerContact.value == normalized,
+    )
+    if state is ContactDeliveryState.REJECTED:
+        if employer_id is None:
+            return
+        query = query.where(EmployerContact.employer_id == employer_id)
+    contacts = list((await session.scalars(query)).all())
+    for contact in contacts:
+        if contact.delivery_state is ContactDeliveryState.SUPPRESSED:
+            continue
+        if state is ContactDeliveryState.INVALID:
+            contact.delivery_state = ContactDeliveryState.INVALID
+        elif contact.delivery_state is not ContactDeliveryState.INVALID:
+            contact.delivery_state = ContactDeliveryState.REJECTED
+        if contact.last_delivery_failure_at is None or (
+            (
+                contact.last_delivery_failure_at.replace(tzinfo=UTC)
+                if contact.last_delivery_failure_at.tzinfo is None
+                else contact.last_delivery_failure_at.astimezone(UTC)
+            )
+            <= occurred_at
+        ):
+            contact.last_delivery_failure_at = occurred_at
+            contact.last_smtp_status = smtp_status
+            contact.last_failure_reason = failure_reason
+
+
 class ContactDiscoveryService:
     async def discover_email_contacts(
         self, session: AsyncSession, job: SourceJob
@@ -145,6 +242,13 @@ class ContactDiscoveryService:
                     existing.employer_id = job.employer_id
                 if existing.discovery_source == "job_detail_explicit_email":
                     existing.verification_status = VerificationStatus.SOURCE_VERIFIED
+                history = await _delivery_history_source(
+                    session,
+                    email=email,
+                    employer_id=job.employer_id,
+                )
+                if history is not None and history.id != existing.id:
+                    _inherit_delivery_history(existing, history)
                 contacts.append(existing)
                 continue
 
@@ -162,6 +266,13 @@ class ContactDiscoveryService:
                 confidence=0.9,
                 evidence_url=job.canonical_url,
             )
+            history = await _delivery_history_source(
+                session,
+                email=email,
+                employer_id=job.employer_id,
+            )
+            if history is not None:
+                _inherit_delivery_history(contact, history)
             session.add(contact)
             await session.flush()
             contacts.append(contact)
@@ -237,6 +348,7 @@ class ContactDiscoveryService:
 __all__ = [
     "ContactDiscoveryService",
     "contact_is_source_verified",
+    "propagate_email_delivery_failure",
     "select_best_email_contact",
     "validate_public_email",
 ]

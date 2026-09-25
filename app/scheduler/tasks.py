@@ -25,7 +25,13 @@ from app.database import async_session_factory
 from app.models.entities import JobSource, ScanRun
 from app.models.enums import RunStatus, ScanType, SourceHealth
 from app.observability import bind_log_context
-from app.observability.metrics import SCAN_ERRORS, SCAN_JOBS, SCAN_RUNS, SOURCE_HEALTH
+from app.observability.metrics import (
+    RABOTA_PROXY_PRIMARY_REACHABLE,
+    SCAN_ERRORS,
+    SCAN_JOBS,
+    SCAN_RUNS,
+    SOURCE_HEALTH,
+)
 from app.scheduler.celery_app import celery_app
 from app.scheduler.locks import (
     close_redis_client,
@@ -802,6 +808,7 @@ __all__ = [
     "prepare_pending_applications_task",
     "process_unprocessed_jobs_task",
     "prune_phone_evidence_task",
+    "rabota_md_proxy_reserve_maintenance_task",
     "rabota_md_waf_canary_task",
     "recheck_source_task",
     "reconcile_auto_approved_applications_task",
@@ -814,6 +821,91 @@ __all__ = [
     "start_scan_task",
     "train_learning_models_task",
 ]
+
+
+@celery_app.task(name="job_agent.scheduler.rabota_md_proxy_reserve_maintenance")
+def rabota_md_proxy_reserve_maintenance_task() -> dict[str, object]:
+    client = _redis_client()
+    try:
+        with leased_redis_lock(
+            client,
+            lock_key("rabota_md", "proxy_reserve_maintenance"),
+            ttl_seconds=240,
+        ) as lease:
+            if lease is None:
+                return {"outcome": "skipped", "reason": "lease_busy"}
+            return _run_async(_rabota_md_proxy_reserve_maintenance())
+    finally:
+        close_redis_client(client)
+
+
+async def _rabota_md_proxy_reserve_maintenance() -> dict[str, object]:
+    from app.crawlers.adapters.rabota_md.transport import (
+        effective_waf_user_agent,
+        warm_rabota_proxy_reserve,
+    )
+
+    source = await _rabota_md_waf_canary_source()
+    settings = get_settings()
+    if (
+        source is None
+        or not _rabota_md_uses_waf_http(source)
+        or not settings.rabota_proxy_pool_enabled
+        or not settings.rabota_proxy_free_fallback_enabled
+    ):
+        return {"outcome": "skipped"}
+
+    configured = source.configuration.get("source", source.configuration)
+    raw = configured if isinstance(configured, dict) else {}
+    configured_ua = raw.get("user_agent")
+    user_agent = effective_waf_user_agent(
+        configured_ua
+        if isinstance(configured_ua, str) and configured_ua.strip()
+        else settings.crawler_user_agent
+    )
+    counts = await warm_rabota_proxy_reserve(
+        base_url=source.base_url.rstrip("/"),
+        user_agent=user_agent,
+        requests_per_minute=int(raw.get("requests_per_minute", min(source.rate_limit, 60))),
+        minimum_interval_seconds=float(raw.get("minimum_interval_seconds", 1.2)),
+        timeout_seconds=float(raw.get("timeout_seconds", 30.0)),
+        max_redirects=int(raw.get("max_redirects", 3)),
+        fallback_transport=str(raw.get("fallback_transport", "stealth_browser")),
+        browser_max_navigations_per_page=int(raw.get("browser_max_navigations_per_page", 50)),
+    )
+    primary_probe = await _rabota_md_primary_egress_probe(
+        source,
+        user_agent=user_agent,
+    )
+    probe_outcome = str(primary_probe["outcome"])
+    if probe_outcome in {"success", "failure"}:
+        RABOTA_PROXY_PRIMARY_REACHABLE.set(1 if probe_outcome == "success" else 0)
+    if probe_outcome == "failure":
+        logger.warning(
+            "rabota_md_proxy_primary_probe_failed",
+            error_type=primary_probe.get("error_type"),
+            ready=counts["ready"],
+            candidates=counts["candidates"],
+        )
+    if counts["ready"] == 0:
+        logger.warning(
+            "rabota_md_proxy_reserve_empty",
+            candidates=counts["candidates"],
+            primary_probe=probe_outcome,
+        )
+    else:
+        logger.info(
+            "rabota_md_proxy_reserve_ready",
+            ready=counts["ready"],
+            candidates=counts["candidates"],
+            primary_probe=probe_outcome,
+        )
+    return {
+        "outcome": "ok",
+        "ready": counts["ready"],
+        "candidates": counts["candidates"],
+        "primary_probe": probe_outcome,
+    }
 
 
 @celery_app.task(name="job_agent.scheduler.rabota_md_waf_canary")
@@ -838,6 +930,29 @@ async def _rabota_md_waf_canary_source() -> JobSource | None:
             .limit(1)
         )
         return source
+
+
+async def _rabota_md_primary_egress_probe(
+    source: JobSource, *, user_agent: str
+) -> dict[str, object]:
+    import httpx
+
+    settings = get_settings()
+    if settings.rabota_proxy_primary_url is None:
+        return {"outcome": "skipped"}
+    primary_url = settings.rabota_proxy_primary_url.get_secret_value()
+    try:
+        async with httpx.AsyncClient(
+            proxy=primary_url,
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            trust_env=False,
+            follow_redirects=False,
+            headers={"User-Agent": user_agent},
+        ) as client:
+            response = await client.get(f"{source.base_url.rstrip('/')}/ru/")
+    except httpx.TransportError as exc:
+        return {"outcome": "failure", "error_type": type(exc).__name__}
+    return {"outcome": "success", "http_status": response.status_code}
 
 
 def _rabota_md_uses_waf_http(source: JobSource) -> bool:

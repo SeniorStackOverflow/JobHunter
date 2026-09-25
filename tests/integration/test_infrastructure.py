@@ -86,6 +86,8 @@ def test_celery_beat_and_worker_safety_configuration() -> None:
         "job_agent.scheduler.finalize_pending_calls",
         "job_agent.scheduler.deliver_phone_notifications",
         "job_agent.scheduler.prune_phone_evidence",
+        "job_agent.scheduler.rabota_md_proxy_reserve_maintenance",
+        "job_agent.scheduler.rabota_md_waf_canary",
         "job_agent.scheduler.ingest_phonegate_sms",
         "job_agent.scheduler.reconcile_phone_sms",
     }

@@ -33,6 +33,7 @@ from app.learning import (
 from app.models.entities import (
     Alert,
     Application,
+    AuditEvent,
     BatchScanRun,
     EmailDelivery,
     EmployerContact,
@@ -241,10 +242,14 @@ async def get_system_status() -> dict[str, Any]:
             DeliveryStatus.SPAM_REJECTED,
             DeliveryStatus.PERMANENT_FAILURE,
         }
+        delivery_failure_at = func.coalesce(
+            EmailDelivery.bounced_at,
+            EmailDelivery.last_attempt_at,
+        )
         delivery_failures_24h = int(
             await session.scalar(
                 select(func.count(EmailDelivery.id)).where(
-                    EmailDelivery.updated_at >= since,
+                    delivery_failure_at >= since,
                     EmailDelivery.status.in_(failed_delivery_statuses),
                 )
             )
@@ -253,17 +258,39 @@ async def get_system_status() -> dict[str, Any]:
         permanent_delivery_failures_24h = int(
             await session.scalar(
                 select(func.count(EmailDelivery.id)).where(
-                    EmailDelivery.updated_at >= since,
+                    delivery_failure_at >= since,
                     EmailDelivery.status.in_(permanent_delivery_statuses),
                 )
             )
             or 0
         )
-        unacknowledged_delivery_alerts = int(
+        delivery_alert_rows = list(
+            (
+                await session.scalars(
+                    select(Alert).where(Alert.code.like("email_permanent_delivery_failure:%"))
+                )
+            ).all()
+        )
+        actionable_delivery_alerts = [
+            alert
+            for alert in delivery_alert_rows
+            if not alert.acknowledged
+            and not bool((alert.safe_diagnostics or {}).get("historical_repair"))
+        ]
+        unacknowledged_delivery_alerts = len(actionable_delivery_alerts)
+        new_delivery_alerts_24h = sum(
+            (
+                alert.created_at.replace(tzinfo=UTC)
+                if alert.created_at.tzinfo is None
+                else alert.created_at.astimezone(UTC)
+            )
+            >= since
+            for alert in actionable_delivery_alerts
+        )
+        historical_delivery_repairs_total = int(
             await session.scalar(
-                select(func.count(Alert.id)).where(
-                    Alert.code.like("email_permanent_delivery_failure:%"),
-                    Alert.acknowledged.is_(False),
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == "email.historical_delivery_repaired"
                 )
             )
             or 0
@@ -279,6 +306,8 @@ async def get_system_status() -> dict[str, Any]:
             "delivery_failures_24h": delivery_failures_24h,
             "permanent_delivery_failures_24h": permanent_delivery_failures_24h,
             "unacknowledged_delivery_alerts": unacknowledged_delivery_alerts,
+            "new_delivery_alerts_24h": new_delivery_alerts_24h,
+            "historical_delivery_repairs_total": historical_delivery_repairs_total,
         }
 
 

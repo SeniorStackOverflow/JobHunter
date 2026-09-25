@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 
-from app.contacts import ContactDiscoveryService
+from app.contacts import ContactDiscoveryService, propagate_email_delivery_failure
 from app.models.entities import CanonicalJob, EmployerContact, JobSource, SourceJob
 from app.models.enums import (
     ContactDeliveryState,
@@ -149,3 +151,92 @@ async def test_rejected_first_email_stays_rejected_and_alternate_is_selected(
         assert rejected.delivery_state is ContactDeliveryState.INVALID
         assert rejected.failure_count == 1
         assert rejected.verification_status is VerificationStatus.SOURCE_VERIFIED
+
+
+async def test_dead_email_reputation_propagates_across_vacancies(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = JobSource(
+            name="Rabota fixture",
+            base_url="https://www.rabota.md",
+            adapter_type="fixture_source",
+            configuration={},
+            health_status=SourceHealth.HEALTHY,
+        )
+        canonical = CanonicalJob(
+            normalized_company="same employer",
+            normalized_title="role",
+            normalized_location="chisinau",
+            canonical_fingerprint="9" * 64,
+            status=JobStatus.ACTIVE,
+        )
+        session.add_all([source, canonical])
+        await session.flush()
+        jobs = []
+        for index in range(2):
+            job = SourceJob(
+                source_id=source.id,
+                canonical_job_id=canonical.id,
+                external_job_id=f"dead-email-{index}",
+                canonical_url=f"https://www.rabota.md/job/dead-email-{index}",
+                localized_urls={},
+                title="Role",
+                company="Same employer",
+                categories_seen=["operating"],
+                category="operating",
+                description="Fixture",
+                public_email="dead@example.md",
+                public_emails=["dead@example.md"],
+                content_hash=str(index + 1) * 64,
+                matching_content_hash=str(index + 1) * 64,
+                source_fingerprint=str(index + 3) * 64,
+                status=JobStatus.ACTIVE,
+                raw_metadata={},
+            )
+            session.add(job)
+            jobs.append(job)
+        await session.flush()
+        service = ContactDiscoveryService()
+        first = (await service.discover_email_contacts(session, jobs[0]))[0]
+        second = (await service.discover_email_contacts(session, jobs[1]))[0]
+
+        await propagate_email_delivery_failure(
+            session,
+            email="dead@example.md",
+            employer_id=None,
+            state=ContactDeliveryState.INVALID,
+            occurred_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+            smtp_status="550 5.1.1",
+            failure_reason="recipient_not_found",
+        )
+        await session.flush()
+
+        assert first.delivery_state is ContactDeliveryState.INVALID
+        assert second.delivery_state is ContactDeliveryState.INVALID
+
+        third_job = SourceJob(
+            source_id=source.id,
+            canonical_job_id=canonical.id,
+            external_job_id="dead-email-2",
+            canonical_url="https://www.rabota.md/job/dead-email-2",
+            localized_urls={},
+            title="Role",
+            company="Same employer",
+            categories_seen=["operating"],
+            category="operating",
+            description="Fixture",
+            public_email="dead@example.md",
+            public_emails=["dead@example.md"],
+            content_hash="7" * 64,
+            matching_content_hash="7" * 64,
+            source_fingerprint="8" * 64,
+            status=JobStatus.ACTIVE,
+            raw_metadata={},
+        )
+        session.add(third_job)
+        await session.flush()
+        inherited = (await service.discover_email_contacts(session, third_job))[0]
+
+        assert inherited.delivery_state is ContactDeliveryState.INVALID
+        assert inherited.last_failure_reason == "recipient_not_found"
