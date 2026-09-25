@@ -831,8 +831,12 @@ class ProxyPoolFetcher:
         counts = await self._pool.reserve_counts()
         if counts["ready"] >= target_ready:
             return counts
+
+        discovered = False
         if not await self._pool.promotion_endpoints(self._excluded, limit=1):
             await self._pool.discover()
+            discovered = True
+
         counts = await self._pool.reserve_counts()
         needed = max(0, target_ready - counts["ready"])
         if needed and self._preflight is not None:
@@ -840,6 +844,25 @@ class ProxyPoolFetcher:
                 self._max_preflight_attempts,
                 target_successes=needed,
             )
+
+        counts = await self._pool.reserve_counts()
+        remaining_budget = max(0, self._max_preflight_attempts - self._preflight_attempts)
+        if (
+            counts["ready"] < target_ready
+            and remaining_budget > 0
+            and not discovered
+            and not await self._pool.promotion_endpoints(self._excluded, limit=1)
+        ):
+            await self._pool.discover()
+            discovered = True
+            counts = await self._pool.reserve_counts()
+            needed = max(0, target_ready - counts["ready"])
+            if needed:
+                await self._promote_candidates(
+                    remaining_budget,
+                    target_successes=needed,
+                )
+
         return await self._pool.reserve_counts()
 
     async def _promote_candidates(
