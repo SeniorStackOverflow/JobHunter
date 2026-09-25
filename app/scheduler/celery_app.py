@@ -70,13 +70,13 @@ celery_app.conf.update(
         },
         "prepare-pending-applications": {
             "task": "job_agent.scheduler.prepare_pending_applications",
-            "schedule": 300.0,
-            "options": {"queue": "applications", "expires": 270},
+            "schedule": 1800.0,
+            "options": {"queue": "applications", "expires": 1740},
         },
         "reconcile-auto-approved-applications": {
             "task": "job_agent.scheduler.reconcile_auto_approved_applications",
-            "schedule": 300.0,
-            "options": {"queue": "applications", "expires": 270},
+            "schedule": 900.0,
+            "options": {"queue": "applications", "expires": 840},
         },
         "send-auto-approved-applications": {
             "task": "job_agent.scheduler.send_auto_approved_applications",
@@ -125,8 +125,8 @@ celery_app.conf.update(
         },
         "rabota-md-proxy-reserve-maintenance": {
             "task": "job_agent.scheduler.rabota_md_proxy_reserve_maintenance",
-            "schedule": 300.0,
-            "options": {"queue": "maintenance", "expires": 270},
+            "schedule": 900.0,
+            "options": {"queue": "proxy-maintenance", "expires": 840},
         },
         "rabota-md-waf-canary": {
             "task": "job_agent.scheduler.rabota_md_waf_canary",
@@ -161,6 +161,7 @@ celery_app.conf.update(
         "job_agent.scheduler.deliver_phone_notifications": {"queue": "phone"},
         "job_agent.scheduler.prune_phone_evidence": {"queue": "phone"},
         "job_agent.scheduler.rabota_md_waf_canary": {"queue": "maintenance"},
+        "job_agent.scheduler.rabota_md_proxy_reserve_maintenance": {"queue": "proxy-maintenance"},
         "job_agent.scheduler.ingest_phonegate_sms": {"queue": "phone"},
         "job_agent.scheduler.reconcile_phone_sms": {"queue": "phone"},
     },

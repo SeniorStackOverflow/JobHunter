@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     matching_batch_size: int = Field(default=8, ge=1, le=100)
     matching_priority_batch_size: int = Field(default=4, ge=1, le=100)
     matching_max_jobs_per_cycle: int = Field(default=100, ge=1, le=1000)
+    application_policy_refresh_batch_size: int = Field(default=100, ge=1, le=5000)
     matching_inter_job_delay_seconds: float = Field(default=8.0, ge=0, le=60)
     matching_provider_failure_retry_seconds: int = Field(default=3600, ge=60, le=86400)
 
@@ -145,6 +146,7 @@ class Settings(BaseSettings):
     rabota_proxy_target_ready_free: int = Field(default=5, ge=1, le=50)
     rabota_proxy_promotion_concurrency: int = Field(default=3, ge=1, le=8)
     rabota_proxy_max_preflight_attempts: int = Field(default=12, ge=1, le=64)
+    rabota_proxy_maintenance_max_preflight_attempts: int = Field(default=4, ge=1, le=16)
     rabota_proxy_ban_cooldown_seconds: int = Field(default=21600, ge=60, le=86400)
     rabota_proxy_dead_cooldown_seconds: int = Field(default=3600, ge=60, le=86400)
     rabota_proxy_primary_dead_cooldown_seconds: int = Field(default=300, ge=10, le=3600)

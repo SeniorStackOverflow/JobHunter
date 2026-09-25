@@ -380,6 +380,22 @@ class BatchScanRun(UUIDPrimaryKeyMixin, Base):
 
 class MatchEvaluation(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "match_evaluations"
+    __table_args__ = (
+        Index(
+            "ix_match_evaluations_profile_source_latest",
+            "profile_id",
+            "source_job_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_match_evaluations_profile_canonical_latest",
+            "profile_id",
+            "canonical_job_id",
+            "created_at",
+            "id",
+        ),
+    )
 
     profile_id: Mapped[UUID] = mapped_column(
         ForeignKey("user_profiles.id", ondelete="CASCADE"), index=True

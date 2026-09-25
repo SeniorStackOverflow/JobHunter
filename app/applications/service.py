@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from uuid import UUID
 
 from sqlalchemy import and_, case, desc, func, or_, select
@@ -428,7 +429,8 @@ async def prepare_pending_applications() -> int:
     from app.database.session import async_session_factory
 
     prepared = 0
-    service = ApplicationService(get_settings())
+    settings = get_settings()
+    service = ApplicationService(settings)
     refreshable = {
         ApplicationStatus.PREPARED,
         ApplicationStatus.PENDING_REVIEW,
@@ -505,7 +507,7 @@ async def prepare_pending_applications() -> int:
         ).all()
 
         full_refresh: list[tuple[UUID, UUID]] = []
-        policy_refresh: list[Application] = []
+        policy_refresh_candidates: list[Application] = []
         for profile_id, canonical_id, latest_evaluation_id, application in rows:
             if (
                 application is None
@@ -514,7 +516,19 @@ async def prepare_pending_applications() -> int:
             ):
                 full_refresh.append((profile_id, canonical_id))
             elif _policy_only_refresh_needed(application):
-                policy_refresh.append(application)
+                policy_refresh_candidates.append(application)
+
+        policy_refresh = policy_refresh_candidates
+        refresh_limit = settings.application_policy_refresh_batch_size
+        if len(policy_refresh_candidates) > refresh_limit:
+            cycle = int(time.time() // 300)
+            start = (cycle * refresh_limit) % len(policy_refresh_candidates)
+            end = start + refresh_limit
+            policy_refresh = policy_refresh_candidates[start:end]
+            if len(policy_refresh) < refresh_limit:
+                policy_refresh.extend(
+                    policy_refresh_candidates[: refresh_limit - len(policy_refresh)]
+                )
 
         for application in policy_refresh:
             try:

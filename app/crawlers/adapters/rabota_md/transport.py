@@ -306,6 +306,7 @@ def build_waf_fetcher(
     fallback_transport: str,
     browser_max_navigations_per_page: int = 50,
     resolver: Resolver | None = None,
+    max_preflight_attempts: int | None = None,
 ) -> RabotaMdFetcher:
     settings = get_settings()
     waf_user_agent = effective_waf_user_agent(user_agent)
@@ -385,7 +386,11 @@ def build_waf_fetcher(
             factory,
             preflight=preflight,
             max_egress_failovers=settings.rabota_proxy_max_failovers,
-            max_preflight_attempts=settings.rabota_proxy_max_preflight_attempts,
+            max_preflight_attempts=(
+                max_preflight_attempts
+                if max_preflight_attempts is not None
+                else settings.rabota_proxy_max_preflight_attempts
+            ),
             promotion_concurrency=settings.rabota_proxy_promotion_concurrency,
         )
 
@@ -415,6 +420,7 @@ async def warm_rabota_proxy_reserve(
     fallback_transport: str,
     browser_max_navigations_per_page: int = 50,
     resolver: Resolver | None = None,
+    max_preflight_attempts: int | None = None,
 ) -> dict[str, int]:
     """Maintain a fully-proven free-proxy reserve without running a job scan."""
     settings = get_settings()
@@ -430,6 +436,7 @@ async def warm_rabota_proxy_reserve(
         fallback_transport=fallback_transport,
         browser_max_navigations_per_page=browser_max_navigations_per_page,
         resolver=resolver,
+        max_preflight_attempts=max_preflight_attempts,
     )
     if not isinstance(fetcher, ProxyPoolFetcher):
         await fetcher.aclose()

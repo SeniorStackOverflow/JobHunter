@@ -666,7 +666,10 @@ def _run_locked_periodic[ResultT](
 def process_unprocessed_jobs_task() -> int | dict[str, str]:
     from app.matching.service import process_unprocessed_jobs
 
-    return _run_locked_periodic("matching", process_unprocessed_jobs(), ttl_seconds=900)
+    result = _run_locked_periodic("matching", process_unprocessed_jobs(), ttl_seconds=900)
+    if isinstance(result, int) and result > 0:
+        prepare_pending_applications_task.apply_async(queue="applications")
+    return result
 
 
 @celery_app.task(name="job_agent.scheduler.prepare_pending_applications")
@@ -872,6 +875,10 @@ async def _rabota_md_proxy_reserve_maintenance() -> dict[str, object]:
         max_redirects=int(raw.get("max_redirects", 3)),
         fallback_transport=str(raw.get("fallback_transport", "stealth_browser")),
         browser_max_navigations_per_page=int(raw.get("browser_max_navigations_per_page", 50)),
+        max_preflight_attempts=min(
+            int(getattr(settings, "rabota_proxy_max_preflight_attempts", 12)),
+            int(getattr(settings, "rabota_proxy_maintenance_max_preflight_attempts", 4)),
+        ),
     )
     primary_probe = await _rabota_md_primary_egress_probe(
         source,

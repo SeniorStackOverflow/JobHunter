@@ -8,8 +8,9 @@ from uuid import UUID
 
 import structlog
 from redis.asyncio import Redis
-from sqlalchemy import and_, func, select
+from sqlalchemy import String, and_, cast, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
 from app.matching.bindings import (
@@ -838,7 +839,7 @@ class MatchingService:
 
 
 async def process_unprocessed_jobs() -> int:
-    """Append profile-scoped evaluations for new jobs and content/profile revisions."""
+    "Append profile-scoped evaluations without rehydrating every current job."
 
     from app.database.session import async_session_factory
 
@@ -853,14 +854,16 @@ async def process_unprocessed_jobs() -> int:
             logger.warning("job_matching_skipped", error_type="MissingUserProfile")
             return 0
 
-        latest_snapshots = (
-            select(
-                JobSnapshot.source_job_id.label("source_job_id"),
-                func.max(JobSnapshot.timestamp).label("snapshot_at"),
+        latest_snapshot_at = (
+            select(JobSnapshot.timestamp)
+            .where(
+                JobSnapshot.source_job_id == SourceJob.id,
+                JobSnapshot.requires_rematch.is_(True),
             )
-            .where(JobSnapshot.requires_rematch.is_(True))
-            .group_by(JobSnapshot.source_job_id)
-            .subquery()
+            .order_by(JobSnapshot.timestamp.desc(), JobSnapshot.id.desc())
+            .limit(1)
+            .correlate(SourceJob)
+            .scalar_subquery()
         )
 
         for profile in profiles:
@@ -877,47 +880,88 @@ async def process_unprocessed_jobs() -> int:
                     )
                 ).all()
             )
-            latest_evaluations = (
-                select(
-                    MatchEvaluation.source_job_id.label("source_job_id"),
-                    func.max(MatchEvaluation.created_at).label("evaluated_at"),
+
+            latest_evaluation = aliased(MatchEvaluation)
+            latest_evaluation_id = (
+                select(latest_evaluation.id)
+                .where(
+                    latest_evaluation.profile_id == profile.id,
+                    latest_evaluation.source_job_id == SourceJob.id,
                 )
-                .where(MatchEvaluation.profile_id == profile.id)
-                .group_by(MatchEvaluation.source_job_id)
-                .subquery()
+                .order_by(
+                    latest_evaluation.created_at.desc(),
+                    latest_evaluation.id.desc(),
+                )
+                .limit(1)
+                .correlate(SourceJob)
+                .scalar_subquery()
             )
+
+            if len(resumes) == 0:
+                resume_stale = or_(
+                    MatchEvaluation.resume_id.is_not(None),
+                    MatchEvaluation.resume_sha256.is_not(None),
+                )
+            elif len(resumes) == 1:
+                current_resume = resumes[0]
+                resume_stale = or_(
+                    MatchEvaluation.resume_id.is_(None),
+                    MatchEvaluation.resume_id != current_resume.id,
+                    MatchEvaluation.resume_sha256.is_(None),
+                    MatchEvaluation.resume_sha256 != current_resume.sha256,
+                )
+            else:
+                resume_stale = true()
+
+            retry_before = datetime.now(UTC) - timedelta(
+                seconds=settings.matching_provider_failure_retry_seconds
+            )
+            stale = or_(
+                MatchEvaluation.id.is_(None),
+                MatchEvaluation.canonical_job_id != SourceJob.canonical_job_id,
+                MatchEvaluation.source_matching_hash.is_(None),
+                MatchEvaluation.source_matching_hash != SourceJob.matching_content_hash,
+                latest_snapshot_at > MatchEvaluation.created_at,
+                MatchEvaluation.profile_fingerprint.is_(None),
+                MatchEvaluation.profile_fingerprint != profile_fingerprint(profile),
+                MatchEvaluation.preference_fingerprint.is_(None),
+                MatchEvaluation.preference_fingerprint != preference_fingerprint(preference),
+                resume_stale,
+                and_(MatchEvaluation.prompt_rules_version != MATCHING_RULES_VERSION, ~MatchEvaluation.prompt_rules_version.in_(_SAFETY_ONLY_PREVIOUS_RULES)),
+                MatchEvaluation.hard_requirement_rules_version.is_(None),
+                MatchEvaluation.hard_requirement_rules_version != HARD_REQUIREMENT_RULES_VERSION,
+                and_(
+                    MatchEvaluation.created_at <= retry_before,
+                    cast(MatchEvaluation.risks, String).like("%llm_provider_failure:%"),
+                ),
+            )
+
             rows = (
                 await session.execute(
-                    select(SourceJob, MatchEvaluation, latest_snapshots.c.snapshot_at)
-                    .outerjoin(
-                        latest_evaluations,
-                        latest_evaluations.c.source_job_id == SourceJob.id,
+                    select(
+                        SourceJob,
+                        MatchEvaluation,
+                        latest_snapshot_at.label("snapshot_at"),
                     )
                     .outerjoin(
                         MatchEvaluation,
-                        and_(
-                            MatchEvaluation.profile_id == profile.id,
-                            MatchEvaluation.source_job_id == SourceJob.id,
-                            MatchEvaluation.created_at == latest_evaluations.c.evaluated_at,
-                        ),
-                    )
-                    .outerjoin(
-                        latest_snapshots,
-                        latest_snapshots.c.source_job_id == SourceJob.id,
+                        MatchEvaluation.id == latest_evaluation_id,
                     )
                     .where(
                         SourceJob.status == JobStatus.ACTIVE,
                         SourceJob.canonical_job_id.is_not(None),
+                        stale,
                     )
-                    .order_by(SourceJob.last_seen_at.desc(), SourceJob.id, MatchEvaluation.id)
+                    .order_by(
+                        SourceJob.last_seen_at.desc(),
+                        SourceJob.id,
+                        MatchEvaluation.id,
+                    )
                 )
             ).all()
+
             candidates: list[tuple[UUID, bool, bool]] = []
-            seen: set[UUID] = set()
             for job, evaluation, snapshot_at in rows:
-                if job.id in seen:
-                    continue
-                seen.add(job.id)
                 resume = choose_resume_for_job(resumes, job)
                 retry_due = bool(
                     evaluation is not None
@@ -943,6 +987,20 @@ async def process_unprocessed_jobs() -> int:
                     evaluation,
                     hard_requirement_refresh_due=hard_requirement_refresh_due,
                 )
+                inputs_current = evaluation is not None and evaluation_inputs_are_current(
+                    evaluation, profile, preference, resume
+                )
+
+                if (
+                    evaluation is not None
+                    and evaluation.prompt_rules_version in _SAFETY_ONLY_PREVIOUS_RULES
+                    and not deterministic.hard_requirements
+                    and not retry_due
+                    and inputs_current
+                    and evaluation.source_matching_hash == job.matching_content_hash
+                    and (snapshot_at is None or _as_aware(snapshot_at) <= _as_aware(evaluation.created_at))
+                ):
+                    evaluation.hard_requirement_rules_version = HARD_REQUIREMENT_RULES_VERSION
 
                 if (
                     evaluation is None
@@ -954,7 +1012,7 @@ async def process_unprocessed_jobs() -> int:
                         snapshot_at is not None
                         and _as_aware(snapshot_at) > _as_aware(evaluation.created_at)
                     )
-                    or not evaluation_inputs_are_current(evaluation, profile, preference, resume)
+                    or not inputs_current
                     or retry_due
                 ):
                     candidates.append(
@@ -984,6 +1042,7 @@ async def process_unprocessed_jobs() -> int:
             logger.info(
                 "job_matching_batch_selected",
                 profile_id=str(profile.id),
+                preselected=len(rows),
                 candidates=len(candidates),
                 batch_size=len(batch),
                 ai_batch_size=ai_selected,
@@ -1032,8 +1091,7 @@ async def process_unprocessed_jobs() -> int:
                     )
                     continue
                 # Release the short SourceJob row lock before the next LLM call.
-                # Without this commit, locks acquired after the SAVEPOINT can survive
-                # until the end of the whole batch and recreate the crawler deadlock window.
+                # Locks acquired after the SAVEPOINT otherwise survive the batch.
                 await session.commit()
                 processed += 1
                 if (

@@ -37,3 +37,12 @@ def test_proxy_pool_requires_some_egress_when_enabled() -> None:
             rabota_proxy_primary_url="",
             rabota_proxy_free_fallback_enabled=False,
         )
+
+
+def test_proxy_maintenance_budget_is_bounded() -> None:
+    settings = make_settings()
+    assert settings.rabota_proxy_maintenance_max_preflight_attempts == 4
+    assert (
+        settings.rabota_proxy_maintenance_max_preflight_attempts
+        < settings.rabota_proxy_max_preflight_attempts
+    )
