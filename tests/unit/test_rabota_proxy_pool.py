@@ -377,6 +377,80 @@ async def test_warm_reserve_promotes_candidates_while_primary_is_healthy() -> No
     await fetcher.aclose()
 
 
+async def test_warm_reserve_revalidates_stale_ready_before_new_candidate() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url="socks5://100.106.163.104:18080",
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        candidate_ttl_seconds=900,
+        ready_ttl_seconds=300,
+        min_fresh_free=1,
+    )
+    stale = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="full_waf",
+    )
+    fresh = ProxyEndpoint(
+        "free",
+        "http://8.8.8.8:3128",
+        "free",
+        capability="waf_candidate",
+    )
+    now = time.time()
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        stale.identity,
+        json.dumps(
+            {
+                "status": "ready",
+                "kind": "free",
+                "url": stale.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": now - 500,
+                "validated_capability": "full_waf",
+            }
+        ),
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        fresh.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": fresh.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": now,
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+    seen: list[str] = []
+
+    async def preflight(endpoint: ProxyEndpoint, _fetcher: StubFetcher) -> None:
+        seen.append(endpoint.identity)
+
+    fetcher = ProxyPoolFetcher(
+        pool,
+        lambda _endpoint: StubFetcher([]),  # type: ignore[arg-type]
+        preflight=preflight,  # type: ignore[arg-type]
+        max_preflight_attempts=2,
+        promotion_concurrency=1,
+    )
+
+    counts = await fetcher.warm_reserve(target_ready=1)
+
+    assert seen == [stale.identity]
+    assert counts == {"ready": 1, "candidates": 1}
+    await fetcher.aclose()
+
+
 async def test_fetcher_fails_over_from_a14_and_stays_on_free_proxy() -> None:
     a14 = ProxyEndpoint("a14", "socks5://100.106.163.104:18080", "primary")
     free = ProxyEndpoint("free", "http://1.1.1.1:8080", "free", capability="waf_candidate")

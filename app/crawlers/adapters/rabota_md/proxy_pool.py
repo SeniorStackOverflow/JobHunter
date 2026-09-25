@@ -163,7 +163,9 @@ class RabotaProxyPool:
 
         counts = await self.reserve_counts()
         if counts["ready"] < self._min_fresh_free and counts["candidates"] == 0:
-            await self.discover()
+            revalidation = await self.promotion_endpoints(excluded, limit=1)
+            if not revalidation:
+                await self.discover()
 
         endpoint = await self._known_free_endpoint(excluded)
         if endpoint is not None:
@@ -540,6 +542,75 @@ class RabotaProxyPool:
     async def _update_reserve_metrics(self) -> None:
         await self.reserve_counts()
 
+    def _revalidatable_ready_state(self, payload: dict[str, object], now: float) -> bool:
+        if self._as_float(payload.get("cooldown_until", 0)) > now:
+            return False
+        last_check = self._as_float(payload.get("last_check", 0))
+        if last_check <= 0:
+            return False
+        age = now - last_check
+        if age <= self._ready_ttl or age > self._candidate_ttl:
+            return False
+        return payload.get("validated_capability") in {
+            "direct_pagination",
+            "full_waf",
+        } and payload.get("status") in {"ready", "alive"}
+
+    async def promotion_endpoints(
+        self,
+        excluded: set[str],
+        *,
+        limit: int,
+    ) -> list[ProxyEndpoint]:
+        now = time.time()
+        entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
+        candidates: list[tuple[int, float, float, ProxyEndpoint]] = []
+        for raw_identity, raw_payload in entries.items():
+            identity = self._decode(raw_identity)
+            if identity in excluded or not identity.startswith("free:"):
+                continue
+            try:
+                payload = json.loads(self._decode(raw_payload))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            url = payload.get("url")
+            if not isinstance(url, str) or not url.startswith("http://"):
+                continue
+            capability = payload.get("validated_capability")
+            if self._revalidatable_ready_state(payload, now):
+                assert capability in {"direct_pagination", "full_waf"}
+                candidates.append(
+                    (
+                        0,
+                        -self._as_float(payload.get("last_check", 0)),
+                        self._as_float(payload.get("last_used", 0)),
+                        ProxyEndpoint(
+                            name="free",
+                            url=url,
+                            kind="free",
+                            capability=capability,
+                        ),
+                    )
+                )
+                continue
+            if not self._fresh_candidate_state(payload, now):
+                continue
+            candidates.append(
+                (
+                    1,
+                    0,
+                    self._as_float(payload.get("last_used", 0)),
+                    ProxyEndpoint(
+                        name="free",
+                        url=url,
+                        kind="free",
+                        capability="waf_candidate",
+                    ),
+                )
+            )
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [endpoint for _, _, _, endpoint in candidates[:limit]]
+
     async def candidate_endpoints(self, excluded: set[str], *, limit: int) -> list[ProxyEndpoint]:
         now = time.time()
         entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
@@ -760,7 +831,7 @@ class ProxyPoolFetcher:
         counts = await self._pool.reserve_counts()
         if counts["ready"] >= target_ready:
             return counts
-        if counts["candidates"] == 0:
+        if not await self._pool.promotion_endpoints(self._excluded, limit=1):
             await self._pool.discover()
         counts = await self._pool.reserve_counts()
         needed = max(0, target_ready - counts["ready"])
@@ -780,7 +851,7 @@ class ProxyPoolFetcher:
         preflight = self._preflight
         if preflight is None or max_candidates <= 0:
             return 0
-        candidates = await self._pool.candidate_endpoints(
+        candidates = await self._pool.promotion_endpoints(
             self._excluded,
             limit=max_candidates,
         )
@@ -837,21 +908,39 @@ class ProxyPoolFetcher:
                 )
                 return False
 
-        tasks = [asyncio.create_task(probe(endpoint)) for endpoint in candidates]
-        target = len(tasks) if target_successes is None else max(1, target_successes)
-        successes = 0
-        try:
-            for completed in asyncio.as_completed(tasks):
-                if await completed:
-                    successes += 1
-                    if successes >= target:
-                        break
-        finally:
-            if successes >= target:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        target = len(candidates) if target_successes is None else max(1, target_successes)
+        revalidation = [
+            endpoint
+            for endpoint in candidates
+            if endpoint.capability in {"direct_pagination", "full_waf"}
+        ]
+        raw_candidates = [
+            endpoint for endpoint in candidates if endpoint.capability == "waf_candidate"
+        ]
+
+        async def run_batch(endpoints: list[ProxyEndpoint], needed: int) -> int:
+            if not endpoints or needed <= 0:
+                return 0
+            tasks = [asyncio.create_task(probe(endpoint)) for endpoint in endpoints]
+            successes = 0
+            try:
+                for completed in asyncio.as_completed(tasks):
+                    if await completed:
+                        successes += 1
+                        if successes >= needed:
+                            break
+            finally:
+                if successes >= needed:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return successes
+
+        successes = await run_batch(revalidation, target)
+        if successes >= target:
+            return successes
+        successes += await run_batch(raw_candidates, target - successes)
         return successes
 
     async def _reject_candidate(self, endpoint: ProxyEndpoint, reason: str) -> None:
