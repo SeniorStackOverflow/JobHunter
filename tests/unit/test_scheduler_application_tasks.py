@@ -32,9 +32,7 @@ def test_application_tasks_are_registered_and_routed() -> None:
     assert schedule["reconcile-auto-approved-applications"]["schedule"] == 60.0
     assert schedule["reconcile-auto-approved-applications"]["options"]["queue"] == "applications"
     assert schedule["refresh-dirty-deferred-applications"]["schedule"] == 60.0
-    assert (
-        schedule["refresh-dirty-deferred-applications"]["options"]["queue"] == "applications"
-    )
+    assert schedule["refresh-dirty-deferred-applications"]["options"]["queue"] == "applications"
     assert schedule["send-auto-approved-applications"]["options"]["queue"] == "email"
 
     assert routes[prepare_pending_applications_task.name] == {"queue": "applications"}

@@ -19,33 +19,34 @@ async def enqueue_employer_policy_refresh(
     reason: str,
 ) -> None:
     now = datetime.now(UTC)
+    normalized_reason = reason[:128]
     values = {
         "profile_id": profile_id,
         "employer_id": employer_id,
-        "reason": reason[:128],
+        "reason": normalized_reason,
         "enqueued_at": now,
     }
     dialect = session.bind.dialect.name if session.bind is not None else ""
     if dialect == "postgresql":
-        statement = pg_insert(ApplicationPolicyRefreshQueue).values(**values)
-        statement = statement.on_conflict_do_update(
+        pg_statement = pg_insert(ApplicationPolicyRefreshQueue).values(**values)
+        pg_statement = pg_statement.on_conflict_do_update(
             index_elements=[
                 ApplicationPolicyRefreshQueue.profile_id,
                 ApplicationPolicyRefreshQueue.employer_id,
             ],
-            set_={"reason": values["reason"], "enqueued_at": now},
+            set_={"reason": normalized_reason, "enqueued_at": now},
         )
-        await session.execute(statement)
+        await session.execute(pg_statement)
     elif dialect == "sqlite":
-        statement = sqlite_insert(ApplicationPolicyRefreshQueue).values(**values)
-        statement = statement.on_conflict_do_update(
+        sqlite_statement = sqlite_insert(ApplicationPolicyRefreshQueue).values(**values)
+        sqlite_statement = sqlite_statement.on_conflict_do_update(
             index_elements=[
                 ApplicationPolicyRefreshQueue.profile_id,
                 ApplicationPolicyRefreshQueue.employer_id,
             ],
-            set_={"reason": values["reason"], "enqueued_at": now},
+            set_={"reason": normalized_reason, "enqueued_at": now},
         )
-        await session.execute(statement)
+        await session.execute(sqlite_statement)
     else:
         row = await session.scalar(
             select(ApplicationPolicyRefreshQueue).where(
@@ -56,6 +57,6 @@ async def enqueue_employer_policy_refresh(
         if row is None:
             session.add(ApplicationPolicyRefreshQueue(**values))
         else:
-            row.reason = values["reason"]
+            row.reason = normalized_reason
             row.enqueued_at = now
     await session.flush()

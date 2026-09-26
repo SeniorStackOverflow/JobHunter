@@ -484,10 +484,7 @@ class EmailService:
                     DeliveryStatus.SPAM_REJECTED,
                     DeliveryStatus.DELIVERY_FAILED,
                 }
-                and not (
-                    fallback_pending
-                    and existing.status is DeliveryStatus.RECIPIENT_REJECTED
-                )
+                and not (fallback_pending and existing.status is DeliveryStatus.RECIPIENT_REJECTED)
             ):
                 return existing
             if application.status not in {
@@ -496,20 +493,14 @@ class EmailService:
                 ApplicationStatus.FAILED,
             }:
                 raise EmailSendBlocked("application is not approved for delivery")
-            retryable_failure = (
-                existing is not None
-                and (
-                    existing.status
-                    in {
-                        DeliveryStatus.TEMPORARY_FAILURE,
-                        DeliveryStatus.BOUNCED_TRANSIENT,
-                        DeliveryStatus.MAILBOX_FULL,
-                    }
-                    or (
-                        fallback_pending
-                        and existing.status is DeliveryStatus.RECIPIENT_REJECTED
-                    )
-                )
+            retryable_failure = existing is not None and (
+                existing.status
+                in {
+                    DeliveryStatus.TEMPORARY_FAILURE,
+                    DeliveryStatus.BOUNCED_TRANSIENT,
+                    DeliveryStatus.MAILBOX_FULL,
+                }
+                or (fallback_pending and existing.status is DeliveryStatus.RECIPIENT_REJECTED)
             )
             if application.status == ApplicationStatus.FAILED and (
                 existing is None

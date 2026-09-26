@@ -1787,20 +1787,24 @@ async def test_retry_scheduler_picks_due_recipient_fallback(
         assert stored_delivery.attempt_count == 2
         assert stored_delivery.sanitized_provider_response["recipient_fallback_used"] is True
 
-async def test_periodic_reconciliation_skips_deferred(sqlite_session_factory,tmp_path,monkeypatch):
+
+async def test_periodic_reconciliation_skips_deferred(
+    sqlite_session_factory, tmp_path, monkeypatch
+):
     from app.email import service as es
+
     async with sqlite_session_factory() as s:
-        a=(await make_graph(s,tmp_path))[8]
-        a.status=ApplicationStatus.DEFERRED
-        a.policy_decision=PolicyDecision.DEFERRED
-        aid=a.id
+        a = (await make_graph(s, tmp_path))[8]
+        a.status = ApplicationStatus.DEFERRED
+        a.policy_decision = PolicyDecision.DEFERRED
+        aid = a.id
         await s.commit()
-    monkeypatch.setattr("app.database.session.async_session_factory",sqlite_session_factory)
-    monkeypatch.setattr(es,"get_settings",lambda:settings(tmp_path))
-    assert await es.reconcile_auto_approved_application_states()=={}
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(es, "get_settings", lambda: settings(tmp_path))
+    assert await es.reconcile_auto_approved_application_states() == {}
     async with sqlite_session_factory() as s:
-        a=await s.get(Application,aid)
-        assert a is not None and a.status==ApplicationStatus.DEFERRED
+        a = await s.get(Application, aid)
+        assert a is not None and a.status == ApplicationStatus.DEFERRED
 
 
 async def test_dirty_deferred_refresh_processes_marked_employer(

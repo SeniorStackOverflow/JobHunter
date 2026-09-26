@@ -927,7 +927,10 @@ async def process_unprocessed_jobs() -> int:
                 MatchEvaluation.preference_fingerprint.is_(None),
                 MatchEvaluation.preference_fingerprint != preference_fingerprint(preference),
                 resume_stale,
-                and_(MatchEvaluation.prompt_rules_version != MATCHING_RULES_VERSION, ~MatchEvaluation.prompt_rules_version.in_(_SAFETY_ONLY_PREVIOUS_RULES)),
+                and_(
+                    MatchEvaluation.prompt_rules_version != MATCHING_RULES_VERSION,
+                    ~MatchEvaluation.prompt_rules_version.in_(_SAFETY_ONLY_PREVIOUS_RULES),
+                ),
                 MatchEvaluation.hard_requirement_rules_version.is_(None),
                 MatchEvaluation.hard_requirement_rules_version != HARD_REQUIREMENT_RULES_VERSION,
                 and_(
@@ -998,7 +1001,10 @@ async def process_unprocessed_jobs() -> int:
                     and not retry_due
                     and inputs_current
                     and evaluation.source_matching_hash == job.matching_content_hash
-                    and (snapshot_at is None or _as_aware(snapshot_at) <= _as_aware(evaluation.created_at))
+                    and (
+                        snapshot_at is None
+                        or _as_aware(snapshot_at) <= _as_aware(evaluation.created_at)
+                    )
                 ):
                     evaluation.hard_requirement_rules_version = HARD_REQUIREMENT_RULES_VERSION
 
