@@ -63,3 +63,11 @@ For production changes, prefer deploying code that is represented by a commit. R
 current commit when diagnosing a rollout, verify the deployed image contains the intended change,
 and leave the working tree clean after a successful deployment unless there is deliberate unfinished
 work that must remain visible in `git status`.
+
+For DEV/PROD code synchronization, `/home/andrei/JobHunter:refs/heads/main` is the canonical DEV
+reference. Never use the currently checked-out DEV `HEAD` for synchronization health because the
+working checkout may legitimately be on a feature branch. A dirty DEV working tree is not itself a
+sync failure. Standard production updates must move `/srv/jobhunter-prod:main` only by fast-forward
+to the exact canonical DEV main commit. Do not create normal commits or cherry-picks in the PROD
+checkout and never push from PROD back into DEV. An explicit emergency override may temporarily
+depart from this flow, but canonical DEV main must be reconciled before normal deployment resumes.

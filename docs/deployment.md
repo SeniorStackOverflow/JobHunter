@@ -79,6 +79,35 @@ SHA текущего PROD HEAD и экспортирует его как `JOBHUN
 production Compose без этого тега намеренно отклоняется. DEV использует отдельный
 namespace `jobhunter-dev:*`, поэтому DEV build больше не может перетереть PROD image.
 
+### Синхронизация кода DEV → PROD
+
+Каноническая DEV-ссылка для production-кода — строго
+`/home/andrei/JobHunter:refs/heads/main`. Текущий checkout DEV может находиться на
+feature-ветке и не участвует в health-check синхронизации.
+
+Read-only проверка выполняется командой:
+
+```bash
+./deploy/check-code-sync.sh
+```
+
+Состояния `equal` и `dev_ahead` не являются ошибкой. `dev_behind` и `diverged`
+требуют вмешательства. `unknown` означает, что отношение нельзя безопасно доказать
+доступными локальными объектами Git; проверка ничего не fetch-ит и не должна
+превращать это состояние в аварийный алерт.
+
+Штатное обновление production-кода выполняется из `/srv/jobhunter-prod` только
+fast-forward:
+
+```bash
+./deploy/sync-prod-code.sh
+```
+
+Скрипт требует чистый PROD working tree и ветку `main`, читает именно DEV
+`refs/heads/main` и отказывается от merge/cherry-pick/reset при расхождении истории.
+Обычный production checkout не должен создавать новые commits и не должен push-ить
+изменения обратно в DEV.
+
 Каждый production image содержит build flavor и revision. Container entrypoint
 проверяет их до запуска процесса. API/workers дополнительно требуют DB-role
 `jobhunter_app`, а `migrate` получает credentials из `/etc/jobhunter/migrator.env`
