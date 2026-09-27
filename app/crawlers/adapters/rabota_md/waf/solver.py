@@ -30,6 +30,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafCaptchaRequired,
     WafPowTimeout,
     WafProofRejected,
+    WafProtocolError,
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
@@ -299,9 +300,22 @@ class AwsWafSolver:
                 ) from exc
             self._reject_waf_response(inputs_response, stage="inputs")
             inputs_latency = round((time.time() - inputs_started) * 1000, 1)
-            inputs = inputs_response.json()
-            challenge = inputs["challenge"]
-            decoded = json.loads(base64.b64decode(challenge["input"]))
+            try:
+                inputs = inputs_response.json()
+                challenge = inputs["challenge"]
+                decoded = json.loads(base64.b64decode(challenge["input"]))
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise WafProtocolError(
+                    stage="inputs",
+                    error_type=type(exc).__name__,
+                    detail="invalid AWS WAF inputs payload",
+                ) from exc
             ctype = str(decoded.get("challenge_type", ""))
             difficulty = int(decoded.get("difficulty", 1))
             memory = int(decoded.get("memory", 128))

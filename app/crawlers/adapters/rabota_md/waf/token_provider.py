@@ -22,6 +22,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBackendExhausted,
     WafBlocked,
     WafCaptchaRequired,
+    WafProtocolError,
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
@@ -136,8 +137,11 @@ class WafTokenProvider:
                     error_type = exc.error_type
                     reason_class = "transport"
                     stage = exc.stage
-                elif isinstance(exc, WafUnsupportedChallenge | WafScriptVersionUnknown):
-                    error_type = type(exc).__name__
+                elif isinstance(
+                    exc,
+                    WafProtocolError | WafUnsupportedChallenge | WafScriptVersionUnknown,
+                ):
+                    error_type = getattr(exc, "error_type", type(exc).__name__)
                     reason_class = "protocol"
                     stage = getattr(exc, "stage", "protocol")
                 elif isinstance(exc, WafSolveFailed):

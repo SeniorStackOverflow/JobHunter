@@ -23,6 +23,7 @@ from app.crawlers.adapters.rabota_md.fetcher import RabotaMdFetcher
 from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBackendExhausted,
     WafProofRejected,
+    WafProtocolError,
     WafRateLimited,
     WafSolveFailed,
     WafTransportError,
@@ -931,6 +932,8 @@ class ProxyPoolFetcher:
             return exc.error_type, "transport", exc.stage
         if isinstance(exc, WafProofRejected):
             return exc.reason_code, "proof", exc.stage
+        if isinstance(exc, WafProtocolError):
+            return exc.error_type, "protocol", exc.stage
         if isinstance(exc, WafRateLimited):
             return type(exc).__name__, "rate_limit", "waf"
         if isinstance(exc, WafUnsupportedChallenge):

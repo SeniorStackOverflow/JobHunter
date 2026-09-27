@@ -13,6 +13,7 @@ from app.crawlers.adapters.rabota_md.waf import (
     WafBlocked,
     WafCaptchaRequired,
     WafPowTimeout,
+    WafProtocolError,
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
@@ -201,4 +202,28 @@ async def test_solve_derives_challenge_base_from_single_quoted_script_src() -> N
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     solver = AwsWafSolver(client=client)
     assert await solver.solve(SITE, UA) == TOKEN
+    await client.aclose()
+
+
+async def test_solve_classifies_invalid_challenge_input_encoding() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            return httpx.Response(202, text=challenge_page())
+        if url == SCRIPT_URL:
+            return httpx.Response(200, content=SCRIPT_BYTES)
+        if url.startswith(f"{CHAL_URL}/inputs"):
+            payload = inputs_payload("SHA256", 4)
+            payload["challenge"]["input"] = base64.b64encode(b"\xff\xfe\xfd").decode()
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client)
+
+    with pytest.raises(WafProtocolError) as caught:
+        await solver.solve(SITE, UA)
+
+    assert caught.value.stage == "inputs"
+    assert caught.value.error_type == "UnicodeDecodeError"
     await client.aclose()

@@ -50,6 +50,15 @@ class WafTransportError(WafError):
         super().__init__(f"{error_type} during WAF {stage}")
 
 
+class WafProtocolError(WafError):
+    """A malformed or incompatible WAF protocol payload was received."""
+
+    def __init__(self, *, stage: str, error_type: str, detail: str) -> None:
+        self.stage = stage
+        self.error_type = error_type
+        super().__init__(detail)
+
+
 class WafProofRejected(WafSolveFailed):
     """The WAF proof protocol responded but rejected or omitted a usable token."""
 
