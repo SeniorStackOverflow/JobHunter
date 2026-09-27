@@ -1435,6 +1435,8 @@ async def test_protocol_v2_recovery_rehabilitates_only_unicode_inputs_failures()
 
     promoted = await pool.promotion_endpoints(set(), limit=3)
     assert [item.identity for item in promoted] == [proven.identity, candidate.identity]
+    assert promoted[0].force_revalidate is True
+    assert promoted[1].force_revalidate is False
 
     assert await pool.reconcile_solver_protocol_v2() == {"candidates": 0, "proven": 0}
     await pool.aclose()

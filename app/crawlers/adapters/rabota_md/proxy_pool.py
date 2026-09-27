@@ -90,6 +90,7 @@ class ProxyEndpoint:
     url: str
     kind: Literal["primary", "free"]
     capability: Literal["direct_pagination", "waf_candidate", "full_waf"] | None = None
+    force_revalidate: bool = False
 
     @property
     def identity(self) -> str:
@@ -905,6 +906,7 @@ class RabotaProxyPool:
                             url=url,
                             kind="free",
                             capability=capability,
+                            force_revalidate=payload.get("force_revalidate") is True,
                         ),
                     )
                 )

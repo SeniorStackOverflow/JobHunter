@@ -383,7 +383,7 @@ def build_waf_fetcher(
             )
 
         async def preflight(endpoint: ProxyEndpoint, fetcher: RabotaMdFetcher) -> None:
-            if endpoint.capability == "waf_candidate":
+            if endpoint.kind == "free":
                 await _prove_free_waf_candidate(
                     endpoint=endpoint,
                     base_url=base_url,
@@ -393,6 +393,9 @@ def build_waf_fetcher(
                     timeout_seconds=timeout_seconds,
                     max_redirects=max_redirects,
                     resolver=resolver,
+                    force_proof=(
+                        endpoint.capability == "waf_candidate" or endpoint.force_revalidate
+                    ),
                 )
             landing_url = f"{base_url}/ru/"
             referer = f"{base_url}/ru/vacancies/category/others"
