@@ -137,7 +137,7 @@ celery_app.conf.update(
         },
         "rabota-md-waf-canary": {
             "task": "job_agent.scheduler.rabota_md_waf_canary",
-            "schedule": crontab(minute=22, hour=4),
+            "schedule": crontab(minute=22, hour="*/4"),
             "options": {"queue": "maintenance", "expires": 3600},
         },
         "ingest-phonegate-sms": {

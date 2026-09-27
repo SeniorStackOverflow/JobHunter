@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import redis.asyncio as aioredis
 
 CANARY_KEY = "crawler:rabota_md:waf_solver_canary_ok"
-CANARY_TTL_SECONDS = 30 * 60 * 60
+CANARY_TTL_SECONDS = 6 * 60 * 60
 # Bump when the solver's protocol assumptions materially change. An old canary
 # then stops authorizing a newly incompatible implementation automatically.
 PROTOCOL_FINGERPRINT = "aws-waf-v1:challenge-inputs-verify-token"

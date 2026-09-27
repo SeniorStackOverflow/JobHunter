@@ -7,9 +7,11 @@ import httpx
 import pytest
 
 from app.crawlers.adapters.rabota_md.waf.errors import (
+    WafBackendExhausted,
     WafCaptchaRequired,
     WafRateLimited,
     WafSolveFailed,
+    WafTransportError,
     WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.token_provider import (
@@ -216,3 +218,22 @@ async def test_env_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JOBHUNTER_RABOTA_MD_WAF_TOKEN", "env-token")
     minted = await backend.mint()
     assert minted.value == "env-token"
+
+
+async def test_refresh_preserves_primary_transport_failure_taxonomy() -> None:
+    redis = FakeRedis()
+    first = StubBackend(
+        error=WafTransportError(
+            stage="challenge_script",
+            error_type="ConnectTimeout",
+        )
+    )
+    second = StubBackend(error=WafSolveFailed("env token absent"))
+    provider = make_provider(redis, [first, second])
+
+    with pytest.raises(WafBackendExhausted) as captured:
+        await provider.refresh_token()
+
+    assert captured.value.primary_error_type == "ConnectTimeout"
+    assert captured.value.primary_reason_class == "transport"
+    assert captured.value.primary_stage == "challenge_script"

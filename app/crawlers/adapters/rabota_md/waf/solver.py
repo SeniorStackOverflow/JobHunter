@@ -29,9 +29,11 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBlocked,
     WafCaptchaRequired,
     WafPowTimeout,
+    WafProofRejected,
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
+    WafTransportError,
     WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.metrics import build_metrics
@@ -215,9 +217,7 @@ class AwsWafSolver:
         self._proxy_url = proxy_url
         self.last_script_hash: str | None = None
 
-    async def solve(self, site: str, user_agent: str) -> str:
-        site = site.rstrip("/")
-        _require_allowed_url(site)
+    def _build_client(self, user_agent: str) -> SecureHttpClient | httpx.AsyncClient:
         proxy_transport = (
             httpx.AsyncHTTPTransport(
                 proxy=self._proxy_url,
@@ -228,7 +228,7 @@ class AwsWafSolver:
             if self._client is None and self._proxy_url is not None
             else None
         )
-        client = self._client or SecureHttpClient(
+        return self._client or SecureHttpClient(
             allowed_domains=(
                 "rabota.md",
                 "www.rabota.md",
@@ -245,8 +245,28 @@ class AwsWafSolver:
             pin_resolved_addresses=False if self._proxy_url else None,
             rate_limiter=self._rate_limiter,
         )
+
+    async def solve(self, site: str, user_agent: str) -> str:
+        site = site.rstrip("/")
+        _require_allowed_url(site)
+        client = self._build_client(user_agent)
         try:
             return await self._solve_with_client(client, site, user_agent)
+        finally:
+            if self._client is None:
+                await client.aclose()
+
+    async def probe_challenge(self, site: str, user_agent: str) -> str:
+        """Prove that this egress can reach and parse the current WAF challenge assets."""
+
+        site = site.rstrip("/")
+        _require_allowed_url(site)
+        client = self._build_client(user_agent)
+        try:
+            await self._discover(client, site, user_agent)
+            if not self.last_script_hash:
+                raise WafUnsupportedChallenge("challenge.js was not fetched during probe")
+            return self.last_script_hash
         finally:
             if self._client is None:
                 await client.aclose()
@@ -268,10 +288,16 @@ class AwsWafSolver:
             encrypted = encrypt(encoded)
 
             inputs_started = time.time()
-            inputs_response = await self._get(
-                client, f"{challenge_url}/inputs?client=browser", headers=headers
-            )
-            self._reject_waf_response(inputs_response)
+            try:
+                inputs_response = await self._get(
+                    client, f"{challenge_url}/inputs?client=browser", headers=headers
+                )
+            except httpx.TransportError as exc:
+                raise WafTransportError(
+                    stage="inputs",
+                    error_type=type(exc).__name__,
+                ) from exc
+            self._reject_waf_response(inputs_response, stage="inputs")
             inputs_latency = round((time.time() - inputs_started) * 1000, 1)
             inputs = inputs_response.json()
             challenge = inputs["challenge"]
@@ -301,18 +327,26 @@ class AwsWafSolver:
                 )
                 content_type = "text/plain;charset=UTF-8"
 
-            verify_response = await self._post(
-                client,
-                f"{challenge_url}/{endpoint}",
-                content=body,
-                headers={**headers, "content-type": content_type},
-            )
-            self._reject_waf_response(verify_response)
+            try:
+                verify_response = await self._post(
+                    client,
+                    f"{challenge_url}/{endpoint}",
+                    content=body,
+                    headers={**headers, "content-type": content_type},
+                )
+            except httpx.TransportError as exc:
+                raise WafTransportError(
+                    stage="verify",
+                    error_type=type(exc).__name__,
+                ) from exc
+            self._reject_waf_response(verify_response, stage="verify")
             result = verify_response.json()
             token = result.get("token", token)
             if token is None:
-                raise WafSolveFailed(
-                    f"token endpoint returned no token (HTTP {verify_response.status_code})"
+                raise WafProofRejected(
+                    stage="verify",
+                    reason_code="no_token",
+                    detail=f"token endpoint returned no token (HTTP {verify_response.status_code})",
                 )
 
         if token is None:  # pragma: no cover - loop above guarantees a token or raises
@@ -322,8 +356,14 @@ class AwsWafSolver:
     async def _discover(
         self, client: SecureHttpClient | httpx.AsyncClient, site: str, user_agent: str
     ) -> tuple[str, bool, dict[str, Any] | None]:
-        response = await self._get(client, site, headers=_nav_headers(user_agent))
-        self._reject_waf_response(response)
+        try:
+            response = await self._get(client, site, headers=_nav_headers(user_agent))
+        except httpx.TransportError as exc:
+            raise WafTransportError(
+                stage="landing",
+                error_type=type(exc).__name__,
+            ) from exc
+        self._reject_waf_response(response, stage="landing")
         html = response.text
 
         script_match = RE_CHAL_SCRIPT.search(html)
@@ -348,8 +388,16 @@ class AwsWafSolver:
             if script_url is None:
                 raise WafUnsupportedChallenge("challenge.js URL not found on the 202 page")
             _require_allowed_url(script_url)
-            script_response = await self._get(client, script_url, headers=_nav_headers(user_agent))
-            self._reject_waf_response(script_response)
+            try:
+                script_response = await self._get(
+                    client, script_url, headers=_nav_headers(user_agent)
+                )
+            except httpx.TransportError as exc:
+                raise WafTransportError(
+                    stage="challenge_script",
+                    error_type=type(exc).__name__,
+                ) from exc
+            self._reject_waf_response(script_response, stage="challenge_script")
             digest = hashlib.sha256(script_response.content).hexdigest()
             self.last_script_hash = digest
             if not self._script_hash_checker(digest):
@@ -405,7 +453,11 @@ class AwsWafSolver:
         return response
 
     @staticmethod
-    def _reject_waf_response(response: httpx.Response) -> None:
+    def _reject_waf_response(
+        response: httpx.Response,
+        *,
+        stage: str = "unknown",
+    ) -> None:
         if response.status_code == 429:
             raise WafRateLimited("AWS WAF rate limited the solver")
         action = response.headers.get(AWS_WAF_ACTION_HEADER, "").casefold()
@@ -414,7 +466,11 @@ class AwsWafSolver:
         if action == "block":
             raise WafBlocked("AWS WAF hard-blocked the request")
         if response.status_code == 403 and not action:
-            raise WafSolveFailed("AWS WAF rejected the request with bare HTTP 403")
+            raise WafProofRejected(
+                stage=stage,
+                reason_code="bare_403",
+                detail="AWS WAF rejected the request with bare HTTP 403",
+            )
         if action and action != "challenge":
             raise WafUnsupportedChallenge(f"unknown x-amzn-waf-action: {action!r}")
 

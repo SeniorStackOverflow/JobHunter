@@ -72,6 +72,21 @@ async def test_waf_canary_uses_proxy_pool_mode_when_enabled(monkeypatch) -> None
 
     monkeypatch.setattr(tasks, "_rabota_md_waf_canary_source", source_stub)
     monkeypatch.setattr(tasks, "_rabota_md_proxy_pool_probe", probe_stub)
+
+    class FakePool:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def promotion_endpoints(self, *_args, **_kwargs):
+            return []
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.proxy_pool.RabotaProxyPool",
+        FakePool,
+    )
     monkeypatch.setattr(
         tasks,
         "get_settings",
@@ -79,12 +94,32 @@ async def test_waf_canary_uses_proxy_pool_mode_when_enabled(monkeypatch) -> None
             crawler_user_agent="job-agent/test",
             rabota_proxy_pool_enabled=True,
             redis_url="redis://unused/0",
+            rabota_proxy_primary_url=None,
+            rabota_proxy_free_fallback_enabled=True,
+            rabota_proxy_discovery_batch=200,
+            rabota_proxy_validation_concurrency=24,
+            rabota_proxy_validation_timeout_seconds=8,
+            rabota_proxy_candidate_ttl_seconds=1800,
+            rabota_proxy_ready_ttl_seconds=1800,
+            rabota_proxy_revalidation_grace_seconds=3600,
+            rabota_proxy_revalidation_retry_seconds=300,
+            rabota_proxy_revalidation_max_failures=3,
+            rabota_proxy_min_fresh_free=3,
+            rabota_proxy_ban_cooldown_seconds=21600,
+            rabota_proxy_dead_cooldown_seconds=3600,
+            rabota_proxy_primary_dead_cooldown_seconds=45,
+            rabota_proxy_maintenance_max_preflight_attempts=9,
         ),
     )
 
     result = await tasks._rabota_md_waf_canary()
 
-    assert result == {"outcome": "success", "mode": "proxy_pool"}
+    assert result == {
+        "outcome": "success",
+        "mode": "proxy_pool",
+        "primary": "success",
+        "pure_solver": "skipped_no_candidate",
+    }
     assert len(calls) == 1
     assert calls[0].startswith("Mozilla/5.0")
 

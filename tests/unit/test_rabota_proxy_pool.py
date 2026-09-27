@@ -56,6 +56,12 @@ class FakeRedis:
     async def hset(self, name: str, key: str, value: str) -> None:
         self.hashes.setdefault(name, {})[key] = value
 
+    async def hincrby(self, name: str, key: str, amount: int) -> int:
+        current = int(self.hashes.setdefault(name, {}).get(key, "0"))
+        current += amount
+        self.hashes[name][key] = str(current)
+        return current
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -104,6 +110,26 @@ class StubPool:
         self.successes.append(endpoint.identity)
 
     async def report_dead(self, endpoint: ProxyEndpoint) -> None:
+        self.dead.append(endpoint.identity)
+
+    async def report_rate_limited(
+        self,
+        endpoint: ProxyEndpoint,
+        *,
+        cooldown_seconds: int = 300,
+    ) -> None:
+        del cooldown_seconds
+        self.dead.append(endpoint.identity)
+
+    async def report_transient_failure(
+        self,
+        endpoint: ProxyEndpoint,
+        *,
+        reason: str,
+        reason_class: str = "proof",
+        stage: str = "unknown",
+    ) -> None:
+        del reason, reason_class, stage
         self.dead.append(endpoint.identity)
 
     async def report_access_rejected(self, endpoint: ProxyEndpoint) -> None:
@@ -1010,3 +1036,142 @@ async def test_waf_candidate_solve_failure_remains_retryable() -> None:
     assert stored["proof_failures"] == 1
     assert stored["cooldown_until"] > time.time()
     await fetcher.aclose()
+
+
+async def test_challenged_proxy_requires_reachable_challenge_assets(monkeypatch) -> None:
+    class FakeStream:
+        async def __aenter__(self) -> httpx.Response:
+            return httpx.Response(
+                202,
+                headers={"x-amzn-waf-action": "challenge"},
+                text="challenge",
+            )
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method: str, url: str) -> FakeStream:
+            del method, url
+            return FakeStream()
+
+    seen: list[str] = []
+
+    async def probe(self, site: str, user_agent: str) -> str:
+        del self, user_agent
+        seen.append(site)
+        return "abc123"
+
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.proxy_pool.httpx.AsyncClient",
+        FakeAsyncClient,
+    )
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.proxy_pool.AwsWafSolver.probe_challenge",
+        probe,
+    )
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+    )
+
+    await pool._validate_free_proxy(
+        "1.1.1.1:8080",
+        asyncio.Semaphore(1),
+    )
+
+    endpoint = ProxyEndpoint("free", "http://1.1.1.1:8080", "free")
+    state = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert state["validated_capability"] == "waf_candidate"
+    assert state["status"] == "candidate"
+    assert seen == ["https://www.rabota.md"]
+
+
+async def test_challenged_proxy_with_unreachable_script_is_not_candidate(monkeypatch) -> None:
+    class FakeStream:
+        async def __aenter__(self) -> httpx.Response:
+            return httpx.Response(
+                202,
+                headers={"x-amzn-waf-action": "challenge"},
+                text="challenge",
+            )
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method: str, url: str) -> FakeStream:
+            del method, url
+            return FakeStream()
+
+    async def probe(self, site: str, user_agent: str) -> str:
+        del self, site, user_agent
+        from app.crawlers.adapters.rabota_md.waf.errors import WafTransportError
+
+        raise WafTransportError(stage="challenge_script", error_type="ConnectTimeout")
+
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.proxy_pool.httpx.AsyncClient",
+        FakeAsyncClient,
+    )
+    monkeypatch.setattr(
+        "app.crawlers.adapters.rabota_md.proxy_pool.AwsWafSolver.probe_challenge",
+        probe,
+    )
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+    )
+
+    await pool._validate_free_proxy(
+        "1.1.1.1:8080",
+        asyncio.Semaphore(1),
+    )
+
+    endpoint = ProxyEndpoint("free", "http://1.1.1.1:8080", "free")
+    state = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert state["status"] == "dead"
+    assert state.get("validated_capability") != "waf_candidate"
+
+
+async def test_free_proxy_http_429_uses_short_rate_limit_cooldown() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+    )
+    endpoint = ProxyEndpoint("free", "http://1.1.1.1:8080", "free")
+    before = time.time()
+
+    await pool.report_rate_limited(endpoint, cooldown_seconds=300)
+
+    state = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert state["status"] == "rate_limited"
+    assert state["last_http_status"] == 429
+    assert before + 295 <= state["cooldown_until"] <= time.time() + 305

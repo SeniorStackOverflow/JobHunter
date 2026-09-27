@@ -29,7 +29,11 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafBlocked,
     WafCaptchaRequired,
     WafError,
+    WafPowTimeout,
+    WafScriptVersionUnknown,
     WafSolveFailed,
+    WafTransportError,
+    WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.http_client import WafHttpClient
 from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
@@ -186,6 +190,7 @@ async def _prove_free_waf_candidate(
     timeout_seconds: float,
     max_redirects: int,
     resolver: Resolver | None,
+    force_proof: bool = False,
 ) -> None:
     """Prove the solver protocol on one free egress before trusting it.
 
@@ -205,7 +210,7 @@ async def _prove_free_waf_candidate(
     proof_ok = False
 
     try:
-        if await watchdog.is_compatible():
+        if not force_proof and await watchdog.is_compatible():
             return
 
         free_timeout = min(timeout_seconds, 15.0)
@@ -229,6 +234,14 @@ async def _prove_free_waf_candidate(
             raise RabotaMdWafFailClosedError(
                 f"Rabota.md free-proxy protocol proof hit {type(exc).__name__}"
             ) from exc
+        except (
+            WafTransportError,
+            WafSolveFailed,
+            WafUnsupportedChallenge,
+            WafScriptVersionUnknown,
+            WafPowTimeout,
+        ):
+            raise
         except WafError as exc:
             raise RabotaMdEgressError(
                 f"Rabota.md free-proxy protocol proof failed ({type(exc).__name__})"
@@ -282,6 +295,14 @@ async def _prove_free_waf_candidate(
         raise RabotaMdWafFailClosedError(
             f"Rabota.md free-proxy protocol proof hit {type(exc).__name__}"
         ) from exc
+    except (
+        WafTransportError,
+        WafSolveFailed,
+        WafUnsupportedChallenge,
+        WafScriptVersionUnknown,
+        WafPowTimeout,
+    ):
+        raise
     except WafError as exc:
         raise RabotaMdEgressError(
             f"Rabota.md free-proxy protocol proof failed ({type(exc).__name__})"

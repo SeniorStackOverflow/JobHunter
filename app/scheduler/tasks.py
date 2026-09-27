@@ -1198,22 +1198,144 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
 
     settings = get_settings()
     if settings.rabota_proxy_pool_enabled:
+        from app.crawlers.adapters.rabota_md.proxy_pool import (
+            ProxyEndpoint,
+            RabotaProxyPool,
+        )
+        from app.crawlers.adapters.rabota_md.transport import _prove_free_waf_candidate
+        from app.crawlers.adapters.rabota_md.waf.errors import (
+            WafSolveFailed,
+            WafTransportError,
+            WafUnsupportedChallenge,
+        )
+
+        primary_outcome = "success"
+        primary_error: str | None = None
         try:
             await _rabota_md_proxy_pool_probe(source, user_agent=user_agent)
         except Exception as exc:
-            WAF_SOLVER_CANARY.labels(outcome="failure").inc()
+            primary_outcome = "failure"
+            primary_error = type(exc).__name__
             logger.warning(
                 "rabota_md_proxy_pool_canary_failed",
-                error_type=type(exc).__name__,
+                error_type=primary_error,
             )
-            return {
-                "outcome": "failure",
-                "mode": "proxy_pool",
-                "error_type": type(exc).__name__,
-            }
-        WAF_SOLVER_CANARY.labels(outcome="success").inc()
-        logger.info("rabota_md_proxy_pool_canary_ok")
-        return {"outcome": "success", "mode": "proxy_pool"}
+        else:
+            logger.info("rabota_md_proxy_pool_canary_ok")
+
+        primary = (
+            settings.rabota_proxy_primary_url.get_secret_value()
+            if settings.rabota_proxy_primary_url is not None
+            else None
+        )
+        pool = RabotaProxyPool(
+            AsyncRedis.from_url(settings.redis_url),
+            primary_url=primary,
+            target_url=f"{source.base_url.rstrip('/')}/ru/",
+            user_agent=user_agent,
+            free_fallback_enabled=settings.rabota_proxy_free_fallback_enabled,
+            discovery_batch=settings.rabota_proxy_discovery_batch,
+            validation_concurrency=settings.rabota_proxy_validation_concurrency,
+            validation_timeout_seconds=settings.rabota_proxy_validation_timeout_seconds,
+            candidate_ttl_seconds=settings.rabota_proxy_candidate_ttl_seconds,
+            ready_ttl_seconds=settings.rabota_proxy_ready_ttl_seconds,
+            revalidation_grace_seconds=settings.rabota_proxy_revalidation_grace_seconds,
+            revalidation_retry_seconds=settings.rabota_proxy_revalidation_retry_seconds,
+            revalidation_max_failures=settings.rabota_proxy_revalidation_max_failures,
+            min_fresh_free=settings.rabota_proxy_min_fresh_free,
+            ban_cooldown_seconds=settings.rabota_proxy_ban_cooldown_seconds,
+            dead_cooldown_seconds=settings.rabota_proxy_dead_cooldown_seconds,
+            primary_dead_cooldown_seconds=settings.rabota_proxy_primary_dead_cooldown_seconds,
+        )
+        solver_outcome = "skipped_no_candidate"
+        solver_error: str | None = None
+        try:
+            candidates = await pool.promotion_endpoints(
+                set(),
+                limit=settings.rabota_proxy_maintenance_max_preflight_attempts,
+            )
+            candidate = next(
+                (
+                    endpoint
+                    for endpoint in candidates
+                    if endpoint.kind == "free" and endpoint.capability == "waf_candidate"
+                ),
+                None,
+            )
+            if candidate is not None:
+                try:
+                    await _prove_free_waf_candidate(
+                        endpoint=candidate,
+                        base_url=source.base_url.rstrip("/"),
+                        waf_user_agent=user_agent,
+                        requests_per_minute=int(
+                            raw_config.get("requests_per_minute", min(source.rate_limit, 60))
+                        ),
+                        minimum_interval_seconds=float(
+                            raw_config.get("minimum_interval_seconds", 1.2)
+                        ),
+                        timeout_seconds=float(raw_config.get("timeout_seconds", 30.0)),
+                        max_redirects=int(raw_config.get("max_redirects", 3)),
+                        resolver=None,
+                        force_proof=True,
+                    )
+                except WafTransportError as exc:
+                    solver_outcome = "inconclusive_transport"
+                    solver_error = exc.error_type
+                    logger.warning(
+                        "rabota_md_pure_solver_canary_inconclusive",
+                        error_type=exc.error_type,
+                        stage=exc.stage,
+                    )
+                except (WafUnsupportedChallenge, WafSolveFailed) as exc:
+                    solver_outcome = "failure"
+                    solver_error = type(exc).__name__
+                    redis = AsyncRedis.from_url(settings.redis_url)
+                    try:
+                        await ScriptWatchdog(redis).invalidate_compatibility()
+                    finally:
+                        await redis.aclose()
+                    WAF_SOLVER_COMPATIBILITY.set(0)
+                    logger.warning(
+                        "rabota_md_pure_solver_canary_failed",
+                        error_type=solver_error,
+                    )
+                else:
+                    solver_outcome = "success"
+                    await pool.report_success(
+                        ProxyEndpoint(
+                            name=candidate.name,
+                            url=candidate.url,
+                            kind=candidate.kind,
+                            capability="full_waf",
+                        ),
+                        200,
+                        validated_capability="full_waf",
+                    )
+                    WAF_SOLVER_COMPATIBILITY.set(1)
+                    logger.info("rabota_md_pure_solver_canary_ok")
+        finally:
+            await pool.aclose()
+
+        overall = (
+            "failure"
+            if primary_outcome == "failure"
+            else "degraded"
+            if solver_outcome == "failure"
+            else "success"
+        )
+        WAF_SOLVER_CANARY.labels(outcome=overall).inc()
+        result = {
+            "outcome": overall,
+            "mode": "proxy_pool",
+            "primary": primary_outcome,
+            "pure_solver": solver_outcome,
+        }
+        if primary_error:
+            result["primary_error"] = primary_error
+        if solver_error:
+            result["solver_error"] = solver_error
+        return result
 
     redis = AsyncRedis.from_url(settings.redis_url)
     try:

@@ -19,10 +19,13 @@ from typing import Protocol
 import redis.asyncio as aioredis
 
 from app.crawlers.adapters.rabota_md.waf.errors import (
+    WafBackendExhausted,
     WafBlocked,
     WafCaptchaRequired,
     WafRateLimited,
+    WafScriptVersionUnknown,
     WafSolveFailed,
+    WafTransportError,
     WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
@@ -115,7 +118,7 @@ class WafTokenProvider:
     async def _mint_with_backends(self) -> str:
         from app.observability.metrics import RABOTA_WAF_TOKEN_REFRESH
 
-        errors: list[str] = []
+        failures: list[tuple[str, str, str, str]] = []
         for backend in self._backends:
             try:
                 minted = await backend.mint()
@@ -128,13 +131,30 @@ class WafTokenProvider:
                 RABOTA_WAF_TOKEN_REFRESH.labels(outcome="rate_limited").inc()
                 raise
             except Exception as exc:
-                errors.append(f"{type(exc).__name__}")
+                backend_name = type(backend).__name__
+                if isinstance(exc, WafTransportError):
+                    error_type = exc.error_type
+                    reason_class = "transport"
+                    stage = exc.stage
+                elif isinstance(exc, WafUnsupportedChallenge | WafScriptVersionUnknown):
+                    error_type = type(exc).__name__
+                    reason_class = "protocol"
+                    stage = getattr(exc, "stage", "protocol")
+                elif isinstance(exc, WafSolveFailed):
+                    error_type = type(exc).__name__
+                    reason_class = "proof"
+                    stage = getattr(exc, "stage", "token")
+                else:
+                    error_type = type(exc).__name__
+                    reason_class = "backend"
+                    stage = getattr(exc, "stage", "unknown")
+                failures.append((backend_name, error_type, reason_class, stage))
                 continue
             await self.publish_token(minted)
             RABOTA_WAF_TOKEN_REFRESH.labels(outcome="success").inc()
             return minted.value
         RABOTA_WAF_TOKEN_REFRESH.labels(outcome="exhausted").inc()
-        raise WafSolveFailed(f"all WAF token backends failed: {', '.join(errors)}")
+        raise WafBackendExhausted(tuple(failures))
 
     async def _await_foreign_refresh(self) -> str:
         deadline = asyncio.get_running_loop().time() + _LOCK_WAIT_TIMEOUT_SECONDS

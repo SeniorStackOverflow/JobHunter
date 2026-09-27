@@ -42,3 +42,27 @@ Reserve maintenance reports capacity explicitly:
 
 A successful Celery task therefore means the maintenance code executed, not that the reserve is
 healthy. Operational checks must inspect the returned reserve outcome and ready count.
+
+
+### Candidate quality and solver diagnostics
+
+A free proxy is no longer promoted to `waf_candidate` merely because Rabota.md
+returns `202 challenge`. The same egress must also fetch and parse the current
+AWS WAF challenge metadata and `challenge.js`. This rejects proxies that can
+reach Rabota.md but cannot carry the complete WAF protocol.
+
+Token-backend exhaustion preserves the primary bounded failure taxonomy
+(`transport`, `proof`, `protocol`, `rate_limit`) and WAF stage
+(`landing`, `challenge_script`, `inputs`, `verify`). Maintenance logs and
+Prometheus preflight metrics use those bounded values instead of collapsing
+network failures into a generic `WafSolveFailed`.
+
+Free-proxy sources accumulate Redis quality counters for challenge reachability,
+fully proven egresses, transport failures and proof/protocol failures. Discovery
+still samples every configured source, but higher-quality sources receive
+priority within the bounded discovery budget.
+
+The primary-path canary and the browserless pure-solver canary are independent.
+The scheduled canary runs every four hours. A transport failure on one free
+egress is inconclusive for solver compatibility; a proof/protocol failure
+invalidates compatibility. The compatibility marker expires after six hours.

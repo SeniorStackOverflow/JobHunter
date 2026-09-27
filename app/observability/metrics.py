@@ -98,6 +98,11 @@ RABOTA_PROXY_EGRESS = Counter(
     "Rabota.md proxy egress selection and health outcomes.",
     ("kind", "outcome"),
 )
+RABOTA_PROXY_PREFLIGHT = Counter(
+    "job_agent_rabota_md_proxy_preflight_total",
+    "Free-proxy preflight outcomes by bounded failure class and WAF protocol stage.",
+    ("outcome", "reason_class", "stage"),
+)
 RABOTA_PROXY_FAILOVER = Counter(
     "job_agent_rabota_md_proxy_failover_total",
     "Rabota.md egress failovers by previous egress kind and bounded reason.",
@@ -173,6 +178,7 @@ __all__ = [
     "RABOTA_PROXY_POOL_ALIVE",
     "RABOTA_PROXY_POOL_CANDIDATES",
     "RABOTA_PROXY_POOL_READY",
+    "RABOTA_PROXY_PREFLIGHT",
     "RABOTA_PROXY_PRIMARY_REACHABLE",
     "RABOTA_TRANSPORT_FALLBACK",
     "RABOTA_TRANSPORT_REQUESTS",
