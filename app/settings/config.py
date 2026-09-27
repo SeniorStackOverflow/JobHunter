@@ -158,6 +158,13 @@ class Settings(BaseSettings):
     crawler_min_mem_available_mb: int = Field(default=700, ge=128, le=16_384)
     crawler_memory_retry_seconds: int = Field(default=900, ge=60, le=86_400)
     crawler_browser_resume_backoff_seconds: int = Field(default=900, ge=60, le=86_400)
+    crawler_scan_lease_seconds: int = Field(default=180, ge=60, le=1800)
+    crawler_scan_heartbeat_stale_seconds: int = Field(default=180, ge=60, le=3600)
+    crawler_scan_reconcile_interval_seconds: int = Field(default=300, ge=60, le=3600)
+    crawler_incremental_scan_timeout_seconds: int = Field(default=2700, ge=300, le=21_600)
+    crawler_full_scan_timeout_seconds: int = Field(default=18_000, ge=1800, le=21_000)
+    crawler_db_lock_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    crawler_db_statement_timeout_seconds: int = Field(default=120, ge=10, le=1800)
     outbound_request_timeout_seconds: float = 20.0
     max_redirects: int = 5
     log_level: str = "INFO"

@@ -25,6 +25,8 @@ _sms_poll_interval = float(settings.phone_sms_poll_interval_seconds)
 _sms_poll_expires = max(1.0, _sms_poll_interval - 5.0)
 _proxy_maintenance_interval = float(settings.rabota_proxy_maintenance_interval_seconds)
 _proxy_maintenance_expires = max(1.0, _proxy_maintenance_interval - 60.0)
+_scan_reconcile_interval = float(settings.crawler_scan_reconcile_interval_seconds)
+_scan_reconcile_expires = max(1.0, _scan_reconcile_interval - 30.0)
 
 celery_app = Celery(
     "job-agent",
@@ -69,6 +71,11 @@ celery_app.conf.update(
             "task": "job_agent.scheduler.process_unprocessed_jobs",
             "schedule": 300.0,
             "options": {"queue": "matching", "expires": 270},
+        },
+        "reconcile-orphaned-scans": {
+            "task": "job_agent.scheduler.reconcile_orphaned_scans",
+            "schedule": _scan_reconcile_interval,
+            "options": {"queue": "maintenance", "expires": _scan_reconcile_expires},
         },
         "prepare-pending-applications": {
             "task": "job_agent.scheduler.prepare_pending_applications",
@@ -153,6 +160,7 @@ celery_app.conf.update(
     },
     task_routes={
         "job_agent.scheduler.run_scan": {"queue": "crawling"},
+        "job_agent.scheduler.reconcile_orphaned_scans": {"queue": "maintenance"},
         "job_agent.scheduler.start_scan": {"queue": "crawling"},
         "job_agent.scheduler.recheck_source": {"queue": "crawling"},
         "job_agent.scheduler.process_unprocessed_jobs": {"queue": "matching"},

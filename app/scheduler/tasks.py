@@ -13,7 +13,7 @@ import structlog
 from celery import Task
 from celery.schedules import crontab
 from redis import Redis
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from app.crawlers.pipeline import (
     ScanService,
@@ -193,23 +193,47 @@ async def _get_or_create_queued_scan(
     scan_type: ScanType,
     *,
     resume_from_checkpoint: bool = False,
-) -> ScanRun:
+) -> tuple[ScanRun, bool]:
     async with async_session_factory() as session:
+        running = await session.scalar(
+            select(ScanRun)
+            .where(
+                ScanRun.source_id == source_id,
+                ScanRun.scan_type == scan_type,
+                ScanRun.status == RunStatus.RUNNING,
+            )
+            .order_by(ScanRun.started_at.desc().nullslast())
+            .limit(1)
+        )
+        if running is not None:
+            return running, False
         queued = await session.scalar(
-            select(ScanRun).where(
+            select(ScanRun)
+            .where(
                 ScanRun.source_id == source_id,
                 ScanRun.scan_type == scan_type,
                 ScanRun.status == RunStatus.QUEUED,
             )
+            .order_by(ScanRun.started_at.desc().nullslast())
+            .limit(1)
         )
     if queued is not None:
-        return queued
-    return await _scan_service().create_scan(
+        return queued, True
+    run = await _scan_service().create_scan(
         source_id,
         scan_type,
         actor="celery_beat",
         resume_from_checkpoint=resume_from_checkpoint,
     )
+    return run, run.status != RunStatus.RUNNING
+
+
+async def _load_scan(scan_id: UUID) -> ScanRun:
+    async with async_session_factory() as session:
+        run = await session.get(ScanRun, scan_id)
+        if run is None:
+            raise LookupError(f"scan {scan_id} does not exist")
+        return run
 
 
 async def _scan_identity(scan_id: UUID) -> tuple[UUID, ScanType]:
@@ -218,6 +242,165 @@ async def _scan_identity(scan_id: UUID) -> tuple[UUID, ScanType]:
         if run is None:
             raise LookupError(f"scan {scan_id} does not exist")
         return run.source_id, run.scan_type
+
+
+def _scan_stale(run: ScanRun, cutoff: datetime) -> bool:
+    heartbeat = run.heartbeat_at or run.started_at
+    if heartbeat is None:
+        return True
+    if heartbeat.tzinfo is None:
+        heartbeat = heartbeat.replace(tzinfo=UTC)
+    return heartbeat < cutoff
+
+
+async def _reconcile_orphaned_scans(
+    client: Redis,
+    *,
+    source_id: UUID | None = None,
+    scan_type: ScanType | None = None,
+    limit: int = 100,
+    now: datetime | None = None,
+) -> list[ScanRun]:
+    settings = get_settings()
+    current = now or datetime.now(UTC)
+    cutoff = current - timedelta(seconds=settings.crawler_scan_heartbeat_stale_seconds)
+    conditions = [
+        ScanRun.status == RunStatus.RUNNING,
+        or_(
+            ScanRun.heartbeat_at < cutoff,
+            and_(ScanRun.heartbeat_at.is_(None), ScanRun.started_at < cutoff),
+            and_(ScanRun.heartbeat_at.is_(None), ScanRun.started_at.is_(None)),
+        ),
+    ]
+    if source_id is not None:
+        conditions.append(ScanRun.source_id == source_id)
+    if scan_type is not None:
+        conditions.append(ScanRun.scan_type == scan_type)
+
+    async with async_session_factory() as session:
+        candidates = (
+            await session.scalars(
+                select(ScanRun)
+                .where(*conditions)
+                .order_by(ScanRun.started_at.asc().nullsfirst())
+                .limit(limit)
+            )
+        ).all()
+
+    reconciled: list[ScanRun] = []
+    for candidate in candidates:
+        lease_key = lock_key("source-operation", str(candidate.source_id))
+        if client.exists(lease_key):
+            logger.warning(
+                "scan_stalled_with_live_owner",
+                scan_id=str(candidate.id),
+                source_id=str(candidate.source_id),
+                scan_type=candidate.scan_type.value,
+                owner_task_id=candidate.owner_task_id,
+                heartbeat_at=(
+                    candidate.heartbeat_at.isoformat() if candidate.heartbeat_at else None
+                ),
+            )
+            continue
+
+        async with async_session_factory() as session:
+            run = await session.scalar(
+                select(ScanRun).where(ScanRun.id == candidate.id).with_for_update(skip_locked=True)
+            )
+            if run is None or run.status != RunStatus.RUNNING or not _scan_stale(run, cutoff):
+                continue
+            if client.exists(lock_key("source-operation", str(run.source_id))):
+                continue
+
+            owner_task_id = run.owner_task_id
+            last_heartbeat = run.heartbeat_at or run.started_at
+            diagnostics = dict(run.diagnostics or {})
+            diagnostics.update(
+                {
+                    "failure": "orphaned_worker",
+                    "orphaned_owner_task_id": owner_task_id,
+                    "orphaned_heartbeat_at": (
+                        last_heartbeat.isoformat() if last_heartbeat else None
+                    ),
+                    "orphaned_at": current.isoformat(),
+                }
+            )
+            run.diagnostics = diagnostics
+            run.status = RunStatus.PARTIAL
+            run.finished_at = current
+            run.heartbeat_at = current
+            run.owner_task_id = None
+            source = await session.get(JobSource, run.source_id)
+            if source is not None:
+                source.last_scan_status = RunStatus.PARTIAL
+            from app.audit import record_audit_event
+
+            await record_audit_event(
+                session,
+                actor="scan_reconciler",
+                action="scan.orphan_reconciled",
+                entity_type="scan_run",
+                entity_id=str(run.id),
+                correlation_id=str(run.id),
+                decision="partial",
+                details={
+                    "owner_task_id": owner_task_id,
+                    "last_heartbeat": (last_heartbeat.isoformat() if last_heartbeat else None),
+                },
+            )
+            await session.commit()
+            reconciled.append(run)
+            logger.warning(
+                "scan_orphan_reconciled",
+                scan_id=str(run.id),
+                source_id=str(run.source_id),
+                scan_type=run.scan_type.value,
+                owner_task_id=owner_task_id,
+                last_heartbeat=(last_heartbeat.isoformat() if last_heartbeat else None),
+            )
+    return reconciled
+
+
+async def _run_scan_with_timeout(
+    service: ScanService,
+    scan_id: UUID,
+    *,
+    owner_task_id: str,
+    timeout_seconds: int,
+) -> ScanRun:
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await service.run_scan(scan_id)
+    except TimeoutError:
+        return await service.interrupt_scan(
+            scan_id,
+            reason="runtime_timeout",
+            expected_owner_task_id=owner_task_id,
+            details={"timeout_seconds": timeout_seconds},
+        )
+
+
+def _scan_timeout_seconds(scan_type: ScanType) -> int:
+    settings = get_settings()
+    if scan_type == ScanType.INCREMENTAL:
+        return settings.crawler_incremental_scan_timeout_seconds
+    return settings.crawler_full_scan_timeout_seconds
+
+
+def _scan_result_payload(run: ScanRun) -> dict[str, Any]:
+    return {
+        "scan_id": str(run.id),
+        "source_id": str(run.source_id),
+        "scan_type": run.scan_type.value,
+        "status": run.status.value,
+        "found_jobs": run.found_jobs,
+        "new_jobs": run.new_jobs,
+        "updated_jobs": run.updated_jobs,
+        "unchanged_jobs": run.unchanged_jobs,
+        "errors": run.parsing_errors + run.network_errors,
+        "processing_task_id": None,
+        "resume_scan_id": None,
+    }
 
 
 def _record_scan_result(run: ScanRun) -> None:
@@ -370,12 +553,50 @@ def run_scan_task(self: Task, scan_id: str) -> dict[str, Any]:
             settings.crawler_memory_retry_seconds,
         )
     client = _redis_client()
+    service = _scan_service()
+    owner_task_id = str(self.request.id or f"inline:{scan_id}")
     try:
         key = lock_key("source-operation", str(source_id))
-        with leased_redis_lock(client, key, ttl_seconds=900) as lease:
+        with leased_redis_lock(
+            client,
+            key,
+            ttl_seconds=settings.crawler_scan_lease_seconds,
+        ) as lease:
             if lease is None:
                 _retry_busy(self, f"{scan_type.value} scan for source {source_id}")
-            run = _run_async(_scan_service().run_scan(parsed_scan_id))
+            claimed = _run_async(service.claim_scan(parsed_scan_id, owner_task_id))
+            if not claimed:
+                current = _run_async(_load_scan(parsed_scan_id))
+                logger.info(
+                    "scan_task_not_owner",
+                    scan_id=scan_id,
+                    source_id=str(source_id),
+                    scan_type=scan_type.value,
+                    owner_task_id=current.owner_task_id,
+                    status=current.status.value,
+                )
+                return _scan_result_payload(current)
+            try:
+                run = _run_async(
+                    _run_scan_with_timeout(
+                        service,
+                        parsed_scan_id,
+                        owner_task_id=owner_task_id,
+                        timeout_seconds=_scan_timeout_seconds(scan_type),
+                    )
+                )
+            except BaseException as exc:
+                try:
+                    _run_async(
+                        service.interrupt_scan(
+                            parsed_scan_id,
+                            reason="worker_exception",
+                            expected_owner_task_id=owner_task_id,
+                            details={"error_type": type(exc).__name__},
+                        )
+                    )
+                finally:
+                    raise
         if lease.lease_lost:
             logger.warning(
                 "scan_lock_lease_lost",
@@ -522,6 +743,58 @@ def recheck_source_task(self: Task, source_id: str) -> dict[str, int | str]:
         close_redis_client(client)
 
 
+def _resume_orphaned_scan(client: Redis, orphan: ScanRun) -> str | None:
+    reservation = reserve_once(
+        client,
+        lock_key("orphan-resume", str(orphan.id)),
+        ttl_seconds=86_400,
+    )
+    if reservation is None:
+        return None
+    try:
+        resumed = _run_async(
+            _scan_service().create_scan(
+                orphan.source_id,
+                orphan.scan_type,
+                resume_scan_id=orphan.id,
+                actor="orphan_reconciliation",
+            )
+        )
+        if resumed.status == RunStatus.RUNNING:
+            return None
+        run_scan_task.apply_async(args=[str(resumed.id)], queue="crawling")
+        logger.info(
+            "orphan_scan_resume_scheduled",
+            orphan_scan_id=str(orphan.id),
+            resume_scan_id=str(resumed.id),
+            source_id=str(orphan.source_id),
+            scan_type=orphan.scan_type.value,
+        )
+        return str(resumed.id)
+    except Exception:
+        reservation.release()
+        raise
+
+
+@celery_app.task(name="job_agent.scheduler.reconcile_orphaned_scans")
+def reconcile_orphaned_scans_task() -> dict[str, Any]:
+    client = _redis_client()
+    try:
+        reconciled = _run_async(_reconcile_orphaned_scans(client))
+        resumed = [
+            resume_id
+            for orphan in reconciled
+            if (resume_id := _resume_orphaned_scan(client, orphan)) is not None
+        ]
+        return {
+            "reconciled": [str(run.id) for run in reconciled],
+            "resumed": resumed,
+            "count": len(reconciled),
+        }
+    finally:
+        close_redis_client(client)
+
+
 def _operation_allowed_for_source(source: SourceSchedule, operation: str) -> bool:
     # A degraded source may run its scheduled incremental scan as a bounded recovery probe.
     # Rechecks and full scans stay suppressed until a successful scan restores HEALTHY.
@@ -568,13 +841,35 @@ def _dispatch_one(
             recheck_source_task.apply_async(args=[str(source.source_id)], queue="crawling")
             return f"recheck:{source.source_id}"
         scan_type = ScanType(operation)
-        run = _run_async(
+        reconciled = _run_async(
+            _reconcile_orphaned_scans(
+                client,
+                source_id=source.source_id,
+                scan_type=scan_type,
+                limit=1,
+                now=now,
+            )
+        )
+        if reconciled:
+            resume_id = _resume_orphaned_scan(client, reconciled[0])
+            if resume_id is not None:
+                return f"{operation}:{resume_id}"
+
+        run, should_enqueue = _run_async(
             _get_or_create_queued_scan(
                 source.source_id,
                 scan_type,
                 resume_from_checkpoint=_resume_from_checkpoint_enabled(source, operation),
             )
         )
+        if not should_enqueue:
+            logger.info(
+                "scheduled_scan_already_running",
+                scan_id=str(run.id),
+                source_id=str(source.source_id),
+                scan_type=scan_type.value,
+            )
+            return None
         run_scan_task.apply_async(args=[str(run.id)], queue="crawling")
         return f"{operation}:{run.id}"
     except Exception:

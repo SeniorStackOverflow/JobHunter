@@ -9,7 +9,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from sqlalchemy import case, desc, func, or_, select
+from sqlalchemy import case, desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.applications.availability import block_closed_vacancy_applications
@@ -41,6 +41,29 @@ from app.models.entities import (
 )
 from app.models.enums import JobStatus, RunStatus, ScanType, SourceHealth
 from app.security.ssrf import UnsafeURLError
+from app.settings import get_settings
+
+_TRANSIENT_CHECKPOINT_ADAPTER_KEYS = frozenset(
+    {
+        "known_external_ids",
+        "known_updated_hints",
+        "known_last_checked_at",
+    }
+)
+
+
+def _persistable_checkpoint(raw: ScanCheckpoint | dict[str, Any] | None) -> dict[str, Any]:
+    checkpoint = (
+        raw if isinstance(raw, ScanCheckpoint) else ScanCheckpoint.model_validate(raw or {})
+    )
+    compact = checkpoint.model_copy(deep=True)
+    compact.adapter_state = {
+        key: value
+        for key, value in compact.adapter_state.items()
+        if key not in _TRANSIENT_CHECKPOINT_ADAPTER_KEYS
+    }
+    return compact.model_dump(mode="json")
+
 
 SOURCE_JOB_FIELDS = (
     "canonical_url",
@@ -213,6 +236,87 @@ class ScanService:
         self.deduplication = deduplication or DeduplicationService()
         self.employer_identity = employer_identity or EmployerIdentityService()
 
+    async def claim_scan(self, scan_id: UUID, owner_task_id: str) -> bool:
+        now = datetime.now(UTC)
+        async with self.session_factory() as session:
+            run = await session.scalar(
+                select(ScanRun).where(ScanRun.id == scan_id).with_for_update()
+            )
+            if run is None:
+                raise LookupError(f"scan {scan_id} does not exist")
+            if run.status == RunStatus.RUNNING:
+                if run.owner_task_id == owner_task_id:
+                    run.heartbeat_at = now
+                    await session.commit()
+                    return True
+                return False
+            if run.status not in {RunStatus.QUEUED, RunStatus.PARTIAL, RunStatus.FAILED}:
+                return False
+            run.owner_task_id = owner_task_id
+            run.heartbeat_at = now
+            await session.commit()
+            return True
+
+    async def interrupt_scan(
+        self,
+        scan_id: UUID,
+        *,
+        reason: str,
+        expected_owner_task_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> ScanRun:
+        now = datetime.now(UTC)
+        async with self.session_factory() as session:
+            run = await session.scalar(
+                select(ScanRun).where(ScanRun.id == scan_id).with_for_update()
+            )
+            if run is None:
+                raise LookupError(f"scan {scan_id} does not exist")
+            if expected_owner_task_id is not None and run.owner_task_id not in {
+                None,
+                expected_owner_task_id,
+            }:
+                return run
+            if (
+                run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                and run.finished_at is not None
+            ):
+                return run
+            diagnostics = dict(run.diagnostics or {})
+            diagnostics["failure"] = reason
+            if details:
+                diagnostics.update(details)
+            run.diagnostics = diagnostics
+            run.status = RunStatus.PARTIAL
+            run.finished_at = now
+            run.heartbeat_at = now
+            run.owner_task_id = None
+            source = await session.get(JobSource, run.source_id)
+            if source is not None:
+                source.last_scan_status = RunStatus.PARTIAL
+            await record_audit_event(
+                session,
+                actor="scheduler",
+                action="scan.interrupted",
+                entity_type="scan_run",
+                entity_id=str(run.id),
+                correlation_id=str(run.id),
+                decision="partial",
+                details={"reason": reason, **(details or {})},
+            )
+            await session.commit()
+            return run
+
+    async def _configure_scan_session(self, session: AsyncSession) -> None:
+        bind = session.get_bind()
+        if bind.dialect.name != "postgresql":
+            return
+        settings = get_settings()
+        lock_seconds = int(settings.crawler_db_lock_timeout_seconds)
+        statement_seconds = int(settings.crawler_db_statement_timeout_seconds)
+        await session.execute(text(f"SET lock_timeout = '{lock_seconds}s'"))
+        await session.execute(text(f"SET statement_timeout = '{statement_seconds}s'"))
+
     async def _refresh_canonical_status(
         self,
         session: AsyncSession,
@@ -298,7 +402,9 @@ class ScanService:
             diagnostics: dict[str, Any] = {}
             if previous is not None:
                 checkpoint = (
-                    deepcopy(previous.checkpoint) if isinstance(previous.checkpoint, dict) else {}
+                    _persistable_checkpoint(deepcopy(previous.checkpoint))
+                    if isinstance(previous.checkpoint, dict)
+                    else {}
                 )
                 previous_diagnostics = (
                     previous.diagnostics if isinstance(previous.diagnostics, dict) else {}
@@ -348,6 +454,8 @@ class ScanService:
     ) -> None:
         run.status = RunStatus.FAILED
         run.finished_at = datetime.now(UTC)
+        run.heartbeat_at = run.finished_at
+        run.owner_task_id = None
         run.diagnostics = {**run.diagnostics, "failure": reason}
         source.last_scan_status = RunStatus.FAILED
         await record_audit_event(
@@ -364,6 +472,7 @@ class ScanService:
 
     async def run_scan(self, scan_id: UUID) -> ScanRun:
         async with self.session_factory() as session:
+            await self._configure_scan_session(session)
             run = await session.get(ScanRun, scan_id)
             if run is None:
                 raise LookupError(f"scan {scan_id} does not exist")
@@ -417,6 +526,7 @@ class ScanService:
 
             run.status = RunStatus.RUNNING
             run.started_at = run.started_at or datetime.now(UTC)
+            run.heartbeat_at = datetime.now(UTC)
             await session.commit()
 
             try:
@@ -428,6 +538,7 @@ class ScanService:
                     + len(await adapter.discover_regions())
                     + len(await adapter.discover_locales())
                 )
+                run.heartbeat_at = datetime.now(UTC)
                 await session.commit()
             except RabotaMdDegradedError as exc:
                 # Exhausted egress is a transport failure, not a parse warning. Stop the
@@ -439,6 +550,8 @@ class ScanService:
                     **_safe_iteration_diagnostics(exc),
                 }
                 run.finished_at = datetime.now(UTC)
+                run.heartbeat_at = run.finished_at
+                run.owner_task_id = None
                 source.last_scan_status = RunStatus.PARTIAL
                 source.health_status = SourceHealth.DEGRADED
                 source.automatic_actions_paused = True
@@ -471,7 +584,8 @@ class ScanService:
                     source.id,
                     checkpoint,
                 )
-                run.checkpoint = checkpoint.model_dump(mode="json")
+                run.checkpoint = _persistable_checkpoint(checkpoint)
+                run.heartbeat_at = datetime.now(UTC)
                 await session.commit()
             iterator = (
                 adapter.iterate_full_scan(checkpoint)
@@ -596,6 +710,8 @@ class ScanService:
                     **_safe_iteration_diagnostics(exc),
                 }
                 run.finished_at = datetime.now(UTC)
+                run.heartbeat_at = run.finished_at
+                run.owner_task_id = None
                 source.last_scan_status = RunStatus.PARTIAL
                 degradation_reason = _degradation_reason(exc)
                 if degradation_reason:
@@ -660,6 +776,8 @@ class ScanService:
                         source.automatic_actions_paused = False
             source.last_scan_status = run.status
             run.finished_at = datetime.now(UTC)
+            run.heartbeat_at = run.finished_at
+            run.owner_task_id = None
             await record_audit_event(
                 session,
                 actor="worker",
@@ -770,7 +888,7 @@ class ScanService:
         failure_count = 0
         if isinstance(raw_checkpoint, dict):
             checkpoint = ScanCheckpoint.model_validate(raw_checkpoint)
-            persisted = ScanCheckpoint.model_validate(run.checkpoint or {})
+            persisted = ScanCheckpoint.model_validate(_persistable_checkpoint(run.checkpoint))
             raw_failures = persisted.adapter_state.get("failed_reference_attempts", {})
             failures = dict(raw_failures) if isinstance(raw_failures, dict) else {}
             raw_references = persisted.adapter_state.get("failed_references", {})
@@ -794,7 +912,8 @@ class ScanService:
                 "failed_reference_attempts": failures,
                 "failed_references": failed_references,
             }
-            run.checkpoint = checkpoint.model_dump(mode="json")
+            run.checkpoint = _persistable_checkpoint(checkpoint)
+        run.heartbeat_at = datetime.now(UTC)
         await session.flush()
         return failure_count
 
@@ -804,12 +923,12 @@ class ScanService:
         mutable: ScanCheckpoint,
     ) -> dict[str, Any]:
         """Merge in-place adapter progress without discarding per-reference progress."""
-        persisted = ScanCheckpoint.model_validate(persisted_raw or {})
+        persisted = ScanCheckpoint.model_validate(_persistable_checkpoint(persisted_raw))
         baseline = ScanCheckpoint()
         if mutable == baseline:
             return persisted.model_dump(mode="json")
 
-        progressed = mutable.model_copy(deep=True)
+        progressed = ScanCheckpoint.model_validate(_persistable_checkpoint(mutable))
         progressed.yielded_external_ids = list(
             dict.fromkeys([*persisted.yielded_external_ids, *mutable.yielded_external_ids])
         )
@@ -842,7 +961,7 @@ class ScanService:
             progressed.cursor = persisted.cursor
         elif mutable.cursor is None:
             progressed.cursor = persisted.cursor
-        return progressed.model_dump(mode="json")
+        return _persistable_checkpoint(progressed)
 
     async def _save_categories(
         self, session: AsyncSession, source_id: UUID, categories: list[Any]

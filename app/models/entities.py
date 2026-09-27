@@ -345,6 +345,7 @@ class JobSnapshot(UUIDPrimaryKeyMixin, Base):
 
 class ScanRun(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "scan_runs"
+    __table_args__ = (Index("ix_scan_runs_status_heartbeat", "status", "heartbeat_at"),)
 
     source_id: Mapped[UUID] = mapped_column(ForeignKey("job_sources.id", ondelete="CASCADE"))
     scan_type: Mapped[ScanType] = mapped_column(enum_column(ScanType), nullable=False)
@@ -362,6 +363,8 @@ class ScanRun(UUIDPrimaryKeyMixin, Base):
     network_errors: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    owner_task_id: Mapped[str | None] = mapped_column(String(255))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

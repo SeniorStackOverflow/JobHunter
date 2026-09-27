@@ -221,7 +221,22 @@ async def get_system_status() -> dict[str, Any]:
             ).all()
         )
         preferences = await ProfileService().get_preferences(session)
-        since = datetime.now(UTC) - timedelta(hours=24)
+        now = datetime.now(UTC)
+        since = now - timedelta(hours=24)
+        stale_after = timedelta(seconds=get_settings().crawler_scan_heartbeat_stale_seconds)
+        heartbeat_ages: list[float] = []
+        stale_running_scans = 0
+        for scan in scans:
+            heartbeat = scan.heartbeat_at or scan.started_at
+            if heartbeat is None:
+                stale_running_scans += 1
+                continue
+            if heartbeat.tzinfo is None:
+                heartbeat = heartbeat.replace(tzinfo=UTC)
+            age = max(0.0, (now - heartbeat.astimezone(UTC)).total_seconds())
+            heartbeat_ages.append(age)
+            if age > stale_after.total_seconds():
+                stale_running_scans += 1
         failed_delivery_statuses = {
             DeliveryStatus.BOUNCED_TRANSIENT,
             DeliveryStatus.BOUNCED_PERMANENT,
@@ -287,6 +302,15 @@ async def get_system_status() -> dict[str, Any]:
             >= since
             for alert in actionable_delivery_alerts
         )
+        orphan_reconciled_24h = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == "scan.orphan_reconciled",
+                    AuditEvent.timestamp >= since,
+                )
+            )
+            or 0
+        )
         historical_delivery_repairs_total = int(
             await session.scalar(
                 select(func.count(AuditEvent.id)).where(
@@ -299,6 +323,11 @@ async def get_system_status() -> dict[str, Any]:
             "sources": len(sources),
             "healthy_sources": sum(item.health_status == SourceHealth.HEALTHY for item in sources),
             "running_scans": len(scans),
+            "stale_running_scans": stale_running_scans,
+            "max_scan_heartbeat_age_seconds": (
+                round(max(heartbeat_ages), 1) if heartbeat_ages else None
+            ),
+            "orphan_reconciled_24h": orphan_reconciled_24h,
             "auto_send_enabled": preferences.auto_send_enabled,
             "global_pause": preferences.global_pause,
             "real_delivery_enabled": get_settings().real_email_delivery_enabled,
