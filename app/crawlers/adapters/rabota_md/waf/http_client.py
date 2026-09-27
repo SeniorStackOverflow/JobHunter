@@ -126,9 +126,15 @@ class WafHttpClient:
             method, url, extra_headers, response, token=fresh_token
         )
         if self._is_challenge(response):
-            raise WafChallengeRequired(f"AWS WAF challenge persists after token refresh: {url}")
+            raise WafChallengeRequired(
+                f"AWS WAF challenge persists after token refresh: {url}",
+                reason_code="challenge_persisted",
+            )
         if self._is_token_rejection(response):
-            raise WafChallengeRequired(f"AWS WAF rejects even a fresh token: {url}")
+            raise WafChallengeRequired(
+                f"AWS WAF rejects even a fresh token: {url}",
+                reason_code="fresh_token_rejected",
+            )
         self._reject_terminal_waf(response)
         return response
 

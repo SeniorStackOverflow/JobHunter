@@ -6,7 +6,18 @@ class WafError(RuntimeError):
 
 
 class WafChallengeRequired(WafError):
-    """The site answered 202 challenge: the current token is missing or stale."""
+    """A fresh WAF token still resulted in a challenge or token rejection."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        reason_code: str = "challenge_persisted",
+        stage: str = "post_refresh",
+    ) -> None:
+        self.reason_code = reason_code
+        self.stage = stage
+        super().__init__(detail)
 
 
 class WafUnsupportedChallenge(WafError):

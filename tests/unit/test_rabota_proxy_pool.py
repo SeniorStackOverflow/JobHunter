@@ -18,7 +18,10 @@ from app.crawlers.adapters.rabota_md.proxy_pool import (
     ProxyPoolFetcher,
     RabotaProxyPool,
 )
-from app.crawlers.adapters.rabota_md.waf.errors import WafSolveFailed
+from app.crawlers.adapters.rabota_md.waf.errors import (
+    WafChallengeRequired,
+    WafSolveFailed,
+)
 
 
 class FakeRedis:
@@ -1216,3 +1219,77 @@ async def test_legacy_waf_candidate_without_challenge_marker_is_not_promoted() -
     )
 
     assert await pool.promotion_endpoints(set(), limit=3) == []
+
+
+def test_waf_challenge_required_has_explicit_preflight_taxonomy() -> None:
+    exc = WafChallengeRequired(
+        "fresh token still challenged",
+        reason_code="challenge_persisted",
+    )
+
+    assert ProxyPoolFetcher._failure_details(exc) == (
+        "challenge_persisted",
+        "proof",
+        "post_refresh",
+    )
+
+
+async def test_waf_challenge_required_keeps_free_candidate_retryable() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        revalidation_retry_seconds=300,
+        revalidation_max_failures=3,
+        min_fresh_free=1,
+    )
+    candidate = ProxyEndpoint(
+        "free",
+        "http://8.8.8.8:3128",
+        "free",
+        capability="waf_candidate",
+    )
+    now = time.time()
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        candidate.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": candidate.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": now,
+                "challenge_reachable_at": now,
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+
+    async def preflight(_endpoint: ProxyEndpoint, _fetcher: StubFetcher) -> None:
+        raise WafChallengeRequired(
+            "fresh token still challenged",
+            reason_code="challenge_persisted",
+        )
+
+    fetcher = ProxyPoolFetcher(
+        pool,
+        lambda _endpoint: StubFetcher([]),  # type: ignore[arg-type]
+        preflight=preflight,  # type: ignore[arg-type]
+        max_preflight_attempts=1,
+        promotion_concurrency=1,
+    )
+
+    counts = await fetcher.warm_reserve(target_ready=1)
+
+    state = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][candidate.identity])
+    assert counts == {"ready": 0, "candidates": 0}
+    assert state["status"] == "candidate"
+    assert state["proof_failures"] == 1
+    assert state["last_failure_class"] == "proof"
+    assert state["last_failure_stage"] == "post_refresh"
+    assert state["last_revalidation_error"] == "challenge_persisted"
+    await fetcher.aclose()
