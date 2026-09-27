@@ -27,6 +27,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafProtocolError,
     WafRateLimited,
     WafSolveFailed,
+    WafSolverCompatibilityError,
     WafTransportError,
     WafUnsupportedChallenge,
 )
@@ -46,7 +47,8 @@ log = structlog.get_logger()
 _STATE_KEY = "crawler:rabota_md:proxy_pool:state"
 _DISCOVERY_LOCK_KEY = "crawler:rabota_md:proxy_pool:discovery_lock"
 _DISCOVERY_LOCK_TTL_SECONDS = 120
-_SOURCE_STATS_KEY = "crawler:rabota_md:proxy_pool:source_stats"
+_SOURCE_STATS_KEY = "crawler:rabota_md:proxy_pool:source_stats:v2"
+_PROTOCOL_V2_RECOVERY_KEY = "crawler:rabota_md:proxy_pool:recovery:aws-waf-v2"
 _FREE_PROXY_SOURCES: tuple[tuple[str, Literal["lines", "proxmint_json", "hproxy_json"]], ...] = (
     (
         "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/all.json",
@@ -232,6 +234,7 @@ class RabotaProxyPool:
             payload["revalidation_failures"] = 0
             payload["proof_failures"] = 0
             payload.pop("last_revalidation_error", None)
+            payload.pop("force_revalidate", None)
         if endpoint.kind == "free":
             payload["url"] = endpoint.url
             if capability is not None:
@@ -320,6 +323,19 @@ class RabotaProxyPool:
             return
 
         now = time.time()
+        if reason_class == "solver_compatibility":
+            payload["last_revalidation_error"] = reason
+            payload["last_failure_class"] = reason_class
+            payload["last_failure_stage"] = stage
+            payload["kind"] = endpoint.kind
+            payload["url"] = endpoint.url
+            payload["last_check"] = now
+            payload["status"] = "candidate" if capability == "waf_candidate" else "suspect"
+            payload["cooldown_until"] = now + self._revalidation_retry
+            await self._write_entry(endpoint.identity, payload)
+            RABOTA_PROXY_EGRESS.labels(kind=endpoint.kind, outcome="transient").inc()
+            return
+
         if capability in {"direct_pagination", "full_waf"} and "last_success_at" not in payload:
             payload["last_success_at"] = payload.get("last_check", now)
         counter_name = (
@@ -733,6 +749,80 @@ class RabotaProxyPool:
     async def _known_free_count(self) -> int:
         return (await self.reserve_counts())["ready"]
 
+    async def reconcile_solver_protocol_v2(self) -> dict[str, int]:
+        if await self._redis.get(_PROTOCOL_V2_RECOVERY_KEY):
+            return {"candidates": 0, "proven": 0}
+        acquired = await self._redis.set(
+            _PROTOCOL_V2_RECOVERY_KEY,
+            "running",
+            nx=True,
+            ex=300,
+        )
+        if not acquired:
+            return {"candidates": 0, "proven": 0}
+
+        try:
+            entries = cast(
+                dict[object, object],
+                await cast(Any, self._redis).hgetall(_STATE_KEY),
+            )
+            now = time.time()
+            recovered_candidates = 0
+            recovered_proven = 0
+            for raw_identity, raw_payload in entries.items():
+                identity = self._decode(raw_identity)
+                if not identity.startswith("free:"):
+                    continue
+                try:
+                    payload = json.loads(self._decode(raw_payload))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if payload.get("last_revalidation_error") != "UnicodeDecodeError":
+                    continue
+                if payload.get("last_failure_stage") != "inputs":
+                    continue
+                capability = payload.get("validated_capability")
+                if capability == "waf_candidate":
+                    payload.update(
+                        status="candidate",
+                        cooldown_until=0,
+                        proof_failures=0,
+                        last_check=now,
+                        challenge_reachable_at=now,
+                    )
+                    recovered_candidates += 1
+                elif capability in {"full_waf", "direct_pagination"}:
+                    payload.update(
+                        status="suspect",
+                        cooldown_until=0,
+                        revalidation_failures=0,
+                        last_check=now,
+                        force_revalidate=True,
+                    )
+                    recovered_proven += 1
+                else:
+                    continue
+                payload["last_revalidation_error"] = "solver_protocol_v2_recovery"
+                payload["last_failure_class"] = "solver_compatibility"
+                payload["last_failure_stage"] = "inputs"
+                await self._write_entry(identity, payload)
+
+            await self._redis.set(
+                _PROTOCOL_V2_RECOVERY_KEY,
+                "done",
+                ex=7 * 24 * 3600,
+            )
+            log.info(
+                "rabota_proxy_solver_protocol_v2_recovered",
+                candidates=recovered_candidates,
+                proven=recovered_proven,
+            )
+            await self._update_reserve_metrics()
+            return {"candidates": recovered_candidates, "proven": recovered_proven}
+        except Exception:
+            await self._redis.delete(_PROTOCOL_V2_RECOVERY_KEY)
+            raise
+
     async def reserve_counts(self) -> dict[str, int]:
         now = time.time()
         entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
@@ -761,6 +851,13 @@ class RabotaProxyPool:
     def _revalidatable_ready_state(self, payload: dict[str, object], now: float) -> bool:
         if self._as_float(payload.get("cooldown_until", 0)) > now:
             return False
+        capability = payload.get("validated_capability")
+        if (
+            payload.get("force_revalidate") is True
+            and capability in {"direct_pagination", "full_waf"}
+            and payload.get("status") == "suspect"
+        ):
+            return True
         last_success = self._as_float(payload.get("last_success_at", payload.get("last_check", 0)))
         if last_success <= 0:
             return False
@@ -935,12 +1032,14 @@ class ProxyPoolFetcher:
             return exc.reason_code, "proof", exc.stage
         if isinstance(exc, WafChallengeRequired):
             return exc.reason_code, "proof", exc.stage
+        if isinstance(exc, WafSolverCompatibilityError):
+            return exc.error_type, "solver_compatibility", exc.stage
         if isinstance(exc, WafProtocolError):
             return exc.error_type, "protocol", exc.stage
         if isinstance(exc, WafRateLimited):
             return type(exc).__name__, "rate_limit", "waf"
         if isinstance(exc, WafUnsupportedChallenge):
-            return type(exc).__name__, "protocol", "challenge"
+            return type(exc).__name__, "solver_compatibility", "challenge"
         if isinstance(exc, WafSolveFailed):
             return type(exc).__name__, "proof", getattr(exc, "stage", "token")
         if isinstance(exc, httpx.TransportError):
@@ -973,6 +1072,9 @@ class ProxyPoolFetcher:
         else:
             await self._pool.report_dead(endpoint)
         return reason, reason_class, stage
+
+    async def reconcile_solver_protocol_v2(self) -> dict[str, int]:
+        return await self._pool.reconcile_solver_protocol_v2()
 
     async def get(self, url: str) -> httpx.Response:
         return await self._request("get", url)

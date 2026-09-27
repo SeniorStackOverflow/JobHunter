@@ -9,6 +9,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
+    WafSolverCompatibilityError,
     WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.solver import AwsWafSolver
@@ -37,6 +38,7 @@ __all__ = [
     "WafRateLimited",
     "WafScriptVersionUnknown",
     "WafSolveFailed",
+    "WafSolverCompatibilityError",
     "WafTokenBackend",
     "WafTokenProvider",
     "WafUnsupportedChallenge",

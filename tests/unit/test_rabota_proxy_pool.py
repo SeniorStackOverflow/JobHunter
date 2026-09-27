@@ -21,6 +21,7 @@ from app.crawlers.adapters.rabota_md.proxy_pool import (
 from app.crawlers.adapters.rabota_md.waf.errors import (
     WafChallengeRequired,
     WafSolveFailed,
+    WafSolverCompatibilityError,
 )
 
 
@@ -1293,3 +1294,147 @@ async def test_waf_challenge_required_keeps_free_candidate_retryable() -> None:
     assert state["last_failure_stage"] == "post_refresh"
     assert state["last_revalidation_error"] == "challenge_persisted"
     await fetcher.aclose()
+
+
+def test_solver_compatibility_failure_has_explicit_preflight_taxonomy() -> None:
+    exc = WafSolverCompatibilityError(
+        stage="inputs",
+        error_type="UnknownChallengeType",
+        detail="unsupported live challenge",
+    )
+
+    assert ProxyPoolFetcher._failure_details(exc) == (
+        "UnknownChallengeType",
+        "solver_compatibility",
+        "inputs",
+    )
+
+
+async def test_solver_compatibility_failure_does_not_poison_source_score() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        revalidation_retry_seconds=300,
+        revalidation_max_failures=3,
+        min_fresh_free=1,
+    )
+    endpoint = ProxyEndpoint(
+        "free",
+        "http://8.8.8.8:3128",
+        "free",
+        capability="full_waf",
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        endpoint.identity,
+        json.dumps(
+            {
+                "status": "ready",
+                "kind": "free",
+                "url": endpoint.url,
+                "cooldown_until": 0,
+                "last_check": time.time(),
+                "last_success_at": time.time(),
+                "validated_capability": "full_waf",
+                "source": "feed.example",
+                "revalidation_failures": 2,
+            }
+        ),
+    )
+
+    await pool.report_transient_failure(
+        endpoint,
+        reason="UnknownChallengeType",
+        reason_class="solver_compatibility",
+        stage="inputs",
+    )
+
+    stored = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert stored["status"] == "suspect"
+    assert stored["revalidation_failures"] == 2
+    assert stored["last_failure_class"] == "solver_compatibility"
+    assert (
+        redis.hashes.get("crawler:rabota_md:proxy_pool:source_stats:v2", {}).get(
+            "feed.example:protocol_failure"
+        )
+        is None
+    )
+    await pool.aclose()
+
+
+async def test_protocol_v2_recovery_rehabilitates_only_unicode_inputs_failures() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        min_fresh_free=1,
+    )
+    candidate = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="waf_candidate",
+    )
+    proven = ProxyEndpoint(
+        "free",
+        "http://8.8.8.8:3128",
+        "free",
+        capability="full_waf",
+    )
+    transport_dead = ProxyEndpoint(
+        "free",
+        "http://9.9.9.9:8080",
+        "free",
+        capability="full_waf",
+    )
+    for endpoint, error, stage in (
+        (candidate, "UnicodeDecodeError", "inputs"),
+        (proven, "UnicodeDecodeError", "inputs"),
+        (transport_dead, "ReadTimeout", "inputs"),
+    ):
+        await redis.hset(
+            "crawler:rabota_md:proxy_pool:state",
+            endpoint.identity,
+            json.dumps(
+                {
+                    "status": "dead",
+                    "kind": "free",
+                    "url": endpoint.url,
+                    "cooldown_until": time.time() + 3600,
+                    "last_check": time.time(),
+                    "validated_capability": endpoint.capability,
+                    "last_revalidation_error": error,
+                    "last_failure_stage": stage,
+                    "proof_failures": 3,
+                    "revalidation_failures": 3,
+                }
+            ),
+        )
+
+    recovered = await pool.reconcile_solver_protocol_v2()
+
+    assert recovered == {"candidates": 1, "proven": 1}
+    candidate_state = json.loads(
+        redis.hashes["crawler:rabota_md:proxy_pool:state"][candidate.identity]
+    )
+    proven_state = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][proven.identity])
+    transport_state = json.loads(
+        redis.hashes["crawler:rabota_md:proxy_pool:state"][transport_dead.identity]
+    )
+    assert candidate_state["status"] == "candidate"
+    assert candidate_state["proof_failures"] == 0
+    assert proven_state["status"] == "suspect"
+    assert proven_state["revalidation_failures"] == 0
+    assert proven_state["force_revalidate"] is True
+    assert transport_state["status"] == "dead"
+
+    promoted = await pool.promotion_endpoints(set(), limit=3)
+    assert [item.identity for item in promoted] == [proven.identity, candidate.identity]
+
+    assert await pool.reconcile_solver_protocol_v2() == {"candidates": 0, "proven": 0}
+    await pool.aclose()

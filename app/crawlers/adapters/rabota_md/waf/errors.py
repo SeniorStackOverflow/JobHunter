@@ -62,7 +62,16 @@ class WafTransportError(WafError):
 
 
 class WafProtocolError(WafError):
-    """A malformed or incompatible WAF protocol payload was received."""
+    """A malformed WAF payload was received from the current egress."""
+
+    def __init__(self, *, stage: str, error_type: str, detail: str) -> None:
+        self.stage = stage
+        self.error_type = error_type
+        super().__init__(detail)
+
+
+class WafSolverCompatibilityError(WafError):
+    """The live AWS WAF protocol is valid but unsupported by this solver version."""
 
     def __init__(self, *, stage: str, error_type: str, detail: str) -> None:
         self.stage = stage

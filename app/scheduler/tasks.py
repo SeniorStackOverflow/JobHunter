@@ -1500,6 +1500,7 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
         from app.crawlers.adapters.rabota_md.transport import _prove_free_waf_candidate
         from app.crawlers.adapters.rabota_md.waf.errors import (
             WafSolveFailed,
+            WafSolverCompatibilityError,
             WafTransportError,
             WafUnsupportedChallenge,
         )
@@ -1582,7 +1583,11 @@ async def _rabota_md_waf_canary() -> dict[str, str]:
                         error_type=exc.error_type,
                         stage=exc.stage,
                     )
-                except (WafUnsupportedChallenge, WafSolveFailed) as exc:
+                except (
+                    WafUnsupportedChallenge,
+                    WafSolverCompatibilityError,
+                    WafSolveFailed,
+                ) as exc:
                     solver_outcome = "failure"
                     solver_error = type(exc).__name__
                     redis = AsyncRedis.from_url(settings.redis_url)

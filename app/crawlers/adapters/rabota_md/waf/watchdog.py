@@ -18,7 +18,7 @@ CANARY_KEY = "crawler:rabota_md:waf_solver_canary_ok"
 CANARY_TTL_SECONDS = 6 * 60 * 60
 # Bump when the solver's protocol assumptions materially change. An old canary
 # then stops authorizing a newly incompatible implementation automatically.
-PROTOCOL_FINGERPRINT = "aws-waf-v1:challenge-inputs-verify-token"
+PROTOCOL_FINGERPRINT = "aws-waf-v2:top-level-inputs-hashed-types"
 
 
 class ScriptWatchdog:

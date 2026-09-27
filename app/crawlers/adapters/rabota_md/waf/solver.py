@@ -20,6 +20,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -34,6 +35,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
+    WafSolverCompatibilityError,
     WafTransportError,
     WafUnsupportedChallenge,
 )
@@ -63,7 +65,169 @@ VERIFY_ENDPOINT = {
     "NetworkBandwidth": "mp_verify",
 }
 
+HASHED_CHALLENGE_TYPES = {
+    "h72f957df656e80ba55f5d8ce2e8c7ccb59687dba3bfb273d54b08a261b2f3002": (
+        "HashcashScrypt",
+        "verify",
+    ),
+    "h7b0c470f0cfe3a80a9e26526ad185f484f6817d0832712a4a37a908786a6a67f": (
+        "SHA256",
+        "verify",
+    ),
+    "ha9faaffd31b4d5ede2a2e19d2d7fd525f66fee61911511960dcbb52d3c48ce25": (
+        "NetworkBandwidth",
+        "mp_verify",
+    ),
+}
+
 BANDWIDTH_SIZES = {1: 1024, 2: 10240, 3: 102400, 4: 1048576, 5: 10485760}
+_MAX_BANDWIDTH_BYTES = max(BANDWIDTH_SIZES.values())
+
+
+@dataclass(frozen=True)
+class ChallengeJsConfig:
+    challenge_endpoints: dict[str, str]
+    multipart_fields: tuple[str, str] = ("solution_data", "solution_metadata")
+    bandwidth_sizes: dict[int, int] | None = None
+
+
+def _parse_challenge_js(script_text: str) -> ChallengeJsConfig:
+    endpoints: dict[str, str] = {}
+    for match in re.finditer(
+        r"""['"](h[0-9a-f]{8,})['"]\s*\+.*?=\s*['"]((?:mp_)?verify)['"]""",
+        script_text,
+    ):
+        endpoints[match.group(1)] = match.group(2)
+
+    solution_field = "solution_data"
+    metadata_field = "solution_metadata"
+    field_match = re.search(
+        r"""['"]verify['"]\s*,\s*['"]\w+['"]\s*:\s*['"](solution_\w+)['"]\s*,\s*"""
+        r"""['"]\w+['"]\s*:\s*['"](solution_\w+)['"]""",
+        script_text,
+    )
+    if field_match:
+        solution_field, metadata_field = field_match.groups()
+
+    sizes: dict[int, int] = {}
+    size_match = re.search(
+        r"case\s+0x1:return\s+(0x[0-9a-f]+);"
+        r"case\s+0x2:return[^;]*\((0x[0-9a-f]+),(0x[0-9a-f]+)\);"
+        r"case\s+0x3:return[^;]*\((0x[0-9a-f]+),(0x[0-9a-f]+)\);"
+        r"case\s+0x4:return[^;]*\((0x[0-9a-f]+),(0x[0-9a-f]+)\);"
+        r"case\s+0x5:return[^;]*\((0x[0-9a-f]+),(0x[0-9a-f]+)\)",
+        script_text,
+    )
+    if size_match:
+        sizes = {
+            1: int(size_match.group(1), 16),
+            2: int(size_match.group(2), 16) * int(size_match.group(3), 16),
+            3: int(size_match.group(4), 16) * int(size_match.group(5), 16),
+            4: int(size_match.group(6), 16) * int(size_match.group(7), 16),
+            5: int(size_match.group(8), 16) * int(size_match.group(9), 16),
+        }
+
+    return ChallengeJsConfig(
+        challenge_endpoints=endpoints,
+        multipart_fields=(solution_field, metadata_field),
+        bandwidth_sizes=sizes or None,
+    )
+
+
+def _resolve_challenge_type(
+    challenge_type: str,
+    js_config: ChallengeJsConfig,
+) -> tuple[str, str]:
+    if challenge_type in VERIFY_ENDPOINT:
+        return challenge_type, VERIFY_ENDPOINT[challenge_type]
+
+    known = HASHED_CHALLENGE_TYPES.get(challenge_type)
+    if known is not None:
+        return known
+
+    endpoint = next(
+        (
+            endpoint
+            for prefix, endpoint in js_config.challenge_endpoints.items()
+            if challenge_type.startswith(prefix)
+        ),
+        None,
+    )
+    if endpoint == "mp_verify":
+        return "NetworkBandwidth", endpoint
+    raise WafSolverCompatibilityError(
+        stage="inputs",
+        error_type="UnknownChallengeType",
+        detail=f"unsupported AWS WAF challenge type: {challenge_type!r}",
+    )
+
+
+def _parse_inputs_payload(
+    inputs: Any,
+    js_config: ChallengeJsConfig,
+) -> tuple[dict[str, Any], str, str, int, int]:
+    if not isinstance(inputs, dict):
+        raise WafProtocolError(
+            stage="inputs",
+            error_type="InvalidInputsType",
+            detail="AWS WAF inputs payload is not an object",
+        )
+    challenge = inputs.get("challenge")
+    if not isinstance(challenge, dict) or not isinstance(challenge.get("input"), str):
+        raise WafProtocolError(
+            stage="inputs",
+            error_type="InvalidChallenge",
+            detail="AWS WAF inputs payload has no usable challenge.input",
+        )
+
+    raw_type = inputs.get("challenge_type")
+    difficulty_raw = inputs.get("difficulty")
+    memory_raw = inputs.get("memory", 128)
+
+    if raw_type is None:
+        try:
+            decoded = json.loads(base64.b64decode(challenge["input"]))
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise WafSolverCompatibilityError(
+                stage="inputs",
+                error_type="LegacyMetadataUnavailable",
+                detail="AWS WAF inputs metadata is neither top-level nor legacy base64 JSON",
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise WafProtocolError(
+                stage="inputs",
+                error_type="InvalidLegacyMetadata",
+                detail="legacy AWS WAF challenge metadata is not an object",
+            )
+        raw_type = decoded.get("challenge_type")
+        difficulty_raw = decoded.get("difficulty", 1)
+        memory_raw = decoded.get("memory", 128)
+
+    if not isinstance(raw_type, str) or not raw_type:
+        raise WafProtocolError(
+            stage="inputs",
+            error_type="MissingChallengeType",
+            detail="AWS WAF inputs payload has no challenge_type",
+        )
+    try:
+        difficulty = int(1 if difficulty_raw is None else difficulty_raw)
+        memory = int(128 if memory_raw is None else memory_raw)
+    except (TypeError, ValueError) as exc:
+        raise WafProtocolError(
+            stage="inputs",
+            error_type=type(exc).__name__,
+            detail="AWS WAF inputs difficulty/memory is invalid",
+        ) from exc
+
+    logical_type, endpoint = _resolve_challenge_type(raw_type, js_config)
+    return challenge, logical_type, endpoint, difficulty, memory
+
 
 BRANDS = {
     0: '"Not/A)Brand";v="8", "Chromium";v="{v}", "Google Chrome";v="{v}"',
@@ -141,10 +305,17 @@ def _check_zeros(digest: bytes, difficulty: int) -> bool:
     return zeros >= difficulty
 
 
-def _solve_bandwidth(difficulty: int) -> str:
-    size = BANDWIDTH_SIZES.get(difficulty)
-    if not size:
-        return base64.b64encode(b"\x00" * 1024).decode()
+def _solve_bandwidth(
+    difficulty: int,
+    sizes: dict[int, int] | None = None,
+) -> str:
+    table = sizes or BANDWIDTH_SIZES
+    raw_size = table.get(difficulty, 1024)
+    try:
+        size = int(raw_size)
+    except (TypeError, ValueError):
+        size = 1024
+    size = min(max(size, 0), _MAX_BANDWIDTH_BYTES)
     return base64.b64encode(b"\x00" * size).decode()
 
 
@@ -166,7 +337,7 @@ def _solve_pow(
                 n=memory,
                 r=8,
                 p=1,
-                dklen=32,
+                dklen=16,
             )
         else:
             digest = hashlib.sha256(f"{challenge_input}{checksum}{nonce}".encode()).digest()
@@ -264,7 +435,31 @@ class AwsWafSolver:
         _require_allowed_url(site)
         client = self._build_client(user_agent)
         try:
-            await self._discover(client, site, user_agent)
+            challenge_url, same_origin, _goku_props, js_config = await self._discover(
+                client, site, user_agent
+            )
+            headers = _api_headers(site, user_agent, same_origin)
+            try:
+                inputs_response = await self._get(
+                    client,
+                    f"{challenge_url}/inputs?client=browser",
+                    headers=headers,
+                )
+            except httpx.TransportError as exc:
+                raise WafTransportError(
+                    stage="inputs",
+                    error_type=type(exc).__name__,
+                ) from exc
+            self._reject_waf_response(inputs_response, stage="inputs")
+            try:
+                inputs = inputs_response.json()
+            except ValueError as exc:
+                raise WafProtocolError(
+                    stage="inputs",
+                    error_type=type(exc).__name__,
+                    detail="AWS WAF inputs response is not JSON",
+                ) from exc
+            _parse_inputs_payload(inputs, js_config)
             if not self.last_script_hash:
                 raise WafUnsupportedChallenge("challenge.js was not fetched during probe")
             return self.last_script_hash
@@ -276,7 +471,9 @@ class AwsWafSolver:
         self, client: SecureHttpClient | httpx.AsyncClient, site: str, user_agent: str
     ) -> str:
         domain = site.split("//")[1].split("/")[0]
-        challenge_url, same_origin, goku_props = await self._discover(client, site, user_agent)
+        challenge_url, same_origin, goku_props, js_config = await self._discover(
+            client, site, user_agent
+        )
         headers = _api_headers(site, user_agent, same_origin)
         token: str | None = None
 
@@ -302,34 +499,31 @@ class AwsWafSolver:
             inputs_latency = round((time.time() - inputs_started) * 1000, 1)
             try:
                 inputs = inputs_response.json()
-                challenge = inputs["challenge"]
-                decoded = json.loads(base64.b64decode(challenge["input"]))
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                KeyError,
-                TypeError,
-                ValueError,
-            ) as exc:
+            except ValueError as exc:
                 raise WafProtocolError(
                     stage="inputs",
                     error_type=type(exc).__name__,
-                    detail="invalid AWS WAF inputs payload",
+                    detail="AWS WAF inputs response is not JSON",
                 ) from exc
-            ctype = str(decoded.get("challenge_type", ""))
-            difficulty = int(decoded.get("difficulty", 1))
-            memory = int(decoded.get("memory", 128))
-            if ctype not in VERIFY_ENDPOINT:
-                raise WafUnsupportedChallenge(f"unknown challenge type: {ctype!r}")
+            challenge, ctype, endpoint, difficulty, memory = _parse_inputs_payload(
+                inputs,
+                js_config,
+            )
 
             if has_token:
                 metrics.insert(0, {"name": "0", "value": inputs_latency, "unit": "2"})
 
-            endpoint = VERIFY_ENDPOINT[ctype]
             if ctype == "NetworkBandwidth":
-                solution_data = _solve_bandwidth(difficulty)
+                solution_data = _solve_bandwidth(difficulty, js_config.bandwidth_sizes)
                 body, content_type = self._build_multipart(
-                    domain, challenge, solution_data, checksum, encrypted, metrics, goku_props
+                    domain,
+                    challenge,
+                    solution_data,
+                    checksum,
+                    encrypted,
+                    metrics,
+                    goku_props,
+                    field_names=js_config.multipart_fields,
                 )
             else:
                 deadline = time.monotonic() + self._pow_budget
@@ -369,7 +563,7 @@ class AwsWafSolver:
 
     async def _discover(
         self, client: SecureHttpClient | httpx.AsyncClient, site: str, user_agent: str
-    ) -> tuple[str, bool, dict[str, Any] | None]:
+    ) -> tuple[str, bool, dict[str, Any] | None, ChallengeJsConfig]:
         try:
             response = await self._get(client, site, headers=_nav_headers(user_agent))
         except httpx.TransportError as exc:
@@ -398,9 +592,8 @@ class AwsWafSolver:
                 raise WafUnsupportedChallenge("challenge URL not found on the 202 page")
         _require_allowed_url(challenge_url)
 
-        if self._script_hash_checker is not None:
-            if script_url is None:
-                raise WafUnsupportedChallenge("challenge.js URL not found on the 202 page")
+        js_config = ChallengeJsConfig(challenge_endpoints={})
+        if script_url is not None:
             _require_allowed_url(script_url)
             try:
                 script_response = await self._get(
@@ -412,18 +605,27 @@ class AwsWafSolver:
                     error_type=type(exc).__name__,
                 ) from exc
             self._reject_waf_response(script_response, stage="challenge_script")
+            if script_response.status_code != 200:
+                raise WafProtocolError(
+                    stage="challenge_script",
+                    error_type=f"HTTP{script_response.status_code}",
+                    detail="AWS WAF challenge.js was not returned successfully",
+                )
             digest = hashlib.sha256(script_response.content).hexdigest()
             self.last_script_hash = digest
-            if not self._script_hash_checker(digest):
+            js_config = _parse_challenge_js(script_response.text)
+            if self._script_hash_checker is not None and not self._script_hash_checker(digest):
                 raise WafScriptVersionUnknown(
                     f"no fresh WAF compatibility canary for challenge.js sha256={digest}"
                 )
+        elif self._script_hash_checker is not None:
+            raise WafUnsupportedChallenge("challenge.js URL not found on the 202 page")
 
         goku_props: dict[str, Any] | None = None
         goku_match = RE_GOKU.search(html)
         if goku_match:
             goku_props = json.loads(goku_match.group(1))
-        return challenge_url, same_origin, goku_props
+        return challenge_url, same_origin, goku_props, js_config
 
     @staticmethod
     def _retry_after_seconds(response: httpx.Response) -> float:
@@ -521,6 +723,8 @@ class AwsWafSolver:
         encrypted: str,
         metrics: list[dict[str, object]],
         goku_props: dict[str, Any] | None,
+        *,
+        field_names: tuple[str, str] = ("solution_data", "solution_metadata"),
     ) -> tuple[str, str]:
         import random
         import string
@@ -542,11 +746,12 @@ class AwsWafSolver:
             random.choices(string.ascii_letters + string.digits, k=16)  # noqa: S311 - form boundary
         )
         meta_json = json.dumps(meta, separators=(",", ":"))
+        solution_field, metadata_field = field_names
         parts = [
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="solution_data"\r\n\r\n{solution_data}',
+            f'Content-Disposition: form-data; name="{solution_field}"\r\n\r\n{solution_data}',
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="solution_metadata"\r\n\r\n{meta_json}',
+            f'Content-Disposition: form-data; name="{metadata_field}"\r\n\r\n{meta_json}',
             f"--{boundary}--\r\n",
         ]
         return "\r\n".join(parts), f"multipart/form-data; boundary={boundary}"

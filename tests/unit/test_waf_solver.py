@@ -13,10 +13,10 @@ from app.crawlers.adapters.rabota_md.waf import (
     WafBlocked,
     WafCaptchaRequired,
     WafPowTimeout,
-    WafProtocolError,
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
+    WafSolverCompatibilityError,
     WafUnsupportedChallenge,
 )
 from app.crawlers.adapters.rabota_md.waf.crypto import decrypt, encode, encrypt
@@ -37,6 +37,9 @@ SCRIPT_URL = f"{CHAL_HOST}/abc123/part/token/challenge.js"
 SCRIPT_BYTES = b"/* challenge.js fixture */"
 SCRIPT_SHA256 = hashlib.sha256(SCRIPT_BYTES).hexdigest()
 TOKEN = "11111111-2222-4333-8444-555555555555:AAAA:BBBB"
+HASHED_SCRYPT = "h72f957df656e80ba55f5d8ce2e8c7ccb59687dba3bfb273d54b08a261b2f3002"
+HASHED_SHA256 = "h7b0c470f0cfe3a80a9e26526ad185f484f6817d0832712a4a37a908786a6a67f"
+HASHED_BANDWIDTH = "ha9faaffd31b4d5ede2a2e19d2d7fd525f66fee61911511960dcbb52d3c48ce25"
 
 
 def challenge_page() -> str:
@@ -46,6 +49,17 @@ def challenge_page() -> str:
         f'<script src="{SCRIPT_URL}"></script></head><body>'
         '<div id="challenge-container"></div></body></html>'
     )
+
+
+def modern_inputs_payload(ctype: str, difficulty: int, *, input_bytes: bytes = b"opaque") -> dict:
+    return {
+        "challenge": {
+            "input": base64.b64encode(input_bytes).decode(),
+            "region": "eu-central-1",
+        },
+        "challenge_type": ctype,
+        "difficulty": difficulty,
+    }
 
 
 def inputs_payload(ctype: str, difficulty: int) -> dict:
@@ -108,7 +122,7 @@ def test_solve_pow_sha256_finds_valid_nonce() -> None:
 def test_solve_pow_scrypt_uses_stdlib() -> None:
     nonce = _solve_pow("input", "CHECKSUM", 4, "HashcashScrypt", 128, time.monotonic() + 10)
     digest = hashlib.scrypt(
-        f"inputCHECKSUM{nonce}".encode(), salt=b"CHECKSUM", n=128, r=8, p=1, dklen=32
+        f"inputCHECKSUM{nonce}".encode(), salt=b"CHECKSUM", n=128, r=8, p=1, dklen=16
     )
     assert _check_zeros(digest, 4)
 
@@ -193,6 +207,8 @@ async def test_solve_derives_challenge_base_from_single_quoted_script_src() -> N
         if url in {SITE, f"{SITE}/"}:
             html = f"<html><script async src='{script_url}'></script></html>"
             return httpx.Response(202, text=html, headers={"x-amzn-waf-action": "challenge"})
+        if url == script_url:
+            return httpx.Response(200, content=SCRIPT_BYTES)
         if url.startswith(f"{challenge_base}/inputs"):
             return httpx.Response(200, json=inputs_payload("SHA256", 4))
         if url.endswith("/verify"):
@@ -221,9 +237,142 @@ async def test_solve_classifies_invalid_challenge_input_encoding() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     solver = AwsWafSolver(client=client)
 
-    with pytest.raises(WafProtocolError) as caught:
+    with pytest.raises(WafSolverCompatibilityError) as caught:
         await solver.solve(SITE, UA)
 
     assert caught.value.stage == "inputs"
-    assert caught.value.error_type == "UnicodeDecodeError"
+    assert caught.value.error_type == "LegacyMetadataUnavailable"
+    await client.aclose()
+
+
+async def test_solve_modern_hashed_bandwidth_with_opaque_input() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            return httpx.Response(202, text=challenge_page())
+        if url == SCRIPT_URL:
+            return httpx.Response(200, content=SCRIPT_BYTES)
+        if url.startswith(f"{CHAL_URL}/inputs"):
+            return httpx.Response(
+                200,
+                json=modern_inputs_payload(
+                    HASHED_BANDWIDTH,
+                    3,
+                    input_bytes=bytes.fromhex("73cd5fd5dddaef5d5ce36d786f9f39d3"),
+                ),
+            )
+        if url.endswith("/mp_verify"):
+            seen_paths.append("/mp_verify")
+            body = request.content.decode()
+            assert 'name="solution_data"' in body
+            return httpx.Response(200, json={"token": TOKEN})
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client)
+    assert await solver.solve(SITE, UA) == TOKEN
+    assert seen_paths == ["/mp_verify", "/mp_verify"]
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("hashed_type", "expected_path"),
+    [
+        (HASHED_SHA256, "/verify"),
+        (HASHED_SCRYPT, "/verify"),
+    ],
+)
+async def test_solve_modern_hashed_pow_types(
+    hashed_type: str,
+    expected_path: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            return httpx.Response(202, text=challenge_page())
+        if url == SCRIPT_URL:
+            return httpx.Response(200, content=SCRIPT_BYTES)
+        if url.startswith(f"{CHAL_URL}/inputs"):
+            return httpx.Response(
+                200,
+                json=modern_inputs_payload(hashed_type, 2, input_bytes=b"proof-seed"),
+            )
+        if url.endswith(expected_path):
+            return httpx.Response(200, json={"token": TOKEN})
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client, pow_budget_seconds=5)
+    assert await solver.solve(SITE, UA) == TOKEN
+    await client.aclose()
+
+
+async def test_probe_challenge_validates_modern_inputs_schema() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            return httpx.Response(202, text=challenge_page())
+        if url == SCRIPT_URL:
+            return httpx.Response(200, content=SCRIPT_BYTES)
+        if url.startswith(f"{CHAL_URL}/inputs"):
+            return httpx.Response(200, json=modern_inputs_payload(HASHED_BANDWIDTH, 3))
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client)
+    assert await solver.probe_challenge(SITE, UA) == SCRIPT_SHA256
+    await client.aclose()
+
+
+async def test_unknown_modern_type_is_solver_compatibility_failure() -> None:
+    unknown = "h" + "1" * 64
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            return httpx.Response(202, text=challenge_page())
+        if url == SCRIPT_URL:
+            return httpx.Response(200, content=SCRIPT_BYTES)
+        if url.startswith(f"{CHAL_URL}/inputs"):
+            return httpx.Response(200, json=modern_inputs_payload(unknown, 3))
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client)
+
+    with pytest.raises(WafSolverCompatibilityError) as caught:
+        await solver.probe_challenge(SITE, UA)
+
+    assert caught.value.error_type == "UnknownChallengeType"
+    await client.aclose()
+
+
+async def test_unknown_hash_can_use_dynamic_mp_verify_mapping() -> None:
+    unknown = "hdeadbeef" + "1" * 56
+    script = (
+        b"var m={};m['hdeadbeef'+'rest']='mp_verify';"
+        b"case 0x1:return 0x400;"
+        b"case 0x2:return x(0xa,0x400);"
+        b"case 0x3:return x(0x64,0x400);"
+        b"case 0x4:return x(0x1,0x100000);"
+        b"case 0x5:return x(0xa,0x100000)"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in {SITE, f"{SITE}/"}:
+            return httpx.Response(202, text=challenge_page())
+        if url == SCRIPT_URL:
+            return httpx.Response(200, content=script)
+        if url.startswith(f"{CHAL_URL}/inputs"):
+            return httpx.Response(200, json=modern_inputs_payload(unknown, 1))
+        if url.endswith("/mp_verify"):
+            return httpx.Response(200, json={"token": TOKEN})
+        return httpx.Response(404, text=f"unexpected: {url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    solver = AwsWafSolver(client=client)
+    assert await solver.solve(SITE, UA) == TOKEN
     await client.aclose()

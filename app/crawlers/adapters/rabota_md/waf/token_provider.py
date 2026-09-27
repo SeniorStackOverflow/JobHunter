@@ -26,6 +26,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafRateLimited,
     WafScriptVersionUnknown,
     WafSolveFailed,
+    WafSolverCompatibilityError,
     WafTransportError,
     WafUnsupportedChallenge,
 )
@@ -139,11 +140,15 @@ class WafTokenProvider:
                     stage = exc.stage
                 elif isinstance(
                     exc,
-                    WafProtocolError | WafUnsupportedChallenge | WafScriptVersionUnknown,
+                    WafSolverCompatibilityError | WafUnsupportedChallenge | WafScriptVersionUnknown,
                 ):
                     error_type = getattr(exc, "error_type", type(exc).__name__)
-                    reason_class = "protocol"
+                    reason_class = "solver_compatibility"
                     stage = getattr(exc, "stage", "protocol")
+                elif isinstance(exc, WafProtocolError):
+                    error_type = exc.error_type
+                    reason_class = "protocol"
+                    stage = exc.stage
                 elif isinstance(exc, WafSolveFailed):
                     error_type = type(exc).__name__
                     reason_class = "proof"
@@ -216,7 +221,7 @@ class PurePythonSolverBackend:
         WAF_SOLVER_ATTEMPTS.inc()
         try:
             token = await self._solver.solve(self._site, self._user_agent)
-        except WafUnsupportedChallenge:
+        except (WafUnsupportedChallenge, WafSolverCompatibilityError):
             if self._watchdog is not None:
                 await self._watchdog.invalidate_compatibility()
                 WAF_SOLVER_COMPATIBILITY.set(0)

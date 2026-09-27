@@ -32,6 +32,7 @@ from app.crawlers.adapters.rabota_md.waf.errors import (
     WafPowTimeout,
     WafScriptVersionUnknown,
     WafSolveFailed,
+    WafSolverCompatibilityError,
     WafTransportError,
     WafUnsupportedChallenge,
 )
@@ -239,6 +240,7 @@ async def _prove_free_waf_candidate(
             WafSolveFailed,
             WafUnsupportedChallenge,
             WafScriptVersionUnknown,
+            WafSolverCompatibilityError,
             WafPowTimeout,
         ):
             raise
@@ -300,6 +302,7 @@ async def _prove_free_waf_candidate(
         WafSolveFailed,
         WafUnsupportedChallenge,
         WafScriptVersionUnknown,
+        WafSolverCompatibilityError,
         WafPowTimeout,
     ):
         raise
@@ -466,6 +469,7 @@ async def warm_rabota_proxy_reserve(
         await fetcher.aclose()
         return {"ready": 0, "candidates": 0}
     try:
+        await fetcher.reconcile_solver_protocol_v2()
         return await fetcher.warm_reserve(target_ready=settings.rabota_proxy_target_ready_free)
     finally:
         await fetcher.aclose()
