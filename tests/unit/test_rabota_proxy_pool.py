@@ -226,6 +226,7 @@ async def test_pool_never_serves_unproven_waf_candidate() -> None:
                 "last_used": 0,
                 "last_check": time.time(),
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -262,6 +263,7 @@ async def test_fetcher_promotes_candidate_before_emergency_takeover() -> None:
                 "last_used": 0,
                 "last_check": time.time(),
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -315,6 +317,7 @@ async def test_emergency_promotion_stops_after_first_ready_proxy() -> None:
                     "last_used": 0,
                     "last_check": time.time(),
                     "validated_capability": "waf_candidate",
+                    "challenge_reachable_at": time.time(),
                 }
             ),
         )
@@ -376,6 +379,7 @@ async def test_warm_reserve_promotes_candidates_while_primary_is_healthy() -> No
                 "last_used": 0,
                 "last_check": time.time(),
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -455,6 +459,7 @@ async def test_warm_reserve_revalidates_stale_ready_before_new_candidate() -> No
                 "last_used": 0,
                 "last_check": now,
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -536,6 +541,7 @@ async def test_warm_reserve_refills_after_stale_revalidation_failure(
                     "last_used": 0,
                     "last_check": time.time(),
                     "validated_capability": "waf_candidate",
+                    "challenge_reachable_at": time.time(),
                 }
             ),
         )
@@ -665,6 +671,7 @@ async def test_pool_prefers_direct_200_free_proxy_over_waf_candidate() -> None:
                 "last_check": time.time(),
                 "last_http_status": 202,
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -829,6 +836,7 @@ async def test_stale_free_proxy_is_not_selected() -> None:
                 "cooldown_until": 0,
                 "last_check": time.time() - 120,
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -1014,6 +1022,7 @@ async def test_waf_candidate_solve_failure_remains_retryable() -> None:
                 "last_used": 0,
                 "last_check": time.time(),
                 "validated_capability": "waf_candidate",
+                "challenge_reachable_at": time.time(),
             }
         ),
     )
@@ -1175,3 +1184,35 @@ async def test_free_proxy_http_429_uses_short_rate_limit_cooldown() -> None:
     assert state["status"] == "rate_limited"
     assert state["last_http_status"] == 429
     assert before + 295 <= state["cooldown_until"] <= time.time() + 305
+
+
+async def test_legacy_waf_candidate_without_challenge_marker_is_not_promoted() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+    )
+    endpoint = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="waf_candidate",
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        endpoint.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": endpoint.url,
+                "cooldown_until": 0,
+                "last_check": time.time(),
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+
+    assert await pool.promotion_endpoints(set(), limit=3) == []

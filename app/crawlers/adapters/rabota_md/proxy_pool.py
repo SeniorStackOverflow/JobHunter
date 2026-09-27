@@ -202,6 +202,7 @@ class RabotaProxyPool:
         *,
         validated_capability: str | None = None,
         source: str | None = None,
+        challenge_reachable: bool = False,
     ) -> None:
         payload = await self._entry(endpoint.identity)
         previous_capability = payload.get("validated_capability")
@@ -222,6 +223,8 @@ class RabotaProxyPool:
             cooldown_until=0,
             fails=0,
         )
+        if endpoint.kind == "free" and capability == "waf_candidate" and challenge_reachable:
+            payload["challenge_reachable_at"] = now
         if endpoint.kind == "free" and capability in {"direct_pagination", "full_waf"}:
             payload["last_success_at"] = now
             payload["revalidation_failures"] = 0
@@ -603,6 +606,7 @@ class RabotaProxyPool:
                             status,
                             validated_capability="waf_candidate",
                             source=candidate.source,
+                            challenge_reachable=True,
                         )
                         return
 
@@ -668,10 +672,12 @@ class RabotaProxyPool:
         last_check = self._as_float(payload.get("last_check", 0))
         if last_check <= 0 or now - last_check > self._candidate_ttl:
             return False
-        return payload.get("validated_capability") == "waf_candidate" and payload.get("status") in {
-            "candidate",
-            "alive",
-        }
+        if payload.get("validated_capability") != "waf_candidate":
+            return False
+        challenge_reachable_at = self._as_float(payload.get("challenge_reachable_at", 0))
+        if challenge_reachable_at <= 0 or now - challenge_reachable_at > self._candidate_ttl:
+            return False
+        return payload.get("status") in {"candidate", "alive"}
 
     def _fresh_ready_state(self, payload: dict[str, object], now: float) -> bool:
         if self._as_float(payload.get("cooldown_until", 0)) > now:
