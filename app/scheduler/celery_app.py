@@ -23,6 +23,8 @@ from app.settings import get_settings
 settings = get_settings()
 _sms_poll_interval = float(settings.phone_sms_poll_interval_seconds)
 _sms_poll_expires = max(1.0, _sms_poll_interval - 5.0)
+_proxy_maintenance_interval = float(settings.rabota_proxy_maintenance_interval_seconds)
+_proxy_maintenance_expires = max(1.0, _proxy_maintenance_interval - 60.0)
 
 celery_app = Celery(
     "job-agent",
@@ -130,8 +132,8 @@ celery_app.conf.update(
         },
         "rabota-md-proxy-reserve-maintenance": {
             "task": "job_agent.scheduler.rabota_md_proxy_reserve_maintenance",
-            "schedule": 900.0,
-            "options": {"queue": "proxy-maintenance", "expires": 840},
+            "schedule": _proxy_maintenance_interval,
+            "options": {"queue": "proxy-maintenance", "expires": _proxy_maintenance_expires},
         },
         "rabota-md-waf-canary": {
             "task": "job_agent.scheduler.rabota_md_waf_canary",

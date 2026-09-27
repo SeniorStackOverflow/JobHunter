@@ -18,6 +18,7 @@ from app.crawlers.adapters.rabota_md.proxy_pool import (
     ProxyPoolFetcher,
     RabotaProxyPool,
 )
+from app.crawlers.adapters.rabota_md.waf.errors import WafSolveFailed
 
 
 class FakeRedis:
@@ -859,3 +860,153 @@ async def test_preflight_budget_stays_exhausted_after_caller_catches_error() -> 
         await fetcher.get("https://www.rabota.md/ru/")
     with pytest.raises(RabotaMdDegradedError):
         await fetcher.get("https://www.rabota.md/ru/")
+
+
+async def test_ready_proxy_stays_fresh_across_one_maintenance_interval() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        ready_ttl_seconds=1800,
+        min_fresh_free=1,
+    )
+    endpoint = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="full_waf",
+    )
+    now = time.time()
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        endpoint.identity,
+        json.dumps(
+            {
+                "status": "ready",
+                "kind": "free",
+                "url": endpoint.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": now - 901,
+                "last_success_at": now - 901,
+                "validated_capability": "full_waf",
+            }
+        ),
+    )
+
+    assert await pool.reserve_counts() == {"ready": 1, "candidates": 0}
+    await pool.aclose()
+
+
+async def test_transient_revalidation_failure_is_suspect_before_dead() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        ready_ttl_seconds=1800,
+        revalidation_grace_seconds=3600,
+        revalidation_retry_seconds=300,
+        revalidation_max_failures=3,
+        dead_cooldown_seconds=3600,
+        min_fresh_free=1,
+    )
+    endpoint = ProxyEndpoint(
+        "free",
+        "http://1.1.1.1:8080",
+        "free",
+        capability="full_waf",
+    )
+    now = time.time()
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        endpoint.identity,
+        json.dumps(
+            {
+                "status": "ready",
+                "kind": "free",
+                "url": endpoint.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": now - 1900,
+                "last_success_at": now - 1900,
+                "validated_capability": "full_waf",
+            }
+        ),
+    )
+
+    await pool.report_transient_failure(endpoint, reason="WafSolveFailed")
+    first = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert first["status"] == "suspect"
+    assert first["revalidation_failures"] == 1
+    assert first["validated_capability"] == "full_waf"
+    assert first["cooldown_until"] > time.time()
+    assert await pool.reserve_counts() == {"ready": 0, "candidates": 0}
+
+    await pool.report_transient_failure(endpoint, reason="WafSolveFailed")
+    second = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert second["status"] == "suspect"
+    assert second["revalidation_failures"] == 2
+
+    await pool.report_transient_failure(endpoint, reason="WafSolveFailed")
+    third = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][endpoint.identity])
+    assert third["status"] == "dead"
+    assert third["revalidation_failures"] == 3
+    assert third["cooldown_until"] > time.time() + 3500
+    await pool.aclose()
+
+
+async def test_waf_candidate_solve_failure_remains_retryable() -> None:
+    redis = FakeRedis()
+    pool = RabotaProxyPool(
+        redis,  # type: ignore[arg-type]
+        primary_url=None,
+        target_url="https://www.rabota.md/ru/",
+        user_agent="Mozilla/5.0 Chrome/151",
+        revalidation_retry_seconds=300,
+        revalidation_max_failures=3,
+        min_fresh_free=1,
+    )
+    candidate = ProxyEndpoint(
+        "free",
+        "http://8.8.8.8:3128",
+        "free",
+        capability="waf_candidate",
+    )
+    await redis.hset(
+        "crawler:rabota_md:proxy_pool:state",
+        candidate.identity,
+        json.dumps(
+            {
+                "status": "candidate",
+                "kind": "free",
+                "url": candidate.url,
+                "cooldown_until": 0,
+                "last_used": 0,
+                "last_check": time.time(),
+                "validated_capability": "waf_candidate",
+            }
+        ),
+    )
+
+    async def preflight(_endpoint: ProxyEndpoint, _fetcher: StubFetcher) -> None:
+        raise WafSolveFailed("temporary proof failure")
+
+    fetcher = ProxyPoolFetcher(
+        pool,
+        lambda _endpoint: StubFetcher([]),  # type: ignore[arg-type]
+        preflight=preflight,  # type: ignore[arg-type]
+        max_preflight_attempts=1,
+        promotion_concurrency=1,
+    )
+    counts = await fetcher.warm_reserve(target_ready=1)
+
+    stored = json.loads(redis.hashes["crawler:rabota_md:proxy_pool:state"][candidate.identity])
+    assert counts == {"ready": 0, "candidates": 0}
+    assert stored["status"] == "candidate"
+    assert stored["proof_failures"] == 1
+    assert stored["cooldown_until"] > time.time()
+    await fetcher.aclose()

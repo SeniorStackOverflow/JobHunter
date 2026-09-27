@@ -854,6 +854,40 @@ def rabota_md_proxy_reserve_maintenance_task() -> dict[str, object]:
         close_redis_client(client)
 
 
+async def _record_rabota_proxy_reserve_health(
+    *,
+    redis_url: str | None,
+    ready: int,
+) -> tuple[int, str | None]:
+    if not redis_url:
+        return 0, None
+
+    from redis.asyncio import Redis as AsyncRedis
+
+    key = "crawler:rabota_md:proxy_pool:maintenance_health"
+    redis = AsyncRedis.from_url(redis_url, decode_responses=True)
+    try:
+        now = datetime.now(UTC).isoformat()
+        if ready > 0:
+            empty_cycles = 0
+            await redis.hset(
+                key,
+                mapping={
+                    "consecutive_empty_cycles": "0",
+                    "last_ready_at": now,
+                    "last_ready_count": str(ready),
+                },
+            )
+        else:
+            empty_cycles = int(await redis.hincrby(key, "consecutive_empty_cycles", 1))
+            await redis.hset(key, mapping={"last_ready_count": "0"})
+        await redis.expire(key, 7 * 24 * 3600)
+        last_ready_at = await redis.hget(key, "last_ready_at")
+        return empty_cycles, last_ready_at
+    finally:
+        await redis.aclose()
+
+
 async def _rabota_md_proxy_reserve_maintenance() -> dict[str, object]:
     from app.crawlers.adapters.rabota_md.transport import (
         effective_waf_user_agent,
@@ -906,24 +940,52 @@ async def _rabota_md_proxy_reserve_maintenance() -> dict[str, object]:
             ready=counts["ready"],
             candidates=counts["candidates"],
         )
-    if counts["ready"] == 0:
-        logger.warning(
-            "rabota_md_proxy_reserve_empty",
-            candidates=counts["candidates"],
-            primary_probe=probe_outcome,
-        )
-    else:
+    target_ready = settings.rabota_proxy_target_ready_free
+    empty_cycles, last_ready_at = await _record_rabota_proxy_reserve_health(
+        redis_url=getattr(settings, "redis_url", None),
+        ready=counts["ready"],
+    )
+    if counts["ready"] >= target_ready:
+        outcome = "ready"
         logger.info(
             "rabota_md_proxy_reserve_ready",
             ready=counts["ready"],
+            target_ready=target_ready,
             candidates=counts["candidates"],
             primary_probe=probe_outcome,
+            consecutive_empty_cycles=empty_cycles,
+            last_ready_at=last_ready_at,
+        )
+    elif counts["ready"] > 0:
+        outcome = "degraded"
+        logger.warning(
+            "rabota_md_proxy_reserve_degraded",
+            ready=counts["ready"],
+            target_ready=target_ready,
+            candidates=counts["candidates"],
+            primary_probe=probe_outcome,
+            consecutive_empty_cycles=empty_cycles,
+            last_ready_at=last_ready_at,
+        )
+    else:
+        outcome = "empty"
+        logger.warning(
+            "rabota_md_proxy_reserve_empty",
+            ready=0,
+            target_ready=target_ready,
+            candidates=counts["candidates"],
+            primary_probe=probe_outcome,
+            consecutive_empty_cycles=empty_cycles,
+            last_ready_at=last_ready_at,
         )
     return {
-        "outcome": "ok",
+        "outcome": outcome,
         "ready": counts["ready"],
+        "target_ready": target_ready,
         "candidates": counts["candidates"],
         "primary_probe": probe_outcome,
+        "consecutive_empty_cycles": empty_cycles,
+        "last_ready_at": last_ready_at,
     }
 
 

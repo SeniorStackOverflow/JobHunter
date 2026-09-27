@@ -20,6 +20,7 @@ from app.crawlers.adapters.rabota_md.errors import (
     RabotaMdWafFailClosedError,
 )
 from app.crawlers.adapters.rabota_md.fetcher import RabotaMdFetcher
+from app.crawlers.adapters.rabota_md.waf.errors import WafSolveFailed
 from app.crawlers.adapters.rabota_md.waf.http_client import _ajax_headers
 from app.observability.metrics import (
     RABOTA_PROXY_EGRESS,
@@ -105,9 +106,12 @@ class RabotaProxyPool:
         discovery_batch: int = 240,
         validation_concurrency: int = 24,
         validation_timeout_seconds: float = 8.0,
-        candidate_ttl_seconds: int = 900,
+        candidate_ttl_seconds: int = 1800,
         ready_ttl_seconds: int = 1800,
-        min_fresh_free: int = 5,
+        revalidation_grace_seconds: int = 3600,
+        revalidation_retry_seconds: int = 300,
+        revalidation_max_failures: int = 3,
+        min_fresh_free: int = 3,
         ban_cooldown_seconds: int = 6 * 3600,
         dead_cooldown_seconds: int = 3600,
         primary_dead_cooldown_seconds: int = 300,
@@ -124,6 +128,9 @@ class RabotaProxyPool:
         self._validation_timeout = validation_timeout_seconds
         self._candidate_ttl = candidate_ttl_seconds
         self._ready_ttl = ready_ttl_seconds
+        self._revalidation_grace = revalidation_grace_seconds
+        self._revalidation_retry = revalidation_retry_seconds
+        self._revalidation_max_failures = revalidation_max_failures
         self._min_fresh_free = min_fresh_free
         self._ban_cooldown = ban_cooldown_seconds
         self._dead_cooldown = dead_cooldown_seconds
@@ -186,14 +193,20 @@ class RabotaProxyPool:
         status = (
             "candidate" if endpoint.kind == "free" and capability == "waf_candidate" else "ready"
         )
+        now = time.time()
         payload.update(
             status=status,
             kind=endpoint.kind,
-            last_check=time.time(),
+            last_check=now,
             last_http_status=status_code,
             cooldown_until=0,
             fails=0,
         )
+        if endpoint.kind == "free" and capability in {"direct_pagination", "full_waf"}:
+            payload["last_success_at"] = now
+            payload["revalidation_failures"] = 0
+            payload["proof_failures"] = 0
+            payload.pop("last_revalidation_error", None)
         if endpoint.kind == "free":
             payload["url"] = endpoint.url
             if capability is not None:
@@ -232,6 +245,52 @@ class RabotaProxyPool:
             payload["url"] = endpoint.url
         await self._write_entry(endpoint.identity, payload)
         RABOTA_PROXY_EGRESS.labels(kind=endpoint.kind, outcome="dead").inc()
+
+    async def report_transient_failure(
+        self,
+        endpoint: ProxyEndpoint,
+        *,
+        reason: str,
+    ) -> None:
+        payload = await self._entry(endpoint.identity)
+        capability = endpoint.capability or payload.get("validated_capability")
+        if endpoint.kind != "free" or capability not in {
+            "waf_candidate",
+            "direct_pagination",
+            "full_waf",
+        }:
+            await self.report_dead(endpoint)
+            return
+
+        now = time.time()
+        if capability in {"direct_pagination", "full_waf"} and "last_success_at" not in payload:
+            payload["last_success_at"] = payload.get("last_check", now)
+        counter_name = (
+            "proof_failures" if capability == "waf_candidate" else "revalidation_failures"
+        )
+        failures = self._as_int(payload.get(counter_name, 0)) + 1
+        payload[counter_name] = failures
+        payload["last_revalidation_error"] = reason
+        payload["kind"] = endpoint.kind
+        payload["url"] = endpoint.url
+        payload["last_check"] = now
+
+        if failures >= self._revalidation_max_failures:
+            payload.update(
+                status="dead",
+                cooldown_until=now + self._dead_cooldown,
+                fails=self._as_int(payload.get("fails", 0)) + 1,
+            )
+            outcome = "dead"
+        else:
+            payload.update(
+                status="candidate" if capability == "waf_candidate" else "suspect",
+                cooldown_until=now + self._revalidation_retry,
+            )
+            outcome = "transient"
+
+        await self._write_entry(endpoint.identity, payload)
+        RABOTA_PROXY_EGRESS.labels(kind=endpoint.kind, outcome=outcome).inc()
 
     async def discover(self) -> int:
         if not self._free_enabled:
@@ -330,10 +389,15 @@ class RabotaProxyPool:
         try:
             response = await client.get(url)
             response.raise_for_status()
+            encoding = response.encoding or "utf-8"
+            try:
+                text = response.content.decode(encoding, errors="replace")
+            except LookupError:
+                text = response.content.decode("utf-8", errors="replace")
             if kind == "lines":
-                raw_candidates = response.text.splitlines()
+                raw_candidates = text.splitlines()
             elif kind == "proxmint_json":
-                data = response.json()
+                data = json.loads(text)
                 raw_candidates = [
                     f"{item.get('ip', '')}:{item.get('port', '')}"
                     for item in data.get("proxies", [])
@@ -343,7 +407,7 @@ class RabotaProxyPool:
                     and self._as_int(item.get("latencyMs", 999999)) <= 1200
                 ]
             else:
-                data = response.json()
+                data = json.loads(text)
                 raw_candidates = [
                     str(item.get("proxy", ""))
                     for item in data
@@ -468,8 +532,8 @@ class RabotaProxyPool:
     def _fresh_ready_state(self, payload: dict[str, object], now: float) -> bool:
         if self._as_float(payload.get("cooldown_until", 0)) > now:
             return False
-        last_check = self._as_float(payload.get("last_check", 0))
-        if last_check <= 0 or now - last_check > self._ready_ttl:
+        last_success = self._as_float(payload.get("last_success_at", payload.get("last_check", 0)))
+        if last_success <= 0 or now - last_success > self._ready_ttl:
             return False
         return payload.get("validated_capability") in {
             "direct_pagination",
@@ -545,16 +609,16 @@ class RabotaProxyPool:
     def _revalidatable_ready_state(self, payload: dict[str, object], now: float) -> bool:
         if self._as_float(payload.get("cooldown_until", 0)) > now:
             return False
-        last_check = self._as_float(payload.get("last_check", 0))
-        if last_check <= 0:
+        last_success = self._as_float(payload.get("last_success_at", payload.get("last_check", 0)))
+        if last_success <= 0:
             return False
-        age = now - last_check
-        if age <= self._ready_ttl or age > self._candidate_ttl:
+        age = now - last_success
+        if age <= self._ready_ttl or age > self._ready_ttl + self._revalidation_grace:
             return False
         return payload.get("validated_capability") in {
             "direct_pagination",
             "full_waf",
-        } and payload.get("status") in {"ready", "alive"}
+        } and payload.get("status") in {"ready", "alive", "suspect"}
 
     async def promotion_endpoints(
         self,
@@ -564,7 +628,7 @@ class RabotaProxyPool:
     ) -> list[ProxyEndpoint]:
         now = time.time()
         entries = cast(dict[object, object], await cast(Any, self._redis).hgetall(_STATE_KEY))
-        candidates: list[tuple[int, float, float, ProxyEndpoint]] = []
+        candidates: list[tuple[int, int, float, float, ProxyEndpoint]] = []
         for raw_identity, raw_payload in entries.items():
             identity = self._decode(raw_identity)
             if identity in excluded or not identity.startswith("free:"):
@@ -582,7 +646,10 @@ class RabotaProxyPool:
                 candidates.append(
                     (
                         0,
-                        -self._as_float(payload.get("last_check", 0)),
+                        self._as_int(payload.get("revalidation_failures", 0)),
+                        -self._as_float(
+                            payload.get("last_success_at", payload.get("last_check", 0))
+                        ),
                         self._as_float(payload.get("last_used", 0)),
                         ProxyEndpoint(
                             name="free",
@@ -598,6 +665,7 @@ class RabotaProxyPool:
             candidates.append(
                 (
                     1,
+                    self._as_int(payload.get("proof_failures", 0)),
                     0,
                     self._as_float(payload.get("last_used", 0)),
                     ProxyEndpoint(
@@ -608,8 +676,8 @@ class RabotaProxyPool:
                     ),
                 )
             )
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-        return [endpoint for _, _, _, endpoint in candidates[:limit]]
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        return [endpoint for _, _, _, _, endpoint in candidates[:limit]]
 
     async def candidate_endpoints(self, excluded: set[str], *, limit: int) -> list[ProxyEndpoint]:
         now = time.time()
@@ -890,14 +958,37 @@ class ProxyPoolFetcher:
                 except RabotaMdWafFailClosedError as exc:
                     await self._pool.report_access_rejected(endpoint)
                     reason = type(exc).__name__
+                except WafSolveFailed as exc:
+                    await self._pool.report_transient_failure(
+                        endpoint,
+                        reason=type(exc).__name__,
+                    )
+                    reason = type(exc).__name__
+                except UnicodeError as exc:
+                    await self._pool.report_transient_failure(
+                        endpoint,
+                        reason=type(exc).__name__,
+                    )
+                    reason = type(exc).__name__
                 except RabotaMdEgressError as exc:
                     if exc.access_rejected:
                         await self._pool.report_access_rejected(endpoint)
+                    elif endpoint.capability in {"direct_pagination", "full_waf"}:
+                        await self._pool.report_transient_failure(
+                            endpoint,
+                            reason=type(exc).__name__,
+                        )
                     else:
                         await self._pool.report_dead(endpoint)
                     reason = type(exc).__name__
                 except httpx.TransportError as exc:
-                    await self._pool.report_dead(endpoint)
+                    if endpoint.capability in {"direct_pagination", "full_waf"}:
+                        await self._pool.report_transient_failure(
+                            endpoint,
+                            reason=type(exc).__name__,
+                        )
+                    else:
+                        await self._pool.report_dead(endpoint)
                     reason = type(exc).__name__
                 except Exception as exc:
                     await self._pool.report_dead(endpoint)

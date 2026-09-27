@@ -140,13 +140,17 @@ class Settings(BaseSettings):
     rabota_proxy_discovery_batch: int = Field(default=240, ge=20, le=1000)
     rabota_proxy_validation_concurrency: int = Field(default=24, ge=1, le=64)
     rabota_proxy_validation_timeout_seconds: float = Field(default=8.0, ge=2.0, le=30.0)
-    rabota_proxy_candidate_ttl_seconds: int = Field(default=900, ge=60, le=86400)
-    rabota_proxy_ready_ttl_seconds: int = Field(default=300, ge=60, le=86400)
+    rabota_proxy_candidate_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+    rabota_proxy_ready_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+    rabota_proxy_revalidation_grace_seconds: int = Field(default=3600, ge=60, le=86400)
+    rabota_proxy_revalidation_retry_seconds: int = Field(default=300, ge=30, le=3600)
+    rabota_proxy_revalidation_max_failures: int = Field(default=3, ge=1, le=10)
+    rabota_proxy_maintenance_interval_seconds: int = Field(default=900, ge=60, le=3600)
     rabota_proxy_min_fresh_free: int = Field(default=3, ge=1, le=50)
-    rabota_proxy_target_ready_free: int = Field(default=5, ge=1, le=50)
+    rabota_proxy_target_ready_free: int = Field(default=3, ge=1, le=50)
     rabota_proxy_promotion_concurrency: int = Field(default=3, ge=1, le=8)
     rabota_proxy_max_preflight_attempts: int = Field(default=12, ge=1, le=64)
-    rabota_proxy_maintenance_max_preflight_attempts: int = Field(default=4, ge=1, le=16)
+    rabota_proxy_maintenance_max_preflight_attempts: int = Field(default=6, ge=1, le=16)
     rabota_proxy_ban_cooldown_seconds: int = Field(default=21600, ge=60, le=86400)
     rabota_proxy_dead_cooldown_seconds: int = Field(default=3600, ge=60, le=86400)
     rabota_proxy_primary_dead_cooldown_seconds: int = Field(default=300, ge=10, le=3600)
@@ -312,6 +316,19 @@ class Settings(BaseSettings):
             and not self.rabota_proxy_free_fallback_enabled
         ):
             raise ValueError("Rabota proxy pool requires a primary URL or free fallback")
+        if self.rabota_proxy_ready_ttl_seconds < 2 * self.rabota_proxy_maintenance_interval_seconds:
+            raise ValueError(
+                "RABOTA_PROXY_READY_TTL_SECONDS must be at least twice "
+                "RABOTA_PROXY_MAINTENANCE_INTERVAL_SECONDS"
+            )
+        if (
+            self.rabota_proxy_target_ready_free
+            > self.rabota_proxy_maintenance_max_preflight_attempts
+        ):
+            raise ValueError(
+                "RABOTA_PROXY_TARGET_READY_FREE must not exceed "
+                "RABOTA_PROXY_MAINTENANCE_MAX_PREFLIGHT_ATTEMPTS"
+            )
         token_file = self.phonegate_auth_token_file
         if token_file is not None:
             if self.phonegate_auth_token is not None:
