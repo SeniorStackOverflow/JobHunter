@@ -1,4 +1,6 @@
 from app.models.entities import (
+    Account,
+    AccountIdentity,
     Alert,
     Application,
     ApplicationPolicyRefreshQueue,
@@ -20,6 +22,7 @@ from app.models.entities import (
     EmployerRelationship,
     ExternalCallEvent,
     InterviewAppointment,
+    Invite,
     JobPreference,
     JobSnapshot,
     JobSource,
@@ -40,6 +43,8 @@ from app.models.entities import (
 )
 
 __all__ = [
+    "Account",
+    "AccountIdentity",
     "Alert",
     "Application",
     "ApplicationPolicyRefreshQueue",
@@ -61,6 +66,7 @@ __all__ = [
     "EmployerRelationship",
     "ExternalCallEvent",
     "InterviewAppointment",
+    "Invite",
     "JobPreference",
     "JobSnapshot",
     "JobSource",

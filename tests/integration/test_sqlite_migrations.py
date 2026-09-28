@@ -31,7 +31,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision == ("b7e3c9a1d4f2",)
+        assert revision == ("c8a4d1f9e210",)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -46,6 +46,9 @@ def test_fresh_sqlite_database_migrations_round_trip(
             "employer_relationships",
             "email_delivery_events",
             "email_mailbox_cursors",
+            "accounts",
+            "account_identities",
+            "invites",
         } <= set(database.get_table_names())
         assert {
             "rfc_message_id",
@@ -64,6 +67,9 @@ def test_fresh_sqlite_database_migrations_round_trip(
         match_columns = {column["name"] for column in database.get_columns("match_evaluations")}
         assert "source_matching_hash" in match_columns
         assert {"hard_requirements", "hard_requirement_rules_version"} <= match_columns
+        assert {"owner_account_id", "status"} <= {
+            column["name"] for column in database.get_columns("user_profiles")
+        }
         assert "profile_id" in {column["name"] for column in database.get_columns("applications")}
         assert "phonegate_generation" in {
             column["name"] for column in database.get_columns("communication_sessions")
@@ -204,4 +210,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("b7e3c9a1d4f2",)
+    assert revision == ("c8a4d1f9e210",)

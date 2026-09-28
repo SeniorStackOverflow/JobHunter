@@ -263,3 +263,25 @@ class PhoneComponentStatus(StrEnum):
     DEGRADED = "degraded"
     UNAVAILABLE = "unavailable"
     UNKNOWN = "unknown"
+
+
+class AccountRole(StrEnum):
+    USER = "user"
+    ADMIN = "admin"
+
+
+class AccountStatus(StrEnum):
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    DISABLED = "disabled"
+
+
+class ProfileStatus(StrEnum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
+
+
+class IdentityProvider(StrEnum):
+    GOOGLE = "google"

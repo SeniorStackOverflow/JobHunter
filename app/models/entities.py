@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
@@ -25,7 +26,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.enums import (
+    AccountRole,
+    AccountStatus,
     ApplicationStatus,
     CallFactConfirmationSource,
     CallFactState,
@@ -39,6 +43,7 @@ from app.models.enums import (
     EmployerInteractionChannel,
     EmployerInteractionType,
     EmployerRelationshipState,
+    IdentityProvider,
     InterviewFormat,
     InterviewStatus,
     JobStatus,
@@ -47,6 +52,7 @@ from app.models.enums import (
     PhoneSummaryState,
     PhoneVerificationStatus,
     PolicyDecision,
+    ProfileStatus,
     ReviewOutcome,
     ReviewReason,
     RunStatus,
@@ -68,9 +74,88 @@ def enum_column(enum_type: type[PythonEnum]) -> Enum:
     )
 
 
+class Account(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "accounts"
+    __table_args__ = (
+        CheckConstraint("invite_allowance >= 0", name="accounts_invite_allowance_nonnegative"),
+        CheckConstraint("max_profiles >= 1", name="accounts_max_profiles_positive"),
+    )
+
+    role: Mapped[AccountRole] = mapped_column(
+        enum_column(AccountRole), default=AccountRole.USER, nullable=False
+    )
+    status: Mapped[AccountStatus] = mapped_column(
+        enum_column(AccountStatus), default=AccountStatus.ACTIVE, nullable=False
+    )
+    session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    invite_allowance: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    allow_open_invites: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    max_profiles: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    allow_phone: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class AccountIdentity(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "account_identities"
+    __table_args__ = (
+        UniqueConstraint("provider", "subject", name="uq_account_identity_provider_subject"),
+        UniqueConstraint("account_id", "provider", name="uq_account_identity_account_provider"),
+    )
+
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    provider: Mapped[IdentityProvider] = mapped_column(
+        enum_column(IdentityProvider), nullable=False
+    )
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Invite(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "invites"
+    __table_args__ = (
+        CheckConstraint(
+            "(redeemed_at IS NULL AND redeemed_by_account_id IS NULL) OR "
+            "(redeemed_at IS NOT NULL AND redeemed_by_account_id IS NOT NULL)",
+            name="invites_redemption_pair",
+        ),
+    )
+
+    created_by_account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_email: Mapped[str | None] = mapped_column(String(320))
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=False
+    )
+    redeemed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    redeemed_by_account_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), index=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class UserProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "user_profiles"
 
+    owner_account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        default=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        index=True,
+        nullable=False,
+    )
+    status: Mapped[ProfileStatus] = mapped_column(
+        enum_column(ProfileStatus), default=ProfileStatus.ACTIVE, nullable=False
+    )
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     contact_email: Mapped[str | None] = mapped_column(String(320))

@@ -12,6 +12,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Application,
     JobPreference,
@@ -20,6 +21,7 @@ from app.models.entities import (
     SourceJob,
     UserProfile,
 )
+from app.models.enums import ProfileStatus
 from app.profiles.schemas import (
     JobPreferenceInput,
     JobPreferenceUpdateInput,
@@ -105,40 +107,73 @@ def choose_resume_for_job(resumes: list[Resume], job: SourceJob) -> Resume | Non
 
 
 class ProfileService:
-    async def list_profiles(self, session: AsyncSession) -> list[UserProfile]:
+    async def list_profiles(
+        self,
+        session: AsyncSession,
+        owner_account_id: UUID | None = None,
+    ) -> list[UserProfile]:
+        query = select(UserProfile)
+        if owner_account_id is not None:
+            query = query.where(UserProfile.owner_account_id == owner_account_id)
         return list(
             (
                 await session.scalars(
-                    select(UserProfile).order_by(UserProfile.created_at, UserProfile.id)
+                    query.order_by(UserProfile.created_at, UserProfile.id)
                 )
             ).all()
         )
 
     async def get_profile(
-        self, session: AsyncSession, profile_id: UUID | None = None
+        self,
+        session: AsyncSession,
+        profile_id: UUID | None = None,
+        *,
+        owner_account_id: UUID | None = None,
     ) -> UserProfile | None:
         if profile_id is not None:
-            return await session.get(UserProfile, profile_id)
-        profile = await session.scalar(
-            select(UserProfile).where(UserProfile.is_default.is_(True)).limit(1)
-        )
+            query = select(UserProfile).where(UserProfile.id == profile_id)
+            if owner_account_id is not None:
+                query = query.where(UserProfile.owner_account_id == owner_account_id)
+            return await session.scalar(query)
+        query = select(UserProfile).where(UserProfile.is_default.is_(True))
+        if owner_account_id is not None:
+            query = query.where(UserProfile.owner_account_id == owner_account_id)
+        profile = await session.scalar(query.limit(1))
         if profile is not None:
             return profile
+        fallback = select(UserProfile)
+        if owner_account_id is not None:
+            fallback = fallback.where(UserProfile.owner_account_id == owner_account_id)
         return cast(
             UserProfile | None,
             await session.scalar(
-                select(UserProfile).order_by(UserProfile.created_at, UserProfile.id).limit(1)
+                fallback.order_by(UserProfile.created_at, UserProfile.id).limit(1)
             ),
         )
 
     async def create_profile(
-        self, session: AsyncSession, payload: UserProfileInput, *, make_default: bool = False
+        self,
+        session: AsyncSession,
+        payload: UserProfileInput,
+        *,
+        make_default: bool = False,
+        owner_account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        status: ProfileStatus = ProfileStatus.ACTIVE,
     ) -> UserProfile:
-        profiles = await self.list_profiles(session)
+        profiles = await self.list_profiles(session, owner_account_id)
         make_default = make_default or not profiles
         if make_default:
-            await session.execute(update(UserProfile).values(is_default=False))
-        profile = UserProfile(**payload.model_dump(mode="json"), is_default=make_default)
+            await session.execute(
+                update(UserProfile)
+                .where(UserProfile.owner_account_id == owner_account_id)
+                .values(is_default=False)
+            )
+        profile = UserProfile(
+            **payload.model_dump(mode="json"),
+            owner_account_id=owner_account_id,
+            status=status,
+            is_default=make_default,
+        )
         session.add(profile)
         await session.flush()
         session.add(JobPreference(profile_id=profile.id))
@@ -146,22 +181,46 @@ class ProfileService:
         return profile
 
     async def upsert_profile(
-        self, session: AsyncSession, payload: UserProfileInput, profile_id: UUID | None = None
+        self,
+        session: AsyncSession,
+        payload: UserProfileInput,
+        profile_id: UUID | None = None,
+        *,
+        owner_account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
     ) -> UserProfile:
-        profile = await self.get_profile(session, profile_id)
+        profile = await self.get_profile(
+            session, profile_id, owner_account_id=owner_account_id
+        )
         values = payload.model_dump(mode="json")
         if profile is None:
-            return await self.create_profile(session, payload, make_default=True)
+            return await self.create_profile(
+                session,
+                payload,
+                make_default=True,
+                owner_account_id=owner_account_id,
+            )
         for key, value in values.items():
             setattr(profile, key, value)
         await session.flush()
         return profile
 
-    async def set_default_profile(self, session: AsyncSession, profile_id: UUID) -> UserProfile:
-        profile = await self.get_profile(session, profile_id)
+    async def set_default_profile(
+        self,
+        session: AsyncSession,
+        profile_id: UUID,
+        *,
+        owner_account_id: UUID | None = None,
+    ) -> UserProfile:
+        profile = await self.get_profile(
+            session, profile_id, owner_account_id=owner_account_id
+        )
         if profile is None:
             raise LookupError(f"profile {profile_id} does not exist")
-        await session.execute(update(UserProfile).values(is_default=False))
+        await session.execute(
+            update(UserProfile)
+            .where(UserProfile.owner_account_id == profile.owner_account_id)
+            .values(is_default=False)
+        )
         profile.is_default = True
         await session.flush()
         return profile
