@@ -17,14 +17,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.accounts import InviteService
+from app.admin import router as admin_router
+from app.admin import routes as admin_routes
 from app.api import routes as api_routes
 from app.auth import google as google_auth
 from app.auth import routes as auth_routes
 from app.auth.google import GOOGLE_IDENTITY_SCOPES, GoogleIdentityService
 from app.database.session import get_session
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
-from app.models.entities import Account, AccountIdentity, Invite, UserProfile
+from app.models.entities import Account, AccountIdentity, Invite, JobPreference, UserProfile
 from app.models.enums import AccountRole, AccountStatus, ProfileStatus
+from app.security.auth import SessionSigner
 from app.settings import Settings
 
 pytestmark = pytest.mark.integration
@@ -97,10 +100,12 @@ async def user_auth_context(
     )
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
     monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
 
     application = FastAPI()
     application.include_router(api_routes.router)
     application.include_router(auth_routes.router)
+    application.include_router(admin_router)
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         async with sqlite_session_factory() as session:
@@ -430,3 +435,114 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
     finally:
         server.should_exit = True
         await server_task
+
+
+
+@pytest.mark.asyncio
+async def test_admin_can_manage_registered_account_lifecycle(
+    user_auth_context: UserAuthContext,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        account = Account(
+            role=AccountRole.USER,
+            status=AccountStatus.ACTIVE,
+            invite_allowance=0,
+            max_profiles=1,
+        )
+        session.add(account)
+        await session.flush()
+        session.add(
+            AccountIdentity(
+                account_id=account.id,
+                provider="google",
+                subject="managed-subject",
+                email="managed@example.com",
+                email_verified=True,
+            )
+        )
+        profile = UserProfile(
+            owner_account_id=account.id,
+            status=ProfileStatus.DRAFT,
+            name="Managed candidate",
+        )
+        session.add(profile)
+        await session.flush()
+        session.add(
+            JobPreference(
+                profile_id=profile.id,
+                auto_send_enabled=True,
+                global_pause=False,
+            )
+        )
+        await session.commit()
+        account_id = account.id
+        profile_id = profile.id
+
+    admin_session = SessionSigner(
+        user_auth_context.settings.secret_key.get_secret_value()
+    ).issue(user_auth_context.settings.admin_username)
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.session_cookie_name,
+        admin_session,
+    )
+
+    page = await user_auth_context.client.get("/admin/accounts")
+    assert page.status_code == 200
+    assert "managed@example.com" in page.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text)
+    assert csrf is not None
+    csrf_token = csrf.group(1)
+
+    limits = await user_auth_context.client.post(
+        f"/admin/accounts/{account_id}/limits",
+        data={
+            "invite_allowance": "3",
+            "max_profiles": "2",
+            "csrf_token": csrf_token,
+        },
+    )
+    assert limits.status_code == 303
+
+    activated = await user_auth_context.client.post(
+        f"/admin/profiles/{profile_id}/status",
+        data={"profile_status": "active", "csrf_token": csrf_token},
+    )
+    assert activated.status_code == 303
+
+    suspended = await user_auth_context.client.post(
+        f"/admin/accounts/{account_id}/suspend",
+        data={"csrf_token": csrf_token},
+    )
+    assert suspended.status_code == 303
+
+    async with user_auth_context.session_factory() as session:
+        stored_account = await session.get(Account, account_id)
+        stored_profile = await session.get(UserProfile, profile_id)
+        preference = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == profile_id)
+        )
+        assert stored_account is not None
+        assert stored_account.status == AccountStatus.SUSPENDED
+        assert stored_account.session_version == 1
+        assert stored_account.invite_allowance == 3
+        assert stored_account.max_profiles == 2
+        assert stored_profile is not None
+        assert stored_profile.status == ProfileStatus.ACTIVE
+        assert preference is not None
+        assert preference.global_pause is True
+
+    reactivated = await user_auth_context.client.post(
+        f"/admin/accounts/{account_id}/reactivate",
+        data={"csrf_token": csrf_token},
+    )
+    assert reactivated.status_code == 303
+
+    async with user_auth_context.session_factory() as session:
+        stored_account = await session.get(Account, account_id)
+        preference = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == profile_id)
+        )
+        assert stored_account is not None
+        assert stored_account.status == AccountStatus.ACTIVE
+        assert preference is not None
+        assert preference.global_pause is True

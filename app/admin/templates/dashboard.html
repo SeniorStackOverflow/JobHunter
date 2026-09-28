@@ -13,6 +13,8 @@
       <a class="nav-link {% if view == 'settings' %}is-active{% endif %}" href="/?view=settings&profile_id={{ selected_profile_id }}"><span class="nav-icon">⚙</span><span>Настройки</span></a>
       <a class="nav-link {% if view == 'diagnostics' %}is-active{% endif %}" href="/?view=diagnostics&profile_id={{ selected_profile_id }}"><span class="nav-icon">◌</span><span>Диагностика</span>{% if counts.active_alerts %}<span class="nav-count">{{ counts.active_alerts }}</span>{% endif %}</a>
       <a class="nav-link {% if view == 'calls' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}"><span class="nav-icon">☎</span><span>Звонки</span>{% if counts.phone_review %}<span class="nav-count">{{ counts.phone_review }}</span>{% endif %}</a>
+      <a class="nav-link" href="/admin/accounts"><span class="nav-icon">◎</span><span>Пользователи</span></a>
+      <a class="nav-link" href="/admin/invites"><span class="nav-icon">＋</span><span>Приглашения</span></a>
     </nav>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-status">

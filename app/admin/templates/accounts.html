@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Пользователи · JobHunter{% endblock %}
+{% block body_class %}detail-page{% endblock %}
+{% block body %}
+<header class="detail-topbar">
+  <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Пользователи</span></div></div>
+  <div class="row-actions"><a class="btn" href="/admin/invites">Приглашения</a><a class="btn" href="/">← Панель</a></div>
+</header>
+<main class="detail-content">
+  <div class="section-heading">
+    <div><h1>Пользователи</h1><p>Регистрация даёт аккаунт, но автоматические действия остаются закрыты, пока профиль не активирован и его настройки не разрешают работу.</p></div>
+  </div>
+
+  {% for account in accounts %}
+  {% set identity = identities_by_account.get(account.id) %}
+  {% set account_profiles = profiles_by_account.get(account.id, []) %}
+  <section class="panel" style="margin-bottom:16px">
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">{{ identity.email if identity else account.id }}</div>
+        <div class="panel-subtitle">{{ account.id }} · {{ account.role.value }} · session v{{ account.session_version }}</div>
+      </div>
+      <span class="badge {{ 'success' if account.status.value == 'active' else 'warning' }}">{{ account.status.value }}</span>
+    </div>
+    <div class="panel-pad">
+      <div class="grid grid-3" style="margin-bottom:16px">
+        <div class="metric-card"><div class="metric-label">Инвайты</div><div class="metric-value">{{ account.invite_allowance }}</div></div>
+        <div class="metric-card"><div class="metric-label">Лимит профилей</div><div class="metric-value">{{ account.max_profiles }}</div></div>
+        <div class="metric-card"><div class="metric-label">Профили</div><div class="metric-value">{{ account_profiles|length }}</div></div>
+      </div>
+
+      <form method="post" action="/admin/accounts/{{ account.id }}/limits" class="form-grid" style="margin-bottom:18px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="field">Лимит приглашений<input type="number" name="invite_allowance" min="0" max="20" value="{{ account.invite_allowance }}"></label>
+        <label class="field">Максимум профилей<input type="number" name="max_profiles" min="1" max="5" value="{{ account.max_profiles }}"></label>
+        <div class="full form-actions"><button class="btn" type="submit">Сохранить лимиты</button></div>
+      </form>
+
+      {% if account_profiles %}
+      <div class="compact-list">
+        {% for profile in account_profiles %}
+        <div class="compact-row">
+          <div><strong>{{ profile.name }}</strong><span>{{ profile.id }} · {{ profile.status.value }}{% if profile.is_default %} · основной{% endif %}</span></div>
+          <form method="post" action="/admin/profiles/{{ profile.id }}/status" class="row-actions">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% if profile.status.value == 'active' %}
+            <input type="hidden" name="profile_status" value="paused">
+            <button class="btn btn-sm btn-warning" type="submit">Пауза</button>
+            {% else %}
+            <input type="hidden" name="profile_status" value="active">
+            <button class="btn btn-sm btn-primary" type="submit">Активировать</button>
+            {% endif %}
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state compact">Профилей пока нет.</div>
+      {% endif %}
+
+      <div class="form-actions">
+        {% if account.status.value == 'active' %}
+        <form method="post" action="/admin/accounts/{{ account.id }}/suspend" data-confirm-title="Заблокировать аккаунт?" data-confirm="Сессии будут отозваны, активные инвайты — аннулированы, автоотправка профилей — поставлена на паузу." data-confirm-action="Заблокировать">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn btn-danger" type="submit">Заблокировать</button>
+        </form>
+        {% elif account.status.value == 'suspended' %}
+        <form method="post" action="/admin/accounts/{{ account.id }}/reactivate">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn btn-primary" type="submit">Разблокировать</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+  {% else %}
+  <div class="panel"><div class="empty-state">Зарегистрированных пользователей пока нет.</div></div>
+  {% endfor %}
+</main>
+{% endblock %}
