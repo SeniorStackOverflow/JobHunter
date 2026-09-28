@@ -33,7 +33,7 @@ from app.models.enums import AccountStatus, ProfileStatus
 from app.profiles import ProfileService
 from app.profiles.schemas import UserProfileInput
 from app.security.auth import AccountSessionSigner, CsrfProtector, SessionSigner
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 
 router = APIRouter(tags=["user-auth"])
 templates = Jinja2Templates(directory="app/auth/templates")
@@ -44,7 +44,7 @@ _REGISTER_ACTOR_PREFIX = "register:"
 _LOGIN_ACTOR = "login"
 
 
-def _settings():
+def _settings() -> Settings:
     return get_settings()
 
 
@@ -106,9 +106,7 @@ async def _require_account(
 
 def _require_user_csrf(request: Request, csrf_token: str) -> None:
     token = request.cookies.get(_settings().user_session_cookie_name)
-    if not token or not _csrf().verify(
-        csrf_token, token, _settings().csrf_ttl_seconds
-    ):
+    if not token or not _csrf().verify(csrf_token, token, _settings().csrf_ttl_seconds):
         raise HTTPException(status_code=403, detail="invalid CSRF token")
 
 
@@ -171,21 +169,21 @@ async def join_page(
         response.headers["Cache-Control"] = "no-store"
         return response
     try:
-        invite = await _bound_invite(request, session)
+        bound_invite: Invite | None = await _bound_invite(request, session)
     except (InviteInvalid, InviteUnavailable):
-        invite = None
-    response = templates.TemplateResponse(
+        bound_invite = None
+    page_response = templates.TemplateResponse(
         request=request,
         name="join.html",
         context={
-            "invite": invite,
-            "masked_email": _mask_email(invite.target_email) if invite else None,
+            "invite": bound_invite,
+            "masked_email": (_mask_email(bound_invite.target_email) if bound_invite else None),
             "error": error,
         },
-        status_code=200 if invite is not None else 400,
+        status_code=200 if bound_invite is not None else 400,
     )
-    response.headers["Cache-Control"] = "no-store"
-    return response
+    page_response.headers["Cache-Control"] = "no-store"
+    return page_response
 
 
 @router.get("/auth/google/register")
@@ -402,9 +400,7 @@ async def create_user_profile(
     _require_user_feature()
     _require_user_csrf(request, csrf_token)
     account, _ = await _require_account(request, session)
-    locked = await session.scalar(
-        select(Account).where(Account.id == account.id).with_for_update()
-    )
+    locked = await session.scalar(select(Account).where(Account.id == account.id).with_for_update())
     if locked is None or locked.status != AccountStatus.ACTIVE:
         raise HTTPException(status_code=401, detail="account unavailable")
     count = int(

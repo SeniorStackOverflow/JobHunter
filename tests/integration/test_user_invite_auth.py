@@ -214,9 +214,7 @@ async def test_invite_registration_creates_account_session_and_owned_draft_profi
     )
     assert callback.status_code == 303
     assert callback.headers["location"] == "/app"
-    assert user_auth_context.client.cookies.get(
-        user_auth_context.settings.user_session_cookie_name
-    )
+    assert user_auth_context.client.cookies.get(user_auth_context.settings.user_session_cookie_name)
 
     home = await user_auth_context.client.get("/app")
     assert home.status_code == 200
@@ -278,9 +276,10 @@ async def test_bound_invite_rejects_different_google_email(
     )
     assert callback.status_code == 303
     assert callback.headers["location"].startswith("/join?error=")
-    assert user_auth_context.client.cookies.get(
-        user_auth_context.settings.user_session_cookie_name
-    ) is None
+    assert (
+        user_auth_context.client.cookies.get(user_auth_context.settings.user_session_cookie_name)
+        is None
+    )
 
     async with user_auth_context.session_factory() as session:
         invite = await session.scalar(
@@ -360,9 +359,7 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
         port = int(port_socket.getsockname()[1])
     base_url = f"http://localhost:{port}"
 
-    settings = user_auth_context.settings.model_copy(
-        update={"public_base_url": base_url}
-    )
+    settings = user_auth_context.settings.model_copy(update={"public_base_url": base_url})
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
     monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
 
@@ -437,7 +434,6 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
         await server_task
 
 
-
 @pytest.mark.asyncio
 async def test_admin_can_manage_registered_account_lifecycle(
     user_auth_context: UserAuthContext,
@@ -478,9 +474,9 @@ async def test_admin_can_manage_registered_account_lifecycle(
         account_id = account.id
         profile_id = profile.id
 
-    admin_session = SessionSigner(
-        user_auth_context.settings.secret_key.get_secret_value()
-    ).issue(user_auth_context.settings.admin_username)
+    admin_session = SessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        user_auth_context.settings.admin_username
+    )
     user_auth_context.client.cookies.set(
         user_auth_context.settings.session_cookie_name,
         admin_session,

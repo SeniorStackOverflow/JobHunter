@@ -72,7 +72,6 @@ class CsrfProtector:
         return hmac.compare_digest(signature, expected)
 
 
-
 @dataclass(frozen=True, slots=True)
 class AccountSession:
     account_id: UUID

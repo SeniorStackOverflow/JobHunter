@@ -82,9 +82,7 @@ def upgrade() -> None:
         "user_profiles",
         sa.column("owner_account_id", sa.Uuid()),
     )
-    op.get_bind().execute(
-        sa.update(profiles).values(owner_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID)
-    )
+    op.get_bind().execute(sa.update(profiles).values(owner_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID))
     with op.batch_alter_table("user_profiles") as batch_op:
         batch_op.alter_column("owner_account_id", nullable=False)
         batch_op.alter_column("status", server_default=None)
@@ -111,12 +109,8 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.ForeignKeyConstraint(["account_id"], ["accounts.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "provider", "subject", name="uq_account_identity_provider_subject"
-        ),
-        sa.UniqueConstraint(
-            "account_id", "provider", name="uq_account_identity_account_provider"
-        ),
+        sa.UniqueConstraint("provider", "subject", name="uq_account_identity_provider_subject"),
+        sa.UniqueConstraint("account_id", "provider", name="uq_account_identity_account_provider"),
     )
     op.create_index(
         "ix_account_identities_account_id",
@@ -141,12 +135,8 @@ def upgrade() -> None:
             "(redeemed_at IS NOT NULL AND redeemed_by_account_id IS NOT NULL)",
             name="invites_redemption_pair",
         ),
-        sa.ForeignKeyConstraint(
-            ["created_by_account_id"], ["accounts.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["redeemed_by_account_id"], ["accounts.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["created_by_account_id"], ["accounts.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["redeemed_by_account_id"], ["accounts.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -173,9 +163,7 @@ def downgrade() -> None:
     op.drop_table("account_identities")
     with op.batch_alter_table("user_profiles") as batch_op:
         batch_op.drop_index("ix_user_profiles_owner_account_id")
-        batch_op.drop_constraint(
-            "fk_user_profiles_owner_account_id_accounts", type_="foreignkey"
-        )
+        batch_op.drop_constraint("fk_user_profiles_owner_account_id_accounts", type_="foreignkey")
         batch_op.drop_column("status")
         batch_op.drop_column("owner_account_id")
     op.drop_table("accounts")

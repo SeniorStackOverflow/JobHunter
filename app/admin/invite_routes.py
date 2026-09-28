@@ -238,9 +238,7 @@ async def reactivate_account(
         raise HTTPException(status_code=404, detail="account not found") from exc
     if value == BOOTSTRAP_ADMIN_ACCOUNT_ID:
         raise HTTPException(status_code=409, detail="bootstrap admin cannot be changed")
-    account = await session.scalar(
-        select(Account).where(Account.id == value).with_for_update()
-    )
+    account = await session.scalar(select(Account).where(Account.id == value).with_for_update())
     if account is None:
         raise HTTPException(status_code=404, detail="account not found")
     if account.status == AccountStatus.DISABLED:
@@ -278,9 +276,7 @@ async def update_account_limits(
         raise HTTPException(status_code=409, detail="bootstrap admin limits are fixed")
     if not 0 <= invite_allowance <= 20 or not 1 <= max_profiles <= 5:
         raise HTTPException(status_code=422, detail="account limits are out of range")
-    account = await session.scalar(
-        select(Account).where(Account.id == value).with_for_update()
-    )
+    account = await session.scalar(select(Account).where(Account.id == value).with_for_update())
     if account is None:
         raise HTTPException(status_code=404, detail="account not found")
     account.invite_allowance = invite_allowance

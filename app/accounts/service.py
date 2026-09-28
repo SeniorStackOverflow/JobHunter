@@ -5,6 +5,7 @@ import hmac
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select, update
@@ -100,13 +101,16 @@ class AccountService:
         provider: IdentityProvider,
         subject: str,
     ) -> Account | None:
-        return await session.scalar(
-            select(Account)
-            .join(AccountIdentity, AccountIdentity.account_id == Account.id)
-            .where(
-                AccountIdentity.provider == provider,
-                AccountIdentity.subject == subject,
-            )
+        return cast(
+            Account | None,
+            await session.scalar(
+                select(Account)
+                .join(AccountIdentity, AccountIdentity.account_id == Account.id)
+                .where(
+                    AccountIdentity.provider == provider,
+                    AccountIdentity.subject == subject,
+                )
+            ),
         )
 
     async def authenticate_google_identity(
@@ -163,11 +167,14 @@ class AccountService:
         account_id: UUID,
         profile_id: UUID,
     ) -> UserProfile | None:
-        return await session.scalar(
-            select(UserProfile).where(
-                UserProfile.id == profile_id,
-                UserProfile.owner_account_id == account_id,
-            )
+        return cast(
+            UserProfile | None,
+            await session.scalar(
+                select(UserProfile).where(
+                    UserProfile.id == profile_id,
+                    UserProfile.owner_account_id == account_id,
+                )
+            ),
         )
 
     async def suspend(self, session: AsyncSession, account_id: UUID) -> Account:
@@ -190,9 +197,7 @@ class AccountService:
             )
         ).all():
             invite.revoked_at = now
-        owned_profile_ids = select(UserProfile.id).where(
-            UserProfile.owner_account_id == account.id
-        )
+        owned_profile_ids = select(UserProfile.id).where(UserProfile.owner_account_id == account.id)
         await session.execute(
             update(JobPreference)
             .where(JobPreference.profile_id.in_(owned_profile_ids))

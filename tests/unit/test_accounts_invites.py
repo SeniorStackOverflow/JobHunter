@@ -331,7 +331,6 @@ async def test_suspend_revokes_sessions_and_active_invites(
         assert created.invite.revoked_at is not None
 
 
-
 @pytest.mark.asyncio
 async def test_processing_profiles_require_active_account_and_profile(
     sqlite_session_factory,
@@ -402,7 +401,6 @@ async def test_suspend_also_pauses_owned_job_preferences(
         assert stored is not None
         assert stored.auto_send_enabled is True
         assert stored.global_pause is True
-
 
 
 @pytest.mark.asyncio

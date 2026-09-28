@@ -117,11 +117,7 @@ class ProfileService:
         if owner_account_id is not None:
             query = query.where(UserProfile.owner_account_id == owner_account_id)
         return list(
-            (
-                await session.scalars(
-                    query.order_by(UserProfile.created_at, UserProfile.id)
-                )
-            ).all()
+            (await session.scalars(query.order_by(UserProfile.created_at, UserProfile.id))).all()
         )
 
     async def list_processing_profiles(self, session: AsyncSession) -> list[UserProfile]:
@@ -147,17 +143,20 @@ class ProfileService:
         session: AsyncSession,
         profile_id: UUID,
     ) -> UserProfile | None:
-        return await session.scalar(
-            select(UserProfile)
-            .outerjoin(Account, Account.id == UserProfile.owner_account_id)
-            .where(
-                UserProfile.id == profile_id,
-                UserProfile.status == ProfileStatus.ACTIVE,
-                or_(
-                    UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
-                    Account.status == AccountStatus.ACTIVE,
-                ),
-            )
+        return cast(
+            UserProfile | None,
+            await session.scalar(
+                select(UserProfile)
+                .outerjoin(Account, Account.id == UserProfile.owner_account_id)
+                .where(
+                    UserProfile.id == profile_id,
+                    UserProfile.status == ProfileStatus.ACTIVE,
+                    or_(
+                        UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                        Account.status == AccountStatus.ACTIVE,
+                    ),
+                )
+            ),
         )
 
     async def get_profile(
@@ -171,7 +170,7 @@ class ProfileService:
             query = select(UserProfile).where(UserProfile.id == profile_id)
             if owner_account_id is not None:
                 query = query.where(UserProfile.owner_account_id == owner_account_id)
-            return await session.scalar(query)
+            return cast(UserProfile | None, await session.scalar(query))
         query = select(UserProfile).where(UserProfile.is_default.is_(True))
         if owner_account_id is not None:
             query = query.where(UserProfile.owner_account_id == owner_account_id)
@@ -225,9 +224,7 @@ class ProfileService:
         *,
         owner_account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
     ) -> UserProfile:
-        profile = await self.get_profile(
-            session, profile_id, owner_account_id=owner_account_id
-        )
+        profile = await self.get_profile(session, profile_id, owner_account_id=owner_account_id)
         values = payload.model_dump(mode="json")
         if profile is None:
             return await self.create_profile(
@@ -248,9 +245,7 @@ class ProfileService:
         *,
         owner_account_id: UUID | None = None,
     ) -> UserProfile:
-        profile = await self.get_profile(
-            session, profile_id, owner_account_id=owner_account_id
-        )
+        profile = await self.get_profile(session, profile_id, owner_account_id=owner_account_id)
         if profile is None:
             raise LookupError(f"profile {profile_id} does not exist")
         await session.execute(

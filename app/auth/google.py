@@ -79,9 +79,7 @@ def _scope_values(value: Any) -> set[str]:
 
 
 def _canonical_identity_scopes(scopes: set[str]) -> set[str]:
-    return {
-        GOOGLE_EMAIL_SCOPE if item == GOOGLE_USERINFO_EMAIL_SCOPE else item for item in scopes
-    }
+    return {GOOGLE_EMAIL_SCOPE if item == GOOGLE_USERINFO_EMAIL_SCOPE else item for item in scopes}
 
 
 def _accept_google_email_scope_alias(flow: Flow, warning: Warning) -> bool:
@@ -182,10 +180,7 @@ class GoogleIdentityService:
                 (OAuthAuthorizationRequest.expires_at < now - IDENTITY_REQUEST_RETENTION)
                 | (
                     OAuthAuthorizationRequest.consumed_at.is_not(None)
-                    & (
-                        OAuthAuthorizationRequest.created_at
-                        < now - IDENTITY_REQUEST_RETENTION
-                    )
+                    & (OAuthAuthorizationRequest.created_at < now - IDENTITY_REQUEST_RETENTION)
                 ),
             )
         )

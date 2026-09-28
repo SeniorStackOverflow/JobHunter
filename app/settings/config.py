@@ -391,9 +391,7 @@ class Settings(BaseSettings):
                 self.gmail_client_secret,
             )
         ):
-            raise ValueError(
-                "User accounts require Google OAuth credentials and token encryption"
-            )
+            raise ValueError("User accounts require Google OAuth credentials and token encryption")
         if self.invite_registration_enabled and not self.user_accounts_enabled:
             raise ValueError("Invite registration requires USER_ACCOUNTS_ENABLED=true")
         if self.llm_provider == "mock":

@@ -365,9 +365,7 @@ class ApplicationService:
         source_job = await session.get(SourceJob, application.source_job_id)
         resume = await session.get(Resume, application.resume_id)
         contact = await session.get(EmployerContact, application.recipient_contact_id)
-        profile = await self.profile_service.get_processing_profile(
-            session, application.profile_id
-        )
+        profile = await self.profile_service.get_processing_profile(session, application.profile_id)
         if (
             evaluation is None
             or source_job is None
@@ -389,9 +387,7 @@ class ApplicationService:
         if application is None:
             raise LookupError(f"application {application_id} does not exist")
         if (
-            await self.profile_service.get_processing_profile(
-                session, application.profile_id
-            )
+            await self.profile_service.get_processing_profile(session, application.profile_id)
             is None
         ):
             raise ApplicationPreparationError("profile or account is not active")
