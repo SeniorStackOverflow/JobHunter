@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -12,10 +13,25 @@ from app.accounts import (
     InviteService,
     InviteUnavailable,
 )
-from app.models.entities import Account, AccountIdentity, Invite
-from app.models.enums import AccountRole, AccountStatus, IdentityProvider
+from app.email.service import EmailSendBlocked, EmailService
+from app.models.entities import (
+    Account,
+    AccountIdentity,
+    Application,
+    Invite,
+    JobPreference,
+    UserProfile,
+)
+from app.models.enums import (
+    AccountRole,
+    AccountStatus,
+    ApplicationStatus,
+    IdentityProvider,
+    ProfileStatus,
+)
 from app.profiles import ProfileService
 from app.profiles.schemas import UserProfileInput
+from app.settings import Settings
 
 
 @pytest.mark.asyncio
@@ -313,3 +329,130 @@ async def test_suspend_revokes_sessions_and_active_invites(
         assert suspended.status == AccountStatus.SUSPENDED
         assert suspended.session_version == 5
         assert created.invite.revoked_at is not None
+
+
+
+@pytest.mark.asyncio
+async def test_processing_profiles_require_active_account_and_profile(
+    sqlite_session_factory,
+) -> None:
+    profiles = ProfileService()
+    async with sqlite_session_factory() as session:
+        active_account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        suspended_account = Account(role=AccountRole.USER, status=AccountStatus.SUSPENDED)
+        session.add_all([active_account, suspended_account])
+        await session.flush()
+        active = UserProfile(
+            owner_account_id=active_account.id,
+            status=ProfileStatus.ACTIVE,
+            name="active",
+        )
+        draft = UserProfile(
+            owner_account_id=active_account.id,
+            status=ProfileStatus.DRAFT,
+            name="draft",
+        )
+        suspended = UserProfile(
+            owner_account_id=suspended_account.id,
+            status=ProfileStatus.ACTIVE,
+            name="suspended-owner",
+        )
+        session.add_all([active, draft, suspended])
+        await session.commit()
+
+        processing = await profiles.list_processing_profiles(session)
+        assert [item.id for item in processing] == [active.id]
+        assert await profiles.get_processing_profile(session, active.id) is not None
+        assert await profiles.get_processing_profile(session, draft.id) is None
+        assert await profiles.get_processing_profile(session, suspended.id) is None
+
+
+@pytest.mark.asyncio
+async def test_suspend_also_pauses_owned_job_preferences(
+    sqlite_session_factory,
+) -> None:
+    accounts = AccountService()
+    async with sqlite_session_factory() as session:
+        account = Account(
+            role=AccountRole.USER,
+            status=AccountStatus.ACTIVE,
+            session_version=2,
+        )
+        session.add(account)
+        await session.flush()
+        profile = UserProfile(
+            owner_account_id=account.id,
+            status=ProfileStatus.ACTIVE,
+            name="owner",
+        )
+        session.add(profile)
+        await session.flush()
+        preference = JobPreference(
+            profile_id=profile.id,
+            auto_send_enabled=True,
+            global_pause=False,
+        )
+        session.add(preference)
+        await session.commit()
+
+        await accounts.suspend(session, account.id)
+        await session.commit()
+
+        stored = await session.get(JobPreference, preference.id)
+        assert stored is not None
+        assert stored.auto_send_enabled is True
+        assert stored.global_pause is True
+
+
+
+@pytest.mark.asyncio
+async def test_email_send_blocks_suspended_owner_before_provider_or_dependencies(
+    sqlite_session_factory,
+    tmp_path,
+) -> None:
+    async with sqlite_session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.SUSPENDED)
+        session.add(account)
+        await session.flush()
+        profile = UserProfile(
+            owner_account_id=account.id,
+            status=ProfileStatus.ACTIVE,
+            name="suspended-owner",
+        )
+        session.add(profile)
+        await session.flush()
+        application = Application(
+            profile_id=profile.id,
+            canonical_job_id=uuid4(),
+            source_job_id=uuid4(),
+            resume_id=uuid4(),
+            recipient_contact_id=uuid4(),
+            subject="Test",
+            body="Test",
+            language="en",
+            status=ApplicationStatus.APPROVED,
+            policy_result={},
+            used_confirmed_facts=[],
+            content_validated=True,
+            idempotency_key="inactive-owner-" + uuid4().hex,
+        )
+        session.add(application)
+        await session.commit()
+        application_id = application.id
+
+    settings = Settings(
+        environment="test",
+        database_url="sqlite+aiosqlite:///:memory:",
+        email_provider="fake",
+        resume_storage_path=tmp_path,
+    )
+    service = EmailService(settings, sqlite_session_factory)
+    with pytest.raises(EmailSendBlocked) as exc_info:
+        await service.send_application(application_id)
+
+    assert exc_info.value.reason == "account_or_profile_inactive"
+    async with sqlite_session_factory() as session:
+        stored = await session.get(Application, application_id)
+        assert stored is not None
+        assert stored.status == ApplicationStatus.DEFERRED
+        assert stored.policy_result["safe_stop_reason"] == "account_or_profile_inactive"

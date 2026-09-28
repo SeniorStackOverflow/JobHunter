@@ -836,7 +836,7 @@ async def process_unprocessed_jobs() -> int:
     processed = 0
     async with async_session_factory() as session:
         profile_service = ProfileService()
-        profiles = await profile_service.list_profiles(session)
+        profiles = await profile_service.list_processing_profiles(session)
         if not profiles:
             logger.warning("job_matching_skipped", error_type="MissingUserProfile")
             return 0

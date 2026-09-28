@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.entities import Account, AccountIdentity, Invite, UserProfile
+from app.models.entities import Account, AccountIdentity, Invite, JobPreference, UserProfile
 from app.models.enums import AccountRole, AccountStatus, IdentityProvider, ProfileStatus
 
 INVITE_PREFIX = "jhi_"
@@ -190,6 +190,14 @@ class AccountService:
             )
         ).all():
             invite.revoked_at = now
+        owned_profile_ids = select(UserProfile.id).where(
+            UserProfile.owner_account_id == account.id
+        )
+        await session.execute(
+            update(JobPreference)
+            .where(JobPreference.profile_id.in_(owned_profile_ids))
+            .values(global_pause=True)
+        )
         await session.flush()
         return account
 

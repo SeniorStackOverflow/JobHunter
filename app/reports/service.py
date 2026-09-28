@@ -875,7 +875,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
 
     summary["learning_shadow"] = [
         await shadow_scorecard(session, profile.id)
-        for profile in await ProfileService().list_profiles(session)
+        for profile in await ProfileService().list_processing_profiles(session)
     ]
     existing = await session.scalar(select(DailyReport).where(DailyReport.report_date == start))
     if existing is None:

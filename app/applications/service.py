@@ -179,6 +179,10 @@ class ApplicationService:
         profile = await self.profile_service.get_profile(session, profile_id)
         if profile is None:
             raise ApplicationPreparationError("profile is required")
+        active_profile = await self.profile_service.get_processing_profile(session, profile.id)
+        if active_profile is None:
+            raise ApplicationPreparationError("profile or account is not active")
+        profile = active_profile
         profile_id = profile.id
         existing = await session.scalar(
             select(Application).where(
@@ -361,7 +365,9 @@ class ApplicationService:
         source_job = await session.get(SourceJob, application.source_job_id)
         resume = await session.get(Resume, application.resume_id)
         contact = await session.get(EmployerContact, application.recipient_contact_id)
-        profile = await session.get(UserProfile, application.profile_id)
+        profile = await self.profile_service.get_processing_profile(
+            session, application.profile_id
+        )
         if (
             evaluation is None
             or source_job is None
@@ -382,6 +388,13 @@ class ApplicationService:
         )
         if application is None:
             raise LookupError(f"application {application_id} does not exist")
+        if (
+            await self.profile_service.get_processing_profile(
+                session, application.profile_id
+            )
+            is None
+        ):
+            raise ApplicationPreparationError("profile or account is not active")
         if application.status not in {
             ApplicationStatus.PENDING_REVIEW,
             ApplicationStatus.PREPARED,

@@ -8,12 +8,13 @@ from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
+    Account,
     Application,
     JobPreference,
     MatchEvaluation,
@@ -21,7 +22,7 @@ from app.models.entities import (
     SourceJob,
     UserProfile,
 )
-from app.models.enums import ProfileStatus
+from app.models.enums import AccountStatus, ProfileStatus
 from app.profiles.schemas import (
     JobPreferenceInput,
     JobPreferenceUpdateInput,
@@ -121,6 +122,42 @@ class ProfileService:
                     query.order_by(UserProfile.created_at, UserProfile.id)
                 )
             ).all()
+        )
+
+    async def list_processing_profiles(self, session: AsyncSession) -> list[UserProfile]:
+        return list(
+            (
+                await session.scalars(
+                    select(UserProfile)
+                    .outerjoin(Account, Account.id == UserProfile.owner_account_id)
+                    .where(
+                        UserProfile.status == ProfileStatus.ACTIVE,
+                        or_(
+                            UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                            Account.status == AccountStatus.ACTIVE,
+                        ),
+                    )
+                    .order_by(UserProfile.created_at, UserProfile.id)
+                )
+            ).all()
+        )
+
+    async def get_processing_profile(
+        self,
+        session: AsyncSession,
+        profile_id: UUID,
+    ) -> UserProfile | None:
+        return await session.scalar(
+            select(UserProfile)
+            .outerjoin(Account, Account.id == UserProfile.owner_account_id)
+            .where(
+                UserProfile.id == profile_id,
+                UserProfile.status == ProfileStatus.ACTIVE,
+                or_(
+                    UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                    Account.status == AccountStatus.ACTIVE,
+                ),
+            )
         )
 
     async def get_profile(

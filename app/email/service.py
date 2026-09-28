@@ -34,7 +34,9 @@ from app.matching.bindings import (
     used_confirmed_facts_are_current,
 )
 from app.matching.freshness import evaluation_is_current
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
+    Account,
     Application,
     EmailDelivery,
     EmployerContact,
@@ -45,6 +47,7 @@ from app.models.entities import (
     UserProfile,
 )
 from app.models.enums import (
+    AccountStatus,
     ApplicationStatus,
     ContactDeliveryState,
     ContactType,
@@ -53,6 +56,7 @@ from app.models.enums import (
     EmployerInteractionType,
     JobStatus,
     PolicyDecision,
+    ProfileStatus,
 )
 from app.observability.metrics import EMAIL_DELIVERIES, SEND_BLOCKED_RELATIONSHIP_CHANGED
 from app.policies import PolicyEngine
@@ -461,6 +465,30 @@ class EmailService:
             )
             if application is None:
                 raise LookupError(f"application {application_id} does not exist")
+            active_profile = await session.scalar(
+                select(UserProfile)
+                .outerjoin(Account, Account.id == UserProfile.owner_account_id)
+                .where(
+                    UserProfile.id == application.profile_id,
+                    UserProfile.status == ProfileStatus.ACTIVE,
+                    or_(
+                        UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                        Account.status == AccountStatus.ACTIVE,
+                    ),
+                )
+            )
+            if active_profile is None:
+                await self._persist_safe_stop(
+                    session,
+                    application,
+                    status=ApplicationStatus.DEFERRED,
+                    reason="account_or_profile_inactive",
+                    failed_rules=("account_profile_active",),
+                )
+                raise EmailSendBlocked(
+                    "account or profile is not active",
+                    reason="account_or_profile_inactive",
+                )
             existing = await session.scalar(
                 select(EmailDelivery).where(EmailDelivery.application_id == application_id)
             )

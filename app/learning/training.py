@@ -75,7 +75,7 @@ async def train_profile(session: AsyncSession, profile_id: UUID) -> LearningMode
 async def train_all_profiles() -> int:
     written = 0
     async with async_session_factory() as session:
-        for profile in await ProfileService().list_profiles(session):
+        for profile in await ProfileService().list_processing_profiles(session):
             try:
                 async with session.begin_nested():
                     trained = await train_profile(session, profile.id)
