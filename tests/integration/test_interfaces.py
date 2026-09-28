@@ -767,8 +767,9 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
         settings_page = await client.get("/?view=settings")
         assert settings_page.status_code == 200
         assert 'name="minimum_daily_applications" value="3"' in settings_page.text
-        assert 'data-daily-minimum readonly aria-disabled="true"' in settings_page.text
-        assert "Принудительный добор" in settings_page.text
+        assert "data-daily-minimum" in settings_page.text
+        assert 'readonly aria-disabled="true"' not in settings_page.text
+        assert "Минимум обязателен" in settings_page.text
 
         legacy_preferences_form = await client.post(
             "/admin/preferences",
@@ -802,7 +803,7 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
             assert unchanged_preferences is not None
             assert unchanged_preferences.additional_rules["minimum_daily_applications"] == 3
 
-        dormant_daily_range = await client.post(
+        mandatory_daily_range = await client.post(
             "/admin/preferences",
             data={
                 "minimum_daily_applications": "5",
@@ -812,13 +813,11 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
                 "csrf_token": csrf_token,
             },
         )
-        assert dormant_daily_range.status_code == 303
+        assert mandatory_daily_range.status_code == 422
         async with sqlite_session_factory() as session:
-            dormant_preferences = await session.scalar(select(JobPreference))
-            assert dormant_preferences is not None
-            assert dormant_preferences.maximum_daily_applications == 4
-            assert dormant_preferences.additional_rules["minimum_daily_applications"] == 5
-            assert dormant_preferences.additional_rules["force_minimum_daily_applications"] is False
+            unchanged_preferences = await session.scalar(select(JobPreference))
+            assert unchanged_preferences is not None
+            assert unchanged_preferences.additional_rules["minimum_daily_applications"] == 3
 
         profile_saved = await client.post(
             "/admin/profile",

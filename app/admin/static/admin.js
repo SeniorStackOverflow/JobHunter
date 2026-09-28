@@ -44,15 +44,13 @@
   document.querySelectorAll('[data-daily-limit-range]').forEach((control) => {
     const minimumInput = control.querySelector('[data-daily-minimum]');
     const maximumInput = control.querySelector('[data-daily-maximum]');
-    const forceInput = control.querySelector('[data-daily-force]');
-    if (!minimumInput || !maximumInput || !forceInput) return;
+    if (!minimumInput || !maximumInput) return;
 
     const validateRange = () => {
       const minimum = Number.parseInt(minimumInput.value, 10);
       const maximum = Number.parseInt(maximumInput.value, 10);
       if (Number.isFinite(maximum)) minimumInput.max = String(maximum);
       const invalid =
-        forceInput.checked &&
         Number.isFinite(minimum) &&
         Number.isFinite(maximum) &&
         minimum > maximum;
@@ -61,18 +59,9 @@
       );
     };
 
-    const syncMinimumAvailability = () => {
-      const enabled = forceInput.checked;
-      minimumInput.readOnly = !enabled;
-      minimumInput.setAttribute('aria-disabled', String(!enabled));
-      minimumInput.closest('label')?.classList.toggle('is-inactive', !enabled);
-      validateRange();
-    };
-
     minimumInput.addEventListener('input', validateRange);
     maximumInput.addEventListener('input', validateRange);
-    forceInput.addEventListener('change', syncMinimumAvailability);
-    syncMinimumAvailability();
+    validateRange();
   });
 
   document.querySelectorAll('[data-password-toggle]').forEach((button) => {

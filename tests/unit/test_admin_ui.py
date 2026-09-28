@@ -32,7 +32,7 @@ def test_admin_javascript_uses_in_app_confirmation_dialog() -> None:
 def test_admin_daily_application_rules_preserve_advanced_settings() -> None:
     existing = {"verified_only": True, "minimum_daily_applications": 9}
 
-    enabled = _daily_application_rules(existing, minimum=2, force_minimum=True)
+    enabled = _daily_application_rules(existing, minimum=2, force_minimum=False)
     disabled = _daily_application_rules(existing, minimum=0, force_minimum=True)
 
     assert enabled == {
@@ -89,14 +89,13 @@ def test_admin_javascript_initializes_every_custom_control() -> None:
         assert hook in script
 
 
-def test_admin_javascript_disables_dormant_daily_minimum() -> None:
+def test_admin_javascript_keeps_mandatory_daily_minimum_editable() -> None:
     script = Path("app/admin/static/admin.js").read_text(encoding="utf-8")
 
-    assert "minimumInput.readOnly = !enabled;" in script
-    assert "minimumInput.setAttribute('aria-disabled', String(!enabled));" in script
-    assert "forceInput.checked &&" in script
-    assert "forceInput.addEventListener('change', syncMinimumAvailability);" in script
-    assert "syncMinimumAvailability();" in script
+    assert "minimumInput.readOnly = !enabled;" not in script
+    assert "data-daily-force" not in script
+    assert "minimum > maximum" in script
+    assert "validateRange();" in script
 
 
 def test_admin_preferences_use_independent_columns() -> None:

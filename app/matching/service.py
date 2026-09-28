@@ -8,16 +8,27 @@ from uuid import UUID
 
 import structlog
 from redis.asyncio import Redis
-from sqlalchemy import String, and_, cast, func, or_, select, true
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 
+from app.applications.daily_target import (
+    minimum_catchup_active as daily_minimum_catchup_active,
+)
+from app.applications.daily_target import (
+    minimum_catchup_score,
+)
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
 from app.matching.bindings import (
     confirmed_fact_hashes,
     evaluation_inputs_are_current,
     preference_fingerprint,
     profile_fingerprint,
+)
+from app.matching.freshness import (
+    SAFETY_ONLY_PREVIOUS_RULES,
+    active_resumes_for_profile,
+    build_matching_preselection_query,
+    matching_rules_refresh_due,
 )
 from app.matching.hard_requirements import (
     HARD_REQUIREMENT_RULES_VERSION,
@@ -51,7 +62,6 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
-    JobStatus,
     MatchDecision,
     PolicyDecision,
 )
@@ -69,20 +79,6 @@ _PRIORITY_REMATCH_SAFE_STOPS = {
     "match_evaluation_stale",
     "match_evaluation_inputs_stale",
 }
-_SAFETY_ONLY_PREVIOUS_RULES = {"matching-v5"}
-
-
-def _matching_rules_refresh_due(
-    evaluation: MatchEvaluation | None,
-    *,
-    hard_requirement_refresh_due: bool,
-) -> bool:
-    if evaluation is None or evaluation.prompt_rules_version == MATCHING_RULES_VERSION:
-        return False
-    return not (
-        evaluation.prompt_rules_version in _SAFETY_ONLY_PREVIOUS_RULES
-        and not hard_requirement_refresh_due
-    )
 
 
 def _as_aware(value: datetime) -> datetime:
@@ -402,21 +398,8 @@ def _estimate_resume_fit(
 async def _minimum_catchup_active(
     session: AsyncSession, preference: JobPreference, profile_id: UUID
 ) -> bool:
-    rules = preference.additional_rules or {}
-    if rules.get("force_minimum_daily_applications") is not True:
-        return False
-    try:
-        minimum_daily = max(
-            0,
-            min(
-                int(rules.get("minimum_daily_applications", 0)),
-                preference.maximum_daily_applications,
-            ),
-        )
-    except (TypeError, ValueError):
-        return False
-    if minimum_daily <= 0:
-        return False
+    # A configured minimum is an operational requirement, not an advisory flag.
+    # The legacy force_minimum_daily_applications key is intentionally ignored.
     _start_local, start_of_day, _end_of_day = local_day_bounds()
     sent_today = await session.scalar(
         select(func.count(Application.id)).where(
@@ -425,7 +408,14 @@ async def _minimum_catchup_active(
             Application.sent_at >= start_of_day,
         )
     )
-    return int(sent_today or 0) < minimum_daily
+    reserved_auto_send = await session.scalar(
+        select(func.count(Application.id)).where(
+            Application.profile_id == profile_id,
+            Application.status.in_({ApplicationStatus.AUTO_APPROVED, ApplicationStatus.SENDING}),
+        )
+    )
+    progress = int(sent_today or 0) + int(reserved_auto_send or 0)
+    return daily_minimum_catchup_active(preference, progress)
 
 
 async def _select_resume(session: AsyncSession, profile_id: UUID, job: SourceJob) -> Resume | None:
@@ -635,6 +625,7 @@ class MatchingService:
         resume_fit: int,
         resume_category: str | None = None,
         resume_summary: str | None = None,
+        minimum_auto_send_score: int | None = None,
     ) -> tuple[MatchResult, str | None, list[dict[str, Any]]]:
         deterministic = self.prefilter.evaluate(
             job,
@@ -664,7 +655,11 @@ class MatchingService:
             reconcile_match_result(
                 deterministic,
                 llm_result,
-                minimum_auto_send_score=preference.minimum_auto_send_score,
+                minimum_auto_send_score=(
+                    preference.minimum_auto_send_score
+                    if minimum_auto_send_score is None
+                    else minimum_auto_send_score
+                ),
             ),
             logical_request_id,
             telemetry,
@@ -728,27 +723,19 @@ class MatchingService:
         telemetry_request_id: str | None = None
         telemetry_attempts: list[dict[str, Any]] = []
         minimum_catchup_active = await _minimum_catchup_active(session, preference, profile.id)
-        if minimum_catchup_active:
-            deterministic = self.prefilter.evaluate(job, preference, profile, resume_fit=resume_fit)
-            if deterministic.eligible_for_ai:
-                result = deterministic.to_match_result().model_copy(
-                    update={
-                        "reason": (
-                            "; ".join(deterministic.reasons)
-                            or "deterministic minimum-daily catch-up evaluation"
-                        )
-                    }
-                )
-            else:
-                result = deterministic.to_match_result()
-        else:
-            result, telemetry_request_id, telemetry_attempts = await self.evaluate_with_telemetry(
-                job,
-                preference,
-                profile,
-                resume_fit=resume_fit,
-                resume_category=resume_category,
-            )
+        effective_auto_send_score = (
+            minimum_catchup_score(preference)
+            if minimum_catchup_active
+            else preference.minimum_auto_send_score
+        )
+        result, telemetry_request_id, telemetry_attempts = await self.evaluate_with_telemetry(
+            job,
+            preference,
+            profile,
+            resume_fit=resume_fit,
+            resume_category=resume_category,
+            minimum_auto_send_score=effective_auto_send_score,
+        )
         result = _apply_same_input_safety_guard(
             previous_evaluation,
             result,
@@ -854,111 +841,18 @@ async def process_unprocessed_jobs() -> int:
             logger.warning("job_matching_skipped", error_type="MissingUserProfile")
             return 0
 
-        latest_snapshot_at = (
-            select(JobSnapshot.timestamp)
-            .where(
-                JobSnapshot.source_job_id == SourceJob.id,
-                JobSnapshot.requires_rematch.is_(True),
-            )
-            .order_by(JobSnapshot.timestamp.desc(), JobSnapshot.id.desc())
-            .limit(1)
-            .correlate(SourceJob)
-            .scalar_subquery()
-        )
-
         for profile in profiles:
             preference = await profile_service.get_preferences(session, profile.id)
             priority_source_ids = await _priority_rematch_source_ids(session, profile.id)
-            resumes = list(
-                (
-                    await session.scalars(
-                        select(Resume).where(
-                            Resume.profile_id == profile.id,
-                            Resume.active.is_(True),
-                            Resume.verified.is_(True),
-                        )
-                    )
-                ).all()
-            )
-
-            latest_evaluation = aliased(MatchEvaluation)
-            latest_evaluation_id = (
-                select(latest_evaluation.id)
-                .where(
-                    latest_evaluation.profile_id == profile.id,
-                    latest_evaluation.source_job_id == SourceJob.id,
-                )
-                .order_by(
-                    latest_evaluation.created_at.desc(),
-                    latest_evaluation.id.desc(),
-                )
-                .limit(1)
-                .correlate(SourceJob)
-                .scalar_subquery()
-            )
-
-            if len(resumes) == 0:
-                resume_stale = or_(
-                    MatchEvaluation.resume_id.is_not(None),
-                    MatchEvaluation.resume_sha256.is_not(None),
-                )
-            elif len(resumes) == 1:
-                current_resume = resumes[0]
-                resume_stale = or_(
-                    MatchEvaluation.resume_id.is_(None),
-                    MatchEvaluation.resume_id != current_resume.id,
-                    MatchEvaluation.resume_sha256.is_(None),
-                    MatchEvaluation.resume_sha256 != current_resume.sha256,
-                )
-            else:
-                resume_stale = true()
-
-            retry_before = datetime.now(UTC) - timedelta(
-                seconds=settings.matching_provider_failure_retry_seconds
-            )
-            stale = or_(
-                MatchEvaluation.id.is_(None),
-                MatchEvaluation.canonical_job_id != SourceJob.canonical_job_id,
-                MatchEvaluation.source_matching_hash.is_(None),
-                MatchEvaluation.source_matching_hash != SourceJob.matching_content_hash,
-                latest_snapshot_at > MatchEvaluation.created_at,
-                MatchEvaluation.profile_fingerprint.is_(None),
-                MatchEvaluation.profile_fingerprint != profile_fingerprint(profile),
-                MatchEvaluation.preference_fingerprint.is_(None),
-                MatchEvaluation.preference_fingerprint != preference_fingerprint(preference),
-                resume_stale,
-                and_(
-                    MatchEvaluation.prompt_rules_version != MATCHING_RULES_VERSION,
-                    ~MatchEvaluation.prompt_rules_version.in_(_SAFETY_ONLY_PREVIOUS_RULES),
-                ),
-                MatchEvaluation.hard_requirement_rules_version.is_(None),
-                MatchEvaluation.hard_requirement_rules_version != HARD_REQUIREMENT_RULES_VERSION,
-                and_(
-                    MatchEvaluation.created_at <= retry_before,
-                    cast(MatchEvaluation.risks, String).like("%llm_provider_failure:%"),
-                ),
-            )
+            resumes = await active_resumes_for_profile(session, profile.id)
 
             rows = (
                 await session.execute(
-                    select(
-                        SourceJob,
-                        MatchEvaluation,
-                        latest_snapshot_at.label("snapshot_at"),
-                    )
-                    .outerjoin(
-                        MatchEvaluation,
-                        MatchEvaluation.id == latest_evaluation_id,
-                    )
-                    .where(
-                        SourceJob.status == JobStatus.ACTIVE,
-                        SourceJob.canonical_job_id.is_not(None),
-                        stale,
-                    )
-                    .order_by(
-                        SourceJob.last_seen_at.desc(),
-                        SourceJob.id,
-                        MatchEvaluation.id,
+                    build_matching_preselection_query(
+                        profile,
+                        preference,
+                        resumes,
+                        settings,
                     )
                 )
             ).all()
@@ -986,7 +880,7 @@ async def process_unprocessed_jobs() -> int:
                     or (evaluation.hard_requirements or [])
                     != hard_requirements_snapshot(deterministic.hard_requirements)
                 )
-                prompt_refresh_due = _matching_rules_refresh_due(
+                prompt_refresh_due = matching_rules_refresh_due(
                     evaluation,
                     hard_requirement_refresh_due=hard_requirement_refresh_due,
                 )
@@ -996,7 +890,7 @@ async def process_unprocessed_jobs() -> int:
 
                 if (
                     evaluation is not None
-                    and evaluation.prompt_rules_version in _SAFETY_ONLY_PREVIOUS_RULES
+                    and evaluation.prompt_rules_version in SAFETY_ONLY_PREVIOUS_RULES
                     and not deterministic.hard_requirements
                     and not retry_due
                     and inputs_current

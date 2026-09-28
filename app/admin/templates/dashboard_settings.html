@@ -29,10 +29,10 @@
               <fieldset class="daily-limit-field" data-daily-limit-range>
                 <legend>Отклики в день</legend>
                 <div class="daily-limit-inputs">
-                  <label><span>Минимум</span><input type="number" min="0" max="100" name="minimum_daily_applications" value="{{ daily_rules.get('minimum_daily_applications', 0) }}" data-daily-minimum {% if not force_minimum_daily %}readonly aria-disabled="true"{% endif %}></label>
+                  <label><span>Минимум</span><input type="number" min="0" max="100" name="minimum_daily_applications" value="{{ daily_rules.get('minimum_daily_applications', 0) }}" data-daily-minimum></label>
                   <label><span>Максимум</span><input type="number" min="0" max="100" name="maximum_daily_applications" value="{{ preferences.maximum_daily_applications }}" data-daily-maximum></label>
                 </div>
-                <label class="daily-catchup"><span class="daily-catchup-copy"><strong>Принудительный добор</strong><span>До минимума допускает вакансии ниже порога; требования безопасности сохраняются.</span></span><span class="switch"><input type="checkbox" name="force_minimum_daily_applications" data-daily-force {% if force_minimum_daily %}checked{% endif %}><span class="switch-ui"></span></span></label>
+                <div class="daily-catchup"><span class="daily-catchup-copy"><strong>Минимум обязателен</strong><span>Пока минимум не достигнут, система автоматически включает безопасный добор с более мягким порогом. Hard safety, защита от дублей и ограничения работодателя не обходятся.</span></span></div>
               </fieldset>
               <div class="switch-row"><div class="switch-copy"><strong>Удалённая работа</strong><span>Рассматривать удалённые вакансии</span></div><label class="switch"><input type="checkbox" name="remote_allowed" {% if preferences.remote_allowed %}checked{% endif %}><span class="switch-ui"></span></label></div>
             </div>

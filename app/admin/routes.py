@@ -51,7 +51,7 @@ from app.learning import (
     ReviewLearningSummary,
     fixed_preference_dimensions,
 )
-from app.matching.freshness import evaluation_is_current
+from app.matching.freshness import count_profile_matching_backlog, evaluation_is_current
 from app.matching.providers import MATCHING_RULES_VERSION
 from app.models.entities import (
     Alert,
@@ -749,18 +749,6 @@ async def dashboard(
         )
     ).all()
     decisions = {decision: int(count) for decision, count in decision_rows}
-    current_match_exists = (
-        select(MatchEvaluation.id)
-        .where(
-            MatchEvaluation.source_job_id == SourceJob.id,
-            MatchEvaluation.profile_id == selected_profile_id,
-            MatchEvaluation.prompt_rules_version == MATCHING_RULES_VERSION,
-            MatchEvaluation.source_matching_hash == SourceJob.matching_content_hash,
-        )
-        .correlate(SourceJob)
-        .exists()
-    )
-
     counts = {
         "jobs": int(await session.scalar(select(func.count(SourceJob.id))) or 0),
         "active_jobs": int(
@@ -824,15 +812,11 @@ async def dashboard(
         )
         or 0
     )
-    matching_backlog = int(
-        await session.scalar(
-            select(func.count(SourceJob.id)).where(
-                SourceJob.status == JobStatus.ACTIVE,
-                SourceJob.canonical_job_id.is_not(None),
-                ~current_match_exists,
-            )
-        )
-        or 0
+    matching_backlog = await count_profile_matching_backlog(
+        session,
+        profile,
+        preferences,
+        get_settings(),
     )
     sent_today = int(
         await session.scalar(
@@ -1464,7 +1448,9 @@ def _daily_application_rules(
 
     rules = dict(existing or {})
     rules["minimum_daily_applications"] = minimum
-    rules["force_minimum_daily_applications"] = force_minimum and minimum > 0
+    # Minimum is an operational requirement whenever it is configured.
+    # Keep the legacy key true for backward-compatible consumers.
+    rules["force_minimum_daily_applications"] = minimum > 0
     return rules
 
 
@@ -1628,11 +1614,7 @@ async def save_preferences(
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    if (
-        daily_application_rules_present
-        and force_minimum_daily_applications
-        and minimum_daily_applications > maximum_daily_applications
-    ):
+    if daily_application_rules_present and minimum_daily_applications > maximum_daily_applications:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="minimum daily applications cannot exceed the maximum",

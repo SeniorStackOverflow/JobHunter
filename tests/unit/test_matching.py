@@ -1088,11 +1088,35 @@ async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
     assert await matching_service.process_unprocessed_jobs() == 1
     assert await matching_service.process_unprocessed_jobs() == 0
     async with session_factory() as session:
+        from app.matching.freshness import count_profile_matching_backlog
+
         evaluations = list((await session.scalars(select(MatchEvaluation))).all())
         assert len(evaluations) == 1
         assert evaluations[0].source_job_id == job.id
         assert evaluations[0].source_content_hash == job.content_hash
-        evaluations[0].prompt_rules_version = "matching-v1"
+        evaluations[0].prompt_rules_version = "matching-v5"
+        await session.commit()
+        stored_profile = await session.scalar(select(UserProfile).limit(1))
+        stored_preference = await session.scalar(select(JobPreference).limit(1))
+        assert stored_profile is not None
+        assert stored_preference is not None
+        assert (
+            await count_profile_matching_backlog(
+                session,
+                stored_profile,
+                stored_preference,
+                Settings(environment="test"),
+            )
+            == 0
+        )
+
+    # Regression: matching-v5 is an accepted safety-only predecessor and must
+    # not appear as backlog when the worker itself has nothing to process.
+    assert await matching_service.process_unprocessed_jobs() == 0
+    async with session_factory() as session:
+        evaluation = await session.scalar(select(MatchEvaluation).limit(1))
+        assert evaluation is not None
+        evaluation.prompt_rules_version = "matching-v1"
         await session.commit()
 
     assert await matching_service.process_unprocessed_jobs() == 1
@@ -1701,19 +1725,19 @@ def test_same_input_skip_to_auto_apply_is_forced_to_review() -> None:
 
 
 def test_matching_v5_safety_rollout_avoids_global_rematch_without_hard_requirements() -> None:
-    from app.matching.service import _matching_rules_refresh_due
+    from app.matching.freshness import matching_rules_refresh_due
 
     evaluation = MatchEvaluation(prompt_rules_version="matching-v5")
 
     assert (
-        _matching_rules_refresh_due(
+        matching_rules_refresh_due(
             evaluation,
             hard_requirement_refresh_due=False,
         )
         is False
     )
     assert (
-        _matching_rules_refresh_due(
+        matching_rules_refresh_due(
             evaluation,
             hard_requirement_refresh_due=True,
         )
@@ -1722,7 +1746,7 @@ def test_matching_v5_safety_rollout_avoids_global_rematch_without_hard_requireme
 
     evaluation.prompt_rules_version = "matching-v1"
     assert (
-        _matching_rules_refresh_due(
+        matching_rules_refresh_due(
             evaluation,
             hard_requirement_refresh_due=False,
         )

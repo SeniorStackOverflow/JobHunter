@@ -331,7 +331,7 @@ async def test_review_or_skip_match_can_never_be_auto_approved(
         assert "match_not_skipped" in skipped.rules_failed
 
 
-async def test_force_minimum_daily_overrides_soft_match_gates_but_not_requirements(
+async def test_mandatory_minimum_lowers_only_soft_score_gate(
     sqlite_session_factory, tmp_path: Path
 ) -> None:
     async with sqlite_session_factory() as session:
@@ -347,21 +347,41 @@ async def test_force_minimum_daily_overrides_soft_match_gates_but_not_requiremen
         )
         preference.additional_rules = {
             "minimum_daily_applications": 2,
-            "force_minimum_daily_applications": True,
+            # Legacy flag is deliberately false: a configured minimum is mandatory.
+            "force_minimum_daily_applications": False,
+            "minimum_daily_catchup_score_delta": 10,
         }
         preference.minimum_auto_send_score = 90
-        evaluation.overall_fit = 5
-        evaluation.decision = MatchDecision.SKIP
+        evaluation.overall_fit = 85
+        evaluation.decision = MatchDecision.PREPARE_FOR_REVIEW
         engine = PolicyEngine(settings(tmp_path))
 
-        forced = await engine.evaluate(
+        catchup = await engine.evaluate(
             session, application, preference, evaluation, job, resume, contact, profile
         )
-        assert forced.decision == PolicyDecision.AUTO_APPROVED
-        assert "overall_score_threshold" in forced.rules_passed
-        assert "match_not_skipped" in forced.rules_passed
-        assert "match_auto_apply" in forced.rules_passed
+        assert catchup.decision == PolicyDecision.AUTO_APPROVED
+        assert "overall_score_threshold" in catchup.rules_passed
+        assert "match_not_skipped" in catchup.rules_passed
+        assert "match_auto_apply" in catchup.rules_passed
 
+        evaluation.risks = ["material schedule uncertainty"]
+        risky_review = await engine.evaluate(
+            session, application, preference, evaluation, job, resume, contact, profile
+        )
+        assert risky_review.decision == PolicyDecision.PENDING_REVIEW
+        assert "match_auto_apply" in risky_review.rules_failed
+
+        evaluation.risks = []
+        evaluation.overall_fit = 100
+        evaluation.decision = MatchDecision.SKIP
+        skipped = await engine.evaluate(
+            session, application, preference, evaluation, job, resume, contact, profile
+        )
+        assert skipped.decision == PolicyDecision.SKIPPED
+        assert "match_not_skipped" in skipped.rules_failed
+        assert "match_auto_apply" in skipped.rules_failed
+
+        evaluation.decision = MatchDecision.AUTO_APPLY
         evaluation.missing_requirements = ["mandatory licence"]
         blocked_by_requirement = await engine.evaluate(
             session, application, preference, evaluation, job, resume, contact, profile
@@ -988,6 +1008,51 @@ async def test_auto_send_scheduler_preserves_approval_when_disabled(
         stored = await session.get(Application, application_id)
         assert stored is not None
         assert stored.status == ApplicationStatus.AUTO_APPROVED
+
+
+async def test_mandatory_minimum_policy_refresh_promotes_safe_review_candidate(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.applications import service as application_service
+
+    current_settings = settings(tmp_path)
+    async with sqlite_session_factory() as session:
+        values = await make_graph(session, tmp_path)
+        preference = values[2]
+        evaluation = values[6]
+        application = values[8]
+        preference.additional_rules = {
+            "minimum_daily_applications": 2,
+            "force_minimum_daily_applications": False,
+            "minimum_daily_catchup_score_delta": 10,
+        }
+        preference.minimum_auto_send_score = 90
+        evaluation.overall_fit = 85
+        evaluation.decision = MatchDecision.PREPARE_FOR_REVIEW
+        evaluation.missing_requirements = []
+        evaluation.risks = []
+        evaluation.scam_indicators = []
+        application.status = ApplicationStatus.PENDING_REVIEW
+        application.policy_decision = PolicyDecision.PENDING_REVIEW
+        application.policy_result = {
+            "decision": "pending_review",
+            "rules_passed": [],
+            "rules_failed": ["overall_score_threshold", "match_auto_apply"],
+        }
+        application_id = application.id
+        await session.commit()
+
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(application_service, "get_settings", lambda: current_settings)
+
+    assert await application_service.prepare_pending_applications() == 1
+    async with sqlite_session_factory() as session:
+        promoted = await session.get(Application, application_id)
+        assert promoted is not None
+        assert promoted.status == ApplicationStatus.AUTO_APPROVED
+        assert promoted.policy_decision == PolicyDecision.AUTO_APPROVED
 
 
 async def test_policy_only_refresh_restores_category_auto_approval(

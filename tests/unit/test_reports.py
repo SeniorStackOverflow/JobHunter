@@ -280,6 +280,9 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         assert report.summary["period_start"].endswith(("+02:00", "+03:00"))
         assert report.summary["daily_limit"] == 20
         assert report.summary["daily_minimum"] == 2
+        assert report.summary["daily_minimum_forced"] is True
+        assert report.summary["daily_minimum_required"] is True
+        assert report.summary["daily_minimum_catchup_active"] is True
         assert report.summary["daily_sent"] == 1
         assert report.summary["daily_limit_used"] == 1
         assert report.summary["daily_limit_remaining"] == 19

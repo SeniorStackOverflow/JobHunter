@@ -7,6 +7,12 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.applications.daily_target import (
+    minimum_catchup_active,
+    minimum_catchup_score,
+    minimum_daily_requirement,
+)
+from app.matching.freshness import count_all_matching_backlog
 from app.models.entities import (
     Alert,
     Application,
@@ -26,12 +32,14 @@ from app.models.enums import (
     ApplicationStatus,
     DeliveryStatus,
     EmployerRelationshipState,
+    JobStatus,
     MatchDecision,
     PolicyDecision,
     RunStatus,
 )
 from app.profiles import ProfileService
 from app.reports.phone_metrics import daily_phone_metrics
+from app.settings import get_settings
 from app.telemetry import external_call_metrics
 from app.time_utils import LOCAL_TIMEZONE_NAME, local_day_bounds
 
@@ -150,7 +158,7 @@ async def _daily_limit_metrics(
         minimum = max(0, int(rules.get("minimum_daily_applications", 0)))
     except (TypeError, ValueError):
         minimum = 0
-    effective_minimum = min(minimum, preference.maximum_daily_applications)
+    effective_minimum = minimum_daily_requirement(preference)
     sent = int(
         await session.scalar(
             select(func.count(Application.id)).where(
@@ -187,11 +195,119 @@ async def _daily_limit_metrics(
         "daily_limit": preference.maximum_daily_applications,
         "daily_minimum": minimum,
         "daily_effective_minimum": effective_minimum,
-        "daily_minimum_forced": rules.get("force_minimum_daily_applications") is True,
+        "daily_minimum_forced": effective_minimum > 0,
+        "daily_minimum_required": effective_minimum > 0,
+        "daily_minimum_catchup_active": minimum_catchup_active(preference, sent),
+        "daily_minimum_catchup_score": minimum_catchup_score(preference),
+        "daily_minimum_effective_score": (
+            minimum_catchup_score(preference)
+            if minimum_catchup_active(preference, sent)
+            else preference.minimum_auto_send_score
+        ),
+        "daily_minimum_normal_score": preference.minimum_auto_send_score,
         "daily_sent": sent,
         "daily_limit_used": limit_used,
         "daily_limit_remaining": max(0, preference.maximum_daily_applications - limit_used),
         "daily_minimum_remaining": max(0, effective_minimum - sent),
+    }
+
+
+async def _daily_minimum_diagnostics(
+    session: AsyncSession,
+    start: datetime,
+    end: datetime,
+    *,
+    profile_id: UUID | None,
+    minimum: int,
+    sent: int,
+) -> dict[str, Any]:
+    safe_ready = int(
+        await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.profile_id == profile_id,
+                Application.status.in_(
+                    {ApplicationStatus.AUTO_APPROVED, ApplicationStatus.SENDING}
+                ),
+            )
+        )
+        or 0
+    )
+    rows = (
+        await session.execute(
+            select(Application.status, Application.policy_result)
+            .join(
+                MatchEvaluation,
+                MatchEvaluation.id == Application.match_evaluation_id,
+            )
+            .where(
+                Application.profile_id == profile_id,
+                MatchEvaluation.created_at >= start,
+                MatchEvaluation.created_at < end,
+                Application.status != ApplicationStatus.SENT,
+            )
+        )
+    ).all()
+    blockers = {
+        "employer_safety": 0,
+        "auto_send_category": 0,
+        "hard_requirements": 0,
+        "delivery_safety": 0,
+        "other_policy": 0,
+    }
+    for _status, policy_result in rows:
+        failed = {
+            item for item in (policy_result or {}).get("rules_failed", []) if isinstance(item, str)
+        }
+        if {"no_active_employer_conversation", "employer_application_slot_available"} & failed:
+            blockers["employer_safety"] += 1
+        if "category_allowed_for_auto_send" in failed:
+            blockers["auto_send_category"] += 1
+        if {
+            "mandatory_requirements_met",
+            "deterministic_hard_requirements_met",
+            "hard_requirement_binding_current",
+        } & failed:
+            blockers["hard_requirements"] += 1
+        if {
+            "contact_delivery_usable",
+            "not_previously_sent",
+            "no_delivery_unknown",
+            "verified_email_contact",
+            "contact_verified",
+        } & failed:
+            blockers["delivery_safety"] += 1
+        if failed and not (
+            {
+                "no_active_employer_conversation",
+                "employer_application_slot_available",
+                "category_allowed_for_auto_send",
+                "mandatory_requirements_met",
+                "deterministic_hard_requirements_met",
+                "hard_requirement_binding_current",
+                "contact_delivery_usable",
+                "not_previously_sent",
+                "no_delivery_unknown",
+                "verified_email_contact",
+                "contact_verified",
+            }
+            & failed
+        ):
+            blockers["other_policy"] += 1
+
+    if minimum <= 0:
+        status = "disabled"
+    elif sent >= minimum:
+        status = "met"
+    elif safe_ready > 0:
+        status = "catchup_ready"
+    elif blockers["employer_safety"] > 0:
+        status = "employer_safety_constrained"
+    else:
+        status = "no_safe_candidates"
+    return {
+        "daily_minimum_status": status,
+        "safe_auto_send_ready": safe_ready,
+        "daily_minimum_blockers": blockers,
     }
 
 
@@ -395,6 +511,33 @@ async def _generate(session: AsyncSession) -> DailyReport:
     matching_metrics = await _daily_matching_metrics(session, start, end)
     external_metrics = await external_call_metrics(session, start, end)
     limit_metrics = await _daily_limit_metrics(session, start, end)
+    report_profile = await ProfileService().get_profile(session)
+    minimum_diagnostics = await _daily_minimum_diagnostics(
+        session,
+        start,
+        end,
+        profile_id=report_profile.id if report_profile is not None else None,
+        minimum=int(limit_metrics.get("daily_effective_minimum") or 0),
+        sent=int(limit_metrics.get("daily_sent") or 0),
+    )
+    minimum = int(limit_metrics.get("daily_effective_minimum") or 0)
+    sent = int(limit_metrics.get("daily_sent") or 0)
+    reserved = int(minimum_diagnostics.get("safe_auto_send_ready") or 0)
+    search_active = minimum > 0 and sent + reserved < minimum
+    limit_metrics["daily_minimum_reserved"] = reserved
+    limit_metrics["daily_minimum_search_active"] = search_active
+    limit_metrics["daily_minimum_effective_score"] = (
+        limit_metrics["daily_minimum_catchup_score"]
+        if search_active
+        else limit_metrics["daily_minimum_normal_score"]
+    )
+    matching_backlog = await count_all_matching_backlog(session, get_settings())
+    active_jobs = int(
+        await session.scalar(
+            select(func.count(SourceJob.id)).where(SourceJob.status == JobStatus.ACTIVE)
+        )
+        or 0
+    )
     phone_metrics = await daily_phone_metrics(session, start, end)
     delivery_event_at = func.coalesce(
         EmailDelivery.bounced_at,
@@ -724,6 +867,9 @@ async def _generate(session: AsyncSession) -> DailyReport:
             ],
         },
         **limit_metrics,
+        **minimum_diagnostics,
+        "active_jobs": active_jobs,
+        "matching_backlog": matching_backlog,
     }
     from app.learning.shadow import shadow_scorecard
 

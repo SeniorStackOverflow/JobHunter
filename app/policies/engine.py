@@ -3,6 +3,11 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.applications.daily_target import (
+    minimum_catchup_active,
+    minimum_catchup_score,
+    review_is_safe_catchup_candidate,
+)
 from app.contacts import contact_is_source_verified
 from app.crawlers.parsing.normalization import (
     detect_prompt_injection,
@@ -145,15 +150,26 @@ class PolicyEngine:
                 Application.sent_at >= start_of_day,
             )
         )
-        raw_minimum_daily = additional_rules.get("minimum_daily_applications", 0)
-        try:
-            minimum_daily = max(
-                0, min(int(raw_minimum_daily), preferences.maximum_daily_applications)
+        reserved_auto_send = await session.scalar(
+            select(func.count(Application.id)).where(
+                Application.profile_id == application.profile_id,
+                Application.id != application.id,
+                Application.status.in_(
+                    {ApplicationStatus.AUTO_APPROVED, ApplicationStatus.SENDING}
+                ),
             )
-        except (TypeError, ValueError):
-            minimum_daily = 0
-        force_minimum = additional_rules.get("force_minimum_daily_applications") is True
-        minimum_catchup_active = force_minimum and int(sent_today or 0) < minimum_daily
+        )
+        catchup_progress = int(sent_today or 0) + int(reserved_auto_send or 0)
+        catchup_active = minimum_catchup_active(preferences, catchup_progress)
+        effective_auto_send_score = (
+            minimum_catchup_score(preferences)
+            if catchup_active
+            else preferences.minimum_auto_send_score
+        )
+        catchup_review_promotion = catchup_active and review_is_safe_catchup_candidate(
+            evaluation,
+            threshold=effective_auto_send_score,
+        )
         prior_unknown = await session.scalar(
             select(func.count(EmailDelivery.id)).where(
                 EmailDelivery.application_id == application.id,
@@ -194,7 +210,7 @@ class PolicyEngine:
         rule("job_title_allowed_by_preferences", not title_forbidden)
         rule(
             "overall_score_threshold",
-            minimum_catchup_active or evaluation.overall_fit >= preferences.minimum_auto_send_score,
+            evaluation.overall_fit >= effective_auto_send_score,
         )
         rule("mandatory_requirements_met", not evaluation.missing_requirements)
         rule("deterministic_hard_requirements_met", hard_requirements_met)
@@ -205,11 +221,11 @@ class PolicyEngine:
         )
         rule(
             "match_not_skipped",
-            minimum_catchup_active or evaluation.decision != MatchDecision.SKIP,
+            evaluation.decision != MatchDecision.SKIP,
         )
         rule(
             "match_auto_apply",
-            minimum_catchup_active or evaluation.decision == MatchDecision.AUTO_APPLY,
+            evaluation.decision == MatchDecision.AUTO_APPLY or catchup_review_promotion,
         )
         rule("verified_email_contact", contact.contact_type == ContactType.EMAIL)
         rule("contact_verified", contact_is_source_verified(contact))
@@ -287,7 +303,7 @@ class PolicyEngine:
             decision = PolicyDecision.SKIPPED
         elif hard_requirement_unknown or not hard_requirement_binding_current:
             decision = PolicyDecision.PENDING_REVIEW
-        elif evaluation.decision == MatchDecision.SKIP and not minimum_catchup_active:
+        elif evaluation.decision == MatchDecision.SKIP:
             decision = PolicyDecision.SKIPPED
         elif failed:
             decision = PolicyDecision.PENDING_REVIEW

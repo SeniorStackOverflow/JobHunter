@@ -1799,32 +1799,8 @@ async def get_daily_report() -> dict[str, Any]:
         item = await _generate(session)
         start_local, start, end = local_day_bounds()
 
-        current_match_exists = (
-            select(MatchEvaluation.id)
-            .where(
-                MatchEvaluation.source_job_id == SourceJob.id,
-                MatchEvaluation.prompt_rules_version == MATCHING_RULES_VERSION,
-                MatchEvaluation.source_matching_hash == SourceJob.matching_content_hash,
-            )
-            .correlate(SourceJob)
-            .exists()
-        )
-        active_jobs = int(
-            await session.scalar(
-                select(func.count(SourceJob.id)).where(SourceJob.status == JobStatus.ACTIVE)
-            )
-            or 0
-        )
-        matching_backlog = int(
-            await session.scalar(
-                select(func.count(SourceJob.id)).where(
-                    SourceJob.status == JobStatus.ACTIVE,
-                    SourceJob.canonical_job_id.is_not(None),
-                    ~current_match_exists,
-                )
-            )
-            or 0
-        )
+        active_jobs = int(item.summary.get("active_jobs") or 0)
+        matching_backlog = int(item.summary.get("matching_backlog") or 0)
 
         latest_evaluations = (
             select(

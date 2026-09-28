@@ -50,6 +50,7 @@ _POLICY_ONLY_REFRESH_RULES = {
     "source_actions_enabled",
     "category_allowed_for_auto_send",
     "overall_score_threshold",
+    "match_auto_apply",
     "vacancy_active",
     "verified_email_contact",
     "contact_verified",
