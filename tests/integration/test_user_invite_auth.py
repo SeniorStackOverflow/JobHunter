@@ -1,0 +1,432 @@
+from __future__ import annotations
+
+import asyncio
+import re
+import socket
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+import httpx
+import pytest
+import pytest_asyncio
+import uvicorn
+from fastapi import FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.accounts import InviteService
+from app.api import routes as api_routes
+from app.auth import google as google_auth
+from app.auth import routes as auth_routes
+from app.auth.google import GOOGLE_IDENTITY_SCOPES, GoogleIdentityService
+from app.database.session import get_session
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
+from app.models.entities import Account, AccountIdentity, Invite, UserProfile
+from app.models.enums import AccountRole, AccountStatus, ProfileStatus
+from app.settings import Settings
+
+pytestmark = pytest.mark.integration
+
+
+@dataclass
+class UserAuthContext:
+    app: FastAPI
+    client: httpx.AsyncClient
+    session_factory: async_sessionmaker[AsyncSession]
+    settings: Settings
+
+
+class IdentityFakeFlow:
+    fetch_count = 0
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        self.credentials = SimpleNamespace(
+            scopes=list(GOOGLE_IDENTITY_SCOPES),
+            granted_scopes=list(GOOGLE_IDENTITY_SCOPES),
+            id_token="signed-user-identity-token",
+        )
+
+    def authorization_url(
+        self,
+        *,
+        access_type: str,
+        prompt: str,
+        state: str,
+        nonce: str,
+    ) -> tuple[str, str]:
+        assert state == self.state
+        query = urlencode(
+            {
+                "response_type": "code",
+                "client_id": "identity-route-client",
+                "redirect_uri": "https://job-agent.example.test/api/v1/oauth/gmail/callback",
+                "scope": " ".join(GOOGLE_IDENTITY_SCOPES),
+                "state": state,
+                "nonce": nonce,
+                "code_challenge": "fake-pkce-challenge",
+                "code_challenge_method": "S256",
+                "access_type": access_type,
+                "prompt": prompt,
+            }
+        )
+        return f"https://accounts.google.com/o/oauth2/auth?{query}", state
+
+    def fetch_token(self, *, code: str) -> None:
+        assert code == "identity-route-code"
+        type(self).fetch_count += 1
+
+
+@pytest_asyncio.fixture
+async def user_auth_context(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[UserAuthContext]:
+    settings = Settings(
+        environment="test",
+        database_url="sqlite+aiosqlite:///:memory:",
+        public_base_url="https://job-agent.example.test",
+        secret_key="user-auth-test-secret-with-more-than-32-chars",
+        token_encryption_key="user-auth-test-token-encryption-key-32chars",
+        gmail_client_id="identity-route-client",
+        gmail_client_secret="identity-route-secret",
+        user_accounts_enabled=True,
+        invite_registration_enabled=True,
+    )
+    monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+
+    application = FastAPI()
+    application.include_router(api_routes.router)
+    application.include_router(auth_routes.router)
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with sqlite_session_factory() as session:
+            yield session
+
+    application.dependency_overrides[get_session] = override_session
+
+    async with sqlite_session_factory() as session:
+        session.add(
+            Account(
+                id=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                role=AccountRole.ADMIN,
+                status=AccountStatus.ACTIVE,
+                invite_allowance=0,
+                allow_open_invites=True,
+                max_profiles=100,
+                allow_phone=True,
+            )
+        )
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://job-agent.example.test",
+        follow_redirects=False,
+    ) as client:
+        yield UserAuthContext(application, client, sqlite_session_factory, settings)
+
+
+async def _invite(context: UserAuthContext, email: str) -> str:
+    async with context.session_factory() as session:
+        created = await InviteService().create(
+            session,
+            creator_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+            target_email=email,
+        )
+        await session.commit()
+        return created.token
+
+
+def _install_fake_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    email: str,
+    nonce: str,
+    subject: str,
+) -> None:
+    monkeypatch.setattr(
+        GoogleIdentityService,
+        "_flow",
+        lambda self, *, state, code_verifier: IdentityFakeFlow(state),
+    )
+
+    def verify_identity(
+        raw_id_token: str,
+        _request: object,
+        audience: str,
+    ) -> dict[str, object]:
+        assert raw_id_token == "signed-user-identity-token"
+        assert audience == "identity-route-client"
+        return {
+            "sub": subject,
+            "email": email,
+            "email_verified": True,
+            "nonce": nonce,
+        }
+
+    monkeypatch.setattr(google_auth.google_id_token, "verify_oauth2_token", verify_identity)
+
+
+@pytest.mark.asyncio
+async def test_invite_registration_creates_account_session_and_owned_draft_profile(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = await _invite(user_auth_context, "new.user@example.test")
+
+    accepted = await user_auth_context.client.get("/join", params={"token": token})
+    assert accepted.status_code == 303
+    assert accepted.headers["location"] == "/join"
+    assert token not in accepted.headers["set-cookie"]
+
+    join_page = await user_auth_context.client.get("/join")
+    assert join_page.status_code == 200
+    assert "ne***@example.test" in join_page.text
+
+    started = await user_auth_context.client.get("/auth/google/register")
+    assert started.status_code == 302
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    assert query["scope"] == [" ".join(GOOGLE_IDENTITY_SCOPES)]
+    assert query["access_type"] == ["online"]
+    assert query["prompt"] == ["select_account"]
+    assert query["code_challenge_method"] == ["S256"]
+    state = query["state"][0]
+    _install_fake_identity(
+        monkeypatch,
+        email="New.User@Example.Test",
+        nonce=query["nonce"][0],
+        subject="google-user-sub-1",
+    )
+
+    callback = await user_auth_context.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "identity-route-code", "state": state},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/app"
+    assert user_auth_context.client.cookies.get(
+        user_auth_context.settings.user_session_cookie_name
+    )
+
+    home = await user_auth_context.client.get("/app")
+    assert home.status_code == 200
+    assert "Мой JobHunter" in home.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', home.text)
+    assert csrf is not None
+
+    created_profile = await user_auth_context.client.post(
+        "/app/profiles",
+        data={
+            "name": "Candidate",
+            "contact_email": "candidate@example.com",
+            "csrf_token": csrf.group(1),
+        },
+    )
+    assert created_profile.status_code == 303
+    assert created_profile.headers["location"] == "/app?notice=profile_created"
+
+    async with user_auth_context.session_factory() as session:
+        identity = await session.scalar(
+            select(AccountIdentity).where(AccountIdentity.subject == "google-user-sub-1")
+        )
+        assert identity is not None
+        assert identity.email == "new.user@example.test"
+        account = await session.get(Account, identity.account_id)
+        assert account is not None
+        assert account.invite_allowance == 0
+        profile = await session.scalar(
+            select(UserProfile).where(UserProfile.owner_account_id == account.id)
+        )
+        assert profile is not None
+        assert profile.name == "Candidate"
+        assert profile.status == ProfileStatus.DRAFT
+        invite = await session.scalar(
+            select(Invite).where(Invite.redeemed_by_account_id == account.id)
+        )
+        assert invite is not None
+        assert invite.redeemed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_bound_invite_rejects_different_google_email(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = await _invite(user_auth_context, "expected@example.test")
+    assert (await user_auth_context.client.get("/join", params={"token": token})).status_code == 303
+    started = await user_auth_context.client.get("/auth/google/register")
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    _install_fake_identity(
+        monkeypatch,
+        email="other@example.test",
+        nonce=query["nonce"][0],
+        subject="wrong-email-sub",
+    )
+    callback = await user_auth_context.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "identity-route-code", "state": query["state"][0]},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"].startswith("/join?error=")
+    assert user_auth_context.client.cookies.get(
+        user_auth_context.settings.user_session_cookie_name
+    ) is None
+
+    async with user_auth_context.session_factory() as session:
+        invite = await session.scalar(
+            select(Invite).where(Invite.target_email == "expected@example.test")
+        )
+        assert invite is not None
+        assert invite.redeemed_at is None
+
+
+@pytest.mark.asyncio
+async def test_google_login_requires_previously_registered_subject(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = await user_auth_context.client.get("/auth/google/login")
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    _install_fake_identity(
+        monkeypatch,
+        email="nobody@example.test",
+        nonce=query["nonce"][0],
+        subject="not-registered-sub",
+    )
+    callback = await user_auth_context.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "identity-route-code", "state": query["state"][0]},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"].startswith("/app/login?error=")
+
+
+@pytest.mark.asyncio
+async def test_user_auth_session_is_invalidated_by_account_session_version(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = await _invite(user_auth_context, "versioned@example.test")
+    await user_auth_context.client.get("/join", params={"token": token})
+    started = await user_auth_context.client.get("/auth/google/register")
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    _install_fake_identity(
+        monkeypatch,
+        email="versioned@example.test",
+        nonce=query["nonce"][0],
+        subject="versioned-sub",
+    )
+    await user_auth_context.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "identity-route-code", "state": query["state"][0]},
+    )
+    assert (await user_auth_context.client.get("/app")).status_code == 200
+
+    async with user_auth_context.session_factory() as session:
+        identity = await session.scalar(
+            select(AccountIdentity).where(AccountIdentity.subject == "versioned-sub")
+        )
+        assert identity is not None
+        account = await session.get(Account, identity.account_id)
+        assert account is not None
+        account.session_version += 1
+        await session.commit()
+
+    expired = await user_auth_context.client.get("/app")
+    assert expired.status_code == 303
+    assert expired.headers["location"] == "/app/login"
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_invite_registration_browser_roundtrip_three_clean_contexts(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from playwright.async_api import async_playwright
+
+    with socket.socket() as port_socket:
+        port_socket.bind(("127.0.0.1", 0))
+        port = int(port_socket.getsockname()[1])
+    base_url = f"http://localhost:{port}"
+
+    settings = user_auth_context.settings.model_copy(
+        update={"public_base_url": base_url}
+    )
+    monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+
+    server = uvicorn.Server(
+        uvicorn.Config(user_auth_context.app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as readiness_client:
+            for _ in range(100):
+                try:
+                    response = await readiness_client.get("/app/login")
+                    if response.status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("local user-auth browser server did not start")
+
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch(headless=True)
+            try:
+                for index in range(3):
+                    email = f"browser-{index}@example.test"
+                    subject = f"browser-sub-{index}"
+                    token = await _invite(user_auth_context, email)
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    join = await page.goto(
+                        f"{base_url}/join?{urlencode({'token': token})}",
+                        wait_until="domcontentloaded",
+                    )
+                    assert join is not None
+                    assert join.status == 200
+                    assert page.url == f"{base_url}/join"
+                    assert token not in page.url
+
+                    started = await context.request.get(
+                        f"{base_url}/auth/google/register",
+                        max_redirects=0,
+                    )
+                    assert started.status == 302
+                    query = parse_qs(urlsplit(started.headers["location"]).query)
+                    assert query["scope"] == [" ".join(GOOGLE_IDENTITY_SCOPES)]
+                    assert query["code_challenge_method"] == ["S256"]
+                    _install_fake_identity(
+                        monkeypatch,
+                        email=email,
+                        nonce=query["nonce"][0],
+                        subject=subject,
+                    )
+                    callback = await page.goto(
+                        f"{base_url}/api/v1/oauth/gmail/callback?"
+                        + urlencode(
+                            {
+                                "code": "identity-route-code",
+                                "state": query["state"][0],
+                            }
+                        ),
+                        wait_until="domcontentloaded",
+                    )
+                    assert callback is not None
+                    assert callback.status == 200
+                    assert page.url == f"{base_url}/app"
+                    assert "Мой JobHunter" in await page.content()
+                    await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await server_task

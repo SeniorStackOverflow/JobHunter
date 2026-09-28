@@ -899,6 +899,17 @@ async def gmail_oauth_callback(
     from app.email.oauth import GMAIL_OAUTH_BINDING_COOKIE, GmailOAuthError
 
     settings = get_settings()
+    if state:
+        from app.auth.google import GoogleIdentityService
+        from app.auth.routes import complete_identity_callback
+
+        identity_service = GoogleIdentityService(settings)
+        if await identity_service.is_identity_request(session, state=state):
+            return await complete_identity_callback(
+                request,
+                state=state,
+                session=session,
+            )
     service = GmailOAuthService(settings)
     admin_login = bool(state and await service.is_admin_login_request(session, state=state))
     binding_token = request.cookies.get(GMAIL_OAUTH_BINDING_COOKIE)

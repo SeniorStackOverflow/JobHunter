@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     gmail_client_id: SecretStr | None = None
     gmail_client_secret: SecretStr | None = None
     google_admin_emails: list[str] = Field(default_factory=list)
+    user_accounts_enabled: bool = False
+    invite_registration_enabled: bool = False
     gmail_delivery_reconciliation_enabled: bool = True
     gmail_delivery_reconciliation_batch: int = Field(default=100, ge=1, le=500)
     gmail_delivery_monitor_days: int = Field(default=14, ge=1, le=90)
@@ -172,6 +174,8 @@ class Settings(BaseSettings):
 
     session_cookie_name: str = "job_agent_session"
     session_ttl_seconds: int = 8 * 60 * 60
+    user_session_cookie_name: str = "jobhunter_user_session"
+    user_session_ttl_seconds: int = 7 * 24 * 60 * 60
     csrf_ttl_seconds: int = 60 * 60
 
     @field_validator("max_resume_bytes")
@@ -379,6 +383,19 @@ class Settings(BaseSettings):
             )
         ):
             raise ValueError("Google admin login requires Gmail credentials and token encryption")
+        if (self.user_accounts_enabled or self.invite_registration_enabled) and any(
+            value is None
+            for value in (
+                self.token_encryption_key,
+                self.gmail_client_id,
+                self.gmail_client_secret,
+            )
+        ):
+            raise ValueError(
+                "User accounts require Google OAuth credentials and token encryption"
+            )
+        if self.invite_registration_enabled and not self.user_accounts_enabled:
+            raise ValueError("Invite registration requires USER_ACCOUNTS_ENABLED=true")
         if self.llm_provider == "mock":
             raise ValueError("LLM_PROVIDER=mock is forbidden in production")
         if not self.openai_model:

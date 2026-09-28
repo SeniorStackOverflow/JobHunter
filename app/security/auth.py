@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import secrets
 import time
+from dataclasses import dataclass
+from uuid import UUID
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pwdlib import PasswordHash
@@ -68,3 +70,31 @@ class CsrfProtector:
         value = f"{session_id}:{timestamp}:{nonce}"
         expected = hmac.new(self._secret, value.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(signature, expected)
+
+
+
+@dataclass(frozen=True, slots=True)
+class AccountSession:
+    account_id: UUID
+    version: int
+
+
+class AccountSessionSigner:
+    def __init__(self, secret_key: str, salt: str = "jobhunter-user-session") -> None:
+        self._serializer = URLSafeTimedSerializer(secret_key, salt=salt)
+
+    def issue(self, account_id: UUID, version: int) -> str:
+        return self._serializer.dumps(
+            {"sub": str(account_id), "ver": version, "nonce": secrets.token_urlsafe(12)}
+        )
+
+    def verify(self, token: str, max_age: int) -> AccountSession | None:
+        try:
+            payload = self._serializer.loads(token, max_age=max_age)
+            account_id = UUID(str(payload.get("sub")))
+            version = int(payload.get("ver"))
+        except (BadSignature, SignatureExpired, TypeError, ValueError):
+            return None
+        if version < 0:
+            return None
+        return AccountSession(account_id=account_id, version=version)

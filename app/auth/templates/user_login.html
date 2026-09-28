@@ -1,0 +1,10 @@
+{% extends "base_user.html" %}
+{% block title %}Вход · JobHunter{% endblock %}
+{% block body %}
+<div class="card">
+  <h1>JobHunter</h1>
+  <p>Вход для зарегистрированных пользователей.</p>
+  {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+  <a class="btn btn-primary" href="/auth/google/login">Войти через Google</a>
+</div>
+{% endblock %}

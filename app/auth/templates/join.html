@@ -1,0 +1,15 @@
+{% extends "base_user.html" %}
+{% block title %}Приглашение · JobHunter{% endblock %}
+{% block body %}
+<div class="card">
+  <h1>Приглашение в JobHunter</h1>
+  {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+  {% if invite %}
+    <p>Приглашение действительно до {{ invite.expires_at }}.</p>
+    <p class="muted">Google-аккаунт: {{ masked_email }}</p>
+    <a class="btn btn-primary" href="/auth/google/register">Продолжить через Google</a>
+  {% else %}
+    <p>Нужна действующая ссылка-приглашение.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base_user.html" %}
+{% block title %}Мой JobHunter{% endblock %}
+{% block body %}
+<div class="row" style="justify-content:space-between;margin-bottom:20px">
+  <div><h1>Мой JobHunter</h1><div class="muted">{{ account.id }}</div></div>
+  <form method="post" action="/app/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn">Выйти</button></form>
+</div>
+{% if notice == "profile_created" %}<div class="card ok">Профиль создан в черновике.</div>{% endif %}
+{% if notice == "invite_created" %}<div class="card ok">Приглашение создано. Ссылка показывается только сейчас.</div>{% endif %}
+{% if invite_token %}<div class="card"><div class="token">{{ request.base_url }}join?token={{ invite_token }}</div></div>{% endif %}
+
+<div class="card">
+  <h2>Профили</h2>
+  {% if profiles %}
+  <table><thead><tr><th>Имя</th><th>Статус</th><th>Основной</th></tr></thead>
+  <tbody>{% for profile in profiles %}<tr><td>{{ profile.name }}</td><td>{{ profile.status.value }}</td><td>{{ "да" if profile.is_default else "" }}</td></tr>{% endfor %}</tbody></table>
+  {% else %}<p class="muted">Профилей пока нет. Создание профиля ничего автоматически не отправляет и не запускает.</p>{% endif %}
+</div>
+
+{% if profiles|length < account.max_profiles %}
+<div class="card">
+  <h2>Создать профиль</h2>
+  <form method="post" action="/app/profiles">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Имя<input name="name" required maxlength="200"></label>
+    <label>Контактный email<input type="email" name="contact_email" maxlength="320"></label>
+    <button class="btn btn-primary">Создать черновик</button>
+  </form>
+</div>
+{% endif %}
+
+{% if account.invite_allowance > 0 %}
+<div class="card">
+  <h2>Пригласить человека</h2>
+  <p class="muted">Обычные пользователи создают только персональные приглашения.</p>
+  <form method="post" action="/app/invites">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="email" name="target_email" required placeholder="email@example.com">
+    <button class="btn">Создать приглашение</button>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

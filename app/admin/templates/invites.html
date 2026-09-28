@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Приглашения · JobHunter{% endblock %}
+{% block body_class %}detail-page{% endblock %}
+{% block body %}
+<header class="detail-topbar">
+  <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Приглашения</span></div></div>
+  <a class="btn" href="/">← Панель</a>
+</header>
+<main class="detail-content">
+  <div class="section-heading"><div><h1>Приглашения</h1><p>Персональные инвайты предпочтительнее. Открытые ссылки используйте только когда это действительно нужно.</p></div></div>
+  {% if created_link %}
+  <div class="notice success" style="margin-bottom:16px">
+    <strong>Ссылка создана. Она показывается только сейчас.</strong>
+    <div class="mono" style="margin-top:8px;word-break:break-all">{{ created_link }}</div>
+  </div>
+  {% endif %}
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-head"><div><div class="panel-title">Создать приглашение</div><div class="panel-subtitle">Пустой email создаст open invite.</div></div></div>
+    <div class="panel-pad">
+      <form method="post" action="/admin/invites" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="field">Email<input type="email" name="target_email" maxlength="320" placeholder="user@example.com"></label>
+        <label class="field">Срок, дней<input type="number" name="ttl_days" min="1" max="30" value="14"></label>
+        <div class="full form-actions"><button class="btn btn-primary" type="submit">Создать приглашение</button></div>
+      </form>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><div><div class="panel-title">История</div><div class="panel-subtitle">Секреты использованных ссылок не хранятся.</div></div></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Email</th><th>Статус</th><th>Истекает</th><th></th></tr></thead>
+      <tbody>
+      {% for invite in invites %}
+        {% set state = invite_state(invite) %}
+        <tr>
+          <td>{{ invite.target_email or "open invite" }}</td>
+          <td><span class="badge {{ 'success' if state == 'active' else 'muted' }}">{{ state }}</span></td>
+          <td>{{ invite.expires_at }}</td>
+          <td class="cell-actions">
+            {% if state == "active" %}
+            <form method="post" action="/admin/invites/{{ invite.id }}/revoke">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="btn btn-sm btn-danger" type="submit">Отозвать</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="empty-state">Приглашений пока нет.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </div>
+</main>
+{% endblock %}
