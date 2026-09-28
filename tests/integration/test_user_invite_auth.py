@@ -114,18 +114,20 @@ async def user_auth_context(
     application.dependency_overrides[get_session] = override_session
 
     async with sqlite_session_factory() as session:
-        session.add(
-            Account(
-                id=BOOTSTRAP_ADMIN_ACCOUNT_ID,
-                role=AccountRole.ADMIN,
-                status=AccountStatus.ACTIVE,
-                invite_allowance=0,
-                allow_open_invites=True,
-                max_profiles=100,
-                allow_phone=True,
+        bootstrap = await session.get(Account, BOOTSTRAP_ADMIN_ACCOUNT_ID)
+        if bootstrap is None:
+            session.add(
+                Account(
+                    id=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                    role=AccountRole.ADMIN,
+                    status=AccountStatus.ACTIVE,
+                    invite_allowance=0,
+                    allow_open_invites=True,
+                    max_profiles=100,
+                    allow_phone=True,
+                )
             )
-        )
-        await session.commit()
+            await session.commit()
 
     transport = httpx.ASGITransport(app=application)
     async with httpx.AsyncClient(

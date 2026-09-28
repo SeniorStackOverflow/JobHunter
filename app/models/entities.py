@@ -21,6 +21,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -94,6 +95,25 @@ class Account(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     allow_phone: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+@event.listens_for(Account.__table__, "after_create")
+def _seed_bootstrap_account(_target: Any, connection: Any, **_: Any) -> None:
+    now = utcnow()
+    connection.execute(
+        _target.insert().values(
+            id=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+            role=AccountRole.ADMIN,
+            status=AccountStatus.ACTIVE,
+            session_version=0,
+            invite_allowance=0,
+            allow_open_invites=True,
+            max_profiles=100,
+            allow_phone=True,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
 class AccountIdentity(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "account_identities"
     __table_args__ = (
@@ -150,11 +170,15 @@ class UserProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     owner_account_id: Mapped[UUID] = mapped_column(
         ForeignKey("accounts.id", ondelete="CASCADE"),
         default=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        server_default=BOOTSTRAP_ADMIN_ACCOUNT_ID.hex,
         index=True,
         nullable=False,
     )
     status: Mapped[ProfileStatus] = mapped_column(
-        enum_column(ProfileStatus), default=ProfileStatus.ACTIVE, nullable=False
+        enum_column(ProfileStatus),
+        default=ProfileStatus.ACTIVE,
+        server_default=ProfileStatus.ACTIVE.value,
+        nullable=False,
     )
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)

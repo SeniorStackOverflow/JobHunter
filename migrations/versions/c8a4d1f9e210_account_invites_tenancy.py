@@ -84,8 +84,11 @@ def upgrade() -> None:
     )
     op.get_bind().execute(sa.update(profiles).values(owner_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID))
     with op.batch_alter_table("user_profiles") as batch_op:
-        batch_op.alter_column("owner_account_id", nullable=False)
-        batch_op.alter_column("status", server_default=None)
+        batch_op.alter_column(
+            "owner_account_id",
+            nullable=False,
+            server_default=BOOTSTRAP_ADMIN_ACCOUNT_ID.hex,
+        )
         batch_op.create_foreign_key(
             "fk_user_profiles_owner_account_id_accounts",
             "accounts",
