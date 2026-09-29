@@ -23,6 +23,7 @@ from sqlalchemy import select
 from app.admin import routes as admin_routes
 from app.api import dependencies as api_dependencies
 from app.api import routes as api_routes
+from app.auth import routes as auth_routes
 from app.database.session import get_session
 from app.learning import FEATURE_SCHEMA_VERSION
 from app.matching.bindings import (
@@ -105,9 +106,11 @@ async def interface_app(
     monkeypatch.setattr(api_dependencies, "get_settings", lambda: settings)
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
 
     application = FastAPI()
     application.include_router(api_routes.router)
+    application.include_router(auth_routes.router)
     application.include_router(admin_routes.router)
 
     async def override_session() -> AsyncIterator[Any]:
@@ -132,7 +135,7 @@ async def _login_admin(
 ) -> str:
     from app.security.auth import CsrfProtector
 
-    login_page = await client.get("/admin/login")
+    login_page = await client.get("/login")
     assert login_page.status_code == 200
     logged_in = await client.post(
         "/admin/login",
@@ -516,19 +519,19 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         base_url="https://testserver",
         follow_redirects=False,
     ) as client:
-        login_page = await client.get("/admin/login")
+        login_page = await client.get("/login")
         assert login_page.status_code == 200
         assert login_page.headers["cache-control"] == "no-store"
         assert 'name="viewport"' in login_page.text
-        assert "Вход в панель управления" in login_page.text
+        assert 'class="login-subtitle"' in login_page.text
+        assert "Вход" in login_page.text
         assert 'src="/admin-assets/admin.js?v=' in login_page.text
         assert "data-password-toggle" in login_page.text
         assert 'name="username"' not in login_page.text
         assert "Аварийный вход" not in login_page.text
-        oauth_error_page = await client.get(
-            "/admin/login", params={"oauth_error": "admin_identity_not_allowed"}
-        )
-        assert "Этот Google-аккаунт не имеет доступа" in oauth_error_page.text
+        legacy_admin_login = await client.get("/admin/login")
+        assert legacy_admin_login.status_code == 303
+        assert legacy_admin_login.headers["location"] == "/login"
         login_csrf = _csrf_token(login_page.text)
 
         rejected = await client.post(
@@ -538,7 +541,8 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
                 "csrf_token": "invalid",
             },
         )
-        assert rejected.status_code == 401
+        assert rejected.status_code == 303
+        assert rejected.headers["location"] == "/login?error=admin_login_expired"
 
         logged_in = await client.post(
             "/admin/login",
@@ -552,7 +556,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert "httponly" in set_cookie
         assert "secure" in set_cookie
         assert "samesite=strict" in set_cookie
-        already_authenticated = await client.get("/admin/login")
+        already_authenticated = await client.get("/login")
         assert already_authenticated.status_code == 303
         assert already_authenticated.headers["location"] == "/admin"
 
@@ -632,7 +636,7 @@ async def test_admin_phone_auto_answer_stop_requires_csrf_and_sets_key(
         base_url="https://testserver",
         follow_redirects=False,
     ) as client:
-        login_csrf = _csrf_token((await client.get("/admin/login")).text)
+        login_csrf = _csrf_token((await client.get("/login")).text)
         logged_in = await client.post(
             "/admin/login",
             data={
@@ -1792,7 +1796,7 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         async with httpx.AsyncClient(base_url=base_url) as readiness_client:
             for _attempt in range(100):
                 try:
-                    response = await readiness_client.get("/admin/login")
+                    response = await readiness_client.get("/login")
                     if response.status_code == 200:
                         break
                 except httpx.TransportError:
@@ -1812,7 +1816,8 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     width, height = viewports[index]
                     context = await browser.new_context(viewport={"width": width, "height": height})
                     page = await context.new_page()
-                    await page.goto(f"{base_url}/admin/login")
+                    await page.goto(f"{base_url}/login")
+                    await page.get_by_text("Войти паролем администратора", exact=True).click()
                     await page.get_by_label("Пароль администратора").fill(ADMIN_PASSWORD)
                     await page.get_by_role("button", name="Войти", exact=True).click()
                     await page.goto(
@@ -3116,7 +3121,7 @@ async def test_admin_resume_file_view_returns_pdf_bytes(
     ) as anon:
         blocked = await anon.get(f"/admin/resumes/{resume_id}/file")
         assert blocked.status_code == 303
-        assert blocked.headers["location"] == "/admin/login"
+        assert blocked.headers["location"] == "/login"
 
 
 @pytest.mark.asyncio

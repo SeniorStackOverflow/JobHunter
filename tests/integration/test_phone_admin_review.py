@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.admin import phone_routes
 from app.admin import router as admin_router
 from app.admin import routes as admin_routes
+from app.auth import routes as auth_routes
 from app.database import get_session
 from app.models.entities import (
     AuditEvent,
@@ -64,8 +65,10 @@ async def review_context(
 ):
     settings = _settings(tmp_path)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
     monkeypatch.setattr("app.admin.phone_routes.get_settings", lambda: settings)
     application = FastAPI()
+    application.include_router(auth_routes.router)
     application.include_router(admin_router)
 
     async def override_session():
@@ -130,7 +133,7 @@ async def review_context(
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver", follow_redirects=False
     ) as client:
-        login = await client.get("/admin/login")
+        login = await client.get("/login")
         token = HTMLParser(login.text).css_first("input[name='csrf_token']").attributes["value"]
         response = await client.post(
             "/admin/login", data={"password": ADMIN_PASSWORD, "csrf_token": token}

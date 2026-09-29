@@ -164,8 +164,7 @@ async def public_root(
         return RedirectResponse("/app", status_code=303)
     if _has_admin_session(request):
         return RedirectResponse("/admin", status_code=303)
-    target = "/login" if settings.user_accounts_enabled else "/admin/login"
-    return RedirectResponse(target, status_code=303)
+    return RedirectResponse("/login", status_code=303)
 
 
 @router.get("/join", response_class=HTMLResponse)
@@ -268,18 +267,24 @@ async def user_login_page(
     error: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    _require_user_feature()
-    if await _current_account(request, session) is not None:
+    settings = _settings()
+    if settings.user_accounts_enabled and await _current_account(request, session) is not None:
         return RedirectResponse("/app", status_code=303)
+    if _has_admin_session(request):
+        return RedirectResponse("/admin", status_code=303)
+    google_identity = GoogleIdentityService(settings)
     response = admin_templates.TemplateResponse(
         request=request,
         name="login.html",
         context={
-            "login_mode": "user",
-            "error": bool(error),
-            "google_login_available": GoogleIdentityService(_settings()).configured,
-            "password_login_available": False,
-            "csrf_token": "",
+            "login_mode": "unified",
+            "error": error,
+            "google_login_available": (
+                google_identity.configured
+                and (settings.user_accounts_enabled or bool(settings.google_admin_emails))
+            ),
+            "password_login_available": settings.admin_password_hash is not None,
+            "csrf_token": _csrf().issue("login"),
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -288,7 +293,6 @@ async def user_login_page(
 
 @router.get("/app/login")
 async def legacy_user_login(error: str | None = None) -> RedirectResponse:
-    _require_user_feature()
     target = "/login" if error is None else f"/login?error={error}"
     return RedirectResponse(target, status_code=303)
 
@@ -297,7 +301,6 @@ async def legacy_user_login(error: str | None = None) -> RedirectResponse:
 async def google_login_start(
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
-    _require_user_feature()
     service = GoogleIdentityService(_settings())
     try:
         authorization = await service.create_authorization_request(
@@ -328,11 +331,15 @@ async def complete_identity_callback(
     state: str,
     session: AsyncSession,
 ) -> Response:
-    service = GoogleIdentityService(_settings())
+    settings = _settings()
+    service = GoogleIdentityService(settings)
     binding_token = request.cookies.get(IDENTITY_OAUTH_BINDING_COOKIE)
     if not binding_token:
         return RedirectResponse("/login?error=invalid_identity_oauth_state", status_code=303)
+
     actor_hint: str | None = None
+    account: Account | None = None
+    admin_authenticated = False
     try:
         exchange = await service.exchange_callback(
             session,
@@ -342,15 +349,38 @@ async def complete_identity_callback(
         )
         actor_hint = exchange.actor
         if exchange.actor == _LOGIN_ACTOR:
-            account = await AccountService().authenticate_google_identity(
-                session,
-                subject=exchange.identity.subject,
-                email=exchange.identity.email,
-                email_verified=True,
-            )
-            action = "account.login"
+            if exchange.identity.email in settings.google_admin_emails:
+                admin_authenticated = True
+                await record_audit_event(
+                    session,
+                    actor=f"google:{exchange.identity.email}",
+                    action="admin.login.google",
+                    entity_type="admin_session",
+                    entity_id=exchange.identity.subject,
+                    correlation_id=str(exchange.request_id),
+                    decision="authenticated",
+                    details={"provider": "google"},
+                )
+            else:
+                if not settings.user_accounts_enabled:
+                    raise AccountAccessError("user accounts are disabled")
+                account = await AccountService().authenticate_google_identity(
+                    session,
+                    subject=exchange.identity.subject,
+                    email=exchange.identity.email,
+                    email_verified=True,
+                )
+                await record_audit_event(
+                    session,
+                    actor=f"account:{account.id}",
+                    action="account.login",
+                    entity_type="account",
+                    entity_id=str(account.id),
+                    correlation_id=str(exchange.request_id),
+                    details={"provider": "google"},
+                )
         elif exchange.actor.startswith(_REGISTER_ACTOR_PREFIX):
-            if not _settings().invite_registration_enabled:
+            if not settings.invite_registration_enabled:
                 raise InviteUnavailable("registration is disabled")
             invite_id = UUID(exchange.actor.removeprefix(_REGISTER_ACTOR_PREFIX))
             account = await InviteService().redeem_bound_invite(
@@ -360,18 +390,17 @@ async def complete_identity_callback(
                 email=exchange.identity.email,
                 email_verified=True,
             )
-            action = "account.registered"
+            await record_audit_event(
+                session,
+                actor=f"account:{account.id}",
+                action="account.registered",
+                entity_type="account",
+                entity_id=str(account.id),
+                correlation_id=str(exchange.request_id),
+                details={"provider": "google"},
+            )
         else:
             raise GoogleIdentityError("unknown identity actor", code="invalid_identity_actor")
-        await record_audit_event(
-            session,
-            actor=f"account:{account.id}",
-            action=action,
-            entity_type="account",
-            entity_id=str(account.id),
-            correlation_id=str(exchange.request_id),
-            details={"provider": "google"},
-        )
         await session.commit()
     except (
         AccountAccessError,
@@ -383,21 +412,44 @@ async def complete_identity_callback(
         ValueError,
     ) as exc:
         await session.rollback()
-        code = getattr(exc, "code", None) or type(exc).__name__.casefold()
+        if isinstance(exc, AccountAccessError):
+            if str(exc) == "Google identity is not registered":
+                code = "identity_not_registered"
+            elif str(exc) == "account is not active":
+                code = "account_inactive"
+            else:
+                code = "account_access_denied"
+        else:
+            code = getattr(exc, "code", None) or type(exc).__name__.casefold()
         target = "/join" if (actor_hint or "").startswith(_REGISTER_ACTOR_PREFIX) else "/login"
         response = RedirectResponse(f"{target}?error={code}", status_code=303)
     else:
-        response = RedirectResponse("/app", status_code=303)
-        response.set_cookie(
-            _settings().user_session_cookie_name,
-            _account_signer().issue(account.id, account.session_version),
-            max_age=_settings().user_session_ttl_seconds,
-            secure=_secure_cookie(),
-            httponly=True,
-            samesite="lax",
-            path="/",
-        )
-        response.delete_cookie(JOIN_COOKIE, path="/")
+        if admin_authenticated:
+            response = RedirectResponse("/admin", status_code=303)
+            response.set_cookie(
+                settings.session_cookie_name,
+                SessionSigner(settings.secret_key.get_secret_value()).issue(
+                    settings.admin_username
+                ),
+                max_age=settings.session_ttl_seconds,
+                secure=_secure_cookie(),
+                httponly=True,
+                samesite="lax",
+                path="/",
+            )
+        else:
+            assert account is not None
+            response = RedirectResponse("/app", status_code=303)
+            response.set_cookie(
+                settings.user_session_cookie_name,
+                _account_signer().issue(account.id, account.session_version),
+                max_age=settings.user_session_ttl_seconds,
+                secure=_secure_cookie(),
+                httponly=True,
+                samesite="lax",
+                path="/",
+            )
+            response.delete_cookie(JOIN_COOKIE, path="/")
     response.delete_cookie(
         IDENTITY_OAUTH_BINDING_COOKIE,
         path="/api/v1/oauth/gmail/callback",

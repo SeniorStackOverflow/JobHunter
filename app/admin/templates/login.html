@@ -8,19 +8,23 @@
     <div>
       <h1>JobHunter</h1>
       <div class="login-subtitle">
-        {% if login_mode == "user" %}Вход{% else %}Вход в панель управления{% endif %}
+        Вход
       </div>
     </div>
   </div>
 
   {% if error %}
   <div class="notice danger login-error" role="alert">
-    {% if login_mode == "user" %}Не удалось войти. Попробуйте ещё раз.{% else %}{{ error }}{% endif %}
+    {% if error == "identity_not_registered" %}Аккаунт не зарегистрирован. Для первого входа нужна ссылка-приглашение.
+    {% elif error == "account_inactive" %}Аккаунт недоступен.
+    {% elif error == "admin_password_invalid" %}Неверный пароль администратора.
+    {% elif error == "admin_login_expired" %}Форма входа устарела. Обновите страницу и повторите.
+    {% else %}Не удалось войти. Попробуйте ещё раз.{% endif %}
   </div>
   {% endif %}
 
   {% if google_login_available %}
-  <a class="btn google-button" href="{{ '/auth/google/login' if login_mode == 'user' else '/admin/auth/google' }}">
+  <a class="btn google-button" href="/auth/google/login">
     <span class="google-mark" aria-hidden="true">G</span>
     Войти через Google
   </a>
@@ -28,11 +32,9 @@
   <div class="notice warning login-error">Вход через Google пока недоступен.</div>
   {% endif %}
 
-  {% if login_mode == "admin" and google_login_available and password_login_available %}
-  <div class="login-divider"><span>или</span></div>
-  {% endif %}
-
-  {% if login_mode == "admin" and password_login_available %}
+    {% if password_login_available %}
+  <details class="login-admin-fallback">
+    <summary>Войти паролем администратора</summary>
   <form method="post" action="/admin/login" class="login-password-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="field">Пароль администратора
@@ -43,6 +45,7 @@
     </label>
     <button class="btn" type="submit">Войти</button>
   </form>
+  </details>
   {% endif %}
 </main>
 {% endblock %}

@@ -117,6 +117,7 @@ async def user_auth_context(
         gmail_client_secret="identity-route-secret",
         user_accounts_enabled=True,
         invite_registration_enabled=True,
+        google_admin_emails=["admin@example.com"],
     )
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
     monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
@@ -698,19 +699,58 @@ async def test_admin_invites_are_embedded_in_users_page(
 
 
 @pytest.mark.asyncio
-async def test_user_login_reuses_admin_card_without_admin_password(
+async def test_login_is_single_entry_page_for_users_and_admins(
     user_auth_context: UserAuthContext,
 ) -> None:
-    user_page = await user_auth_context.client.get("/login")
-    assert user_page.status_code == 200
-    assert 'class="login-card"' in user_page.text
-    assert 'href="/auth/google/login"' in user_page.text
-    assert "Пароль администратора" not in user_page.text
-    assert 'class="login-divider"' not in user_page.text
+    page = await user_auth_context.client.get("/login")
+    assert page.status_code == 200
+    assert 'class="login-card"' in page.text
+    assert 'href="/auth/google/login"' in page.text
+    assert 'class="login-divider"' not in page.text
 
-    admin_page = await user_auth_context.client.get("/admin/login")
-    assert admin_page.status_code == 200
-    assert 'class="login-card"' in admin_page.text
+    legacy_admin = await user_auth_context.client.get("/admin/login")
+    assert legacy_admin.status_code == 303
+    assert legacy_admin.headers["location"] == "/login"
+
+
+@pytest.mark.asyncio
+async def test_unified_google_login_routes_admin_without_user_identity(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        identity = await session.scalar(
+            select(AccountIdentity).where(AccountIdentity.email == "admin@example.com")
+        )
+        assert identity is None
+
+    started = await user_auth_context.client.get("/auth/google/login")
+    assert started.status_code == 302
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    _install_fake_identity(
+        monkeypatch,
+        email="admin@example.com",
+        nonce=query["nonce"][0],
+        subject="google-admin-sub",
+    )
+
+    callback = await user_auth_context.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "identity-route-code", "state": query["state"][0]},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/admin"
+    assert user_auth_context.client.cookies.get(user_auth_context.settings.session_cookie_name)
+    assert (
+        user_auth_context.client.cookies.get(user_auth_context.settings.user_session_cookie_name)
+        is None
+    )
+
+    async with user_auth_context.session_factory() as session:
+        identity = await session.scalar(
+            select(AccountIdentity).where(AccountIdentity.subject == "google-admin-sub")
+        )
+        assert identity is None
 
 
 @pytest.mark.asyncio

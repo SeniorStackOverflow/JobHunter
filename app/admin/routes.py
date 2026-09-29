@@ -36,13 +36,7 @@ from app.crawlers.source_control import (
     enable_source_record,
 )
 from app.database import get_session
-from app.email.oauth import (
-    GMAIL_OAUTH_BINDING_COOKIE,
-    GOOGLE_ADMIN_OAUTH_ACTOR,
-    OAUTH_STATE_TTL_SECONDS,
-    GmailOAuthError,
-    GmailOAuthService,
-)
+from app.email.oauth import GmailOAuthService
 from app.email.service import EmailSendBlocked, EmailService
 from app.learning import (
     LearnedReviewScore,
@@ -502,7 +496,7 @@ def require_admin_page(request: Request) -> str:
         if exc.status_code == status.HTTP_401_UNAUTHORIZED:
             raise HTTPException(
                 status_code=status.HTTP_303_SEE_OTHER,
-                headers={"Location": "/admin/login"},
+                headers={"Location": "/login"},
             ) from exc
         raise
 
@@ -534,152 +528,35 @@ async def _audit_admin(
     )
 
 
-@router.get("/admin/login", response_class=HTMLResponse)
-async def login_form(request: Request, oauth_error: str | None = None) -> Response:
-    settings = get_settings()
-    token = request.cookies.get(settings.session_cookie_name)
-    if token and _signer().verify(token, settings.session_ttl_seconds) == settings.admin_username:
-        return RedirectResponse("/admin", status_code=303)
-    google_oauth = GmailOAuthService(settings)
-    oauth_errors = {
-        "configuration": "Вход через Google пока не настроен. Используйте пароль администратора.",
-        "start": "Google временно не ответил. Попробуйте начать вход ещё раз.",
-        "authorization_cancelled": (
-            "Вход через Google отменён. Попробуйте ещё раз, когда будете готовы."
-        ),
-        "authorization_denied": (
-            "Google не разрешил вход. Проверьте выбранный аккаунт и разрешения."
-        ),
-        "admin_identity_not_allowed": "Этот Google-аккаунт не имеет доступа к JobHunter.",
-        "invalid_google_identity": "Google не подтвердил адрес выбранного аккаунта.",
-        "invalid_oauth_state": "Сессия входа устарела. Начните вход через Google заново.",
-        "invalid_pkce_verifier": "Сессия входа повреждена. Начните вход через Google заново.",
-        "required_scope_missing": "Google не предоставил нужное разрешение Gmail. Вход отменён.",
-        "unexpected_scope_grant": "Google вернул неожиданные разрешения. Вход отменён.",
-        "token_exchange_failed": "Google не завершил выдачу доступа. Попробуйте ещё раз.",
-        "credential_storage_failed": (
-            "Не удалось безопасно сохранить доступ Google. Попробуйте ещё раз."
-        ),
-        "oauth_not_configured": (
-            "Вход через Google пока не настроен. Используйте пароль администратора."
-        ),
-    }
-    response = templates.TemplateResponse(
-        request=request,
-        name="login.html",
-        context={
-            "csrf_token": _csrf().issue("login"),
-            "error": (
-                oauth_errors.get(
-                    oauth_error,
-                    "Вход через Google не завершён. Выберите разрешённый аккаунт и повторите.",
-                )
-                if oauth_error
-                else None
-            ),
-            "google_login_available": (
-                google_oauth.configured and bool(settings.google_admin_emails)
-            ),
-            "password_login_available": settings.admin_password_hash is not None,
-            "login_mode": "admin",
-        },
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return response
+@router.get("/admin/login")
+async def legacy_admin_login(oauth_error: str | None = None) -> RedirectResponse:
+    target = "/login"
+    if oauth_error:
+        target = f"/login?error={quote(oauth_error)}"
+    return RedirectResponse(target, status_code=303)
 
 
 @router.get("/admin/auth/google")
-async def google_admin_login_start(
-    consent: bool = False,
-    session: AsyncSession = Depends(get_session),
-) -> RedirectResponse:
-    settings = get_settings()
-    service = GmailOAuthService(settings)
-    if not service.configured or not settings.google_admin_emails:
-        return RedirectResponse("/admin/login?oauth_error=configuration", status_code=303)
-    try:
-        oauth_status = await service.get_status(session)
-        authorization = await service.create_authorization_request(
-            session,
-            actor=GOOGLE_ADMIN_OAUTH_ACTOR,
-            force_consent=(
-                consent or not oauth_status["connected"] or oauth_status["reauth_required"]
-            ),
-        )
-    except GmailOAuthError as exc:
-        await session.rollback()
-        await record_audit_event(
-            session,
-            actor="google-login",
-            action="admin.login.google_start_failed",
-            entity_type="admin_session",
-            entity_id="google",
-            correlation_id=str(exc.correlation_id or "google"),
-            decision="failed",
-            details={"provider": "google", "error_code": exc.code},
-        )
-        await session.commit()
-        return RedirectResponse("/admin/login?oauth_error=start", status_code=303)
-
-    await record_audit_event(
-        session,
-        actor="google-login",
-        action="admin.login.google_started",
-        entity_type="oauth_authorization_request",
-        entity_id=str(authorization.request_id),
-        correlation_id=str(authorization.request_id),
-        decision="redirected",
-        details={"provider": "google", "expires_at": authorization.expires_at.isoformat()},
-    )
-    await session.commit()
-    response = RedirectResponse(authorization.authorization_url, status_code=302)
-    response.set_cookie(
-        GMAIL_OAUTH_BINDING_COOKIE,
-        authorization.binding_token,
-        max_age=OAUTH_STATE_TTL_SECONDS,
-        path="/api/v1/oauth/gmail/callback",
-        secure=service.secure_cookie,
-        httponly=True,
-        samesite="lax",
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return response
+async def legacy_google_admin_login_start() -> RedirectResponse:
+    return RedirectResponse("/auth/google/login", status_code=303)
 
 
-@router.post("/admin/login", response_class=HTMLResponse)
+@router.post("/admin/login")
 async def login(
     request: Request,
     password: str = Form(...),
     csrf_token: str = Form(...),
-) -> Response:
+) -> RedirectResponse:
     settings = get_settings()
     csrf_valid = _csrf().verify(csrf_token, "login", settings.csrf_ttl_seconds)
     password_valid = bool(
         settings.admin_password_hash
         and verify_password(password, settings.admin_password_hash.get_secret_value())
     )
-    if not csrf_valid or not password_valid:
-        google_oauth = GmailOAuthService(settings)
-        error_response = templates.TemplateResponse(
-            request=request,
-            name="login.html",
-            context={
-                "csrf_token": _csrf().issue("login"),
-                "error": (
-                    "Форма входа устарела. Обновите страницу и повторите."
-                    if not csrf_valid
-                    else "Неверный пароль администратора."
-                ),
-                "google_login_available": (
-                    google_oauth.configured and bool(settings.google_admin_emails)
-                ),
-                "password_login_available": settings.admin_password_hash is not None,
-                "login_mode": "admin",
-            },
-            status_code=401,
-        )
-        error_response.headers["Cache-Control"] = "no-store"
-        return error_response
+    if not csrf_valid:
+        return RedirectResponse("/login?error=admin_login_expired", status_code=303)
+    if not password_valid:
+        return RedirectResponse("/login?error=admin_password_invalid", status_code=303)
     token = _signer().issue(settings.admin_username)
     response = RedirectResponse("/admin", status_code=303)
     response.set_cookie(
@@ -697,7 +574,7 @@ async def login(
 @router.post("/admin/logout")
 async def logout(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    response = RedirectResponse("/admin/login", status_code=303)
+    response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(get_settings().session_cookie_name, path="/")
     return response
 

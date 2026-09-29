@@ -29,7 +29,7 @@ from app.email.oauth import (
     GmailOAuthService,
 )
 from app.models.entities import AuditEvent, OAuthAuthorizationRequest, OAuthCredential
-from app.security.auth import SessionSigner, hash_api_key
+from app.security.auth import hash_api_key
 from app.settings import Settings
 
 pytestmark = pytest.mark.integration
@@ -239,172 +239,16 @@ async def test_gmail_oauth_rest_lifecycle_is_bound_audited_and_disconnectable(
 
 
 @pytest.mark.asyncio
-async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
+async def test_legacy_admin_google_login_redirects_to_unified_identity_login(
     oauth_api: OAuthApiContext,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    started = await oauth_api.client.get("/admin/auth/google")
-    assert started.status_code == 302
-    location_query = parse_qs(urlsplit(started.headers["location"]).query)
-    assert set(location_query["scope"][0].split()) == set(GOOGLE_ADMIN_SCOPES)
-    assert location_query["prompt"] == ["consent select_account"]
-    state = location_query["state"][0]
-    nonce = location_query["nonce"][0]
-
-    monkeypatch.setattr(
-        GmailOAuthService,
-        "_flow",
-        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteOAuthlibFlow(scopes),
-    )
-
-    async def verify_identity(_service: GmailOAuthService, raw_id_token: str) -> dict[str, object]:
-        assert raw_id_token == "signed-google-id-token"
-        return {
-            "sub": "google-subject-123",
-            "email": "Owner@Example.Test",
-            "email_verified": True,
-            "nonce": nonce,
-        }
-
-    monkeypatch.setattr(GmailOAuthService, "_verify_admin_id_token", verify_identity)
-    callback = await oauth_api.client.get(
-        "/api/v1/oauth/gmail/callback",
-        params={"code": "admin-route-code", "state": state},
-    )
-    assert callback.status_code == 303
-    assert callback.headers["location"] == "/admin?view=overview&google=connected"
-    session_cookie = oauth_api.client.cookies.get("job_agent_session")
-    assert session_cookie is not None
-    assert (
-        SessionSigner("gmail-oauth-route-test-secret-over-32-characters").verify(session_cookie, 60)
-        == "operator"
-    )
-    set_cookie = callback.headers["set-cookie"]
-    assert "HttpOnly" in set_cookie
-    assert "Secure" in set_cookie
-    # OAuth returns from a different site, so Strict would suppress this cookie on the
-    # callback's immediate dashboard redirect and bounce the operator back to /admin/login.
-    assert "SameSite=lax" in set_cookie
+    response = await oauth_api.client.get("/admin/auth/google")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/auth/google/login"
 
     async with oauth_api.session_factory() as session:
-        credential = await session.scalar(select(OAuthCredential))
-        assert credential is not None
-        assert credential.token_metadata["identity_verified"] is True
-        assert credential.token_metadata["identity_email"] == "owner@example.test"
-        assert credential.token_metadata["identity_provider"] == "google"
-        assert credential.token_metadata["reauth_required"] is False
-        assert credential.token_metadata["last_refresh_ok"]
-        assert credential.token_metadata["last_refresh_error"] is None
-        actions = set((await session.scalars(select(AuditEvent.action))).all())
-        assert "admin.login.google_started" in actions
-        assert "admin.login.google" in actions
-
-
-@pytest.mark.asyncio
-async def test_google_admin_login_rejects_account_outside_allowlist(
-    oauth_api: OAuthApiContext,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    started = await oauth_api.client.get("/admin/auth/google")
-    location_query = parse_qs(urlsplit(started.headers["location"]).query)
-    state = location_query["state"][0]
-    nonce = location_query["nonce"][0]
-    monkeypatch.setattr(
-        GmailOAuthService,
-        "_flow",
-        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteOAuthlibFlow(scopes),
-    )
-
-    async def verify_identity(_service: GmailOAuthService, _raw_id_token: str) -> dict[str, object]:
-        return {
-            "sub": "attacker-subject",
-            "email": "attacker@example.test",
-            "email_verified": True,
-            "nonce": nonce,
-        }
-
-    monkeypatch.setattr(GmailOAuthService, "_verify_admin_id_token", verify_identity)
-    callback = await oauth_api.client.get(
-        "/api/v1/oauth/gmail/callback",
-        params={"code": "admin-route-code", "state": state},
-    )
-    assert callback.status_code == 303
-    assert callback.headers["location"] == "/admin/login?oauth_error=admin_identity_not_allowed"
-    assert oauth_api.client.cookies.get("job_agent_session") is None
-    async with oauth_api.session_factory() as session:
+        assert await session.scalar(select(OAuthAuthorizationRequest)) is None
         assert await session.scalar(select(OAuthCredential)) is None
-        failed = await session.scalar(
-            select(AuditEvent).where(AuditEvent.action == "admin.login.google_failed")
-        )
-        assert failed is not None
-
-
-@pytest.mark.asyncio
-async def test_google_admin_login_rejects_scope_change_beyond_email_alias(
-    oauth_api: OAuthApiContext,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    started = await oauth_api.client.get("/admin/auth/google")
-    state = parse_qs(urlsplit(started.headers["location"]).query)["state"][0]
-    monkeypatch.setattr(
-        GmailOAuthService,
-        "_flow",
-        lambda self, state=None, code_verifier=None, scopes=None: AdminRouteOAuthlibFlow(
-            scopes,
-            extra_scopes=("https://www.googleapis.com/auth/drive.readonly",),
-        ),
-    )
-
-    callback = await oauth_api.client.get(
-        "/api/v1/oauth/gmail/callback",
-        params={"code": "admin-route-code", "state": state},
-    )
-
-    assert callback.status_code == 303
-    assert callback.headers["location"] == "/admin/login?oauth_error=token_exchange_failed"
-    assert oauth_api.client.cookies.get("job_agent_session") is None
-    async with oauth_api.session_factory() as session:
-        assert await session.scalar(select(OAuthCredential)) is None
-        failed = await session.scalar(
-            select(AuditEvent).where(AuditEvent.action == "oauth.gmail.connect_failed")
-        )
-        assert failed is not None
-        assert failed.sanitized_details["error_code"] == "token_exchange_failed"
-
-
-@pytest.mark.asyncio
-async def test_google_login_only_forces_consent_when_gmail_needs_reauthorization(
-    oauth_api: OAuthApiContext,
-) -> None:
-    async with oauth_api.session_factory() as session:
-        session.add(
-            OAuthCredential(
-                provider="gmail",
-                encrypted_refresh_token=b"stored-refresh-token",
-                scopes=list(GOOGLE_ADMIN_SCOPES),
-                token_metadata={
-                    "identity_verified": True,
-                    "identity_email": "owner@example.test",
-                    "identity_provider": "google",
-                    "reauth_required": False,
-                },
-            )
-        )
-        await session.commit()
-
-    healthy_login = await oauth_api.client.get("/admin/auth/google")
-    healthy_query = parse_qs(urlsplit(healthy_login.headers["location"]).query)
-    assert healthy_query["prompt"] == ["select_account"]
-
-    async with oauth_api.session_factory() as session:
-        credential = await session.scalar(select(OAuthCredential))
-        assert credential is not None
-        credential.token_metadata = {**credential.token_metadata, "reauth_required": True}
-        await session.commit()
-
-    recovery_login = await oauth_api.client.get("/admin/auth/google")
-    recovery_query = parse_qs(urlsplit(recovery_login.headers["location"]).query)
-    assert recovery_query["prompt"] == ["consent select_account"]
 
 
 @pytest.mark.e2e

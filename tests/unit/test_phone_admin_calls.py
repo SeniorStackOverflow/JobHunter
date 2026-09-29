@@ -15,6 +15,7 @@ from selectolax.parser import HTMLParser
 
 from app.admin import routes as admin_routes
 from app.admin.phone_routes import build_calls_context
+from app.auth import routes as auth_routes
 from app.database.session import get_session
 from app.models.entities import (
     AuditEvent,
@@ -185,9 +186,11 @@ async def admin_client(
 ) -> AsyncIterator[httpx.AsyncClient]:
     settings = _settings(tmp_path)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_routes, "_phone_redis", lambda: FakeAsyncRedis())
 
     application = FastAPI()
+    application.include_router(auth_routes.router)
     application.include_router(admin_routes.router)
 
     async def override_session() -> AsyncIterator[Any]:
@@ -203,7 +206,7 @@ async def admin_client(
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver", follow_redirects=False
     ) as client:
-        login_page = await client.get("/admin/login")
+        login_page = await client.get("/login")
         token = (
             HTMLParser(login_page.text).css_first("input[name='csrf_token']").attributes["value"]
         )
