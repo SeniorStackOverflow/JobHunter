@@ -719,6 +719,8 @@ async def dashboard(
             )
         ).all()
     )
+    counts["unhealthy_sources"] = counts["enabled_sources"] - counts["healthy_sources"]
+    counts["notification_count"] = counts["active_alerts"] + int(counts["unhealthy_sources"] > 0)
     counts["phone_review"] = int(
         await session.scalar(
             select(func.count(CommunicationSession.id)).where(
@@ -829,7 +831,7 @@ async def dashboard(
                 "action": "Проверить",
             }
         )
-    unhealthy_sources = counts["enabled_sources"] - counts["healthy_sources"]
+    unhealthy_sources = counts["unhealthy_sources"]
     if unhealthy_sources:
         unhealthy_names = ", ".join(
             item.name
@@ -1716,6 +1718,8 @@ async def acknowledge_alert(
     alert_id: UUID,
     request: Request,
     csrf_token: str = Form(...),
+    return_view: str = Form("diagnostics"),
+    profile_id: UUID | None = Form(None),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
@@ -1732,7 +1736,11 @@ async def acknowledge_alert(
         decision="acknowledged",
     )
     await session.commit()
-    return RedirectResponse("/admin?view=diagnostics&notice=alert_acknowledged", status_code=303)
+    target_view = return_view if return_view in _VIEW_TITLES else "diagnostics"
+    target = f"/admin?view={target_view}&notice=alert_acknowledged"
+    if profile_id is not None:
+        target += f"&profile_id={profile_id}"
+    return RedirectResponse(target, status_code=303)
 
 
 @router.post("/admin/resumes/{resume_id}/verify")

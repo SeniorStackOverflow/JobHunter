@@ -33,6 +33,7 @@ from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Account,
     AccountIdentity,
+    Alert,
     Application,
     CanonicalJob,
     EmployerContact,
@@ -516,6 +517,8 @@ async def test_admin_source_selection_is_profile_scoped_and_keeps_crawler_enable
     assert first_overview.status_code == second_overview.status_code == 200
     assert 'Новых вакансий сегодня</div><div class="metric-value">0</div>' in first_overview.text
     assert 'Новых вакансий сегодня</div><div class="metric-value">7</div>' in second_overview.text
+    assert 'class="notification-count">' not in first_overview.text
+    assert 'class="notification-count">1</span>' in second_overview.text
 
 
 @pytest.mark.asyncio
@@ -796,6 +799,89 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
                         .locator("xpath=..")
                         .inner_text()
                     )
+                    await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await server_task
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_admin_notification_acknowledgement_three_clean_browser_contexts(
+    user_auth_context: UserAuthContext,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        profile = UserProfile(name="Admin", owner_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID)
+        session.add(profile)
+        await session.commit()
+        profile_id = profile.id
+
+    with socket.socket() as port_socket:
+        port_socket.bind(("127.0.0.1", 0))
+        port = int(port_socket.getsockname()[1])
+    base_url = f"http://localhost:{port}"
+    signed = SessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        user_auth_context.settings.admin_username
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(user_auth_context.app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as readiness_client:
+            for _ in range(100):
+                try:
+                    if (await readiness_client.get("/login")).status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("local notification browser server did not start")
+
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch(headless=True)
+            try:
+                for index in range(3):
+                    async with user_auth_context.session_factory() as session:
+                        alert = Alert(
+                            severity="error",
+                            code=f"browser_alert_{index}",
+                            message=f"Browser alert {index}",
+                        )
+                        session.add(alert)
+                        await session.commit()
+                        alert_id = alert.id
+                    context = await browser.new_context()
+                    await context.add_cookies(
+                        [
+                            {
+                                "name": user_auth_context.settings.session_cookie_name,
+                                "value": signed,
+                                "url": base_url,
+                            }
+                        ]
+                    )
+                    page = await context.new_page()
+                    response = await page.goto(
+                        f"{base_url}/admin?view=overview&profile_id={profile_id}",
+                        wait_until="domcontentloaded",
+                    )
+                    assert response is not None and response.status == 200
+                    await page.locator("summary[aria-label='Уведомления']").click()
+                    assert await page.get_by_text(f"Browser alert {index}").is_visible()
+                    await page.locator(
+                        f"form[action='/admin/alerts/{alert_id}/acknowledge'] button"
+                    ).click()
+                    assert "view=overview" in page.url
+                    assert "notice=alert_acknowledged" in page.url
+                    async with user_auth_context.session_factory() as session:
+                        stored = await session.get(Alert, alert_id)
+                        assert stored is not None and stored.acknowledged is True
                     await context.close()
             finally:
                 await browser.close()
