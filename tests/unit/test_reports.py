@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
     CanonicalJob,
+    DailyReport,
     EmailDelivery,
     EmployerContact,
     ExternalCallEvent,
@@ -361,9 +363,75 @@ async def test_daily_report_includes_learning_shadow_block(
         profile = UserProfile(name="p", is_default=True)
         session.add(profile)
         await session.flush()
+        session.add(
+            Resume(
+                profile_id=profile.id,
+                name="CV",
+                category="office",
+                storage_key="profile.pdf",
+                original_filename="profile.pdf",
+                mime_type="application/pdf",
+                sha256="d" * 64,
+                active=True,
+                verified=True,
+                is_default=True,
+            )
+        )
+        await session.flush()
 
         report = await _generate(session)
 
     assert "learning_shadow" in report.summary
     assert isinstance(report.summary["learning_shadow"], list)
     assert report.summary["learning_shadow"][0]["profile_id"] == str(profile.id)
+
+
+async def test_read_only_daily_report_collection_does_not_persist(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        profile = UserProfile(name="read-only", is_default=True)
+        session.add(profile)
+        await session.flush()
+        session.add_all(
+            [
+                JobPreference(profile_id=profile.id),
+                Resume(
+                    profile_id=profile.id,
+                    name="CV",
+                    category="office",
+                    storage_key="readonly.pdf",
+                    original_filename="readonly.pdf",
+                    mime_type="application/pdf",
+                    sha256="e" * 64,
+                    active=True,
+                    verified=True,
+                    is_default=True,
+                ),
+            ]
+        )
+        await session.flush()
+
+        report = await _generate(session, persist=False)
+        await session.flush()
+
+        assert report.summary["matching_backlog_state"] == "ok"
+        assert int(await session.scalar(select(func.count(DailyReport.id))) or 0) == 0
+
+
+async def test_matching_backlog_section_times_out_fail_open(
+    sqlite_session_factory,
+    monkeypatch,
+) -> None:
+    import app.database.session as database_session
+    import app.reports.service as reports
+
+    async def slow_backlog(*_args, **_kwargs) -> int:
+        await asyncio.sleep(0.05)
+        return 123
+
+    monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr(reports, "count_all_matching_backlog", slow_backlog)
+    monkeypatch.setattr(reports, "_REPORT_SECTION_TIMEOUT_SECONDS", 0.001)
+
+    assert await reports._bounded_matching_backlog() == (None, "timeout")

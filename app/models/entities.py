@@ -507,6 +507,7 @@ class BatchScanRun(UUIDPrimaryKeyMixin, Base):
 class MatchEvaluation(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "match_evaluations"
     __table_args__ = (
+        Index("ix_match_evaluations_profile_created", "profile_id", "created_at", "id"),
         Index(
             "ix_match_evaluations_profile_source_latest",
             "profile_id",
@@ -602,6 +603,7 @@ class Application(UUIDPrimaryKeyMixin, Base):
             "profile_id", "canonical_job_id", name="uq_application_profile_canonical_job"
         ),
         UniqueConstraint("idempotency_key", name="uq_application_idempotency"),
+        Index("ix_applications_profile_match_evaluation", "profile_id", "match_evaluation_id"),
     )
 
     profile_id: Mapped[UUID] = mapped_column(

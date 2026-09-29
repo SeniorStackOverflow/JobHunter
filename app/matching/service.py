@@ -498,6 +498,24 @@ def _apply_same_input_safety_guard(
     )
 
 
+def _apply_missing_resume_guard(
+    result: MatchResult,
+    resume: Resume | None,
+) -> MatchResult:
+    if resume is not None or result.decision is not MatchDecision.AUTO_APPLY:
+        return result
+    return result.model_copy(
+        update={
+            "decision": MatchDecision.PREPARE_FOR_REVIEW,
+            "risks": _unique([*result.risks, "missing_verified_resume"]),
+            "reason": (
+                f"{result.reason}; automatic application blocked because no active verified "
+                "resume is available"
+            )[:4000],
+        }
+    )
+
+
 def reconcile_match_result(
     deterministic: DeterministicFilterResult,
     llm_result: MatchResult,
@@ -746,6 +764,7 @@ class MatchingService:
             profile_fingerprint_value=current_profile_fingerprint,
             preference_fingerprint_value=current_preference_fingerprint,
         )
+        result = _apply_missing_resume_guard(result, resume)
         if resume is not None:
             # FOR SHARE, not FOR UPDATE: analyze never writes the resume row, it
             # only needs it to stay unchanged until persist. An exclusive lock

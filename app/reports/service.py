@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -241,6 +242,7 @@ async def _daily_minimum_diagnostics(
             )
             .where(
                 Application.profile_id == profile_id,
+                MatchEvaluation.profile_id == profile_id,
                 MatchEvaluation.created_at >= start,
                 MatchEvaluation.created_at < end,
                 Application.status != ApplicationStatus.SENT,
@@ -311,7 +313,56 @@ async def _daily_minimum_diagnostics(
     }
 
 
-async def _generate(session: AsyncSession) -> DailyReport:
+_REPORT_SECTION_TIMEOUT_SECONDS = 8.0
+
+
+async def _bounded_matching_backlog() -> tuple[int | None, str]:
+    from app.database.session import async_session_factory
+
+    async def _run() -> int:
+        async with async_session_factory() as diagnostics_session:
+            return await count_all_matching_backlog(diagnostics_session, get_settings())
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=_REPORT_SECTION_TIMEOUT_SECONDS), "ok"
+    except TimeoutError:
+        return None, "timeout"
+
+
+async def _bounded_minimum_diagnostics(
+    start: datetime,
+    end: datetime,
+    *,
+    profile_id: UUID | None,
+    minimum: int,
+    sent: int,
+) -> dict[str, Any]:
+    from app.database.session import async_session_factory
+
+    async def _run() -> dict[str, Any]:
+        async with async_session_factory() as diagnostics_session:
+            return await _daily_minimum_diagnostics(
+                diagnostics_session,
+                start,
+                end,
+                profile_id=profile_id,
+                minimum=minimum,
+                sent=sent,
+            )
+
+    try:
+        result = await asyncio.wait_for(_run(), timeout=_REPORT_SECTION_TIMEOUT_SECONDS)
+        return {**result, "daily_minimum_diagnostics_state": "ok"}
+    except TimeoutError:
+        return {
+            "daily_minimum_status": "unavailable_timeout",
+            "safe_auto_send_ready": None,
+            "daily_minimum_blockers": {},
+            "daily_minimum_diagnostics_state": "timeout",
+        }
+
+
+async def _generate(session: AsyncSession, *, persist: bool = True) -> DailyReport:
     start_local, start, end = local_day_bounds()
     scans = list(
         (
@@ -512,14 +563,24 @@ async def _generate(session: AsyncSession) -> DailyReport:
     external_metrics = await external_call_metrics(session, start, end)
     limit_metrics = await _daily_limit_metrics(session, start, end)
     report_profile = await ProfileService().get_profile(session)
-    minimum_diagnostics = await _daily_minimum_diagnostics(
-        session,
-        start,
-        end,
-        profile_id=report_profile.id if report_profile is not None else None,
-        minimum=int(limit_metrics.get("daily_effective_minimum") or 0),
-        sent=int(limit_metrics.get("daily_sent") or 0),
-    )
+    if session.get_bind().dialect.name == "sqlite":
+        minimum_diagnostics = await _daily_minimum_diagnostics(
+            session,
+            start,
+            end,
+            profile_id=report_profile.id if report_profile is not None else None,
+            minimum=int(limit_metrics.get("daily_effective_minimum") or 0),
+            sent=int(limit_metrics.get("daily_sent") or 0),
+        )
+        minimum_diagnostics["daily_minimum_diagnostics_state"] = "ok"
+    else:
+        minimum_diagnostics = await _bounded_minimum_diagnostics(
+            start,
+            end,
+            profile_id=report_profile.id if report_profile is not None else None,
+            minimum=int(limit_metrics.get("daily_effective_minimum") or 0),
+            sent=int(limit_metrics.get("daily_sent") or 0),
+        )
     minimum = int(limit_metrics.get("daily_effective_minimum") or 0)
     sent = int(limit_metrics.get("daily_sent") or 0)
     reserved = int(minimum_diagnostics.get("safe_auto_send_ready") or 0)
@@ -531,7 +592,11 @@ async def _generate(session: AsyncSession) -> DailyReport:
         if search_active
         else limit_metrics["daily_minimum_normal_score"]
     )
-    matching_backlog = await count_all_matching_backlog(session, get_settings())
+    if session.get_bind().dialect.name == "sqlite":
+        matching_backlog = await count_all_matching_backlog(session, get_settings())
+        matching_backlog_state = "ok"
+    else:
+        matching_backlog, matching_backlog_state = await _bounded_matching_backlog()
     active_jobs = int(
         await session.scalar(
             select(func.count(SourceJob.id)).where(SourceJob.status == JobStatus.ACTIVE)
@@ -693,25 +758,26 @@ async def _generate(session: AsyncSession) -> DailyReport:
                 "count": retry_stuck,
             }
         )
-    for alert_data in delivery_alerts:
-        code = str(alert_data["code"])
-        existing_alert = await session.scalar(
-            select(Alert.id).where(
-                Alert.code == code,
-                Alert.created_at >= start,
-                Alert.acknowledged.is_(False),
-            )
-        )
-        if existing_alert is None:
-            session.add(
-                Alert(
-                    severity=str(alert_data["severity"]),
-                    code=code,
-                    message="Email delivery health requires operator attention",
-                    safe_diagnostics=alert_data,
-                    acknowledged=False,
+    if persist:
+        for alert_data in delivery_alerts:
+            code = str(alert_data["code"])
+            existing_alert = await session.scalar(
+                select(Alert.id).where(
+                    Alert.code == code,
+                    Alert.created_at >= start,
+                    Alert.acknowledged.is_(False),
                 )
             )
+            if existing_alert is None:
+                session.add(
+                    Alert(
+                        severity=str(alert_data["severity"]),
+                        code=code,
+                        message="Email delivery health requires operator attention",
+                        safe_diagnostics=alert_data,
+                        acknowledged=False,
+                    )
+                )
     relationship_applications = list(
         (
             await session.scalars(
@@ -870,6 +936,7 @@ async def _generate(session: AsyncSession) -> DailyReport:
         **minimum_diagnostics,
         "active_jobs": active_jobs,
         "matching_backlog": matching_backlog,
+        "matching_backlog_state": matching_backlog_state,
     }
     from app.learning.shadow import shadow_scorecard
 
@@ -877,6 +944,9 @@ async def _generate(session: AsyncSession) -> DailyReport:
         await shadow_scorecard(session, profile.id)
         for profile in await ProfileService().list_processing_profiles(session)
     ]
+    if not persist:
+        return DailyReport(report_date=start, summary=summary)
+
     existing = await session.scalar(select(DailyReport).where(DailyReport.report_date == start))
     if existing is None:
         existing = DailyReport(report_date=start, summary=summary)

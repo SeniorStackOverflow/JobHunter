@@ -1788,7 +1788,7 @@ async def get_daily_report() -> dict[str, Any]:
     """Return today's Europe/Chisinau live report, backlog, and safe diagnostics."""
     from datetime import UTC, datetime, timedelta
 
-    from sqlalchemy import and_
+    from sqlalchemy import and_, text
 
     from app.database.session import async_session_factory
     from app.matching.providers import MATCHING_RULES_VERSION
@@ -1796,18 +1796,30 @@ async def get_daily_report() -> dict[str, Any]:
     from app.time_utils import local_day_bounds
 
     async with async_session_factory() as session:
-        item = await _generate(session)
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+        item = await _generate(session, persist=False)
         start_local, start, end = local_day_bounds()
 
         active_jobs = int(item.summary.get("active_jobs") or 0)
-        matching_backlog = int(item.summary.get("matching_backlog") or 0)
+        raw_matching_backlog = item.summary.get("matching_backlog")
+        matching_backlog = (
+            int(raw_matching_backlog)
+            if isinstance(raw_matching_backlog, (int, float))
+            else None
+        )
+        processing_profile_ids = [
+            profile.id for profile in await ProfileService().list_processing_profiles(session)
+        ]
 
         latest_evaluations = (
             select(
+                MatchEvaluation.profile_id.label("profile_id"),
                 MatchEvaluation.source_job_id.label("source_job_id"),
                 func.max(MatchEvaluation.created_at).label("created_at"),
             )
-            .group_by(MatchEvaluation.source_job_id)
+            .where(MatchEvaluation.profile_id.in_(processing_profile_ids))
+            .group_by(MatchEvaluation.profile_id, MatchEvaluation.source_job_id)
             .subquery()
         )
         latest_current_rows = (
@@ -1816,6 +1828,7 @@ async def get_daily_report() -> dict[str, Any]:
                 .join(
                     latest_evaluations,
                     and_(
+                        latest_evaluations.c.profile_id == MatchEvaluation.profile_id,
                         latest_evaluations.c.source_job_id == MatchEvaluation.source_job_id,
                         latest_evaluations.c.created_at == MatchEvaluation.created_at,
                     ),
@@ -1824,6 +1837,7 @@ async def get_daily_report() -> dict[str, Any]:
                 .where(
                     SourceJob.status == JobStatus.ACTIVE,
                     SourceJob.canonical_job_id.is_not(None),
+                    MatchEvaluation.profile_id.in_(processing_profile_ids),
                     MatchEvaluation.prompt_rules_version == MATCHING_RULES_VERSION,
                     MatchEvaluation.source_matching_hash == SourceJob.matching_content_hash,
                 )
@@ -1872,12 +1886,16 @@ async def get_daily_report() -> dict[str, Any]:
                 "matching_backlog": matching_backlog,
                 "matching_retry_backlog": matching_retry_backlog,
                 "matching_retry_due": matching_retry_due,
-                "effective_matching_backlog": matching_backlog + matching_retry_backlog,
+                "effective_matching_backlog": (
+                    matching_backlog + matching_retry_backlog
+                    if matching_backlog is not None
+                    else None
+                ),
+                "matching_backlog_state": item.summary.get("matching_backlog_state", "ok"),
                 "matching_rules_version": MATCHING_RULES_VERSION,
                 "scan_error_details": scan_error_details,
             }
         )
-        await session.commit()
         return {"date": start_local.isoformat(), "summary": summary}
 
 

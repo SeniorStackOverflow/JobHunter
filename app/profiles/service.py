@@ -8,7 +8,7 @@ from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import structlog
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
@@ -107,6 +107,16 @@ def choose_resume_for_job(resumes: list[Resume], job: SourceJob) -> Resume | Non
     )
 
 
+def _processing_resume_exists():
+    return exists(
+        select(Resume.id).where(
+            Resume.profile_id == UserProfile.id,
+            Resume.active.is_(True),
+            Resume.verified.is_(True),
+        )
+    )
+
+
 class ProfileService:
     async def list_profiles(
         self,
@@ -128,6 +138,7 @@ class ProfileService:
                     .outerjoin(Account, Account.id == UserProfile.owner_account_id)
                     .where(
                         UserProfile.status == ProfileStatus.ACTIVE,
+                        _processing_resume_exists(),
                         or_(
                             UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
                             Account.status == AccountStatus.ACTIVE,
@@ -151,6 +162,7 @@ class ProfileService:
                 .where(
                     UserProfile.id == profile_id,
                     UserProfile.status == ProfileStatus.ACTIVE,
+                    _processing_resume_exists(),
                     or_(
                         UserProfile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
                         Account.status == AccountStatus.ACTIVE,

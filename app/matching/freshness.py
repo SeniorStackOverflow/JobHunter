@@ -231,7 +231,7 @@ async def count_all_matching_backlog(
 
     profiles = ProfileService()
     total = 0
-    for profile in await profiles.list_profiles(session):
+    for profile in await profiles.list_processing_profiles(session):
         preference = await profiles.get_preferences(session, profile.id)
         total += await count_profile_matching_backlog(
             session,

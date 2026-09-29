@@ -20,6 +20,7 @@ from app.models.entities import (
     Application,
     Invite,
     JobPreference,
+    Resume,
     UserProfile,
 )
 from app.models.enums import (
@@ -356,7 +357,27 @@ async def test_processing_profiles_require_active_account_and_profile(
             status=ProfileStatus.ACTIVE,
             name="suspended-owner",
         )
-        session.add_all([active, draft, suspended])
+        unready = UserProfile(
+            owner_account_id=active_account.id,
+            status=ProfileStatus.ACTIVE,
+            name="active-without-resume",
+        )
+        session.add_all([active, draft, suspended, unready])
+        await session.flush()
+        session.add(
+            Resume(
+                profile_id=active.id,
+                name="Ready CV",
+                category="office",
+                storage_key="ready.pdf",
+                original_filename="ready.pdf",
+                mime_type="application/pdf",
+                sha256="a" * 64,
+                active=True,
+                verified=True,
+                is_default=True,
+            )
+        )
         await session.commit()
 
         processing = await profiles.list_processing_profiles(session)
@@ -364,6 +385,7 @@ async def test_processing_profiles_require_active_account_and_profile(
         assert await profiles.get_processing_profile(session, active.id) is not None
         assert await profiles.get_processing_profile(session, draft.id) is None
         assert await profiles.get_processing_profile(session, suspended.id) is None
+        assert await profiles.get_processing_profile(session, unready.id) is None
 
 
 @pytest.mark.asyncio

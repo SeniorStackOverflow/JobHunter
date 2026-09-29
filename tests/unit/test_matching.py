@@ -1678,6 +1678,23 @@ def test_forklift_hard_requirements_can_be_met_only_with_trusted_evidence() -> N
     assert result.decision is MatchDecision.AUTO_APPLY
 
 
+def test_missing_verified_resume_blocks_auto_apply() -> None:
+    from app.matching.service import _apply_missing_resume_guard
+
+    result = _apply_missing_resume_guard(
+        make_result(
+            resume_fit=90,
+            preference_fit=95,
+            overall_fit=93,
+            decision=MatchDecision.AUTO_APPLY,
+        ),
+        None,
+    )
+
+    assert result.decision is MatchDecision.PREPARE_FOR_REVIEW
+    assert "missing_verified_resume" in result.risks
+
+
 def test_same_input_skip_to_auto_apply_is_forced_to_review() -> None:
     from app.matching.service import _apply_same_input_safety_guard
 

@@ -425,6 +425,20 @@ async def activate_user_profile(
     account, profile = await _actor_profile(request, session, profile_id)
     if profile.status != ProfileStatus.DRAFT:
         raise HTTPException(status_code=409, detail="only a draft profile can be activated")
+    ready_resume_id = await session.scalar(
+        select(Resume.id)
+        .where(
+            Resume.profile_id == profile.id,
+            Resume.active.is_(True),
+            Resume.verified.is_(True),
+        )
+        .limit(1)
+    )
+    if ready_resume_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="verified active resume required before activation",
+        )
     profile.status = ProfileStatus.ACTIVE
     await record_audit_event(
         session,
