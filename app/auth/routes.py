@@ -4,7 +4,7 @@ from __future__ import annotations
 # ruff: noqa: B008
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -22,12 +22,41 @@ from app.accounts import (
 )
 from app.admin.routes import templates as admin_templates
 from app.audit import record_audit_event
+from app.auth.access import (
+    account_signer as _account_signer,
+)
+from app.auth.access import (
+    csrf as _csrf,
+)
+from app.auth.access import (
+    current_account as _current_account,
+)
+from app.auth.access import (
+    has_admin_session as _has_admin_session,
+)
+from app.auth.access import (
+    require_account as _require_account,
+)
+from app.auth.access import (
+    require_user_csrf as _require_user_csrf,
+)
+from app.auth.access import (
+    require_user_feature as _require_user_feature,
+)
+from app.auth.access import (
+    secure_cookie as _secure_cookie,
+)
+from app.auth.access import (
+    settings as _settings,
+)
 from app.auth.google import (
     IDENTITY_OAUTH_BINDING_COOKIE,
     IDENTITY_STATE_TTL_SECONDS,
     GoogleIdentityError,
     GoogleIdentityService,
 )
+from app.auth.workspace import render_user_dashboard
+from app.auth.workspace import router as workspace_router
 from app.database import get_session
 from app.email.oauth import (
     GMAIL_OAUTH_BINDING_COOKIE,
@@ -40,8 +69,7 @@ from app.models.entities import Account, Invite, UserProfile
 from app.models.enums import AccountStatus, ProfileStatus
 from app.profiles import ProfileService
 from app.profiles.schemas import UserProfileInput
-from app.security.auth import AccountSessionSigner, CsrfProtector, SessionSigner
-from app.settings import Settings, get_settings
+from app.security.auth import SessionSigner
 
 router = APIRouter(tags=["user-auth"])
 templates = Jinja2Templates(directory="app/auth/templates")
@@ -52,81 +80,8 @@ _REGISTER_ACTOR_PREFIX = "register:"
 _LOGIN_ACTOR = "login"
 
 
-def _settings() -> Settings:
-    return get_settings()
-
-
-def _require_user_feature(*, registration: bool = False) -> None:
-    settings = _settings()
-    enabled = (
-        settings.invite_registration_enabled if registration else settings.user_accounts_enabled
-    )
-    if not enabled:
-        raise HTTPException(status_code=404)
-
-
 def _join_signer() -> SessionSigner:
     return SessionSigner(_settings().secret_key.get_secret_value(), salt="jobhunter-join")
-
-
-def _account_signer() -> AccountSessionSigner:
-    return AccountSessionSigner(_settings().secret_key.get_secret_value())
-
-
-def _csrf() -> CsrfProtector:
-    return CsrfProtector(_settings().secret_key.get_secret_value())
-
-
-def _secure_cookie() -> bool:
-    return _settings().public_base_url.casefold().startswith("https://")
-
-
-def _has_admin_session(request: Request) -> bool:
-    settings = _settings()
-    token = request.cookies.get(settings.session_cookie_name)
-    if not token:
-        return False
-    subject = SessionSigner(settings.secret_key.get_secret_value()).verify(
-        token, settings.session_ttl_seconds
-    )
-    return subject == settings.admin_username
-
-
-async def _current_account(
-    request: Request,
-    session: AsyncSession,
-) -> tuple[Account, str] | None:
-    settings = _settings()
-    token = request.cookies.get(settings.user_session_cookie_name)
-    if not token:
-        return None
-    payload = _account_signer().verify(token, settings.user_session_ttl_seconds)
-    if payload is None:
-        return None
-    account = await session.get(Account, payload.account_id)
-    if (
-        account is None
-        or account.status != AccountStatus.ACTIVE
-        or account.session_version != payload.version
-    ):
-        return None
-    return account, token
-
-
-async def _require_account(
-    request: Request,
-    session: AsyncSession,
-) -> tuple[Account, str]:
-    current = await _current_account(request, session)
-    if current is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="login required")
-    return current
-
-
-def _require_user_csrf(request: Request, csrf_token: str) -> None:
-    token = request.cookies.get(_settings().user_session_cookie_name)
-    if not token or not _csrf().verify(csrf_token, token, _settings().csrf_ttl_seconds):
-        raise HTTPException(status_code=403, detail="invalid CSRF token")
 
 
 async def _bound_invite(request: Request, session: AsyncSession) -> Invite:
@@ -464,6 +419,9 @@ async def complete_identity_callback(
 @router.get("/app", response_class=HTMLResponse)
 async def user_home(
     request: Request,
+    view: str = "overview",
+    profile_id: UUID | None = None,
+    page: int = 1,
     notice: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
@@ -472,21 +430,16 @@ async def user_home(
     if current is None:
         return RedirectResponse("/login", status_code=303)
     account, session_token = current
-    profiles = await AccountService().list_owned_profiles(session, account.id)
-    gmail_oauth = await GmailOAuthService(_settings()).get_status(session, account_id=account.id)
-    response = templates.TemplateResponse(
-        request=request,
-        name="user_home.html",
-        context={
-            "account": account,
-            "profiles": profiles,
-            "csrf_token": _csrf().issue(session_token),
-            "notice": notice,
-            "gmail_oauth": gmail_oauth,
-        },
+    return await render_user_dashboard(
+        request,
+        session,
+        account,
+        session_token,
+        view=view,
+        profile_id=profile_id,
+        page=page,
+        notice=notice,
     )
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 @router.post("/app/profiles")
@@ -535,7 +488,9 @@ async def create_user_profile(
         decision="draft",
     )
     await session.commit()
-    return RedirectResponse("/app?notice=profile_created", status_code=303)
+    return RedirectResponse(
+        f"/app?view=settings&profile_id={profile.id}&notice=profile_created", status_code=303
+    )
 
 
 @router.post("/app/invites")
@@ -566,22 +521,15 @@ async def create_user_invite(
         details={"target_email": created.invite.target_email},
     )
     await session.commit()
-    profiles = await AccountService().list_owned_profiles(session, account.id)
-    gmail_oauth = await GmailOAuthService(_settings()).get_status(session, account_id=account.id)
-    response = templates.TemplateResponse(
-        request=request,
-        name="user_home.html",
-        context={
-            "account": account,
-            "profiles": profiles,
-            "csrf_token": _csrf().issue(session_token),
-            "notice": "invite_created",
-            "invite_token": created.token,
-            "gmail_oauth": gmail_oauth,
-        },
+    return await render_user_dashboard(
+        request,
+        session,
+        account,
+        session_token,
+        view="settings",
+        notice="invite_created",
+        invite_token=created.token,
     )
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 @router.get("/app/gmail/connect")
@@ -661,6 +609,9 @@ async def user_logout(
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(_settings().user_session_cookie_name, path="/")
     return response
+
+
+router.include_router(workspace_router)
 
 
 __all__ = [

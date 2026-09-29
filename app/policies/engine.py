@@ -48,6 +48,7 @@ from app.observability.metrics import (
     APPLICATIONS_DEFERRED_SAME_EMPLOYER,
 )
 from app.policies.schemas import PolicyResult
+from app.profiles.sources import source_selected
 from app.settings import Settings
 from app.time_utils import local_day_bounds
 
@@ -203,6 +204,10 @@ class PolicyEngine:
         rule("global_pause_off", not preferences.global_pause)
         rule("source_healthy", bool(source and source.health_status == SourceHealth.HEALTHY))
         rule(
+            "source_selected_for_profile",
+            await source_selected(session, profile.id, job.source_id),
+        )
+        rule(
             "source_actions_enabled",
             bool(source and source.enabled and not source.automatic_actions_paused),
         )
@@ -276,6 +281,7 @@ class PolicyEngine:
         hard_block_rules = {
             "deployment_emergency_switch_off",
             "source_healthy",
+            "source_selected_for_profile",
             "source_actions_enabled",
             "job_title_allowed_by_preferences",
             "match_not_blocked",

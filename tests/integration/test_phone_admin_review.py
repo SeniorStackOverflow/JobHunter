@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.admin import phone_routes
 from app.admin import router as admin_router
 from app.admin import routes as admin_routes
+from app.auth import access as auth_access
 from app.auth import routes as auth_routes
 from app.database import get_session
 from app.models.entities import (
@@ -65,7 +66,7 @@ async def review_context(
 ):
     settings = _settings(tmp_path)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_access, "get_settings", lambda: settings)
     monkeypatch.setattr("app.admin.phone_routes.get_settings", lambda: settings)
     application = FastAPI()
     application.include_router(auth_routes.router)

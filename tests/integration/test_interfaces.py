@@ -23,6 +23,7 @@ from sqlalchemy import select
 from app.admin import routes as admin_routes
 from app.api import dependencies as api_dependencies
 from app.api import routes as api_routes
+from app.auth import access as auth_access
 from app.auth import routes as auth_routes
 from app.database.session import get_session
 from app.learning import FEATURE_SCHEMA_VERSION
@@ -106,7 +107,7 @@ async def interface_app(
     monkeypatch.setattr(api_dependencies, "get_settings", lambda: settings)
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_access, "get_settings", lambda: settings)
 
     application = FastAPI()
     application.include_router(api_routes.router)

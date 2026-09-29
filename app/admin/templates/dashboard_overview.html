@@ -18,7 +18,7 @@
     <div class="metric-card"><div class="metric-label">Новых вакансий сегодня</div><div class="metric-value">{{ overview.today_new }}</div><div class="metric-note">найдено всего {{ overview.today_found }}</div></div>
   </div>
 
-  <div class="daily-digest"><div class="digest-icon">✦</div><div><strong>Сводка нейросети за сегодня</strong><p>{% if overview.today_found or overview.today_matches or overview.sent_today %}Источники нашли {{ overview.today_found }} вакансий, оценено {{ overview.today_matches }}, отправлено {{ overview.sent_today }}. {% if overview.today_scan_errors %}При обходе возникло {{ overview.today_scan_errors }} ошибок — подробности есть в диагностике.{% else %}Новых ошибок при обходе источников нет.{% endif %}{% else %}Сегодня новых результатов пока нет. JobHunter продолжит работу по расписанию.{% endif %}</p></div></div>
+  <div class="daily-digest"><div class="digest-icon" aria-hidden="true">◎</div><div><strong>Результат подбора за сегодня</strong><p>{% if overview.today_matches %}Для этого профиля оценено {{ overview.today_matches }} вакансий: {{ overview.auto_apply }} подходят для автоотправки, {{ overview.review }} требуют проверки, {{ overview.skip + overview.block }} отсеяны. {% if overview.matching_backlog %}Ещё {{ overview.matching_backlog }} ждут оценки.{% endif %}{% else %}Для этого профиля сегодня ещё нет новых оценок. {% if overview.matching_backlog %}В очереди {{ overview.matching_backlog }} вакансий.{% else %}Новые вакансии появятся здесь после следующего обхода и оценки.{% endif %}{% endif %}</p></div></div>
 
   <div class="grid grid-2 overview-columns">
     <div class="panel">

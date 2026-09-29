@@ -41,6 +41,17 @@
     select.addEventListener('change', () => select.form?.requestSubmit());
   });
 
+  const notifications = document.querySelector('[data-notifications]');
+  document.addEventListener('click', (event) => {
+    if (notifications?.open && !notifications.contains(event.target)) notifications.open = false;
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && notifications?.open) {
+      notifications.open = false;
+      notifications.querySelector('summary')?.focus();
+    }
+  });
+
   document.querySelectorAll('[data-daily-limit-range]').forEach((control) => {
     const minimumInput = control.querySelector('[data-daily-minimum]');
     const maximumInput = control.querySelector('[data-daily-maximum]');

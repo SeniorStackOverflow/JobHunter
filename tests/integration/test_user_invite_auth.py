@@ -5,8 +5,11 @@ import re
 import socket
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -20,6 +23,7 @@ from app.accounts import InviteService
 from app.admin import router as admin_router
 from app.admin import routes as admin_routes
 from app.api import routes as api_routes
+from app.auth import access as auth_access
 from app.auth import google as google_auth
 from app.auth import routes as auth_routes
 from app.auth.google import GOOGLE_IDENTITY_SCOPES, GoogleIdentityService
@@ -29,12 +33,28 @@ from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Account,
     AccountIdentity,
+    Application,
+    CanonicalJob,
+    EmployerContact,
     Invite,
     JobPreference,
+    JobSource,
     OAuthCredential,
+    ProfileSourcePreference,
+    Resume,
+    ScanRun,
+    SourceJob,
     UserProfile,
 )
-from app.models.enums import AccountRole, AccountStatus, ProfileStatus
+from app.models.enums import (
+    AccountRole,
+    AccountStatus,
+    ApplicationStatus,
+    ContactType,
+    ProfileStatus,
+    RunStatus,
+    ScanType,
+)
 from app.security.auth import AccountSessionSigner, SessionSigner
 from app.settings import Settings
 
@@ -106,6 +126,7 @@ class GmailUserFakeFlow:
 async def user_auth_context(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> AsyncIterator[UserAuthContext]:
     settings = Settings(
         environment="test",
@@ -118,9 +139,10 @@ async def user_auth_context(
         user_accounts_enabled=True,
         invite_registration_enabled=True,
         google_admin_emails=["admin@example.com"],
+        resume_storage_path=tmp_path / "resumes",
     )
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_access, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
 
     application = FastAPI()
@@ -254,7 +276,8 @@ async def test_invite_registration_creates_account_session_and_owned_draft_profi
         },
     )
     assert created_profile.status_code == 303
-    assert created_profile.headers["location"] == "/app?notice=profile_created"
+    assert created_profile.headers["location"].startswith("/app?view=settings&profile_id=")
+    assert created_profile.headers["location"].endswith("&notice=profile_created")
 
     async with user_auth_context.session_factory() as session:
         identity = await session.scalar(
@@ -369,6 +392,295 @@ async def test_user_auth_session_is_invalidated_by_account_session_version(
     assert expired.headers["location"] == "/login"
 
 
+@pytest.mark.asyncio
+async def test_user_workspace_routes_keep_profile_settings_and_sources_owned(
+    user_auth_context: UserAuthContext,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        first_owner = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        second_owner = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add_all([first_owner, second_owner])
+        await session.flush()
+        first_profile = UserProfile(name="First", owner_account_id=first_owner.id)
+        second_profile = UserProfile(name="Second", owner_account_id=second_owner.id)
+        source = JobSource(
+            name="Shared source",
+            base_url="https://jobs.example.test",
+            adapter_type="fixture_source",
+        )
+        session.add_all([first_profile, second_profile, source])
+        await session.commit()
+        first_id, second_id, source_id = first_profile.id, second_profile.id, source.id
+
+    signed = AccountSessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        first_owner.id, first_owner.session_version
+    )
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.user_session_cookie_name, signed
+    )
+    home = await user_auth_context.client.get("/app", params={"view": "settings"})
+    assert home.status_code == 200
+    assert "First" in home.text
+    assert "Second" not in home.text
+    csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', home.text)
+    assert csrf_match is not None
+    csrf_token = csrf_match.group(1)
+
+    foreign_view = await user_auth_context.client.get("/app", params={"profile_id": second_id})
+    assert foreign_view.status_code == 404
+    foreign_updates = [
+        (f"/app/profiles/{second_id}/update", {"name": "Changed"}),
+        (f"/app/profiles/{second_id}/preferences", {"maximum_daily_applications": "1"}),
+        (f"/app/profiles/{second_id}/sources/{source_id}", {"enabled": "false"}),
+        (f"/app/profiles/{second_id}/activate", {}),
+    ]
+    for path, fields in foreign_updates:
+        response = await user_auth_context.client.post(
+            path, data={"csrf_token": csrf_token, **fields}
+        )
+        assert response.status_code == 404, path
+
+    own_selection = await user_auth_context.client.post(
+        f"/app/profiles/{first_id}/sources/{source_id}",
+        data={"csrf_token": csrf_token, "enabled": "false"},
+    )
+    assert own_selection.status_code == 303
+    async with user_auth_context.session_factory() as session:
+        selected = await session.get(ProfileSourcePreference, (first_id, source_id))
+        untouched = await session.get(ProfileSourcePreference, (second_id, source_id))
+        other_profile = await session.get(UserProfile, second_id)
+        assert selected is not None and selected.enabled is False
+        assert untouched is None
+        assert other_profile is not None and other_profile.name == "Second"
+
+
+@pytest.mark.asyncio
+async def test_admin_source_selection_is_profile_scoped_and_keeps_crawler_enabled(
+    user_auth_context: UserAuthContext,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        first_profile = UserProfile(
+            name="Admin profile", owner_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID
+        )
+        second_profile = UserProfile(
+            name="Other profile", owner_account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID
+        )
+        source = JobSource(
+            name="Shared source",
+            base_url="https://jobs.example.test",
+            adapter_type="fixture_source",
+        )
+        session.add_all([first_profile, second_profile, source])
+        await session.flush()
+        session.add(
+            ScanRun(
+                source_id=source.id,
+                scan_type=ScanType.INCREMENTAL,
+                status=RunStatus.SUCCEEDED,
+                started_at=datetime.now(UTC),
+                new_jobs=7,
+            )
+        )
+        await session.commit()
+        first_id, second_id, source_id = first_profile.id, second_profile.id, source.id
+
+    signed = SessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        user_auth_context.settings.admin_username
+    )
+    user_auth_context.client.cookies.set(user_auth_context.settings.session_cookie_name, signed)
+    settings_page = await user_auth_context.client.get(
+        "/admin", params={"view": "settings", "profile_id": first_id}
+    )
+    assert settings_page.status_code == 200
+    assert "Источники для Admin profile" in settings_page.text
+    csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', settings_page.text)
+    assert csrf_match is not None
+    response = await user_auth_context.client.post(
+        f"/admin/profile-sources/{source_id}/selection",
+        data={"profile_id": str(first_id), "enabled": "false", "csrf_token": csrf_match.group(1)},
+    )
+    assert response.status_code == 303
+    async with user_auth_context.session_factory() as session:
+        first_choice = await session.get(ProfileSourcePreference, (first_id, source_id))
+        second_choice = await session.get(ProfileSourcePreference, (second_id, source_id))
+        shared_source = await session.get(JobSource, source_id)
+        assert first_choice is not None and first_choice.enabled is False
+        assert second_choice is None
+        assert shared_source is not None and shared_source.enabled is True
+    first_overview = await user_auth_context.client.get(
+        "/admin", params={"view": "overview", "profile_id": first_id}
+    )
+    second_overview = await user_auth_context.client.get(
+        "/admin", params={"view": "overview", "profile_id": second_id}
+    )
+    assert first_overview.status_code == second_overview.status_code == 200
+    assert 'Новых вакансий сегодня</div><div class="metric-value">0</div>' in first_overview.text
+    assert 'Новых вакансий сегодня</div><div class="metric-value">7</div>' in second_overview.text
+
+
+@pytest.mark.asyncio
+async def test_user_can_upload_review_and_delete_own_resume(
+    user_auth_context: UserAuthContext,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(account)
+        await session.flush()
+        profile = UserProfile(name="Candidate", owner_account_id=account.id)
+        session.add(profile)
+        await session.commit()
+        profile_id = profile.id
+    token = AccountSessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        account.id, account.session_version
+    )
+    user_auth_context.client.cookies.set(user_auth_context.settings.user_session_cookie_name, token)
+    settings_page = await user_auth_context.client.get("/app", params={"view": "settings"})
+    assert settings_page.status_code == 200
+    csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', settings_page.text)
+    assert csrf_match is not None
+    csrf_token = csrf_match.group(1)
+
+    pdf = b"%PDF-1.7\nuser resume\n%%EOF"
+    uploaded = await user_auth_context.client.post(
+        f"/app/profiles/{profile_id}/resumes",
+        data={
+            "name": "CV",
+            "category": "office",
+            "make_default": "true",
+            "csrf_token": csrf_token,
+        },
+        files={"file": ("cv.pdf", pdf, "application/pdf")},
+    )
+    assert uploaded.status_code == 303
+    async with user_auth_context.session_factory() as session:
+        resume = await session.scalar(select(Resume).where(Resume.profile_id == profile_id))
+        assert resume is not None
+        assert resume.is_default is True
+        resume_id = resume.id
+    viewed = await user_auth_context.client.get(f"/app/resumes/{resume_id}/file")
+    assert viewed.status_code == 200
+    assert viewed.content == pdf
+    verified = await user_auth_context.client.post(
+        f"/app/resumes/{resume_id}/verify", data={"csrf_token": csrf_token}
+    )
+    assert verified.status_code == 303
+    settings_page = await user_auth_context.client.get(
+        "/app", params={"view": "settings", "profile_id": profile_id}
+    )
+    assert settings_page.status_code == 200
+    assert f"/app/resumes/{resume_id}/delete" in settings_page.text
+    deleted = await user_auth_context.client.post(
+        f"/app/resumes/{resume_id}/delete", data={"csrf_token": csrf_token}
+    )
+    assert deleted.status_code == 303
+    async with user_auth_context.session_factory() as session:
+        assert await session.get(Resume, resume_id) is None
+
+
+@pytest.mark.asyncio
+async def test_user_history_and_decisions_paginate_all_owned_applications(
+    user_auth_context: UserAuthContext,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(account)
+        await session.flush()
+        profile = UserProfile(name="Candidate", owner_account_id=account.id)
+        source = JobSource(
+            name="Jobs", base_url="https://jobs.example.test", adapter_type="fixture_source"
+        )
+        session.add_all([profile, source])
+        await session.flush()
+        resume = Resume(
+            profile_id=profile.id,
+            name="CV",
+            category="office",
+            storage_key="fixture/cv.pdf",
+            original_filename="cv.pdf",
+            mime_type="application/pdf",
+            sha256="a" * 64,
+        )
+        session.add(resume)
+        await session.flush()
+        canonical_jobs = [
+            CanonicalJob(
+                normalized_company="company",
+                normalized_title=f"role {index}",
+                canonical_fingerprint=uuid4().hex,
+            )
+            for index in range(26)
+        ]
+        session.add_all(canonical_jobs)
+        await session.flush()
+        jobs = [
+            SourceJob(
+                source_id=source.id,
+                canonical_job_id=canonical.id,
+                external_job_id=str(index),
+                canonical_url=f"https://jobs.example.test/{index}",
+                title=f"Role {index}",
+                content_hash="a" * 64,
+                matching_content_hash="b" * 64,
+                source_fingerprint="c" * 64,
+            )
+            for index, canonical in enumerate(canonical_jobs)
+        ]
+        session.add_all(jobs)
+        await session.flush()
+        contacts = [
+            EmployerContact(
+                canonical_job_id=canonical.id,
+                source_job_id=job.id,
+                value=f"hr{index}@example.test",
+                contact_type=ContactType.EMAIL,
+                discovery_source="fixture",
+                evidence_url=job.canonical_url,
+            )
+            for index, (canonical, job) in enumerate(zip(canonical_jobs, jobs, strict=True))
+        ]
+        session.add_all(contacts)
+        await session.flush()
+        session.add_all(
+            [
+                Application(
+                    profile_id=profile.id,
+                    canonical_job_id=canonical.id,
+                    source_job_id=job.id,
+                    resume_id=resume.id,
+                    recipient_contact_id=contact.id,
+                    subject=f"Application {index}",
+                    body="Letter",
+                    language="en",
+                    status=ApplicationStatus.PENDING_REVIEW,
+                    idempotency_key=uuid4().hex,
+                )
+                for index, (canonical, job, contact) in enumerate(
+                    zip(canonical_jobs, jobs, contacts, strict=True)
+                )
+            ]
+        )
+        await session.commit()
+        profile_id = profile.id
+
+    token = AccountSessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        account.id, account.session_version
+    )
+    user_auth_context.client.cookies.set(user_auth_context.settings.user_session_cookie_name, token)
+    for view, row_class in (("history", "history-row"), ("decisions", "compact-row")):
+        first = await user_auth_context.client.get(
+            "/app", params={"view": view, "profile_id": profile_id}
+        )
+        assert first.status_code == 200
+        assert "Страница 1 из 2" in first.text
+        assert first.text.count(f'class="{row_class}"') == 25
+        second = await user_auth_context.client.get(
+            "/app", params={"view": view, "profile_id": profile_id, "page": 2}
+        )
+        assert second.status_code == 200
+        assert "Страница 2 из 2" in second.text
+        assert second.text.count(f'class="{row_class}"') == 1
+
+
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_invite_registration_browser_roundtrip_three_clean_contexts(
@@ -384,7 +696,7 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
 
     settings = user_auth_context.settings.model_copy(update={"public_base_url": base_url})
     monkeypatch.setattr(api_routes, "get_settings", lambda: settings)
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_access, "get_settings", lambda: settings)
 
     server = uvicorn.Server(
         uvicorn.Config(user_auth_context.app, host="127.0.0.1", port=port, log_level="error")
@@ -402,6 +714,16 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
                 await asyncio.sleep(0.05)
             else:
                 pytest.fail("local user-auth browser server did not start")
+
+        async with user_auth_context.session_factory() as session:
+            session.add(
+                JobSource(
+                    name="Browser fixture jobs",
+                    base_url="https://jobs.example.test",
+                    adapter_type="fixture_source",
+                )
+            )
+            await session.commit()
 
         async with async_playwright() as runtime:
             browser = await runtime.chromium.launch(headless=True)
@@ -449,6 +771,31 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
                     assert callback.status == 200
                     assert page.url == f"{base_url}/app"
                     assert "Мой JobHunter" in await page.content()
+                    notifications = page.locator("[data-notifications]")
+                    await notifications.locator("summary").click()
+                    assert await notifications.evaluate("element => element.open") is True
+                    await page.goto(f"{base_url}/app?view=settings")
+                    await page.locator("form[action='/app/profiles'] input[name='name']").fill(
+                        f"Browser candidate {index}"
+                    )
+                    await page.locator("form[action='/app/profiles'] button").click()
+                    assert "notice=profile_created" in page.url
+                    source_form = page.locator("form[action*='/sources/']")
+                    assert await source_form.count() == 1
+                    await source_form.locator("button").click()
+                    assert (
+                        "Исключён"
+                        in await page.locator("form[action*='/sources/']")
+                        .locator("xpath=..")
+                        .inner_text()
+                    )
+                    await page.locator("form[action*='/sources/'] button").click()
+                    assert (
+                        "В моём поиске"  # noqa: RUF001
+                        in await page.locator("form[action*='/sources/']")
+                        .locator("xpath=..")
+                        .inner_text()
+                    )
                     await context.close()
             finally:
                 await browser.close()
@@ -622,10 +969,10 @@ async def test_user_gmail_oauth_is_bound_to_logged_in_account(
         assert credential is not None
         assert credential.provider == "gmail"
 
-    home = await user_auth_context.client.get("/app")
-    assert home.status_code == 200
-    assert "Подключён и готов к работе" in home.text
-    csrf = re.search(r'name="csrf_token" value="([^"]+)"', home.text)
+    user_settings = await user_auth_context.client.get("/app?view=settings")
+    assert user_settings.status_code == 200
+    assert "gmail.owner@example.com" in user_settings.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', user_settings.text)
     assert csrf is not None
 
     disconnected = await user_auth_context.client.post(

@@ -66,6 +66,7 @@ from app.models.enums import (
     PolicyDecision,
 )
 from app.profiles.service import ProfileService, choose_resume_for_job
+from app.profiles.sources import source_selected
 from app.settings import Settings, get_settings
 from app.telemetry import record_external_call_attempts
 from app.time_utils import local_day_bounds
@@ -701,6 +702,8 @@ class MatchingService:
         profile = await profile_service.get_profile(session, profile_id)
         if profile is None:
             raise ValueError("a user profile is required before job analysis")
+        if not await source_selected(session, profile.id, job.source_id):
+            raise ValueError("source is disabled for this profile")
         preference = await profile_service.get_preferences(session, profile.id)
         expected_matching_hash = job.matching_content_hash
         expected_content_hash = job.content_hash
@@ -777,6 +780,8 @@ class MatchingService:
             or current_job.canonical_job_id != expected_canonical_job_id
         ):
             raise ValueError("source job changed during analysis")
+        if not await source_selected(session, profile.id, current_job.source_id):
+            raise ValueError("source was disabled during analysis")
         evaluation = MatchEvaluation(
             profile_id=profile.id,
             canonical_job_id=expected_canonical_job_id,

@@ -46,7 +46,7 @@ from app.learning import (
     fixed_preference_dimensions,
 )
 from app.matching.freshness import count_profile_matching_backlog, evaluation_is_current
-from app.matching.providers import MATCHING_RULES_VERSION
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Alert,
     Application,
@@ -54,6 +54,7 @@ from app.models.entities import (
     CommunicationSession,
     JobSource,
     MatchEvaluation,
+    ProfileSourcePreference,
     Resume,
     ScanRun,
     SourceJob,
@@ -74,6 +75,7 @@ from app.models.enums import (
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeDeletion, ResumeInUseError
+from app.profiles.sources import set_source_selected
 from app.security.auth import CsrfProtector, SessionSigner, verify_password
 from app.security.files import (
     UnsafeResumeError,
@@ -248,6 +250,10 @@ _FEEDBACK_NOTICES = {
         "Оно сохранено в архиве диагностики.",
     ),
     "source_enabled": ("Источник включён", "Новые обходы снова разрешены."),
+    "source_selection_saved": (
+        "Источники профиля обновлены",
+        "Выбор действует только для этого профиля; общие обходы не изменились.",
+    ),
     "source_disabled": (
         "Источник выключен",
         "Новые обходы остановлены, собранные вакансии сохранены.",
@@ -604,6 +610,20 @@ async def dashboard(
     selected_profile_id = profile.id
     preferences = await profile_service.get_preferences(session, selected_profile_id)
     sources = list((await session.scalars(select(JobSource).order_by(JobSource.name))).all())
+    disabled_source_ids = {
+        row.source_id
+        for row in (
+            await session.scalars(
+                select(ProfileSourcePreference).where(
+                    ProfileSourcePreference.profile_id == selected_profile_id,
+                    ProfileSourcePreference.enabled.is_(False),
+                )
+            )
+        ).all()
+    }
+    selected_source_ids = {
+        item.id for item in sources if item.enabled and item.id not in disabled_source_ids
+    }
 
     now_local = datetime.now(_LOCAL_TZ)
     start_local = datetime.combine(now_local.date(), time.min, _LOCAL_TZ)
@@ -612,7 +632,11 @@ async def dashboard(
     today_scans = list(
         (
             await session.scalars(
-                select(ScanRun).where(ScanRun.started_at >= start, ScanRun.started_at < end)
+                select(ScanRun).where(
+                    ScanRun.source_id.in_(selected_source_ids),
+                    ScanRun.started_at >= start,
+                    ScanRun.started_at < end,
+                )
             )
         ).all()
     )
@@ -661,9 +685,15 @@ async def dashboard(
             )
             or 0
         ),
-        "enabled_sources": sum(1 for item in sources if item.enabled),
+        "enabled_sources": sum(
+            1 for item in sources if item.enabled and item.id not in disabled_source_ids
+        ),
         "healthy_sources": sum(
-            1 for item in sources if item.enabled and item.health_status == SourceHealth.HEALTHY
+            1
+            for item in sources
+            if item.enabled
+            and item.id not in disabled_source_ids
+            and item.health_status == SourceHealth.HEALTHY
         ),
         "unacknowledged_alerts": int(
             await session.scalar(select(func.count(Alert.id)).where(Alert.acknowledged.is_(False)))
@@ -678,6 +708,16 @@ async def dashboard(
             )
         )
         or 0
+    )
+    notification_alerts = list(
+        (
+            await session.scalars(
+                select(Alert)
+                .where(Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff)
+                .order_by(desc(Alert.created_at))
+                .limit(5)
+            )
+        ).all()
     )
     counts["phone_review"] = int(
         await session.scalar(
@@ -710,8 +750,6 @@ async def dashboard(
     overview = {
         "today_found": sum(item.found_jobs for item in today_scans),
         "today_new": sum(item.new_jobs for item in today_scans),
-        "today_updated": sum(item.updated_jobs for item in today_scans),
-        "today_scan_errors": sum(item.parsing_errors + item.network_errors for item in today_scans),
         "today_matches": sum(decisions.values()),
         "auto_apply": decisions.get(MatchDecision.AUTO_APPLY, 0),
         "review": decisions.get(MatchDecision.PREPARE_FOR_REVIEW, 0),
@@ -720,9 +758,10 @@ async def dashboard(
         "sent_today": sent_today,
         "daily_limit": preferences.maximum_daily_applications,
         "matching_backlog": matching_backlog,
-        "rules_version": MATCHING_RULES_VERSION,
     }
-    gmail_oauth = await GmailOAuthService(get_settings()).get_status(session)
+    gmail_oauth = await GmailOAuthService(get_settings()).get_status(
+        session, account_id=profile.owner_account_id
+    )
     attention_items: list[dict[str, str]] = []
     if not gmail_oauth["configured"]:
         attention_items.append(
@@ -739,9 +778,17 @@ async def dashboard(
             {
                 "tone": "danger",
                 "title": "Google-аккаунт не подключён",
-                "detail": "Письма не смогут отправляться до повторного входа через Google.",
-                "href": "/admin/auth/google",
-                "action": "Подключить",
+                "detail": "Для этого профиля нужен Gmail его владельца.",
+                "href": (
+                    "/admin/auth/google"
+                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
+                    else "/admin/accounts"
+                ),
+                "action": (
+                    "Подключить"
+                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
+                    else "Открыть пользователей"
+                ),
             }
         )
     elif gmail_oauth["reauth_required"]:
@@ -750,8 +797,16 @@ async def dashboard(
                 "tone": "danger",
                 "title": "Gmail требует переподключения",
                 "detail": "Автоотправка остановлена до получения нового OAuth-доступа.",
-                "href": "/admin/auth/google?consent=1",
-                "action": "Переподключить Gmail",
+                "href": (
+                    "/admin/auth/google?consent=1"
+                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
+                    else "/admin/accounts"
+                ),
+                "action": (
+                    "Переподключить Gmail"
+                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
+                    else "Открыть пользователей"
+                ),
             }
         )
     elif not gmail_oauth["identity_verified"]:
@@ -779,7 +834,9 @@ async def dashboard(
         unhealthy_names = ", ".join(
             item.name
             for item in sources
-            if item.enabled and item.health_status != SourceHealth.HEALTHY
+            if item.enabled
+            and item.id not in disabled_source_ids
+            and item.health_status != SourceHealth.HEALTHY
         )
         attention_items.append(
             {
@@ -1265,6 +1322,7 @@ async def dashboard(
         context={
             "csrf_token": _csrf().issue(token),
             "profile": profile,
+            "profile_is_admin_owned": profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
             "profiles": profiles,
             "selected_profile_id": selected_profile_id,
             "view": view,
@@ -1275,6 +1333,7 @@ async def dashboard(
             "pagination": pagination,
             "preferences": preferences,
             "sources": sources,
+            "disabled_source_ids": disabled_source_ids,
             "source_names": source_names,
             "resumes": resumes,
             "resume_usage": resume_usage,
@@ -1289,6 +1348,7 @@ async def dashboard(
             "learning_scores": learning_scores,
             "scans": scans,
             "active_alerts": active_alerts,
+            "notification_alerts": notification_alerts,
             "historical_alerts": historical_alerts,
             "audits": audits,
             "phone_health": phone_health,
@@ -1876,6 +1936,37 @@ async def admin_resume_file(
             "Content-Disposition": f"inline; filename*=UTF-8''{filename}",
             "Cache-Control": "no-store",
         },
+    )
+
+
+@router.post("/admin/profile-sources/{source_id}/selection")
+async def admin_select_profile_source(
+    source_id: UUID,
+    request: Request,
+    profile_id: UUID = Form(...),
+    enabled: bool = Form(...),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    try:
+        await set_source_selected(
+            session, profile_id=profile_id, source_id=source_id, enabled=enabled
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="profile or source not found") from exc
+    await _audit_admin(
+        session,
+        "profile_source.selected" if enabled else "profile_source.deselected",
+        "user_profile",
+        str(profile_id),
+        details={"source_id": str(source_id)},
+    )
+    await session.commit()
+    return RedirectResponse(
+        f"/admin?view=settings&profile_id={profile_id}&notice=source_selection_saved",
+        status_code=303,
     )
 
 

@@ -79,6 +79,7 @@ logger = structlog.get_logger(__name__)
 
 _AUTO_SEND_HARD_FAILURES = {
     "source_actions_enabled",
+    "source_selected_for_profile",
     "match_not_blocked",
     "match_not_skipped",
     "deterministic_hard_requirements_met",

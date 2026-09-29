@@ -269,6 +269,20 @@ class JobSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     automatic_actions_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+class ProfileSourcePreference(TimestampMixin, Base):
+    """A profile's choice of sources, separate from global crawler control."""
+
+    __tablename__ = "profile_source_preferences"
+
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), primary_key=True
+    )
+    source_id: Mapped[UUID] = mapped_column(
+        ForeignKey("job_sources.id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class CanonicalEmployer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "canonical_employers"
 

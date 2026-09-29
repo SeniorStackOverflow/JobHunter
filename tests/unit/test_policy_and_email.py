@@ -55,6 +55,7 @@ from app.models.enums import (
 )
 from app.policies import PolicyEngine
 from app.policies.schemas import PolicyResult
+from app.profiles.sources import set_source_selected
 from app.security.crypto import SecretBox
 from app.settings import Settings
 
@@ -271,6 +272,31 @@ async def test_policy_auto_approves_only_when_every_rule_passes(
         )
         assert result.decision == PolicyDecision.AUTO_APPROVED
         assert result.rules_failed == []
+
+
+async def test_policy_blocks_delivery_when_profile_deselects_source(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        (
+            source,
+            profile,
+            preference,
+            resume,
+            _,
+            job,
+            evaluation,
+            contact,
+            application,
+        ) = await make_graph(session, tmp_path)
+        await set_source_selected(
+            session, profile_id=profile.id, source_id=source.id, enabled=False
+        )
+        result = await PolicyEngine(settings(tmp_path)).evaluate(
+            session, application, preference, evaluation, job, resume, contact, profile
+        )
+        assert result.decision == PolicyDecision.BLOCKED
+        assert "source_selected_for_profile" in result.rules_failed
 
 
 async def test_policy_never_treats_an_implicit_fact_as_confirmed(

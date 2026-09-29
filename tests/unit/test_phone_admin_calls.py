@@ -15,6 +15,7 @@ from selectolax.parser import HTMLParser
 
 from app.admin import routes as admin_routes
 from app.admin.phone_routes import build_calls_context
+from app.auth import access as auth_access
 from app.auth import routes as auth_routes
 from app.database.session import get_session
 from app.models.entities import (
@@ -186,7 +187,7 @@ async def admin_client(
 ) -> AsyncIterator[httpx.AsyncClient]:
     settings = _settings(tmp_path)
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth_access, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_routes, "_phone_redis", lambda: FakeAsyncRedis())
 
     application = FastAPI()

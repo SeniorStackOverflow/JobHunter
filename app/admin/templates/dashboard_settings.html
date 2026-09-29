@@ -4,9 +4,9 @@
     <div class="panel panel-pad google-settings">
       <div class="settings-summary">
         <div class="identity-line"><div class="identity-avatar">G</div><div class="identity-copy"><strong>Gmail для откликов</strong><span>{% if gmail_oauth.reauth_required %}Требуется переподключение · автоотправка Gmail остановлена{% elif gmail_oauth.delivery_ready %}Готов к отправке · {{ gmail_oauth.identity_email or 'Google-аккаунт подключён' }}{% else %}Gmail не подключён{% endif %}</span>{% if gmail_oauth.last_refresh_ok %}<span>Последняя успешная проверка OAuth: {{ format_dt(gmail_oauth.last_refresh_ok) }}</span>{% endif %}{% if gmail_oauth.last_refresh_error %}<span>Последняя ошибка: {{ gmail_oauth.last_refresh_error }}</span>{% endif %}</div></div>
-        <div class="section-actions"><a class="btn {{ 'btn-primary' if gmail_oauth.reauth_required or not gmail_oauth.connected else '' }}" href="/admin/auth/google?consent=1">{{ 'Переподключить Gmail' if gmail_oauth.connected else 'Подключить Gmail' }}</a>{% if gmail_oauth.connected %}<form method="post" action="/admin/oauth/gmail/disconnect" data-confirm-title="Отключить Gmail?" data-confirm="Вход по текущей сессии сохранится, но отправка Gmail остановится до повторного подключения аккаунта." data-confirm-action="Отключить" data-confirm-tone="danger"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отключить</button></form>{% endif %}</div>
+        <div class="section-actions">{% if profile_is_admin_owned %}<a class="btn {{ 'btn-primary' if gmail_oauth.reauth_required or not gmail_oauth.connected else '' }}" href="/admin/auth/google?consent=1">{{ 'Переподключить Gmail' if gmail_oauth.connected else 'Подключить Gmail' }}</a>{% if gmail_oauth.connected %}<form method="post" action="/admin/oauth/gmail/disconnect" data-confirm-title="Отключить Gmail?" data-confirm="Вход по текущей сессии сохранится, но отправка Gmail остановится до повторного подключения аккаунта." data-confirm-action="Отключить" data-confirm-tone="danger"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отключить</button></form>{% endif %}{% else %}<a class="btn" href="/admin/accounts">Управление пользователем</a>{% endif %}</div>
       </div>
-      <p class="panel-subtitle">Обычный вход через Google автоматически запросит новый Gmail-доступ только когда JobHunter обнаружит истёкший или отозванный refresh token. При OAuth-приложении в режиме Testing Google может снова потребовать переподключение примерно через 7 дней.</p>
+      <p class="panel-subtitle">{% if profile_is_admin_owned %}Обычный вход через Google автоматически запросит новый Gmail-доступ только когда JobHunter обнаружит истёкший или отозванный refresh token. При OAuth-приложении в режиме Testing Google может снова потребовать переподключение примерно через 7 дней.{% else %}Gmail подключает владелец профиля в своей панели. Администратор видит состояние, но не может подключить собственный ящик вместо пользователя.{% endif %}</p>
     </div>
 
     <div class="panel">
@@ -129,23 +129,32 @@
       </div>
     </div>
 
-    <details class="settings-section"><summary><span><strong>Источники вакансий</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} включённых работают штатно</small></span><span>Открыть</span></summary><div class="details-body settings-body">
+    <details class="settings-section"><summary><span><strong>Источники для {{ profile.name }}</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} выбранных источников работают штатно. Выбор не влияет на других пользователей.</small></span><span>Открыть</span></summary><div class="details-body settings-body">
       <div class="compact-list">
-        {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}
+        {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}{% set chosen = item.id not in disabled_source_ids %}
         <div class="compact-row">
           <div>
             <strong>{% if source_link %}<a href="{{ source_link }}" rel="noreferrer" target="_blank">{{ item.name }} ↗</a>{% else %}{{ item.name }}{% endif %}</strong>
-            <span>{{ item.adapter_type }}</span>
+            <span>{{ 'Доступен для поиска' if item.enabled else 'Администратор временно остановил обход' }}</span>
           </div>
           <div class="row-actions">
             <span class="badge {{ status_tone(item.health_status) }}">{{ status_label(item.health_status) }}</span>
-            <span class="badge {{ 'success' if item.enabled else 'muted' }}">{{ 'Включён' if item.enabled else 'Выключен' }}</span>
-            <form method="post" action="/admin/sources/{{ item.id }}/toggle" data-confirm-title="{{ 'Выключить источник?' if item.enabled else 'Включить источник?' }}" data-confirm="{{ item.name }}: {{ 'новые обходы остановятся, уже собранные вакансии сохранятся.' if item.enabled else 'JobHunter начнёт обход по настроенному расписанию.' }}" data-confirm-action="{{ 'Выключить' if item.enabled else 'Включить' }}" data-confirm-tone="{{ 'danger' if item.enabled else 'default' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm {{ 'btn-danger' if item.enabled else '' }}">{{ 'Выключить' if item.enabled else 'Включить' }}</button></form>
-            {% if item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Обновить сейчас</button></form>{% endif %}
+            <span class="badge {{ 'success' if chosen else 'muted' }}">{{ 'В моём поиске' if chosen else 'Исключён' }}</span>
+            <form method="post" action="/admin/profile-sources/{{ item.id }}/selection">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="enabled" value="{{ 'false' if chosen else 'true' }}">
+              <button class="btn btn-sm">{{ 'Исключить' if chosen else 'Включить для профиля' }}</button>
+            </form>
           </div>
         </div>
         {% else %}<div class="empty-state compact">Источники ещё не настроены.</div>{% endfor %}
       </div>
+    </div></details>
+    <details class="settings-section"><summary><span><strong>Управление общим обходом</strong><small>Только для администратора · влияет на всех пользователей</small></span><span>Открыть</span></summary><div class="details-body settings-body">
+        <p class="panel-subtitle">Эти действия влияют на всех пользователей и используются при обслуживании источника.</p>
+        <div class="compact-list">{% for item in sources %}<div class="compact-row"><div><strong>{{ item.name }}</strong><span>{{ 'Обход включён' if item.enabled else 'Обход остановлен' }}</span></div><div class="row-actions">
+          <form method="post" action="/admin/sources/{{ item.id }}/toggle" data-confirm-title="{{ 'Остановить общий обход?' if item.enabled else 'Запустить общий обход?' }}" data-confirm="Изменение затронет всех пользователей."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm {{ 'btn-danger' if item.enabled else '' }}">{{ 'Остановить' if item.enabled else 'Запустить' }}</button></form>
+          {% if item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Обновить сейчас</button></form>{% endif %}
+        </div></div>{% endfor %}</div>
     </div></details>
   </div>
 </section>

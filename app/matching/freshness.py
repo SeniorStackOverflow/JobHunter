@@ -21,6 +21,7 @@ from app.models.entities import (
     UserProfile,
 )
 from app.models.enums import JobStatus
+from app.profiles.sources import source_selected_clause
 from app.settings import Settings
 
 SAFETY_ONLY_PREVIOUS_RULES = frozenset({"matching-v5"})
@@ -169,6 +170,7 @@ def build_matching_preselection_query(
         .where(
             SourceJob.status == JobStatus.ACTIVE,
             SourceJob.canonical_job_id.is_not(None),
+            source_selected_clause(profile.id, SourceJob.source_id),
             stale,
         )
         .order_by(
