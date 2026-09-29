@@ -639,3 +639,59 @@ async def test_user_gmail_oauth_is_bound_to_logged_in_account(
             select(OAuthCredential).where(OAuthCredential.account_id == account_id)
         )
         assert credential is None
+
+
+@pytest.mark.asyncio
+async def test_admin_invites_are_embedded_in_users_page(
+    user_auth_context: UserAuthContext,
+) -> None:
+    admin_session = SessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        user_auth_context.settings.admin_username
+    )
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.session_cookie_name,
+        admin_session,
+    )
+
+    page = await user_auth_context.client.get("/admin/accounts")
+    assert page.status_code == 200
+    assert "Пользователи" in page.text
+    assert "Приглашения" in page.text
+    assert 'action="/admin/invites"' in page.text
+    assert 'href="/admin/invites"' not in page.text
+
+    legacy_get = await user_auth_context.client.get("/admin/invites")
+    assert legacy_get.status_code == 303
+    assert legacy_get.headers["location"] == "/admin/accounts"
+
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text)
+    assert csrf is not None
+    created = await user_auth_context.client.post(
+        "/admin/invites",
+        data={
+            "target_email": "embedded.invite@example.com",
+            "ttl_days": "14",
+            "csrf_token": csrf.group(1),
+        },
+    )
+    assert created.status_code == 200
+    assert "Пользователи" in created.text
+    assert "Ссылка создана. Она показывается только сейчас." in created.text
+    assert "/join?token=jhi_" in created.text
+    assert "embedded.invite@example.com" in created.text
+
+    async with user_auth_context.session_factory() as session:
+        invite = await session.scalar(
+            select(Invite).where(Invite.target_email == "embedded.invite@example.com")
+        )
+        assert invite is not None
+        invite_id = invite.id
+
+    csrf_after = re.search(r'name="csrf_token" value="([^"]+)"', created.text)
+    assert csrf_after is not None
+    revoked = await user_auth_context.client.post(
+        f"/admin/invites/{invite_id}/revoke",
+        data={"csrf_token": csrf_after.group(1)},
+    )
+    assert revoked.status_code == 303
+    assert revoked.headers["location"] == "/admin/accounts"

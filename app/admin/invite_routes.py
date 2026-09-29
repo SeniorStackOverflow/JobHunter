@@ -27,13 +27,40 @@ from app.models.enums import AccountStatus, ProfileStatus
 router = APIRouter()
 
 
-@router.get("/admin/invites", response_class=HTMLResponse)
-async def admin_invites(
+async def _accounts_context(
     request: Request,
-    _: str = Depends(require_admin_page),
-    session: AsyncSession = Depends(get_session),
-) -> Response:
-    values = list(
+    session: AsyncSession,
+    *,
+    created_link: str | None = None,
+) -> dict[str, object]:
+    accounts = list(
+        (
+            await session.scalars(
+                select(Account)
+                .where(Account.id != BOOTSTRAP_ADMIN_ACCOUNT_ID)
+                .order_by(Account.created_at.desc(), Account.id.desc())
+            )
+        ).all()
+    )
+    account_ids = [account.id for account in accounts]
+    identities_by_account: dict[object, AccountIdentity] = {}
+    profiles_by_account: dict[object, list[UserProfile]] = {}
+    if account_ids:
+        for identity in (
+            await session.scalars(
+                select(AccountIdentity).where(AccountIdentity.account_id.in_(account_ids))
+            )
+        ).all():
+            identities_by_account[identity.account_id] = identity
+        for profile in (
+            await session.scalars(
+                select(UserProfile)
+                .where(UserProfile.owner_account_id.in_(account_ids))
+                .order_by(UserProfile.created_at, UserProfile.id)
+            )
+        ).all():
+            profiles_by_account.setdefault(profile.owner_account_id, []).append(profile)
+    invites = list(
         (
             await session.scalars(
                 select(Invite)
@@ -42,18 +69,22 @@ async def admin_invites(
             )
         ).all()
     )
-    response = templates.TemplateResponse(
-        request=request,
-        name="invites.html",
-        context={
-            "invites": values,
-            "invite_state": invite_state,
-            "csrf_token": _csrf().issue(_session_token(request)),
-            "created_link": None,
-        },
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return response
+    return {
+        "accounts": accounts,
+        "identities_by_account": identities_by_account,
+        "profiles_by_account": profiles_by_account,
+        "invites": invites,
+        "invite_state": invite_state,
+        "created_link": created_link,
+        "csrf_token": _csrf().issue(_session_token(request)),
+    }
+
+
+@router.get("/admin/invites")
+async def admin_invites(
+    _: str = Depends(require_admin_page),
+) -> RedirectResponse:
+    return RedirectResponse("/admin/accounts", status_code=303)
 
 
 @router.post("/admin/invites", response_class=HTMLResponse)
@@ -87,25 +118,15 @@ async def create_admin_invite(
         },
     )
     await session.commit()
-    values = list(
-        (
-            await session.scalars(
-                select(Invite)
-                .where(Invite.created_by_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID)
-                .order_by(Invite.created_at.desc(), Invite.id.desc())
-            )
-        ).all()
-    )
     base = str(request.base_url).rstrip("/")
     response = templates.TemplateResponse(
         request=request,
-        name="invites.html",
-        context={
-            "invites": values,
-            "invite_state": invite_state,
-            "csrf_token": _csrf().issue(_session_token(request)),
-            "created_link": f"{base}/join?token={created.token}",
-        },
+        name="accounts.html",
+        context=await _accounts_context(
+            request,
+            session,
+            created_link=f"{base}/join?token={created.token}",
+        ),
     )
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -139,7 +160,7 @@ async def revoke_admin_invite(
         decision="revoked",
     )
     await session.commit()
-    return RedirectResponse("/admin/invites", status_code=303)
+    return RedirectResponse("/admin/accounts", status_code=303)
 
 
 @router.get("/admin/accounts", response_class=HTMLResponse)
@@ -148,42 +169,10 @@ async def admin_accounts(
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    accounts = list(
-        (
-            await session.scalars(
-                select(Account)
-                .where(Account.id != BOOTSTRAP_ADMIN_ACCOUNT_ID)
-                .order_by(Account.created_at.desc(), Account.id.desc())
-            )
-        ).all()
-    )
-    account_ids = [account.id for account in accounts]
-    identities_by_account: dict[object, AccountIdentity] = {}
-    profiles_by_account: dict[object, list[UserProfile]] = {}
-    if account_ids:
-        for identity in (
-            await session.scalars(
-                select(AccountIdentity).where(AccountIdentity.account_id.in_(account_ids))
-            )
-        ).all():
-            identities_by_account[identity.account_id] = identity
-        for profile in (
-            await session.scalars(
-                select(UserProfile)
-                .where(UserProfile.owner_account_id.in_(account_ids))
-                .order_by(UserProfile.created_at, UserProfile.id)
-            )
-        ).all():
-            profiles_by_account.setdefault(profile.owner_account_id, []).append(profile)
     response = templates.TemplateResponse(
         request=request,
         name="accounts.html",
-        context={
-            "accounts": accounts,
-            "identities_by_account": identities_by_account,
-            "profiles_by_account": profiles_by_account,
-            "csrf_token": _csrf().issue(_session_token(request)),
-        },
+        context=await _accounts_context(request, session),
     )
     response.headers["Cache-Control"] = "no-store"
     return response

@@ -4,12 +4,66 @@
 {% block body %}
 <header class="detail-topbar">
   <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Пользователи</span></div></div>
-  <div class="row-actions"><a class="btn" href="/admin/invites">Приглашения</a><a class="btn" href="/">← Панель</a></div>
+  <div class="row-actions"><a class="btn" href="/">← Панель</a></div>
 </header>
 <main class="detail-content">
   <div class="section-heading">
     <div><h1>Пользователи</h1><p>Регистрация даёт аккаунт, но автоматические действия остаются закрыты, пока профиль не активирован и его настройки не разрешают работу.</p></div>
   </div>
+
+  <section class="panel" style="margin-bottom:16px">
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">Приглашения</div>
+        <div class="panel-subtitle">Создание доступа и история приглашений находятся здесь же, рядом с пользователями.</div>
+      </div>
+    </div>
+    <div class="panel-pad">
+      {% if created_link %}
+      <div class="notice success" style="margin-bottom:16px">
+        <strong>Ссылка создана. Она показывается только сейчас.</strong>
+        <div class="mono" style="margin-top:8px;word-break:break-all">{{ created_link }}</div>
+      </div>
+      {% endif %}
+      <form method="post" action="/admin/invites" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="field">Email<input type="email" name="target_email" maxlength="320" placeholder="user@example.com"><span class="field-help">Оставьте пустым только если нужен open invite.</span></label>
+        <label class="field">Срок, дней<input type="number" name="ttl_days" min="1" max="30" value="14"></label>
+        <div class="full form-actions"><button class="btn btn-primary" type="submit">Создать приглашение</button></div>
+      </form>
+
+      <details class="settings-section" style="margin-top:16px">
+        <summary>
+          <span><strong>История приглашений</strong><small>{{ invites|length }} всего</small></span>
+          <span>Открыть</span>
+        </summary>
+        <div class="details-body settings-body">
+          <div class="compact-list">
+            {% for invite in invites %}
+            {% set state = invite_state(invite) %}
+            <div class="compact-row">
+              <div>
+                <strong>{{ invite.target_email or "Open invite" }}</strong>
+                <span>{{ state }} · до {{ invite.expires_at }}</span>
+              </div>
+              <div class="row-actions">
+                <span class="badge {{ 'success' if state == 'active' else 'muted' }}">{{ state }}</span>
+                {% if state == "active" %}
+                <form method="post" action="/admin/invites/{{ invite.id }}/revoke">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btn btn-sm btn-danger" type="submit">Отозвать</button>
+                </form>
+                {% endif %}
+              </div>
+            </div>
+            {% else %}
+            <div class="empty-state compact">Приглашений пока нет.</div>
+            {% endfor %}
+          </div>
+        </div>
+      </details>
+    </div>
+  </section>
 
   {% for account in accounts %}
   {% set identity = identities_by_account.get(account.id) %}
