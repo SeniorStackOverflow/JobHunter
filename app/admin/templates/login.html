@@ -5,13 +5,22 @@
 <main class="login-card">
   <div class="login-brand">
     <div class="brand-mark">JH</div>
-    <div><h1>JobHunter</h1><div class="login-subtitle">Вход в панель управления</div></div>
+    <div>
+      <h1>JobHunter</h1>
+      <div class="login-subtitle">
+        {% if login_mode == "user" %}Вход{% else %}Вход в панель управления{% endif %}
+      </div>
+    </div>
   </div>
 
-  {% if error %}<div class="notice danger login-error" role="alert">{{ error }}</div>{% endif %}
+  {% if error %}
+  <div class="notice danger login-error" role="alert">
+    {% if login_mode == "user" %}Не удалось войти. Попробуйте ещё раз.{% else %}{{ error }}{% endif %}
+  </div>
+  {% endif %}
 
   {% if google_login_available %}
-  <a class="btn google-button" href="/admin/auth/google">
+  <a class="btn google-button" href="{{ '/auth/google/login' if login_mode == 'user' else '/admin/auth/google' }}">
     <span class="google-mark" aria-hidden="true">G</span>
     Войти через Google
   </a>
@@ -19,11 +28,11 @@
   <div class="notice warning login-error">Вход через Google пока недоступен.</div>
   {% endif %}
 
-  {% if google_login_available and password_login_available %}
+  {% if login_mode == "admin" and google_login_available and password_login_available %}
   <div class="login-divider"><span>или</span></div>
   {% endif %}
 
-  {% if password_login_available %}
+  {% if login_mode == "admin" and password_login_available %}
   <form method="post" action="/login" class="login-password-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="field">Пароль администратора

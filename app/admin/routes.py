@@ -581,6 +581,7 @@ async def login_form(request: Request, oauth_error: str | None = None) -> Respon
                 google_oauth.configured and bool(settings.google_admin_emails)
             ),
             "password_login_available": settings.admin_password_hash is not None,
+            "login_mode": "admin",
         },
     )
     response.headers["Cache-Control"] = "no-store"

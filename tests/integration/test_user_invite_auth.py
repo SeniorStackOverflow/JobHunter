@@ -695,3 +695,19 @@ async def test_admin_invites_are_embedded_in_users_page(
     )
     assert revoked.status_code == 303
     assert revoked.headers["location"] == "/admin/accounts"
+
+
+@pytest.mark.asyncio
+async def test_user_login_reuses_admin_card_without_admin_password(
+    user_auth_context: UserAuthContext,
+) -> None:
+    user_page = await user_auth_context.client.get("/app/login")
+    assert user_page.status_code == 200
+    assert 'class="login-card"' in user_page.text
+    assert 'href="/auth/google/login"' in user_page.text
+    assert "Пароль администратора" not in user_page.text
+    assert 'class="login-divider"' not in user_page.text
+
+    admin_page = await user_auth_context.client.get("/login")
+    assert admin_page.status_code == 200
+    assert 'class="login-card"' in admin_page.text

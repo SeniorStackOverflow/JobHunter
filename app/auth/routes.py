@@ -20,6 +20,7 @@ from app.accounts import (
     InviteUnavailable,
     invite_state,
 )
+from app.admin.routes import templates as admin_templates
 from app.audit import record_audit_event
 from app.auth.google import (
     IDENTITY_OAUTH_BINDING_COOKIE,
@@ -245,10 +246,16 @@ async def user_login_page(
     _require_user_feature()
     if await _current_account(request, session) is not None:
         return RedirectResponse("/app", status_code=303)
-    response = templates.TemplateResponse(
+    response = admin_templates.TemplateResponse(
         request=request,
-        name="user_login.html",
-        context={"error": error},
+        name="login.html",
+        context={
+            "login_mode": "user",
+            "error": bool(error),
+            "google_login_available": GoogleIdentityService(_settings()).configured,
+            "password_login_available": False,
+            "csrf_token": "",
+        },
     )
     response.headers["Cache-Control"] = "no-store"
     return response
