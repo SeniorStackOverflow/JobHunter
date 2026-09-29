@@ -4,7 +4,7 @@
 {% block body %}
 <header class="detail-topbar">
   <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Проверка отклика</span></div></div>
-  <a class="btn" href="/?view=decisions">← К очереди</a>
+  <a class="btn" href="/admin?view=decisions">← К очереди</a>
 </header>
 <main class="detail-content">
   {% set vacancy_active = application.job and application.job.status == 'active' %}

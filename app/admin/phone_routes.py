@@ -770,7 +770,7 @@ async def review_call_fact(
         },
     )
     await session.commit()
-    return RedirectResponse(f"/?view=calls&tab=history&session={call.id}", status_code=303)
+    return RedirectResponse(f"/admin?view=calls&tab=history&session={call.id}", status_code=303)
 
 
 @router.post("/admin/phone/calls/{call_id}/sms/{sms_id}/link")
@@ -841,7 +841,7 @@ async def link_call_sms(
         details={"call_id": str(call.id), "sms_id": str(sms.id), "manual": True},
     )
     await session.commit()
-    return RedirectResponse(f"/?view=calls&tab=history&session={call.id}", status_code=303)
+    return RedirectResponse(f"/admin?view=calls&tab=history&session={call.id}", status_code=303)
 
 
 @router.post("/admin/phone/calls/{call_id}/sms/{sms_id}/unlink")
@@ -874,7 +874,7 @@ async def unlink_call_sms(
         details={"call_id": str(call.id), "sms_id": str(sms.id)},
     )
     await session.commit()
-    return RedirectResponse(f"/?view=calls&tab=history&session={call.id}", status_code=303)
+    return RedirectResponse(f"/admin?view=calls&tab=history&session={call.id}", status_code=303)
 
 
 async def build_calls_context(
@@ -985,7 +985,7 @@ async def phone_auto_answer_toggle(
         session, f"phone.auto_answer.{action}", "phone_channel", "auto_answer"
     )
     await session.commit()
-    return RedirectResponse("/?view=diagnostics", status_code=303)
+    return RedirectResponse("/admin?view=diagnostics", status_code=303)
 
 
 @router.get("/admin/phone/evidence/{session_id}/{transcript_id}.wav")
@@ -1053,4 +1053,4 @@ async def phone_call_action(
         session, f"phone.call.{action}", "communication_session", str(session_id)
     )
     await session.commit()
-    return RedirectResponse("/?view=diagnostics", status_code=303)
+    return RedirectResponse("/admin?view=diagnostics", status_code=303)

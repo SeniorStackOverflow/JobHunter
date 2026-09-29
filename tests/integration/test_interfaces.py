@@ -132,17 +132,17 @@ async def _login_admin(
 ) -> str:
     from app.security.auth import CsrfProtector
 
-    login_page = await client.get("/login")
+    login_page = await client.get("/admin/login")
     assert login_page.status_code == 200
     logged_in = await client.post(
-        "/login",
+        "/admin/login",
         data={
             "password": ADMIN_PASSWORD,
             "csrf_token": _csrf_token(login_page.text),
         },
     )
     assert logged_in.status_code == 303
-    dashboard = await client.get("/")
+    dashboard = await client.get("/admin")
     # If dashboard returns 404 (no default profile), generate CSRF token from session
     if dashboard.status_code == 404:
         # Extract session token from cookies
@@ -516,7 +516,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         base_url="https://testserver",
         follow_redirects=False,
     ) as client:
-        login_page = await client.get("/login")
+        login_page = await client.get("/admin/login")
         assert login_page.status_code == 200
         assert login_page.headers["cache-control"] == "no-store"
         assert 'name="viewport"' in login_page.text
@@ -526,13 +526,13 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert 'name="username"' not in login_page.text
         assert "Аварийный вход" not in login_page.text
         oauth_error_page = await client.get(
-            "/login", params={"oauth_error": "admin_identity_not_allowed"}
+            "/admin/login", params={"oauth_error": "admin_identity_not_allowed"}
         )
         assert "Этот Google-аккаунт не имеет доступа" in oauth_error_page.text
         login_csrf = _csrf_token(login_page.text)
 
         rejected = await client.post(
-            "/login",
+            "/admin/login",
             data={
                 "password": ADMIN_PASSWORD,
                 "csrf_token": "invalid",
@@ -541,7 +541,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert rejected.status_code == 401
 
         logged_in = await client.post(
-            "/login",
+            "/admin/login",
             data={
                 "password": ADMIN_PASSWORD,
                 "csrf_token": login_csrf,
@@ -552,11 +552,11 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert "httponly" in set_cookie
         assert "secure" in set_cookie
         assert "samesite=strict" in set_cookie
-        already_authenticated = await client.get("/login")
+        already_authenticated = await client.get("/admin/login")
         assert already_authenticated.status_code == 303
-        assert already_authenticated.headers["location"] == "/"
+        assert already_authenticated.headers["location"] == "/admin"
 
-        dashboard = await client.get("/")
+        dashboard = await client.get("/admin")
         assert dashboard.status_code == 200
         assert dashboard.headers["cache-control"] == "no-store"
         assert 'name="viewport"' in dashboard.text
@@ -575,7 +575,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
             "settings": "Критерии и лимиты",
             "diagnostics": "Текущие проблемы",
         }.items():
-            page = await client.get("/", params={"view": view})
+            page = await client.get("/admin", params={"view": view})
             assert page.status_code == 200
             assert heading in page.text
             assert page.text.count('class="admin-section"') == 1
@@ -583,7 +583,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
                 assert len(HTMLParser(page.text).css(".archive-item")) == 1
                 assert "Отметить просмотренным" in page.text
                 assert "white-space:normal!important" in page.text
-        feedback_page = await client.get("/", params={"notice": "preferences_saved"})
+        feedback_page = await client.get("/admin", params={"notice": "preferences_saved"})
         assert "Настройки сохранены" in feedback_page.text
         assert "data-notice-dismiss" in feedback_page.text
         dashboard_csrf = _csrf_token(dashboard.text)
@@ -608,7 +608,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         base_url="https://testserver",
         cookies={settings.session_cookie_name: forged_subject},
     ) as forged_client:
-        assert (await forged_client.get("/")).status_code == 303
+        assert (await forged_client.get("/admin")).status_code == 303
 
 
 async def test_admin_phone_auto_answer_stop_requires_csrf_and_sets_key(
@@ -632,16 +632,16 @@ async def test_admin_phone_auto_answer_stop_requires_csrf_and_sets_key(
         base_url="https://testserver",
         follow_redirects=False,
     ) as client:
-        login_csrf = _csrf_token((await client.get("/login")).text)
+        login_csrf = _csrf_token((await client.get("/admin/login")).text)
         logged_in = await client.post(
-            "/login",
+            "/admin/login",
             data={
                 "password": ADMIN_PASSWORD,
                 "csrf_token": login_csrf,
             },
         )
         assert logged_in.status_code == 303
-        dashboard = await client.get("/")
+        dashboard = await client.get("/admin")
         assert dashboard.status_code == 200
         dashboard_csrf = _csrf_token(dashboard.text)
 
@@ -764,7 +764,7 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
         follow_redirects=False,
     ) as client:
         csrf_token = await _login_admin(client, settings)
-        settings_page = await client.get("/?view=settings")
+        settings_page = await client.get("/admin?view=settings")
         assert settings_page.status_code == 200
         assert 'name="minimum_daily_applications" value="3"' in settings_page.text
         assert "data-daily-minimum" in settings_page.text
@@ -1088,7 +1088,7 @@ async def test_admin_decision_queue_hides_markerless_stale_approval(
         follow_redirects=False,
     ) as client:
         await _login_admin(client, settings)
-        queue = await client.get(f"/?view=decisions&profile_id={profile_id}")
+        queue = await client.get(f"/admin?view=decisions&profile_id={profile_id}")
 
         assert queue.status_code == 200
         assert "Вакансия изменилась — JobHunter выполняет повторный анализ." in queue.text
@@ -1128,7 +1128,7 @@ async def test_admin_hides_approval_without_public_email_and_redirects_stale_pos
         follow_redirects=False,
     ) as client:
         csrf_token = await _login_admin(client, settings)
-        queue = await client.get(f"/?view=decisions&profile_id={profile_id}")
+        queue = await client.get(f"/admin?view=decisions&profile_id={profile_id}")
         assert queue.status_code == 200
         assert "нет публичного email" in queue.text
         assert f'action="/admin/applications/{application_id}/approve"' not in queue.text
@@ -1145,7 +1145,7 @@ async def test_admin_hides_approval_without_public_email_and_redirects_stale_pos
         )
         assert direct_approval.status_code == 303
         assert direct_approval.headers["location"] == (
-            f"/?view=decisions&profile_id={profile_id}&notice=application_approval_no_email"
+            f"/admin?view=decisions&profile_id={profile_id}&notice=application_approval_no_email"
         )
 
         approval_notice = await client.get(direct_approval.headers["location"])
@@ -1241,7 +1241,7 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
     ) as client:
         csrf_token = await _login_admin(client, settings)
         queue = await client.get(
-            "/",
+            "/admin",
             params={"view": "decisions", "profile_id": str(profile_id)},
         )
         assert queue.status_code == 200
@@ -1255,7 +1255,7 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         assert "Страница 1 из 2" in queue.text
 
         second_page = await client.get(
-            "/",
+            "/admin",
             params={
                 "view": "decisions",
                 "profile_id": str(profile_id),
@@ -1266,7 +1266,7 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         assert "Backend Engineer" in second_page.text
 
         no_results = await client.get(
-            "/",
+            "/admin",
             params={
                 "view": "decisions",
                 "profile_id": str(profile_id),
@@ -1286,7 +1286,7 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
             },
         )
         assert rejected.status_code == 303
-        assert rejected.headers["location"].startswith("/?view=decisions")
+        assert rejected.headers["location"].startswith("/admin?view=decisions")
 
         paused_learning = await client.post(
             "/admin/review-learning/influence",
@@ -1298,13 +1298,13 @@ async def test_admin_decision_queue_filters_and_rejects_without_sending(
         )
         assert paused_learning.status_code == 303
         paused_queue = await client.get(
-            "/",
+            "/admin",
             params={"view": "decisions", "profile_id": str(profile_id)},
         )
         assert "Обучение: приостановлено" in paused_queue.text
 
         rejected_queue = await client.get(
-            "/",
+            "/admin",
             params={
                 "view": "decisions",
                 "profile_id": str(profile_id),
@@ -1595,7 +1595,7 @@ async def test_admin_review_queue_uses_learned_order_and_explanations(
     ) as client:
         await _login_admin(client, settings)
         queue = await client.get(
-            "/",
+            "/admin",
             params={"view": "decisions", "profile_id": str(profile_id)},
         )
 
@@ -1792,7 +1792,7 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
         async with httpx.AsyncClient(base_url=base_url) as readiness_client:
             for _attempt in range(100):
                 try:
-                    response = await readiness_client.get("/login")
+                    response = await readiness_client.get("/admin/login")
                     if response.status_code == 200:
                         break
                 except httpx.TransportError:
@@ -1812,7 +1812,7 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     width, height = viewports[index]
                     context = await browser.new_context(viewport={"width": width, "height": height})
                     page = await context.new_page()
-                    await page.goto(f"{base_url}/login")
+                    await page.goto(f"{base_url}/admin/login")
                     await page.get_by_label("Пароль администратора").fill(ADMIN_PASSWORD)
                     await page.get_by_role("button", name="Войти", exact=True).click()
                     await page.goto(
@@ -1870,7 +1870,9 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                     assert detail_dialog_box["x"] + detail_dialog_box["width"] <= width
                     assert detail_dialog_box["y"] + detail_dialog_box["height"] <= height
                     await detail_dialog.get_by_role("button", name="Отмена", exact=True).click()
-                    await page.goto(f"{base_url}/?view=decisions&profile_id={seeded['profile_id']}")
+                    await page.goto(
+                        f"{base_url}/admin?view=decisions&profile_id={seeded['profile_id']}"
+                    )
                     await expect(
                         page.get_by_role("heading", name="Требуют решения")
                     ).to_be_visible()
@@ -1936,7 +1938,7 @@ async def test_admin_review_learning_browser_flow_three_clean_contexts(
                         "Одобрение недоступно"
                     )
                     await page.goto(
-                        f"{base_url}/?view=decisions&profile_id={internal_review['profile_id']}"
+                        f"{base_url}/admin?view=decisions&profile_id={internal_review['profile_id']}"
                     )
                     await expect(
                         page.locator("details.learning-control > summary")
@@ -3114,7 +3116,7 @@ async def test_admin_resume_file_view_returns_pdf_bytes(
     ) as anon:
         blocked = await anon.get(f"/admin/resumes/{resume_id}/file")
         assert blocked.status_code == 303
-        assert blocked.headers["location"] == "/login"
+        assert blocked.headers["location"] == "/admin/login"
 
 
 @pytest.mark.asyncio
@@ -3557,7 +3559,7 @@ async def test_settings_page_renders_unified_profile_block(
             files={"file": ("spare.pdf", b"%PDF-1.7\nspare\n%%EOF", "application/pdf")},
         )
 
-        page = await client.get(f"/?view=settings&profile_id={seeded['profile_id']}")
+        page = await client.get(f"/admin?view=settings&profile_id={seeded['profile_id']}")
         assert page.status_code == 200
         html = page.text
 
@@ -3608,7 +3610,9 @@ async def test_settings_page_playwright_narrow_view(
         transport=transport, base_url="https://testserver", follow_redirects=False
     ) as client:
         await _login_admin(client, settings)
-        page_html = (await client.get(f"/?view=settings&profile_id={seeded['profile_id']}")).text
+        page_html = (
+            await client.get(f"/admin?view=settings&profile_id={seeded['profile_id']}")
+        ).text
 
     async with playwright_api.async_playwright() as runtime:
         browser = await runtime.chromium.launch()
@@ -4031,7 +4035,7 @@ async def test_settings_page_archived_resume_section(
     ) as client:
         csrf_token = await _login_admin(client, settings)
 
-        html = (await client.get(f"/?view=settings&profile_id={profile_id}")).text
+        html = (await client.get(f"/admin?view=settings&profile_id={profile_id}")).text
         # referenced + not archived: an archive form, no delete form, no archived section
         assert f'action="/admin/resumes/{resume_id}/archive"' in html
         assert f'action="/admin/resumes/{resume_id}/delete"' not in html
@@ -4043,7 +4047,7 @@ async def test_settings_page_archived_resume_section(
         )
         assert archived.status_code == 303
 
-        html = (await client.get(f"/?view=settings&profile_id={profile_id}")).text
+        html = (await client.get(f"/admin?view=settings&profile_id={profile_id}")).text
         assert "Архивные (1)" in html
         assert f'action="/admin/resumes/{resume_id}/restore"' in html
         # the archived row lives inside the disclosure, after its heading

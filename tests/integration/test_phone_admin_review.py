@@ -130,10 +130,10 @@ async def review_context(
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver", follow_redirects=False
     ) as client:
-        login = await client.get("/login")
+        login = await client.get("/admin/login")
         token = HTMLParser(login.text).css_first("input[name='csrf_token']").attributes["value"]
         response = await client.post(
-            "/login", data={"password": ADMIN_PASSWORD, "csrf_token": token}
+            "/admin/login", data={"password": ADMIN_PASSWORD, "csrf_token": token}
         )
         assert response.status_code == 303
         yield client, call_id, sms_id, sqlite_session_factory
@@ -147,7 +147,7 @@ async def test_fact_review_requires_csrf_and_confirms_manual_value(review_contex
         data={"action": "correct", "value": "03.09.2026", "csrf_token": "bad"},
     )
     assert invalid.status_code == 403
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/facts/interview_date/review",
@@ -164,7 +164,7 @@ async def test_fact_review_requires_csrf_and_confirms_manual_value(review_contex
         call = await db.get(CommunicationSession, call_id)
         assert call is not None
         assert call.verification_status is PhoneVerificationStatus.NEEDS_REVIEW
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/facts/interview_time/review",
@@ -180,7 +180,7 @@ async def test_fact_review_requires_csrf_and_confirms_manual_value(review_contex
 @pytest.mark.asyncio
 async def test_unknown_review_creates_missing_fact_and_audits(review_context) -> None:
     client, call_id, _sms_id, factory = review_context
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/facts/timezone/review",
@@ -223,7 +223,7 @@ async def test_fact_review_accepts_canonical_interview_format(review_context, va
             )
         )
         await db.commit()
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     document = HTMLParser(page.text)
     csrf = document.css_first("input[name='csrf_token']").attributes["value"]
     assert document.css_first("select[name='value']") is not None
@@ -266,7 +266,7 @@ async def test_fact_review_sqlite_cas_loss_rolls_back_fact_and_audit(
         return await original(db, call)
 
     monkeypatch.setattr(phone_routes, "_reserve_call_mutation", contend)
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/facts/interview_date/review",
@@ -304,7 +304,7 @@ async def test_sms_link_sqlite_cas_loss_does_not_persist_relation_or_audit(
         return await original(db, call)
 
     monkeypatch.setattr(phone_routes, "_reserve_call_mutation", contend)
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/sms/{sms_id}/link",
@@ -360,7 +360,7 @@ async def test_concurrent_sms_link_has_exactly_one_call_owner(
         return sms
 
     monkeypatch.setattr(phone_routes, "_get_sms_for_call", synchronize_after_read)
-    page = await client.get(f"/?view=calls&tab=history&session={first_call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={first_call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     responses = await asyncio.gather(
         client.post(
@@ -415,11 +415,11 @@ async def test_history_and_detail_render_confirmation_provenance_and_loading_sta
         call.summary_state = PhoneSummaryState.PENDING
         await db.commit()
 
-    history = await client.get("/?view=calls&tab=history")
+    history = await client.get("/admin?view=calls&tab=history")
     assert history.status_code == 200
     assert "Подтверждено вручную" in history.text
 
-    detail = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    detail = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     assert detail.status_code == 200
     assert "Подтверждено по SMS" in detail.text
     assert "Подтверждено вручную" in detail.text
@@ -431,7 +431,7 @@ async def test_history_and_detail_render_confirmation_provenance_and_loading_sta
         assert call is not None
         call.summary_state = PhoneSummaryState.PROCESSING
         await db.commit()
-    processing = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    processing = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     assert processing.status_code == 200
     assert "Обработка выполняется" in processing.text
     assert "Резюме формируется. Обновите страницу через минуту." in processing.text
@@ -440,7 +440,7 @@ async def test_history_and_detail_render_confirmation_provenance_and_loading_sta
 @pytest.mark.asyncio
 async def test_sms_link_and_unlink_require_matching_identity(review_context) -> None:
     client, call_id, sms_id, factory = review_context
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     link = await client.post(
         f"/admin/phone/calls/{call_id}/sms/{sms_id}/link", data={"csrf_token": csrf}
@@ -450,7 +450,7 @@ async def test_sms_link_and_unlink_require_matching_identity(review_context) -> 
         sms = await db.get(CommunicationSession, sms_id)
         assert sms is not None
         assert sms.related_session_id == call_id
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     unlink = await client.post(
         f"/admin/phone/calls/{call_id}/sms/{sms_id}/unlink", data={"csrf_token": csrf}
@@ -466,7 +466,7 @@ async def test_fact_review_rejects_active_processing_claim(review_context) -> No
         assert call is not None
         call.claim_token = "live-worker-claim"
         await db.commit()
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/facts/interview_date/review",
@@ -495,7 +495,7 @@ async def test_sms_link_rejects_multiple_or_non_employer_turns(review_context) -
             )
         )
         await db.commit()
-    page = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/sms/{sms_id}/link", data={"csrf_token": csrf}
@@ -534,7 +534,7 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
             )
         )
         await db.commit()
-    response = await client.get(f"/?view=calls&tab=history&session={call_id}")
+    response = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     assert response.status_code == 200
     async with playwright_api.async_playwright() as runtime:
         browser = await runtime.chromium.launch()
@@ -560,7 +560,7 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
             assert call is not None
             call.summary_state = PhoneSummaryState.PROCESSING
             await db.commit()
-        processing = await client.get(f"/?view=calls&tab=history&session={call_id}")
+        processing = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
         await page.set_content(processing.text, wait_until="domcontentloaded")
         assert await page.get_by_text("Обработка выполняется").count() >= 1
 
@@ -589,7 +589,7 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
                 }
             }
             await db.commit()
-        failed = await client.get(f"/?view=calls&tab=history&session={call_id}")
+        failed = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
         await page.set_content(failed.text, wait_until="domcontentloaded")
         assert await page.get_by_text("резюме: ошибка").count() == 1
         assert await page.get_by_text("Нужна проверка: конфликт").count() == 1
@@ -605,7 +605,7 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
             assert call is not None
             call.summary = {}
             await db.commit()
-        empty = await client.get(f"/?view=calls&tab=history&session={call_id}")
+        empty = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
         await page.set_content(empty.text, wait_until="domcontentloaded")
         assert await page.get_by_text("Факты ещё не извлечены. Требуется проверка.").count() == 1
         await browser.close()

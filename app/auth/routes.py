@@ -81,6 +81,17 @@ def _secure_cookie() -> bool:
     return _settings().public_base_url.casefold().startswith("https://")
 
 
+def _has_admin_session(request: Request) -> bool:
+    settings = _settings()
+    token = request.cookies.get(settings.session_cookie_name)
+    if not token:
+        return False
+    subject = SessionSigner(settings.secret_key.get_secret_value()).verify(
+        token, settings.session_ttl_seconds
+    )
+    return subject == settings.admin_username
+
+
 async def _current_account(
     request: Request,
     session: AsyncSession,
@@ -141,6 +152,20 @@ def _mask_email(value: str | None) -> str:
     local, domain = value.split("@", maxsplit=1)
     visible = local[:2] if len(local) > 2 else local[:1]
     return f"{visible}***@{domain}"
+
+
+@router.get("/")
+async def public_root(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    settings = _settings()
+    if settings.user_accounts_enabled and await _current_account(request, session) is not None:
+        return RedirectResponse("/app", status_code=303)
+    if _has_admin_session(request):
+        return RedirectResponse("/admin", status_code=303)
+    target = "/login" if settings.user_accounts_enabled else "/admin/login"
+    return RedirectResponse(target, status_code=303)
 
 
 @router.get("/join", response_class=HTMLResponse)
@@ -237,7 +262,7 @@ async def google_register_start(
     return response
 
 
-@router.get("/app/login", response_class=HTMLResponse)
+@router.get("/login", response_class=HTMLResponse)
 async def user_login_page(
     request: Request,
     error: str | None = None,
@@ -259,6 +284,13 @@ async def user_login_page(
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@router.get("/app/login")
+async def legacy_user_login(error: str | None = None) -> RedirectResponse:
+    _require_user_feature()
+    target = "/login" if error is None else f"/login?error={error}"
+    return RedirectResponse(target, status_code=303)
 
 
 @router.get("/auth/google/login")
@@ -299,7 +331,7 @@ async def complete_identity_callback(
     service = GoogleIdentityService(_settings())
     binding_token = request.cookies.get(IDENTITY_OAUTH_BINDING_COOKIE)
     if not binding_token:
-        return RedirectResponse("/app/login?error=invalid_identity_oauth_state", status_code=303)
+        return RedirectResponse("/login?error=invalid_identity_oauth_state", status_code=303)
     actor_hint: str | None = None
     try:
         exchange = await service.exchange_callback(
@@ -352,7 +384,7 @@ async def complete_identity_callback(
     ) as exc:
         await session.rollback()
         code = getattr(exc, "code", None) or type(exc).__name__.casefold()
-        target = "/join" if (actor_hint or "").startswith(_REGISTER_ACTOR_PREFIX) else "/app/login"
+        target = "/join" if (actor_hint or "").startswith(_REGISTER_ACTOR_PREFIX) else "/login"
         response = RedirectResponse(f"{target}?error={code}", status_code=303)
     else:
         response = RedirectResponse("/app", status_code=303)
@@ -386,7 +418,7 @@ async def user_home(
     _require_user_feature()
     current = await _current_account(request, session)
     if current is None:
-        return RedirectResponse("/app/login", status_code=303)
+        return RedirectResponse("/login", status_code=303)
     account, session_token = current
     profiles = await AccountService().list_owned_profiles(session, account.id)
     gmail_oauth = await GmailOAuthService(_settings()).get_status(session, account_id=account.id)
@@ -574,7 +606,7 @@ async def user_logout(
 ) -> RedirectResponse:
     _require_user_feature()
     _require_user_csrf(request, csrf_token)
-    response = RedirectResponse("/app/login", status_code=303)
+    response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(_settings().user_session_cookie_name, path="/")
     return response
 

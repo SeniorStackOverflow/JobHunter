@@ -9,13 +9,13 @@
   </div></div>
   <div class="filter-panel">
     <div class="tabs" aria-label="Фильтр статуса">
-      <a class="tab {% if status_filter == 'pending_review' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=pending_review">Ждут решения</a>
-      <a class="tab {% if status_filter == 'approved' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=approved">Одобрены</a>
-      <a class="tab {% if status_filter == 'problems' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=problems">С проблемами</a>
-      <a class="tab {% if status_filter == 'cancelled' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=cancelled">Отклонены</a>
-      <a class="tab {% if status_filter == 'all' %}is-active{% endif %}" href="/?view=decisions&profile_id={{ selected_profile_id }}&status_filter=all">Все</a>
+      <a class="tab {% if status_filter == 'pending_review' %}is-active{% endif %}" href="/admin?view=decisions&profile_id={{ selected_profile_id }}&status_filter=pending_review">Ждут решения</a>
+      <a class="tab {% if status_filter == 'approved' %}is-active{% endif %}" href="/admin?view=decisions&profile_id={{ selected_profile_id }}&status_filter=approved">Одобрены</a>
+      <a class="tab {% if status_filter == 'problems' %}is-active{% endif %}" href="/admin?view=decisions&profile_id={{ selected_profile_id }}&status_filter=problems">С проблемами</a>
+      <a class="tab {% if status_filter == 'cancelled' %}is-active{% endif %}" href="/admin?view=decisions&profile_id={{ selected_profile_id }}&status_filter=cancelled">Отклонены</a>
+      <a class="tab {% if status_filter == 'all' %}is-active{% endif %}" href="/admin?view=decisions&profile_id={{ selected_profile_id }}&status_filter=all">Все</a>
     </div>
-    <form class="server-search" method="get" action="/"><input type="hidden" name="view" value="decisions"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="status_filter" value="{{ status_filter }}"><input type="search" name="q" value="{{ q }}" placeholder="Вакансия или компания"><button class="btn">Найти</button></form>
+    <form class="server-search" method="get" action="/admin"><input type="hidden" name="view" value="decisions"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="status_filter" value="{{ status_filter }}"><input type="search" name="q" value="{{ q }}" placeholder="Вакансия или компания"><button class="btn">Найти</button></form>
   </div>
   <div class="queue-list">
     {% for item in applications %}{% set job = application_jobs.get(item.source_job_id) %}

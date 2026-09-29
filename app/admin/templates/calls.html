@@ -4,9 +4,9 @@
   {% include "_phone_health.html" %}
   <div class="filter-panel">
     <div class="tabs">
-      <a class="tab {% if tab == 'live' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=live">Live</a>
-      <a class="tab {% if tab == 'history' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history">История</a>
-      <a class="tab {% if tab == 'evidence' %}is-active{% endif %}" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=evidence">Evidence</a>
+      <a class="tab {% if tab == 'live' %}is-active{% endif %}" href="/admin?view=calls&profile_id={{ selected_profile_id }}&tab=live">Live</a>
+      <a class="tab {% if tab == 'history' %}is-active{% endif %}" href="/admin?view=calls&profile_id={{ selected_profile_id }}&tab=history">История</a>
+      <a class="tab {% if tab == 'evidence' %}is-active{% endif %}" href="/admin?view=calls&profile_id={{ selected_profile_id }}&tab=evidence">Evidence</a>
       <span class="tab" style="opacity:.4;pointer-events:none" aria-disabled="true">Собеседования · после Phase 4</span>
     </div>
   </div>

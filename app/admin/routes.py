@@ -502,7 +502,7 @@ def require_admin_page(request: Request) -> str:
         if exc.status_code == status.HTTP_401_UNAUTHORIZED:
             raise HTTPException(
                 status_code=status.HTTP_303_SEE_OTHER,
-                headers={"Location": "/login"},
+                headers={"Location": "/admin/login"},
             ) from exc
         raise
 
@@ -534,12 +534,12 @@ async def _audit_admin(
     )
 
 
-@router.get("/login", response_class=HTMLResponse)
+@router.get("/admin/login", response_class=HTMLResponse)
 async def login_form(request: Request, oauth_error: str | None = None) -> Response:
     settings = get_settings()
     token = request.cookies.get(settings.session_cookie_name)
     if token and _signer().verify(token, settings.session_ttl_seconds) == settings.admin_username:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/admin", status_code=303)
     google_oauth = GmailOAuthService(settings)
     oauth_errors = {
         "configuration": "Вход через Google пока не настроен. Используйте пароль администратора.",
@@ -596,7 +596,7 @@ async def google_admin_login_start(
     settings = get_settings()
     service = GmailOAuthService(settings)
     if not service.configured or not settings.google_admin_emails:
-        return RedirectResponse("/login?oauth_error=configuration", status_code=303)
+        return RedirectResponse("/admin/login?oauth_error=configuration", status_code=303)
     try:
         oauth_status = await service.get_status(session)
         authorization = await service.create_authorization_request(
@@ -619,7 +619,7 @@ async def google_admin_login_start(
             details={"provider": "google", "error_code": exc.code},
         )
         await session.commit()
-        return RedirectResponse("/login?oauth_error=start", status_code=303)
+        return RedirectResponse("/admin/login?oauth_error=start", status_code=303)
 
     await record_audit_event(
         session,
@@ -646,7 +646,7 @@ async def google_admin_login_start(
     return response
 
 
-@router.post("/login", response_class=HTMLResponse)
+@router.post("/admin/login", response_class=HTMLResponse)
 async def login(
     request: Request,
     password: str = Form(...),
@@ -674,13 +674,14 @@ async def login(
                     google_oauth.configured and bool(settings.google_admin_emails)
                 ),
                 "password_login_available": settings.admin_password_hash is not None,
+                "login_mode": "admin",
             },
             status_code=401,
         )
         error_response.headers["Cache-Control"] = "no-store"
         return error_response
     token = _signer().issue(settings.admin_username)
-    response = RedirectResponse("/", status_code=303)
+    response = RedirectResponse("/admin", status_code=303)
     response.set_cookie(
         settings.session_cookie_name,
         token,
@@ -693,15 +694,15 @@ async def login(
     return response
 
 
-@router.post("/logout")
+@router.post("/admin/logout")
 async def logout(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    response = RedirectResponse("/login", status_code=303)
+    response = RedirectResponse("/admin/login", status_code=303)
     response.delete_cookie(get_settings().session_cookie_name, path="/")
     return response
 
 
-@router.get("/", response_class=HTMLResponse)
+@router.get("/admin", response_class=HTMLResponse)
 async def dashboard(
     request: Request,
     profile_id: UUID | None = None,
@@ -852,7 +853,7 @@ async def dashboard(
                 "tone": "danger",
                 "title": "Google OAuth не настроен",
                 "detail": "Вход через Google и автономная отправка Gmail недоступны.",
-                "href": "/?view=settings",
+                "href": "/admin?view=settings",
                 "action": "Открыть настройки",
             }
         )
@@ -892,7 +893,7 @@ async def dashboard(
                 "tone": "danger",
                 "title": f"{counts['active_alerts']} свежих системных предупреждений",
                 "detail": "Появились за последние 24 часа и ещё не просмотрены.",
-                "href": "/?view=diagnostics",
+                "href": "/admin?view=diagnostics",
                 "action": "Проверить",
             }
         )
@@ -908,7 +909,7 @@ async def dashboard(
                 "tone": "danger",
                 "title": f"{unhealthy_sources} источников требуют проверки",
                 "detail": unhealthy_names,
-                "href": "/?view=diagnostics",
+                "href": "/admin?view=diagnostics",
                 "action": "Диагностика",
             }
         )
@@ -918,7 +919,7 @@ async def dashboard(
                 "tone": "warning",
                 "title": f"{counts['pending_review']} откликов ждут решения",
                 "detail": "Нейросеть подготовила их, но финальное действие остаётся за вами.",
-                "href": "/?view=decisions",
+                "href": "/admin?view=decisions",
                 "action": "Открыть очередь",
             }
         )
@@ -928,7 +929,7 @@ async def dashboard(
                 "tone": "warning",
                 "title": "Автоотправка на паузе",
                 "detail": "Автоматизация продолжит анализ, но не отправит новые отклики.",
-                "href": "/?view=settings",
+                "href": "/admin?view=settings",
                 "action": "Управление",
             }
         )
@@ -1488,7 +1489,7 @@ async def save_profile(
     await _audit_admin(session, "profile.updated", "user_profile", str(profile.id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={profile.id}&notice=profile_saved", status_code=303
+        f"/admin?view=settings&profile_id={profile.id}&notice=profile_saved", status_code=303
     )
 
 
@@ -1570,7 +1571,7 @@ async def create_profile(
     if resume is not None:
         resume_service.finalize_upload(resume)
     return RedirectResponse(
-        f"/?view=settings&profile_id={profile.id}&notice={notice}", status_code=303
+        f"/admin?view=settings&profile_id={profile.id}&notice={notice}", status_code=303
     )
 
 
@@ -1590,7 +1591,7 @@ async def make_default_profile(
     await _audit_admin(session, "profile.default_changed", "user_profile", str(profile.id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={profile.id}&notice=profile_default", status_code=303
+        f"/admin?view=settings&profile_id={profile.id}&notice=profile_default", status_code=303
     )
 
 
@@ -1656,7 +1657,7 @@ async def save_preferences(
     )
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={preferences.profile_id}&notice=preferences_saved",
+        f"/admin?view=settings&profile_id={preferences.profile_id}&notice=preferences_saved",
         status_code=303,
     )
 
@@ -1691,7 +1692,7 @@ async def set_pause(
     await session.commit()
     notice = "auto_send_paused" if paused else "auto_send_resumed"
     return RedirectResponse(
-        f"/?view=overview&profile_id={preferences.profile_id}&notice={notice}", status_code=303
+        f"/admin?view=overview&profile_id={preferences.profile_id}&notice={notice}", status_code=303
     )
 
 
@@ -1748,7 +1749,7 @@ async def admin_upload_resume(
             raise
     resume_service.finalize_upload(resume)
     return RedirectResponse(
-        f"/?view=settings&profile_id={profile.id}&notice=resume_uploaded", status_code=303
+        f"/admin?view=settings&profile_id={profile.id}&notice=resume_uploaded", status_code=303
     )
 
 
@@ -1770,7 +1771,7 @@ async def admin_disconnect_gmail(
         details={"pending_authorizations_invalidated": True, "remote_grant_revoked": False},
     )
     await session.commit()
-    return RedirectResponse("/?view=settings&notice=google_disconnected", status_code=303)
+    return RedirectResponse("/admin?view=settings&notice=google_disconnected", status_code=303)
 
 
 @router.post("/admin/alerts/{alert_id}/acknowledge")
@@ -1794,7 +1795,7 @@ async def acknowledge_alert(
         decision="acknowledged",
     )
     await session.commit()
-    return RedirectResponse("/?view=diagnostics&notice=alert_acknowledged", status_code=303)
+    return RedirectResponse("/admin?view=diagnostics&notice=alert_acknowledged", status_code=303)
 
 
 @router.post("/admin/resumes/{resume_id}/verify")
@@ -1816,7 +1817,7 @@ async def verify_resume(
     await _audit_admin(session, "resume.verified", "resume", str(resume.id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_verified",
+        f"/admin?view=settings&profile_id={selected_profile.id}&notice=resume_verified",
         status_code=303,
     )
 
@@ -1846,7 +1847,7 @@ async def admin_deactivate_resume(
     await _audit_admin(session, "resume.deactivated", "resume", str(resume_id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_deactivated",
+        f"/admin?view=settings&profile_id={selected_profile.id}&notice=resume_deactivated",
         status_code=303,
     )
 
@@ -1869,7 +1870,7 @@ async def admin_activate_resume(
     await _audit_admin(session, "resume.activated", "resume", str(resume_id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_activated",
+        f"/admin?view=settings&profile_id={selected_profile.id}&notice=resume_activated",
         status_code=303,
     )
 
@@ -1889,7 +1890,7 @@ async def admin_archive_resume(
     await _audit_admin(session, "resume.archived", "resume", str(resume_id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_archived",
+        f"/admin?view=settings&profile_id={selected_profile.id}&notice=resume_archived",
         status_code=303,
     )
 
@@ -1909,7 +1910,7 @@ async def admin_restore_resume(
     await _audit_admin(session, "resume.restored", "resume", str(resume_id))
     await session.commit()
     return RedirectResponse(
-        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_restored",
+        f"/admin?view=settings&profile_id={selected_profile.id}&notice=resume_restored",
         status_code=303,
     )
 
@@ -1960,7 +1961,7 @@ async def admin_delete_resume(
             raise
     resume_service.finalize_delete(deletion)
     return RedirectResponse(
-        f"/?view=settings&profile_id={selected_profile.id}&notice=resume_deleted",
+        f"/admin?view=settings&profile_id={selected_profile.id}&notice=resume_deleted",
         status_code=303,
     )
 
@@ -2030,7 +2031,7 @@ async def toggle_source(
     )
     await session.commit()
     notice = "source_enabled" if enabling else "source_disabled"
-    return RedirectResponse(f"/?view=settings&notice={notice}", status_code=303)
+    return RedirectResponse(f"/admin?view=settings&notice={notice}", status_code=303)
 
 
 @router.post("/admin/sources/{source_id}/scan/{scan_type}")
@@ -2058,7 +2059,7 @@ async def admin_start_scan(
                 stored.diagnostics = {"queue_error": type(exc).__name__}
                 await session.commit()
         raise HTTPException(status_code=503, detail="task queue unavailable") from exc
-    return RedirectResponse("/?view=diagnostics&notice=scan_started", status_code=303)
+    return RedirectResponse("/admin?view=diagnostics&notice=scan_started", status_code=303)
 
 
 @router.get("/admin/applications/{application_id}", response_class=HTMLResponse)
@@ -2107,7 +2108,7 @@ async def admin_approve_application(
         notice = _approval_failure_notice(failed_application, exc)
         if return_to == "decisions" and failed_application is not None:
             return RedirectResponse(
-                f"/?view=decisions&profile_id={failed_application.profile_id}&notice={notice}",
+                f"/admin?view=decisions&profile_id={failed_application.profile_id}&notice={notice}",
                 status_code=303,
             )
         return RedirectResponse(
@@ -2130,7 +2131,7 @@ async def admin_approve_application(
     await session.commit()
     if return_to == "decisions":
         return RedirectResponse(
-            f"/?view=decisions&profile_id={application.profile_id}&notice=application_approved",
+            f"/admin?view=decisions&profile_id={application.profile_id}&notice=application_approved",
             status_code=303,
         )
     return RedirectResponse(
@@ -2186,7 +2187,7 @@ async def admin_reject_application(
     await session.commit()
     if return_to == "decisions":
         return RedirectResponse(
-            f"/?view=decisions&profile_id={application.profile_id}&notice=application_rejected",
+            f"/admin?view=decisions&profile_id={application.profile_id}&notice=application_rejected",
             status_code=303,
         )
     return RedirectResponse(
@@ -2224,7 +2225,7 @@ async def admin_set_review_learning_influence(
     await session.commit()
     notice = "review_learning_enabled" if enabled else "review_learning_paused"
     return RedirectResponse(
-        f"/?view=decisions&profile_id={profile.id}&notice={notice}", status_code=303
+        f"/admin?view=decisions&profile_id={profile.id}&notice={notice}", status_code=303
     )
 
 

@@ -1,8 +1,8 @@
 <section class="admin-section">
   <div class="section-heading"><div><h1>История</h1><p>Отправленные и отклонённые отклики, вакансии, оценки и обходы источников.</p></div><span class="badge muted">{{ pagination.total }} записей</span></div>
   <div class="filter-panel">
-    <div class="tabs">{% for kind, label in [('sent','Отправлены'),('rejected','Отклонены'),('jobs','Вакансии'),('matches','Оценки'),('scans','Обходы')] %}<a class="tab {% if history_kind == kind %}is-active{% endif %}" href="/?view=history&profile_id={{ selected_profile_id }}&history_kind={{ kind }}">{{ label }}</a>{% endfor %}</div>
-    <form class="server-search" method="get" action="/"><input type="hidden" name="view" value="history"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="history_kind" value="{{ history_kind }}"><input type="search" name="q" value="{{ q }}" placeholder="Поиск по истории"><button class="btn">Найти</button></form>
+    <div class="tabs">{% for kind, label in [('sent','Отправлены'),('rejected','Отклонены'),('jobs','Вакансии'),('matches','Оценки'),('scans','Обходы')] %}<a class="tab {% if history_kind == kind %}is-active{% endif %}" href="/admin?view=history&profile_id={{ selected_profile_id }}&history_kind={{ kind }}">{{ label }}</a>{% endfor %}</div>
+    <form class="server-search" method="get" action="/admin"><input type="hidden" name="view" value="history"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="history_kind" value="{{ history_kind }}"><input type="search" name="q" value="{{ q }}" placeholder="Поиск по истории"><button class="btn">Найти</button></form>
   </div>
   <div class="history-list panel">
     {% if history_kind in ['sent', 'rejected'] %}

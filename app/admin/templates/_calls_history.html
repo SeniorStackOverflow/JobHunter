@@ -1,6 +1,6 @@
 {% if detail %}{% include "_calls_history_detail.html" %}{% else %}
 <div class="filter-panel">
-  <form class="server-search" method="get" action="/">
+  <form class="server-search" method="get" action="/admin">
     <input type="hidden" name="view" value="calls">
     <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
     <input type="hidden" name="tab" value="history">
@@ -15,7 +15,7 @@
 </div>
 <div class="queue-list panel">
   {% for row in call_rows %}
-  <a class="queue-card" href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history&session={{ row.id }}">
+  <a class="queue-card" href="/admin?view=calls&profile_id={{ selected_profile_id }}&tab=history&session={{ row.id }}">
     <div>
       <strong>{{ row.company or 'Компания не указана' }}{% if row.vacancy %} · {{ row.vacancy }}{% endif %}</strong>
       <span>{{ row.caller }} · {{ format_dt(row.started_at) }} · {{ status_label(row.direction) }}{% if row.duration_s is not none %} · {{ row.duration_s }} с{% endif %}</span>

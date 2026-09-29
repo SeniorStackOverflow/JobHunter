@@ -203,12 +203,12 @@ async def admin_client(
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver", follow_redirects=False
     ) as client:
-        login_page = await client.get("/login")
+        login_page = await client.get("/admin/login")
         token = (
             HTMLParser(login_page.text).css_first("input[name='csrf_token']").attributes["value"]
         )
         logged_in = await client.post(
-            "/login", data={"password": ADMIN_PASSWORD, "csrf_token": token}
+            "/admin/login", data={"password": ADMIN_PASSWORD, "csrf_token": token}
         )
         assert logged_in.status_code == 303
         yield client
@@ -399,7 +399,7 @@ async def test_calls_context_live_tab_has_health(seeded_calls: SeededCalls) -> N
 
 @pytest.mark.asyncio
 async def test_calls_view_renders(admin_client: httpx.AsyncClient) -> None:
-    resp = await admin_client.get("/?view=calls&tab=history")
+    resp = await admin_client.get("/admin?view=calls&tab=history")
     assert resp.status_code == 200
     assert "Звонки" in resp.text
     assert "123456" not in resp.text
@@ -407,9 +407,9 @@ async def test_calls_view_renders(admin_client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_calls_nav_link_present_on_other_views(admin_client: httpx.AsyncClient) -> None:
-    resp = await admin_client.get("/?view=overview")
+    resp = await admin_client.get("/admin?view=overview")
     assert resp.status_code == 200
-    assert "/?view=calls" in resp.text
+    assert "/admin?view=calls" in resp.text
 
 
 @pytest.mark.asyncio
@@ -466,7 +466,9 @@ async def test_calls_detail_absent_for_unknown_session(seeded_calls: SeededCalls
 async def test_calls_detail_page_renders(
     admin_client: httpx.AsyncClient, seeded_calls: SeededCalls
 ) -> None:
-    resp = await admin_client.get(f"/?view=calls&tab=history&session={seeded_calls.summarized_id}")
+    resp = await admin_client.get(
+        f"/admin?view=calls&tab=history&session={seeded_calls.summarized_id}"
+    )
     assert resp.status_code == 200
     assert "Итог звонка" in resp.text
     assert "Работодатель предложил собеседование в четверг." in resp.text
@@ -477,7 +479,7 @@ async def test_calls_detail_page_renders(
 async def test_calls_detail_page_non_numeric_page_no_500(
     admin_client: httpx.AsyncClient,
 ) -> None:
-    resp = await admin_client.get("/?view=calls&tab=history&page=abc")
+    resp = await admin_client.get("/admin?view=calls&tab=history&page=abc")
     assert resp.status_code != 500
 
 

@@ -33,7 +33,7 @@
   {% endif %}
 
   {% if login_mode == "admin" and password_login_available %}
-  <form method="post" action="/login" class="login-password-form">
+  <form method="post" action="/admin/login" class="login-password-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="field">Пароль администратора
       <span class="password-input">

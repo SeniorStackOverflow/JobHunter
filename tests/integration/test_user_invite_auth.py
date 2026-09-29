@@ -329,7 +329,7 @@ async def test_google_login_requires_previously_registered_subject(
         params={"code": "identity-route-code", "state": query["state"][0]},
     )
     assert callback.status_code == 303
-    assert callback.headers["location"].startswith("/app/login?error=")
+    assert callback.headers["location"].startswith("/login?error=")
 
 
 @pytest.mark.asyncio
@@ -365,7 +365,7 @@ async def test_user_auth_session_is_invalidated_by_account_session_version(
 
     expired = await user_auth_context.client.get("/app")
     assert expired.status_code == 303
-    assert expired.headers["location"] == "/app/login"
+    assert expired.headers["location"] == "/login"
 
 
 @pytest.mark.e2e
@@ -393,7 +393,7 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
         async with httpx.AsyncClient(base_url=base_url) as readiness_client:
             for _ in range(100):
                 try:
-                    response = await readiness_client.get("/app/login")
+                    response = await readiness_client.get("/login")
                     if response.status_code == 200:
                         break
                 except httpx.TransportError:
@@ -701,13 +701,52 @@ async def test_admin_invites_are_embedded_in_users_page(
 async def test_user_login_reuses_admin_card_without_admin_password(
     user_auth_context: UserAuthContext,
 ) -> None:
-    user_page = await user_auth_context.client.get("/app/login")
+    user_page = await user_auth_context.client.get("/login")
     assert user_page.status_code == 200
     assert 'class="login-card"' in user_page.text
     assert 'href="/auth/google/login"' in user_page.text
     assert "Пароль администратора" not in user_page.text
     assert 'class="login-divider"' not in user_page.text
 
-    admin_page = await user_auth_context.client.get("/login")
+    admin_page = await user_auth_context.client.get("/admin/login")
     assert admin_page.status_code == 200
     assert 'class="login-card"' in admin_page.text
+
+
+@pytest.mark.asyncio
+async def test_public_root_dispatches_by_session(
+    user_auth_context: UserAuthContext,
+) -> None:
+    guest = await user_auth_context.client.get("/")
+    assert guest.status_code == 303
+    assert guest.headers["location"] == "/login"
+
+    async with user_auth_context.session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(account)
+        await session.commit()
+        account_id = account.id
+        session_version = account.session_version
+
+    user_token = AccountSessionSigner(
+        user_auth_context.settings.secret_key.get_secret_value()
+    ).issue(account_id, session_version)
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.user_session_cookie_name,
+        user_token,
+    )
+    user_root = await user_auth_context.client.get("/")
+    assert user_root.status_code == 303
+    assert user_root.headers["location"] == "/app"
+
+    user_auth_context.client.cookies.delete(user_auth_context.settings.user_session_cookie_name)
+    admin_token = SessionSigner(user_auth_context.settings.secret_key.get_secret_value()).issue(
+        user_auth_context.settings.admin_username
+    )
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.session_cookie_name,
+        admin_token,
+    )
+    admin_root = await user_auth_context.client.get("/")
+    assert admin_root.status_code == 303
+    assert admin_root.headers["location"] == "/admin"

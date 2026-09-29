@@ -4,7 +4,7 @@
   <div class="queue-card" style="display:block">
     <div>
       <strong>{{ first.company or 'Компания не указана' }}</strong>
-      <span>{{ format_dt(first.started_at) }} · <a href="/?view=calls&profile_id={{ selected_profile_id }}&tab=history&session={{ session_id }}">детали звонка</a></span>
+      <span>{{ format_dt(first.started_at) }} · <a href="/admin?view=calls&profile_id={{ selected_profile_id }}&tab=history&session={{ session_id }}">детали звонка</a></span>
     </div>
     <div class="evidence-clips">
       {% for row in rows %}

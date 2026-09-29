@@ -272,7 +272,7 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
         params={"code": "admin-route-code", "state": state},
     )
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/?view=overview&google=connected"
+    assert callback.headers["location"] == "/admin?view=overview&google=connected"
     session_cookie = oauth_api.client.cookies.get("job_agent_session")
     assert session_cookie is not None
     assert (
@@ -283,7 +283,7 @@ async def test_google_admin_login_verifies_allowlist_and_stores_gmail_token(
     assert "HttpOnly" in set_cookie
     assert "Secure" in set_cookie
     # OAuth returns from a different site, so Strict would suppress this cookie on the
-    # callback's immediate dashboard redirect and bounce the operator back to /login.
+    # callback's immediate dashboard redirect and bounce the operator back to /admin/login.
     assert "SameSite=lax" in set_cookie
 
     async with oauth_api.session_factory() as session:
@@ -329,7 +329,7 @@ async def test_google_admin_login_rejects_account_outside_allowlist(
         params={"code": "admin-route-code", "state": state},
     )
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/login?oauth_error=admin_identity_not_allowed"
+    assert callback.headers["location"] == "/admin/login?oauth_error=admin_identity_not_allowed"
     assert oauth_api.client.cookies.get("job_agent_session") is None
     async with oauth_api.session_factory() as session:
         assert await session.scalar(select(OAuthCredential)) is None
@@ -361,7 +361,7 @@ async def test_google_admin_login_rejects_scope_change_beyond_email_alias(
     )
 
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/login?oauth_error=token_exchange_failed"
+    assert callback.headers["location"] == "/admin/login?oauth_error=token_exchange_failed"
     assert oauth_api.client.cookies.get("job_agent_session") is None
     async with oauth_api.session_factory() as session:
         assert await session.scalar(select(OAuthCredential)) is None
