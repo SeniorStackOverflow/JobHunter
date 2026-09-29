@@ -24,10 +24,18 @@ from app.auth import google as google_auth
 from app.auth import routes as auth_routes
 from app.auth.google import GOOGLE_IDENTITY_SCOPES, GoogleIdentityService
 from app.database.session import get_session
+from app.email.oauth import GMAIL_DELIVERY_SCOPES, GmailOAuthService
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
-from app.models.entities import Account, AccountIdentity, Invite, JobPreference, UserProfile
+from app.models.entities import (
+    Account,
+    AccountIdentity,
+    Invite,
+    JobPreference,
+    OAuthCredential,
+    UserProfile,
+)
 from app.models.enums import AccountRole, AccountStatus, ProfileStatus
-from app.security.auth import SessionSigner
+from app.security.auth import AccountSessionSigner, SessionSigner
 from app.settings import Settings
 
 pytestmark = pytest.mark.integration
@@ -80,6 +88,18 @@ class IdentityFakeFlow:
     def fetch_token(self, *, code: str) -> None:
         assert code == "identity-route-code"
         type(self).fetch_count += 1
+
+
+class GmailUserFakeFlow:
+    def __init__(self) -> None:
+        self.credentials = SimpleNamespace(
+            refresh_token="user-gmail-refresh-token",
+            scopes=list(GMAIL_DELIVERY_SCOPES),
+            granted_scopes=list(GMAIL_DELIVERY_SCOPES),
+        )
+
+    def fetch_token(self, *, code: str) -> None:
+        assert code == "user-gmail-code"
 
 
 @pytest_asyncio.fixture
@@ -544,3 +564,78 @@ async def test_admin_can_manage_registered_account_lifecycle(
         assert stored_account.status == AccountStatus.ACTIVE
         assert preference is not None
         assert preference.global_pause is True
+
+
+@pytest.mark.asyncio
+async def test_user_gmail_oauth_is_bound_to_logged_in_account(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(account)
+        await session.flush()
+        session.add(
+            AccountIdentity(
+                account_id=account.id,
+                provider="google",
+                subject="gmail-owner-sub",
+                email="gmail.owner@example.com",
+                email_verified=True,
+            )
+        )
+        await session.commit()
+        account_id = account.id
+        session_version = account.session_version
+
+    user_session = AccountSessionSigner(
+        user_auth_context.settings.secret_key.get_secret_value()
+    ).issue(account_id, session_version)
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.user_session_cookie_name,
+        user_session,
+    )
+
+    started = await user_auth_context.client.get("/app/gmail/connect")
+    assert started.status_code == 302
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    assert set(query["scope"][0].split()) == set(GMAIL_DELIVERY_SCOPES)
+    state = query["state"][0]
+
+    monkeypatch.setattr(
+        GmailOAuthService,
+        "_flow",
+        lambda self, state=None, code_verifier=None, scopes=None: GmailUserFakeFlow(),
+    )
+    callback = await user_auth_context.client.get(
+        "/api/v1/oauth/gmail/callback",
+        params={"code": "user-gmail-code", "state": state},
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/app?notice=gmail_connected"
+
+    async with user_auth_context.session_factory() as session:
+        credential = await session.scalar(
+            select(OAuthCredential).where(OAuthCredential.account_id == account_id)
+        )
+        assert credential is not None
+        assert credential.provider == "gmail"
+
+    home = await user_auth_context.client.get("/app")
+    assert home.status_code == 200
+    assert "Подключён и готов к работе" in home.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', home.text)
+    assert csrf is not None
+
+    disconnected = await user_auth_context.client.post(
+        "/app/gmail/disconnect",
+        data={"csrf_token": csrf.group(1)},
+    )
+    assert disconnected.status_code == 303
+    assert disconnected.headers["location"] == "/app?notice=gmail_disconnected"
+
+    async with user_auth_context.session_factory() as session:
+        credential = await session.scalar(
+            select(OAuthCredential).where(OAuthCredential.account_id == account_id)
+        )
+        assert credential is None

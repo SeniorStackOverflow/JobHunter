@@ -10,6 +10,7 @@ from email import message_from_bytes, policy
 from email.message import Message
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Protocol
+from uuid import UUID
 
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
@@ -28,6 +29,7 @@ from app.email.oauth import GmailOAuthService
 from app.email.providers import GMAIL_READONLY_SCOPE
 from app.email.retries import retry_delay
 from app.employers import EmployerRelationshipService
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Alert,
     Application,
@@ -37,6 +39,7 @@ from app.models.entities import (
     EmployerContact,
     OAuthCredential,
     SourceJob,
+    UserProfile,
 )
 from app.models.enums import (
     ApplicationStatus,
@@ -521,18 +524,28 @@ class EmailDeliveryReconciliationService:
         self.session_factory = session_factory
         self._mailbox = mailbox
 
-    async def _mailbox_for(self, session: AsyncSession) -> MailboxProvider | None:
+    async def _mailbox_for(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID,
+    ) -> MailboxProvider | None:
         if self._mailbox is not None:
             return self._mailbox
         credential = await session.scalar(
-            select(OAuthCredential).where(OAuthCredential.provider == "gmail")
+            select(OAuthCredential).where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == "gmail",
+            )
         )
         if credential is None or GMAIL_READONLY_SCOPE not in credential.scopes:
             return None
         if self.settings.gmail_client_id is None or self.settings.gmail_client_secret is None:
             return None
         token = await GmailOAuthService(self.settings).get_refresh_token(
-            session, required_scopes=(GMAIL_READONLY_SCOPE,)
+            session,
+            account_id=account_id,
+            required_scopes=(GMAIL_READONLY_SCOPE,),
         )
         return GmailMailboxProvider(
             client_id=self.settings.gmail_client_id.get_secret_value(),
@@ -545,11 +558,16 @@ class EmailDeliveryReconciliationService:
         session: AsyncSession,
         notice: ParsedDeliveryNotice,
         *,
+        account_id: UUID,
         thread_id: str | None,
     ) -> EmailDelivery | None:
         if notice.original_message_id:
             delivery = await session.scalar(
-                select(EmailDelivery).where(
+                select(EmailDelivery)
+                .join(Application, Application.id == EmailDelivery.application_id)
+                .join(UserProfile, UserProfile.id == Application.profile_id)
+                .where(
+                    UserProfile.owner_account_id == account_id,
                     EmailDelivery.rfc_message_id == notice.original_message_id,
                     *(
                         [EmailDelivery.recipient == notice.final_recipient]
@@ -566,7 +584,11 @@ class EmailDeliveryReconciliationService:
             rows = list(
                 (
                     await session.scalars(
-                        select(EmailDelivery).where(
+                        select(EmailDelivery)
+                        .join(Application, Application.id == EmailDelivery.application_id)
+                        .join(UserProfile, UserProfile.id == Application.profile_id)
+                        .where(
+                            UserProfile.owner_account_id == account_id,
                             EmailDelivery.thread_id == thread_id,
                             *(
                                 [EmailDelivery.recipient == notice.final_recipient]
@@ -585,7 +607,10 @@ class EmailDeliveryReconciliationService:
                 (
                     await session.scalars(
                         select(EmailDelivery)
+                        .join(Application, Application.id == EmailDelivery.application_id)
+                        .join(UserProfile, UserProfile.id == Application.profile_id)
                         .where(
+                            UserProfile.owner_account_id == account_id,
                             EmailDelivery.recipient == notice.final_recipient,
                             EmailDelivery.created_at >= lower_bound,
                             EmailDelivery.created_at <= notice.occurred_at,
@@ -604,9 +629,12 @@ class EmailDeliveryReconciliationService:
         session: AsyncSession,
         mailbox_message: MailboxMessage,
         notice: ParsedDeliveryNotice,
+        *,
+        account_id: UUID,
     ) -> tuple[bool, bool]:
         existing = await session.scalar(
             select(EmailDeliveryEvent.id).where(
+                EmailDeliveryEvent.account_id == account_id,
                 EmailDeliveryEvent.provider == "gmail",
                 EmailDeliveryEvent.provider_message_id == mailbox_message.message_id,
             )
@@ -614,7 +642,12 @@ class EmailDeliveryReconciliationService:
         if existing is not None:
             return False, False
         delivery = (
-            await self._correlate(session, notice, thread_id=mailbox_message.thread_id)
+            await self._correlate(
+                session,
+                notice,
+                account_id=account_id,
+                thread_id=mailbox_message.thread_id,
+            )
             if notice.is_dsn or (mailbox_message.inbox and not notice.automated_sender)
             else None
         )
@@ -624,6 +657,7 @@ class EmailDeliveryReconciliationService:
             else None
         )
         event = EmailDeliveryEvent(
+            account_id=account_id,
             delivery_id=delivery.id if delivery is not None else None,
             provider="gmail",
             provider_message_id=mailbox_message.message_id,
@@ -673,7 +707,7 @@ class EmailDeliveryReconciliationService:
                     employer_id=application.employer_id,
                     event_type=EmployerInteractionType.EMPLOYER_REPLIED,
                     channel=EmployerInteractionChannel.EMAIL,
-                    idempotency_key=f"gmail-reply:{mailbox_message.message_id}",
+                    idempotency_key=(f"gmail-reply:{account_id}:{mailbox_message.message_id}"),
                     occurred_at=notice.occurred_at,
                     application_id=application.id,
                     canonical_job_id=application.canonical_job_id,
@@ -799,7 +833,7 @@ class EmailDeliveryReconciliationService:
                     event_type=EmployerInteractionType.APPLICATION_DELIVERY_FAILED,
                     channel=EmployerInteractionChannel.EMAIL,
                     idempotency_key=(
-                        f"delivery-failed:{event.provider}:{event.provider_message_id}"
+                        f"delivery-failed:{account_id}:{event.provider}:{event.provider_message_id}"
                     ),
                     occurred_at=notice.occurred_at,
                     application_id=application.id,
@@ -958,11 +992,15 @@ class EmailDeliveryReconciliationService:
         await session.flush()
         return True, True
 
-    async def reconcile(self) -> dict[str, int | str]:
+    async def reconcile(
+        self,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+    ) -> dict[str, int | str]:
         if not self.settings.gmail_delivery_reconciliation_enabled:
             return {"status": "disabled", "fetched": 0, "processed": 0, "correlated": 0}
         async with self.session_factory() as session:
-            mailbox = await self._mailbox_for(session)
+            mailbox = await self._mailbox_for(session, account_id=account_id)
             if mailbox is None:
                 return {
                     "status": "gmail_readonly_scope_required",
@@ -970,7 +1008,7 @@ class EmailDeliveryReconciliationService:
                     "processed": 0,
                     "correlated": 0,
                 }
-            cursor = await session.get(EmailMailboxCursor, "gmail")
+            cursor = await session.get(EmailMailboxCursor, (account_id, "gmail"))
             start_history_id = cursor.history_id if cursor is not None else None
         batch = await mailbox.fetch(
             start_history_id=start_history_id,
@@ -982,21 +1020,27 @@ class EmailDeliveryReconciliationService:
         async with self.session_factory() as session:
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 await session.execute(
-                    text(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtext('jobhunter:gmail-delivery-reconciliation'))"
-                    )
+                    text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                    {"lock_key": f"jobhunter:gmail-delivery-reconciliation:{account_id}"},
                 )
-            cursor_query = select(EmailMailboxCursor).where(EmailMailboxCursor.provider == "gmail")
+            cursor_query = select(EmailMailboxCursor).where(
+                EmailMailboxCursor.account_id == account_id,
+                EmailMailboxCursor.provider == "gmail",
+            )
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 cursor_query = cursor_query.with_for_update()
             cursor = await session.scalar(cursor_query)
             if cursor is None:
-                cursor = EmailMailboxCursor(provider="gmail")
+                cursor = EmailMailboxCursor(account_id=account_id, provider="gmail")
                 session.add(cursor)
             for mailbox_message in batch.messages:
                 notice = parse_delivery_notice(mailbox_message.raw)
-                created, linked = await self._apply_notice(session, mailbox_message, notice)
+                created, linked = await self._apply_notice(
+                    session,
+                    mailbox_message,
+                    notice,
+                    account_id=account_id,
+                )
                 processed += int(created)
                 correlated += int(linked)
             proposed_history_id = batch.next_history_id
@@ -1017,10 +1061,59 @@ class EmailDeliveryReconciliationService:
             "correlated": correlated,
         }
 
-    async def audit_mailbox(self, *, recipient_filter: str | None = None) -> dict[str, object]:
+    async def reconcile_all(self) -> dict[str, int | str]:
+        if not self.settings.gmail_delivery_reconciliation_enabled:
+            return {"status": "disabled", "fetched": 0, "processed": 0, "correlated": 0}
+        if self._mailbox is not None:
+            return await self.reconcile(account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID)
+        async with self.session_factory() as session:
+            credentials = list(
+                (
+                    await session.scalars(
+                        select(OAuthCredential).where(OAuthCredential.provider == "gmail")
+                    )
+                ).all()
+            )
+        account_ids = [
+            credential.account_id
+            for credential in credentials
+            if GMAIL_READONLY_SCOPE in credential.scopes
+        ]
+        if not account_ids:
+            return {
+                "status": "gmail_readonly_scope_required",
+                "mailboxes": 0,
+                "fetched": 0,
+                "processed": 0,
+                "correlated": 0,
+            }
+        fetched = 0
+        processed = 0
+        correlated = 0
+        ok_mailboxes = 0
+        for account_id in account_ids:
+            result = await self.reconcile(account_id=account_id)
+            fetched += int(result.get("fetched", 0))
+            processed += int(result.get("processed", 0))
+            correlated += int(result.get("correlated", 0))
+            ok_mailboxes += int(result.get("status") == "ok")
+        return {
+            "status": "ok" if ok_mailboxes else "gmail_readonly_scope_required",
+            "mailboxes": len(account_ids),
+            "fetched": fetched,
+            "processed": processed,
+            "correlated": correlated,
+        }
+
+    async def audit_mailbox(
+        self,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        recipient_filter: str | None = None,
+    ) -> dict[str, object]:
         """Inspect recent DSNs without advancing the cursor or mutating delivery state."""
         async with self.session_factory() as session:
-            mailbox = await self._mailbox_for(session)
+            mailbox = await self._mailbox_for(session, account_id=account_id)
             if mailbox is None:
                 return {"status": "gmail_readonly_scope_required", "matches": []}
         batch = await mailbox.fetch(
@@ -1038,7 +1131,10 @@ class EmailDeliveryReconciliationService:
                 if normalized_filter and notice.final_recipient != normalized_filter:
                     continue
                 delivery = await self._correlate(
-                    session, notice, thread_id=mailbox_message.thread_id
+                    session,
+                    notice,
+                    account_id=account_id,
+                    thread_id=mailbox_message.thread_id,
                 )
                 classification = classify_smtp_failure(
                     notice.diagnostic, status=notice.status, action=notice.action

@@ -7,7 +7,35 @@
 </div>
 {% if notice == "profile_created" %}<div class="card ok">Профиль создан в черновике.</div>{% endif %}
 {% if notice == "invite_created" %}<div class="card ok">Приглашение создано. Ссылка показывается только сейчас.</div>{% endif %}
+{% if notice == "gmail_connected" %}<div class="card ok">Gmail подключён к вашему аккаунту.</div>{% endif %}
+{% if notice == "gmail_disconnected" %}<div class="card ok">Gmail отключён.</div>{% endif %}
 {% if invite_token %}<div class="card"><div class="token">{{ request.base_url }}join?token={{ invite_token }}</div></div>{% endif %}
+
+<div class="card">
+  <h2>Gmail</h2>
+  {% if gmail_oauth.connected %}
+    <p>
+      {% if gmail_oauth.reauth_required %}
+        Требуется повторная авторизация.
+      {% else %}
+        Подключён и готов к работе.
+      {% endif %}
+    </p>
+    {% if gmail_oauth.identity_email %}<p class="muted">{{ gmail_oauth.identity_email }}</p>{% endif %}
+    <div class="row">
+      <a class="btn btn-primary" href="/app/gmail/connect">
+        {{ "Переподключить Gmail" if gmail_oauth.reauth_required else "Обновить доступ" }}
+      </a>
+      <form method="post" action="/app/gmail/disconnect">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn" type="submit">Отключить Gmail</button>
+      </form>
+    </div>
+  {% else %}
+    <p class="muted">Подключите свой Gmail перед отправкой откликов.</p>
+    <a class="btn btn-primary" href="/app/gmail/connect">Подключить Gmail</a>
+  {% endif %}
+</div>
 
 <div class="card">
   <h2>Профили</h2>

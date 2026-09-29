@@ -22,11 +22,13 @@ from app.email.providers import (
     GMAIL_REAUTH_REQUIRED_CODE,
     GMAIL_SEND_SCOPE,
 )
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Application,
     EmailDelivery,
     OAuthAuthorizationRequest,
     OAuthCredential,
+    UserProfile,
 )
 from app.models.enums import ApplicationStatus, DeliveryStatus, PolicyDecision
 from app.security.crypto import SecretBox, TokenDecryptionError
@@ -35,6 +37,7 @@ from app.settings import Settings
 GMAIL_PROVIDER = "gmail"
 GMAIL_OAUTH_BINDING_COOKIE = "job_agent_gmail_oauth_binding"
 GOOGLE_ADMIN_OAUTH_ACTOR = "google-admin-login"
+USER_GMAIL_OAUTH_ACTOR_PREFIX = "user-gmail:"
 GOOGLE_OPENID_SCOPE = "openid"
 GOOGLE_EMAIL_SCOPE = "email"
 GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
@@ -187,9 +190,17 @@ class GmailOAuthService:
             "last_refresh_error": metadata.get("last_refresh_error"),
         }
 
-    async def mark_refresh_ok(self, session: AsyncSession) -> None:
+    async def mark_refresh_ok(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+    ) -> None:
         credential = await session.scalar(
-            select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
+            select(OAuthCredential).where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == GMAIL_PROVIDER,
+            )
         )
         if credential is None:
             return
@@ -205,10 +216,17 @@ class GmailOAuthService:
         await session.flush()
 
     async def mark_reauthorization_required(
-        self, session: AsyncSession, *, error: str = GMAIL_REAUTH_REQUIRED_CODE
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        error: str = GMAIL_REAUTH_REQUIRED_CODE,
     ) -> None:
         credential = await session.scalar(
-            select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
+            select(OAuthCredential).where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == GMAIL_PROVIDER,
+            )
         )
         if credential is None:
             return
@@ -222,12 +240,19 @@ class GmailOAuthService:
         credential.token_metadata = metadata
         await session.flush()
 
-    async def recover_reauthorization_failures(self, session: AsyncSession) -> int:
+    async def recover_reauthorization_failures(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+    ) -> int:
         rows = (
             await session.execute(
                 select(EmailDelivery, Application)
                 .join(Application, Application.id == EmailDelivery.application_id)
+                .join(UserProfile, UserProfile.id == Application.profile_id)
                 .where(
+                    UserProfile.owner_account_id == account_id,
                     EmailDelivery.error_code == GMAIL_REAUTH_REQUIRED_CODE,
                     EmailDelivery.status == DeliveryStatus.TEMPORARY_FAILURE,
                     EmailDelivery.provider_message_id.is_(None),
@@ -295,6 +320,7 @@ class GmailOAuthService:
         session: AsyncSession,
         *,
         actor: str,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
         force_consent: bool = False,
     ) -> OAuthAuthorizationStart:
         normalized_actor = actor.strip()
@@ -318,6 +344,7 @@ class GmailOAuthService:
         code_verifier = secrets.token_urlsafe(64)
         expires_at = now + timedelta(seconds=OAUTH_STATE_TTL_SECONDS)
         authorization_request = OAuthAuthorizationRequest(
+            account_id=account_id,
             provider=GMAIL_PROVIDER,
             state_hash=_hash_token(state),
             binding_hash=_hash_token(binding_token),
@@ -380,6 +407,7 @@ class GmailOAuthService:
         now = datetime.now(UTC)
         request_id = await session.scalar(
             select(OAuthAuthorizationRequest.id).where(
+                OAuthAuthorizationRequest.account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
                 OAuthAuthorizationRequest.provider == GMAIL_PROVIDER,
                 OAuthAuthorizationRequest.state_hash == _hash_token(state),
                 OAuthAuthorizationRequest.actor == GOOGLE_ADMIN_OAUTH_ACTOR,
@@ -414,7 +442,7 @@ class GmailOAuthService:
         *,
         state: str,
         binding_token: str,
-    ) -> tuple[UUID, str, str]:
+    ) -> tuple[UUID, UUID, str, str]:
         now = datetime.now(UTC)
         result = await session.execute(
             update(OAuthAuthorizationRequest)
@@ -429,6 +457,7 @@ class GmailOAuthService:
             .values(consumed_at=now)
             .returning(
                 OAuthAuthorizationRequest.id,
+                OAuthAuthorizationRequest.account_id,
                 OAuthAuthorizationRequest.actor,
                 OAuthAuthorizationRequest.encrypted_code_verifier,
             )
@@ -442,7 +471,7 @@ class GmailOAuthService:
                 code="invalid_oauth_state",
             )
 
-        request_id, actor, encrypted_code_verifier = consumed
+        request_id, account_id, actor, encrypted_code_verifier = consumed
         # Commit the one-time transition before any external token request. A provider
         # timeout or a replay can therefore never reuse the authorization request.
         await session.commit()
@@ -473,7 +502,7 @@ class GmailOAuthService:
                 actor=actor,
                 correlation_id=request_id,
             )
-        return request_id, actor, code_verifier
+        return request_id, account_id, actor, code_verifier
 
     @staticmethod
     async def _clear_code_verifier(session: AsyncSession, request_id: UUID) -> None:
@@ -521,7 +550,7 @@ class GmailOAuthService:
             )
 
         expected_nonce = _hash_token(binding_token)
-        request_id, actor, code_verifier = await self._consume_authorization_request(
+        request_id, account_id, actor, code_verifier = await self._consume_authorization_request(
             session, state=state, binding_token=binding_token
         )
         admin_login = actor == GOOGLE_ADMIN_OAUTH_ACTOR
@@ -666,7 +695,10 @@ class GmailOAuthService:
         await self._lock_consumed_request(session, request_id=request_id, actor=actor)
         credential = await session.scalar(
             select(OAuthCredential)
-            .where(OAuthCredential.provider == GMAIL_PROVIDER)
+            .where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == GMAIL_PROVIDER,
+            )
             .with_for_update()
         )
         if credential is None:
@@ -679,6 +711,7 @@ class GmailOAuthService:
                 )
             assert isinstance(refresh_token, str)
             credential = OAuthCredential(
+                account_id=account_id,
                 provider=GMAIL_PROVIDER,
                 encrypted_refresh_token=self._require_box().encrypt(refresh_token),
                 scopes=sorted(normalized_scopes),
@@ -692,7 +725,10 @@ class GmailOAuthService:
                 await self._lock_consumed_request(session, request_id=request_id, actor=actor)
                 credential = await session.scalar(
                     select(OAuthCredential)
-                    .where(OAuthCredential.provider == GMAIL_PROVIDER)
+                    .where(
+                        OAuthCredential.account_id == account_id,
+                        OAuthCredential.provider == GMAIL_PROVIDER,
+                    )
                     .with_for_update()
                 )
                 if credential is None:
@@ -720,7 +756,7 @@ class GmailOAuthService:
             )
             credential.token_metadata = metadata
             await session.flush()
-            recovered = await self.recover_reauthorization_failures(session)
+            recovered = await self.recover_reauthorization_failures(session, account_id=account_id)
         await session.flush()
         return OAuthExchangeResult(
             credential=credential,
@@ -730,12 +766,21 @@ class GmailOAuthService:
             recovered_applications=recovered,
         )
 
-    async def get_status(self, session: AsyncSession) -> dict[str, Any]:
+    async def get_status(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+    ) -> dict[str, Any]:
         credential = await session.scalar(
-            select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
+            select(OAuthCredential).where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == GMAIL_PROVIDER,
+            )
         )
         pending_count = await session.scalar(
             select(func.count(OAuthAuthorizationRequest.id)).where(
+                OAuthAuthorizationRequest.account_id == account_id,
                 OAuthAuthorizationRequest.provider == GMAIL_PROVIDER,
                 OAuthAuthorizationRequest.expires_at > datetime.now(UTC),
                 OAuthAuthorizationRequest.consumed_at.is_(None),
@@ -773,17 +818,26 @@ class GmailOAuthService:
             "pending_authorizations": int(pending_count or 0),
         }
 
-    async def disconnect(self, session: AsyncSession) -> bool:
+    async def disconnect(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+    ) -> bool:
         # This order pairs with _lock_consumed_request: an in-flight callback either
         # observes the deletion and aborts, or commits first and is then deleted here.
         await session.execute(
             delete(OAuthAuthorizationRequest).where(
-                OAuthAuthorizationRequest.provider == GMAIL_PROVIDER
+                OAuthAuthorizationRequest.account_id == account_id,
+                OAuthAuthorizationRequest.provider == GMAIL_PROVIDER,
             )
         )
         deleted_credential = await session.execute(
             delete(OAuthCredential)
-            .where(OAuthCredential.provider == GMAIL_PROVIDER)
+            .where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == GMAIL_PROVIDER,
+            )
             .returning(OAuthCredential.id)
         )
         await session.flush()
@@ -793,10 +847,14 @@ class GmailOAuthService:
         self,
         session: AsyncSession,
         *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
         required_scopes: tuple[str, ...] = (),
     ) -> str:
         credential = await session.scalar(
-            select(OAuthCredential).where(OAuthCredential.provider == GMAIL_PROVIDER)
+            select(OAuthCredential).where(
+                OAuthCredential.account_id == account_id,
+                OAuthCredential.provider == GMAIL_PROVIDER,
+            )
         )
         if credential is None:
             raise GmailOAuthError(

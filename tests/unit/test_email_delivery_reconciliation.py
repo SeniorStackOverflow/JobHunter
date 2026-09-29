@@ -16,6 +16,7 @@ from app.email.delivery import (
     classify_smtp_failure,
     parse_delivery_notice,
 )
+from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Alert,
     Application,
@@ -66,7 +67,10 @@ async def test_stale_mailbox_batch_does_not_rewind_cursor(sqlite_session_factory
         ) -> MailboxBatch:
             assert start_history_id == "100"
             async with sqlite_session_factory() as session:
-                cursor = await session.get(EmailMailboxCursor, "gmail")
+                cursor = await session.get(
+                    EmailMailboxCursor,
+                    (BOOTSTRAP_ADMIN_ACCOUNT_ID, "gmail"),
+                )
                 assert cursor is not None
                 cursor.history_id = "200"
                 await session.commit()
@@ -77,7 +81,7 @@ async def test_stale_mailbox_batch_does_not_rewind_cursor(sqlite_session_factory
     ).reconcile()
 
     async with sqlite_session_factory() as session:
-        cursor = await session.get(EmailMailboxCursor, "gmail")
+        cursor = await session.get(EmailMailboxCursor, (BOOTSTRAP_ADMIN_ACCOUNT_ID, "gmail"))
         assert cursor is not None and cursor.history_id == "200"
     assert result["status"] == "ok"
 

@@ -28,6 +28,13 @@ from app.auth.google import (
     GoogleIdentityService,
 )
 from app.database import get_session
+from app.email.oauth import (
+    GMAIL_OAUTH_BINDING_COOKIE,
+    OAUTH_STATE_TTL_SECONDS,
+    USER_GMAIL_OAUTH_ACTOR_PREFIX,
+    GmailOAuthError,
+    GmailOAuthService,
+)
 from app.models.entities import Account, Invite, UserProfile
 from app.models.enums import AccountStatus, ProfileStatus
 from app.profiles import ProfileService
@@ -375,6 +382,7 @@ async def user_home(
         return RedirectResponse("/app/login", status_code=303)
     account, session_token = current
     profiles = await AccountService().list_owned_profiles(session, account.id)
+    gmail_oauth = await GmailOAuthService(_settings()).get_status(session, account_id=account.id)
     response = templates.TemplateResponse(
         request=request,
         name="user_home.html",
@@ -383,6 +391,7 @@ async def user_home(
             "profiles": profiles,
             "csrf_token": _csrf().issue(session_token),
             "notice": notice,
+            "gmail_oauth": gmail_oauth,
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -467,6 +476,7 @@ async def create_user_invite(
     )
     await session.commit()
     profiles = await AccountService().list_owned_profiles(session, account.id)
+    gmail_oauth = await GmailOAuthService(_settings()).get_status(session, account_id=account.id)
     response = templates.TemplateResponse(
         request=request,
         name="user_home.html",
@@ -476,10 +486,78 @@ async def create_user_invite(
             "csrf_token": _csrf().issue(session_token),
             "notice": "invite_created",
             "invite_token": created.token,
+            "gmail_oauth": gmail_oauth,
         },
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@router.get("/app/gmail/connect")
+async def user_gmail_connect(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    _require_user_feature()
+    account, _ = await _require_account(request, session)
+    service = GmailOAuthService(_settings())
+    try:
+        authorization = await service.create_authorization_request(
+            session,
+            actor=f"{USER_GMAIL_OAUTH_ACTOR_PREFIX}{account.id}",
+            account_id=account.id,
+        )
+    except GmailOAuthError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=503, detail=exc.code) from exc
+    await record_audit_event(
+        session,
+        actor=f"account:{account.id}",
+        action="oauth.gmail.started",
+        entity_type="oauth_authorization_request",
+        entity_id=str(authorization.request_id),
+        correlation_id=str(authorization.request_id),
+        decision="redirected",
+        details={"provider": "gmail"},
+    )
+    await session.commit()
+    response = RedirectResponse(authorization.authorization_url, status_code=302)
+    response.set_cookie(
+        GMAIL_OAUTH_BINDING_COOKIE,
+        authorization.binding_token,
+        max_age=OAUTH_STATE_TTL_SECONDS,
+        path="/api/v1/oauth/gmail/callback",
+        secure=service.secure_cookie,
+        httponly=True,
+        samesite="lax",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/app/gmail/disconnect")
+async def user_gmail_disconnect(
+    request: Request,
+    csrf_token: str = Form(...),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    _require_user_feature()
+    _require_user_csrf(request, csrf_token)
+    account, _ = await _require_account(request, session)
+    service = GmailOAuthService(_settings())
+    was_connected = await service.disconnect(session, account_id=account.id)
+    await record_audit_event(
+        session,
+        actor=f"account:{account.id}",
+        action="oauth.gmail.disconnected",
+        entity_type="oauth_credential",
+        entity_id=str(account.id),
+        correlation_id=str(account.id),
+        decision="disconnected" if was_connected else "already_disconnected",
+        details={"provider": "gmail", "remote_grant_revoked": False},
+    )
+    await session.commit()
+    return RedirectResponse("/app?notice=gmail_disconnected", status_code=303)
 
 
 @router.post("/app/logout")

@@ -920,11 +920,20 @@ class EmailDeliveryEvent(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "email_delivery_events"
     __table_args__ = (
         UniqueConstraint(
-            "provider", "provider_message_id", name="uq_email_delivery_event_provider_message"
+            "account_id",
+            "provider",
+            "provider_message_id",
+            name="uq_email_delivery_event_account_provider_message",
         ),
         Index("ix_email_delivery_events_delivery_occurred", "delivery_id", "occurred_at"),
     )
 
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        default=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        index=True,
+        nullable=False,
+    )
     delivery_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("email_deliveries.id", ondelete="SET NULL"), index=True
     )
@@ -949,6 +958,11 @@ class EmailDeliveryEvent(UUIDPrimaryKeyMixin, Base):
 class EmailMailboxCursor(Base):
     __tablename__ = "email_mailbox_cursors"
 
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        default=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        primary_key=True,
+    )
     provider: Mapped[str] = mapped_column(String(64), primary_key=True)
     history_id: Mapped[str | None] = mapped_column(String(64))
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -959,8 +973,17 @@ class EmailMailboxCursor(Base):
 
 class OAuthCredential(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "oauth_credentials"
+    __table_args__ = (
+        UniqueConstraint("account_id", "provider", name="uq_oauth_credentials_account_provider"),
+    )
 
-    provider: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        default=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        index=True,
+        nullable=False,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
     encrypted_refresh_token: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     scopes: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     token_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
@@ -970,6 +993,12 @@ class OAuthAuthorizationRequest(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "oauth_authorization_requests"
     __table_args__ = (Index("ix_oauth_authorization_requests_expires_at", "expires_at"),)
 
+    account_id: Mapped[UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        default=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+        index=True,
+        nullable=False,
+    )
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     state_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     binding_hash: Mapped[str] = mapped_column(String(64), nullable=False)

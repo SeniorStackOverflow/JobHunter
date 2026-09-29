@@ -27,6 +27,7 @@ from app.database import get_session
 from app.email.oauth import GmailOAuthService
 from app.email.service import EmailSendBlocked, EmailService
 from app.models.entities import (
+    Account,
     Alert,
     Application,
     AuditEvent,
@@ -36,7 +37,7 @@ from app.models.entities import (
     ScanRun,
     SourceJob,
 )
-from app.models.enums import RunStatus, ScanType, SourceHealth
+from app.models.enums import AccountStatus, RunStatus, ScanType, SourceHealth
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeDeletion, ResumeInUseError
@@ -896,7 +897,11 @@ async def gmail_oauth_callback(
 
     from fastapi.responses import JSONResponse
 
-    from app.email.oauth import GMAIL_OAUTH_BINDING_COOKIE, GmailOAuthError
+    from app.email.oauth import (
+        GMAIL_OAUTH_BINDING_COOKIE,
+        USER_GMAIL_OAUTH_ACTOR_PREFIX,
+        GmailOAuthError,
+    )
 
     settings = get_settings()
     if state:
@@ -922,8 +927,40 @@ async def gmail_oauth_callback(
             state=state,
             binding_token=binding_token,
         )
+        user_gmail_account_id: UUID | None = None
+        if exchange.actor.startswith(USER_GMAIL_OAUTH_ACTOR_PREFIX):
+            try:
+                user_gmail_account_id = UUID(
+                    exchange.actor.removeprefix(USER_GMAIL_OAUTH_ACTOR_PREFIX)
+                )
+            except ValueError as actor_error:
+                raise GmailOAuthError(
+                    "invalid user Gmail OAuth actor",
+                    code="invalid_actor",
+                    actor=exchange.actor,
+                    correlation_id=exchange.request_id,
+                ) from actor_error
+            if user_gmail_account_id != exchange.credential.account_id:
+                raise GmailOAuthError(
+                    "Gmail OAuth account binding mismatch",
+                    code="account_binding_mismatch",
+                    actor=exchange.actor,
+                    correlation_id=exchange.request_id,
+                )
+            account = await session.get(Account, user_gmail_account_id)
+            if account is None or account.status != AccountStatus.ACTIVE:
+                raise GmailOAuthError(
+                    "account is not active",
+                    code="account_inactive",
+                    actor=exchange.actor,
+                    correlation_id=exchange.request_id,
+                )
         audit_actor = (
-            f"google:{exchange.identity.email}" if exchange.identity is not None else exchange.actor
+            f"google:{exchange.identity.email}"
+            if exchange.identity is not None
+            else f"account:{user_gmail_account_id}"
+            if user_gmail_account_id is not None
+            else exchange.actor
         )
         await record_audit_event(
             session,
@@ -965,6 +1002,7 @@ async def gmail_oauth_callback(
             decision="failed",
             details={"provider": "gmail", "error_code": exc.code},
         )
+        user_gmail_error = bool(exc.actor and exc.actor.startswith(USER_GMAIL_OAUTH_ACTOR_PREFIX))
         if admin_login:
             await record_audit_event(
                 session,
@@ -980,13 +1018,20 @@ async def gmail_oauth_callback(
         response = (
             RedirectResponse(f"/login?oauth_error={exc.code}", status_code=303)
             if admin_login
+            else RedirectResponse(
+                f"/app?notice=gmail_error&error={exc.code}",
+                status_code=303,
+            )
+            if user_gmail_error
             else JSONResponse(
                 status_code=400,
                 content={"status": "failed", "error": exc.code},
             )
         )
     else:
-        if exchange.identity is not None:
+        if user_gmail_account_id is not None:
+            response = RedirectResponse("/app?notice=gmail_connected", status_code=303)
+        elif exchange.identity is not None:
             response = RedirectResponse("/?view=overview&google=connected", status_code=303)
             response.set_cookie(
                 settings.session_cookie_name,

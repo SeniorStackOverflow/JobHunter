@@ -1028,7 +1028,7 @@ def reconcile_email_delivery_status_task() -> dict[str, int | str] | dict[str, s
 
     return _run_locked_periodic(
         "reconcile-email-delivery",
-        EmailDeliveryReconciliationService(get_settings(), async_session_factory).reconcile(),
+        EmailDeliveryReconciliationService(get_settings(), async_session_factory).reconcile_all(),
         ttl_seconds=600,
     )
 

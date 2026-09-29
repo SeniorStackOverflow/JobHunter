@@ -421,7 +421,12 @@ class EmailService:
         await session.flush()
         return counts
 
-    async def _provider_for(self, session: AsyncSession) -> EmailProvider:
+    async def _provider_for(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: UUID = BOOTSTRAP_ADMIN_ACCOUNT_ID,
+    ) -> EmailProvider:
         if self._provider is not None:
             if self.settings.environment != "test" and isinstance(
                 self._provider,
@@ -446,6 +451,7 @@ class EmailService:
         oauth = GmailOAuthService(self.settings)
         refresh_token = await oauth.get_refresh_token(
             session,
+            account_id=account_id,
             required_scopes=(GMAIL_SEND_SCOPE, GMAIL_READONLY_SCOPE),
         )
         if self.settings.gmail_client_id is None or self.settings.gmail_client_secret is None:
@@ -867,7 +873,7 @@ class EmailService:
                 message_id=deterministic_message_id(message_id_key),
             )
             authorized_status = application.status
-            provider = await self._provider_for(session)
+            provider = await self._provider_for(session, account_id=active_profile.owner_account_id)
             if existing is None:
                 delivery = EmailDelivery(
                     application_id=application.id,
@@ -927,7 +933,9 @@ class EmailService:
                 }
                 application.status = ApplicationStatus.FAILED
                 await GmailOAuthService(self.settings).mark_reauthorization_required(
-                    session, error=GMAIL_REAUTH_REQUIRED_CODE
+                    session,
+                    account_id=active_profile.owner_account_id,
+                    error=GMAIL_REAUTH_REQUIRED_CODE,
                 )
             except DeliveryUnknownError as exc:
                 delivery.status = DeliveryStatus.DELIVERY_UNKNOWN
@@ -987,7 +995,9 @@ class EmailService:
                     role=job.title,
                 )
                 if provider.name == "gmail":
-                    await GmailOAuthService(self.settings).mark_refresh_ok(session)
+                    await GmailOAuthService(self.settings).mark_refresh_ok(
+                        session, account_id=active_profile.owner_account_id
+                    )
             await record_audit_event(
                 session,
                 actor="email_worker",
@@ -1083,15 +1093,6 @@ async def send_auto_approved_applications() -> int:
     service = EmailService(settings, async_session_factory)
     _start_local, start_of_day, _end_of_day = local_day_bounds()
     async with async_session_factory() as session:
-        oauth_status = await GmailOAuthService(settings).get_status(session)
-        if settings.email_provider == "gmail" and not oauth_status["delivery_ready"]:
-            reason = (
-                GMAIL_REAUTH_REQUIRED_CODE
-                if oauth_status["reauth_required"]
-                else "gmail_not_connected"
-            )
-            logger.warning("automatic_email_deferred", reason=reason)
-            return 0
         attempt_rows = (
             await session.execute(
                 select(Application.profile_id, func.count(EmailDelivery.id))
@@ -1122,6 +1123,12 @@ async def send_auto_approved_applications() -> int:
                     JobPreference.auto_send_enabled,
                     JobPreference.global_pause,
                 )
+                .join(UserProfile, UserProfile.id == JobPreference.profile_id)
+                .join(Account, Account.id == UserProfile.owner_account_id)
+                .where(
+                    UserProfile.status == ProfileStatus.ACTIVE,
+                    Account.status == AccountStatus.ACTIVE,
+                )
             )
         ).all()
         if not preference_rows:
@@ -1144,25 +1151,36 @@ async def send_auto_approved_applications() -> int:
             return 0
         candidate_rows = (
             await session.execute(
-                select(Application.id, Application.profile_id)
+                select(
+                    Application.id,
+                    Application.profile_id,
+                    UserProfile.owner_account_id,
+                )
                 .join(JobPreference, JobPreference.profile_id == Application.profile_id)
+                .join(UserProfile, UserProfile.id == Application.profile_id)
+                .join(Account, Account.id == UserProfile.owner_account_id)
                 .where(
                     Application.status == ApplicationStatus.AUTO_APPROVED,
                     JobPreference.auto_send_enabled.is_(True),
                     JobPreference.global_pause.is_(False),
+                    UserProfile.status == ProfileStatus.ACTIVE,
+                    Account.status == AccountStatus.ACTIVE,
                 )
                 .order_by(Application.created_at, Application.id)
             )
         ).all()
-        application_ids: list[UUID] = []
-        for application_id, profile_id in candidate_rows:
+        applications: list[tuple[UUID, UUID]] = []
+        for application_id, profile_id, account_id in candidate_rows:
             remaining = capacities.get(profile_id, 0)
             if remaining <= 0:
                 continue
-            application_ids.append(application_id)
+            applications.append((application_id, account_id))
             capacities[profile_id] = remaining - 1
     sent = 0
-    for application_id in application_ids:
+    blocked_accounts: set[UUID] = set()
+    for application_id, account_id in applications:
+        if account_id in blocked_accounts:
+            continue
         try:
             delivery = await service.send_application(application_id)
         except EmailSendBlocked as exc:
@@ -1184,8 +1202,12 @@ async def send_auto_approved_applications() -> int:
         if delivery.status in {DeliveryStatus.PROVIDER_ACCEPTED, DeliveryStatus.DELIVERED}:
             sent += 1
         if delivery.error_code == GMAIL_REAUTH_REQUIRED_CODE:
-            logger.warning("automatic_email_batch_stopped", reason=GMAIL_REAUTH_REQUIRED_CODE)
-            break
+            blocked_accounts.add(account_id)
+            logger.warning(
+                "automatic_email_account_deferred",
+                account_id=str(account_id),
+                reason=GMAIL_REAUTH_REQUIRED_CODE,
+            )
     return sent
 
 
@@ -1195,21 +1217,16 @@ async def retry_temporary_failures() -> int:
     settings = get_settings()
     service = EmailService(settings, async_session_factory)
     async with async_session_factory() as session:
-        oauth_status = await GmailOAuthService(settings).get_status(session)
-        if settings.email_provider == "gmail" and not oauth_status["delivery_ready"]:
-            reason = (
-                GMAIL_REAUTH_REQUIRED_CODE
-                if oauth_status["reauth_required"]
-                else "gmail_not_connected"
-            )
-            logger.warning("temporary_email_retry_deferred", reason=reason)
-            return 0
-        ids = list(
+        retry_rows = list(
             (
-                await session.scalars(
-                    select(EmailDelivery.application_id)
+                await session.execute(
+                    select(EmailDelivery.application_id, UserProfile.owner_account_id)
                     .join(Application, Application.id == EmailDelivery.application_id)
+                    .join(UserProfile, UserProfile.id == Application.profile_id)
+                    .join(Account, Account.id == UserProfile.owner_account_id)
                     .where(
+                        UserProfile.status == ProfileStatus.ACTIVE,
+                        Account.status == AccountStatus.ACTIVE,
                         or_(
                             and_(
                                 EmailDelivery.status.in_(
@@ -1247,7 +1264,10 @@ async def retry_temporary_failures() -> int:
             ).all()
         )
     retried = 0
-    for application_id in ids:
+    blocked_accounts: set[UUID] = set()
+    for application_id, account_id in retry_rows:
+        if account_id in blocked_accounts:
+            continue
         try:
             delivery = await service.send_application(application_id)
         except EmailSendBlocked as exc:
@@ -1269,6 +1289,10 @@ async def retry_temporary_failures() -> int:
         if delivery.status in {DeliveryStatus.PROVIDER_ACCEPTED, DeliveryStatus.DELIVERED}:
             retried += 1
         if delivery.error_code == GMAIL_REAUTH_REQUIRED_CODE:
-            logger.warning("temporary_email_retry_stopped", reason=GMAIL_REAUTH_REQUIRED_CODE)
-            break
+            blocked_accounts.add(account_id)
+            logger.warning(
+                "temporary_email_retry_account_deferred",
+                account_id=str(account_id),
+                reason=GMAIL_REAUTH_REQUIRED_CODE,
+            )
     return retried

@@ -16,7 +16,8 @@ from app.email.oauth import (
     GmailOAuthService,
 )
 from app.email.providers import GMAIL_SEND_SCOPE
-from app.models.entities import OAuthAuthorizationRequest, OAuthCredential
+from app.models.entities import Account, OAuthAuthorizationRequest, OAuthCredential
+from app.models.enums import AccountRole, AccountStatus
 from app.security.crypto import SecretBox
 from app.settings import Settings
 
@@ -392,3 +393,121 @@ async def test_disconnect_cancels_pending_callback_before_provider_exchange(
 
     assert cancelled.value.code == "invalid_oauth_state"
     assert fake_flow.fetch_count == 0
+
+
+@pytest.mark.asyncio
+async def test_gmail_credentials_and_reauth_are_isolated_by_account(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = GmailOAuthService(oauth_settings())
+    async with sqlite_session_factory() as session:
+        first = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        second = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add_all([first, second])
+        await session.flush()
+        first_start = await service.create_authorization_request(
+            session,
+            actor=f"user-gmail:{first.id}",
+            account_id=first.id,
+        )
+        second_start = await service.create_authorization_request(
+            session,
+            actor=f"user-gmail:{second.id}",
+            account_id=second.id,
+        )
+        await session.commit()
+        first_id = first.id
+        second_id = second.id
+
+    first_state = parse_qs(urlsplit(first_start.authorization_url).query)["state"][0]
+    second_state = parse_qs(urlsplit(second_start.authorization_url).query)["state"][0]
+    flows = [
+        FakeOAuthFlow("refresh-first"),
+        FakeOAuthFlow("refresh-second"),
+    ]
+    monkeypatch.setattr(
+        service,
+        "_flow",
+        lambda state=None, code_verifier=None, scopes=None: flows.pop(0),
+    )
+
+    async with sqlite_session_factory() as session:
+        first_result = await service.exchange_callback(
+            session,
+            authorization_response=callback_url(first_state),
+            state=first_state,
+            binding_token=first_start.binding_token,
+        )
+        await session.commit()
+        assert first_result.credential.account_id == first_id
+
+    async with sqlite_session_factory() as session:
+        second_result = await service.exchange_callback(
+            session,
+            authorization_response=callback_url(second_state),
+            state=second_state,
+            binding_token=second_start.binding_token,
+        )
+        await session.commit()
+        assert second_result.credential.account_id == second_id
+
+    async with sqlite_session_factory() as session:
+        assert await service.get_refresh_token(session, account_id=first_id) == "refresh-first"
+        assert await service.get_refresh_token(session, account_id=second_id) == "refresh-second"
+        await service.mark_reauthorization_required(
+            session,
+            account_id=first_id,
+        )
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        first_status = await service.get_status(session, account_id=first_id)
+        second_status = await service.get_status(session, account_id=second_id)
+        assert first_status["reauth_required"] is True
+        assert first_status["delivery_ready"] is False
+        assert second_status["reauth_required"] is False
+        assert second_status["delivery_ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_disconnect_deletes_only_target_accounts_gmail_credential(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = oauth_settings()
+    service = GmailOAuthService(settings)
+    box = SecretBox(settings.token_encryption_key or "")
+    async with sqlite_session_factory() as session:
+        first = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        second = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add_all([first, second])
+        await session.flush()
+        session.add_all(
+            [
+                OAuthCredential(
+                    account_id=first.id,
+                    provider="gmail",
+                    encrypted_refresh_token=box.encrypt("first"),
+                    scopes=list(GMAIL_DELIVERY_SCOPES),
+                    token_metadata={},
+                ),
+                OAuthCredential(
+                    account_id=second.id,
+                    provider="gmail",
+                    encrypted_refresh_token=box.encrypt("second"),
+                    scopes=list(GMAIL_DELIVERY_SCOPES),
+                    token_metadata={},
+                ),
+            ]
+        )
+        await session.commit()
+        first_id = first.id
+        second_id = second.id
+
+    async with sqlite_session_factory() as session:
+        assert await service.disconnect(session, account_id=first_id) is True
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        assert (await service.get_status(session, account_id=first_id))["connected"] is False
+        assert (await service.get_status(session, account_id=second_id))["connected"] is True
