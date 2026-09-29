@@ -13,7 +13,7 @@ from app.applications.daily_target import (
     minimum_catchup_score,
     minimum_daily_requirement,
 )
-from app.matching.freshness import count_all_matching_backlog
+from app.matching.freshness import count_profile_matching_backlog
 from app.models.entities import (
     Alert,
     Application,
@@ -74,23 +74,28 @@ def _llm_failure_codes(risks: list[str] | None) -> list[str]:
 
 
 async def _daily_matching_metrics(
-    session: AsyncSession, start: datetime, end: datetime
+    session: AsyncSession,
+    start: datetime,
+    end: datetime,
+    *,
+    profile_id: UUID | None = None,
 ) -> dict[str, Any]:
-    rows = (
-        await session.execute(
-            select(
-                MatchEvaluation.source_job_id,
-                MatchEvaluation.decision,
-                MatchEvaluation.risks,
-                MatchEvaluation.created_at,
-            )
-            .where(
-                MatchEvaluation.created_at >= start,
-                MatchEvaluation.created_at < end,
-            )
-            .order_by(MatchEvaluation.created_at, MatchEvaluation.id)
+    query = (
+        select(
+            MatchEvaluation.source_job_id,
+            MatchEvaluation.decision,
+            MatchEvaluation.risks,
+            MatchEvaluation.created_at,
         )
-    ).all()
+        .where(
+            MatchEvaluation.created_at >= start,
+            MatchEvaluation.created_at < end,
+        )
+        .order_by(MatchEvaluation.created_at, MatchEvaluation.id)
+    )
+    if profile_id is not None:
+        query = query.where(MatchEvaluation.profile_id == profile_id)
+    rows = (await session.execute(query)).all()
     latest_by_source: dict[UUID, tuple[MatchDecision, list[str] | None]] = {}
     failure_codes: dict[str, int] = {}
     failure_jobs: set[UUID] = set()
@@ -316,12 +321,31 @@ async def _daily_minimum_diagnostics(
 _REPORT_SECTION_TIMEOUT_SECONDS = 8.0
 
 
-async def _bounded_matching_backlog() -> tuple[int | None, str]:
+async def _profile_matching_backlog(
+    session: AsyncSession,
+    profile_id: UUID | None,
+) -> int:
+    if profile_id is None:
+        return 0
+    profiles = ProfileService()
+    profile = await profiles.get_processing_profile(session, profile_id)
+    if profile is None:
+        return 0
+    preference = await profiles.get_preferences(session, profile.id)
+    return await count_profile_matching_backlog(
+        session,
+        profile,
+        preference,
+        get_settings(),
+    )
+
+
+async def _bounded_matching_backlog(profile_id: UUID | None) -> tuple[int | None, str]:
     from app.database.session import async_session_factory
 
     async def _run() -> int:
         async with async_session_factory() as diagnostics_session:
-            return await count_all_matching_backlog(diagnostics_session, get_settings())
+            return await _profile_matching_backlog(diagnostics_session, profile_id)
 
     try:
         return await asyncio.wait_for(_run(), timeout=_REPORT_SECTION_TIMEOUT_SECONDS), "ok"
@@ -364,6 +388,8 @@ async def _bounded_minimum_diagnostics(
 
 async def _generate(session: AsyncSession, *, persist: bool = True) -> DailyReport:
     start_local, start, end = local_day_bounds()
+    report_profile = await ProfileService().get_profile(session)
+    report_profile_id = report_profile.id if report_profile is not None else None
     scans = list(
         (
             await session.scalars(
@@ -559,10 +585,14 @@ async def _generate(session: AsyncSession, *, persist: bool = True) -> DailyRepo
         or 0
     )
     scan_errors = sum(scan.parsing_errors + scan.network_errors for scan in scans)
-    matching_metrics = await _daily_matching_metrics(session, start, end)
+    matching_metrics = await _daily_matching_metrics(
+        session,
+        start,
+        end,
+        profile_id=report_profile_id,
+    )
     external_metrics = await external_call_metrics(session, start, end)
     limit_metrics = await _daily_limit_metrics(session, start, end)
-    report_profile = await ProfileService().get_profile(session)
     if session.get_bind().dialect.name == "sqlite":
         minimum_diagnostics = await _daily_minimum_diagnostics(
             session,
@@ -593,10 +623,12 @@ async def _generate(session: AsyncSession, *, persist: bool = True) -> DailyRepo
         else limit_metrics["daily_minimum_normal_score"]
     )
     if session.get_bind().dialect.name == "sqlite":
-        matching_backlog = await count_all_matching_backlog(session, get_settings())
+        matching_backlog = await _profile_matching_backlog(session, report_profile_id)
         matching_backlog_state = "ok"
     else:
-        matching_backlog, matching_backlog_state = await _bounded_matching_backlog()
+        matching_backlog, matching_backlog_state = await _bounded_matching_backlog(
+            report_profile_id
+        )
     active_jobs = int(
         await session.scalar(
             select(func.count(SourceJob.id)).where(SourceJob.status == JobStatus.ACTIVE)
@@ -844,7 +876,9 @@ async def _generate(session: AsyncSession, *, persist: bool = True) -> DailyRepo
         ),
         "duplicates_merged": max(0, new_source_jobs - new_canonical_jobs),
         **matching_metrics,
+        "matching_scope": "default_profile",
         "external_calls": external_metrics,
+        "external_calls_scope": "system",
         "phone_calls": phone_metrics,
         "employer_safety": {
             "employers_with_active_conversation": active_employers,

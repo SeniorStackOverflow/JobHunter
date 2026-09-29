@@ -52,7 +52,7 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             canonical_fingerprint="a" * 64,
             status=JobStatus.ACTIVE,
         )
-        profile = UserProfile(name="Report Candidate")
+        profile = UserProfile(name="Report Candidate", is_default=True)
         session.add(profile)
         await session.flush()
         session.add(
@@ -166,6 +166,45 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
             source_content_hash=jobs[0].content_hash,
             source_matching_hash=jobs[0].matching_content_hash,
             created_at=now + timedelta(seconds=1),
+        )
+        other_profile = UserProfile(name="Other Candidate")
+        session.add(other_profile)
+        await session.flush()
+        session.add_all(
+            [
+                JobPreference(profile_id=other_profile.id),
+                Resume(
+                    profile_id=other_profile.id,
+                    name="Other CV",
+                    category="technology",
+                    storage_key="other.pdf",
+                    original_filename="other.pdf",
+                    mime_type="application/pdf",
+                    sha256="f" * 64,
+                    active=True,
+                    verified=True,
+                    is_default=True,
+                ),
+                MatchEvaluation(
+                    profile_id=other_profile.id,
+                    canonical_job_id=canonical.id,
+                    source_job_id=jobs[1].id,
+                    resume_fit=99,
+                    preference_fit=99,
+                    overall_fit=99,
+                    requirements_met=[],
+                    missing_requirements=[],
+                    risks=[],
+                    scam_indicators=[],
+                    explanation="other profile fixture",
+                    decision=MatchDecision.AUTO_APPLY,
+                    model="mock",
+                    prompt_rules_version="v1",
+                    source_content_hash=jobs[1].content_hash,
+                    source_matching_hash=jobs[1].matching_content_hash,
+                    created_at=now + timedelta(seconds=3),
+                ),
+            ]
         )
         session.add_all([contact, fallback_1, fallback_2, evaluation])
         await session.flush()
@@ -289,6 +328,8 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         assert report.summary["daily_limit_used"] == 1
         assert report.summary["daily_limit_remaining"] == 19
         assert report.summary["daily_minimum_remaining"] == 1
+        assert report.summary["matching_scope"] == "default_profile"
+        assert report.summary["external_calls_scope"] == "system"
         assert report.summary["matching_attempts"] == 3
         assert report.summary["matching_evaluated"] == 1
         assert report.summary["matching_decisions"] == {
@@ -431,7 +472,7 @@ async def test_matching_backlog_section_times_out_fail_open(
         return 123
 
     monkeypatch.setattr(database_session, "async_session_factory", sqlite_session_factory)
-    monkeypatch.setattr(reports, "count_all_matching_backlog", slow_backlog)
+    monkeypatch.setattr(reports, "_profile_matching_backlog", slow_backlog)
     monkeypatch.setattr(reports, "_REPORT_SECTION_TIMEOUT_SECONDS", 0.001)
 
-    assert await reports._bounded_matching_backlog() == (None, "timeout")
+    assert await reports._bounded_matching_backlog(None) == (None, "timeout")

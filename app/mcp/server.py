@@ -1808,9 +1808,9 @@ async def get_daily_report() -> dict[str, Any]:
             if isinstance(raw_matching_backlog, (int, float))
             else None
         )
-        processing_profile_ids = [
-            profile.id for profile in await ProfileService().list_processing_profiles(session)
-        ]
+        report_profile = await ProfileService().get_profile(session)
+        report_profile_id = report_profile.id if report_profile is not None else None
+        processing_profile_ids = [report_profile_id] if report_profile_id is not None else []
 
         latest_evaluations = (
             select(
