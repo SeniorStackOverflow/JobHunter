@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_nav_icon.html" import icon %}
 {% block title %}Мой JobHunter · {{ view_title }}{% endblock %}
 {% block body_class %}dashboard-page{% endblock %}
 {% block body %}
@@ -6,15 +7,15 @@
   <aside class="sidebar">
     <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Мой кабинет</span></div></div>
     <nav class="side-nav" aria-label="Основная навигация">
-      <a class="nav-link {{ 'is-active' if view == 'overview' else '' }}" href="/app?view=overview{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">⌂</span><span>Главная</span></a>
-      <a class="nav-link {{ 'is-active' if view == 'decisions' else '' }}" href="/app?view=decisions{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">✓</span><span>Решения</span>{% if pending_count %}<span class="nav-count">{{ pending_count }}</span>{% endif %}</a>
-      <a class="nav-link {{ 'is-active' if view == 'history' else '' }}" href="/app?view=history{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">◷</span><span>История</span></a>
-      <a class="nav-link {{ 'is-active' if view == 'settings' else '' }}" href="/app?view=settings{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">⚙</span><span>Настройки</span></a>
+      <a class="nav-link {{ 'is-active' if view == 'overview' else '' }}" href="/app?view=overview{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('home') }}</span><span>Главная</span></a>
+      <a class="nav-link {{ 'is-active' if view == 'decisions' else '' }}" href="/app?view=decisions{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('decisions') }}</span><span>Решения</span>{% if pending_count %}<span class="nav-count">{{ pending_count }}</span>{% endif %}</a>
+      <a class="nav-link {{ 'is-active' if view == 'history' else '' }}" href="/app?view=history{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('history') }}</span><span>История</span></a>
+      <a class="nav-link {{ 'is-active' if view == 'settings' else '' }}" href="/app?view=settings{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('settings') }}</span><span>Настройки</span></a>
     </nav>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-status">
       <span class="badge {{ 'warning' if not profile or profile.status.value != 'active' or preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Поиск не запущен' if not profile or profile.status.value != 'active' else ('Отправка на паузе' if preferences.global_pause else ('Автоотправка включена' if preferences.auto_send_enabled else 'Автоотправка выключена')) }}</span>
-      <div class="sidebar-status-row"><span>Источники</span><strong>{{ selected_sources|length }}</strong></div>
+      <div class="sidebar-status-row"><span>Источники поиска</span><strong>{{ selected_sources|length }} из {{ sources|length }}</strong></div>
       <div class="sidebar-status-row"><span>Gmail</span><strong>{{ 'переподключить' if gmail_oauth.reauth_required else ('подключён' if gmail_oauth.connected else 'не подключён') }}</strong></div>
     </div>
     <div class="sidebar-footer"><button class="btn btn-icon btn-ghost" type="button" data-theme-toggle title="Сменить тему">◐</button><form method="post" action="/app/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-ghost">Выйти</button></form></div>

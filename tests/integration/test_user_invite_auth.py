@@ -684,6 +684,46 @@ async def test_user_history_and_decisions_paginate_all_owned_applications(
         assert second.text.count(f'class="{row_class}"') == 1
 
 
+async def _assert_notification_popover_visible(page: object, *, width: int, height: int) -> int:
+    from playwright.async_api import Page
+
+    assert isinstance(page, Page)
+    await page.set_viewport_size({"width": width, "height": height})
+    notifications = page.locator("[data-notifications]")
+    if await notifications.evaluate("element => element.open"):
+        await notifications.locator("summary").click()
+    await notifications.locator("summary").click()
+    geometry = await notifications.evaluate(
+        """element => {
+          const popover = element.querySelector('.notification-popover');
+          const badge = element.querySelector('.notification-count');
+          const rect = popover.getBoundingClientRect();
+          const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + 35);
+          const badgeRect = badge?.getBoundingClientRect();
+          return {
+            open: element.open,
+            hitPopover: popover.contains(hit),
+            overflow: getComputedStyle(element).overflow,
+            borderWidth: getComputedStyle(element).borderTopWidth,
+            count: badge?.textContent.trim() ?? null,
+            headCount: popover.querySelector('.notification-head .badge').textContent.trim(),
+            itemCount: popover.querySelectorAll('.notification-item').length,
+            badgeInViewport: !badgeRect || (
+              badgeRect.left >= 0 && badgeRect.top >= 0 &&
+              badgeRect.right <= innerWidth && badgeRect.bottom <= innerHeight
+            ),
+          };
+        }"""
+    )
+    assert geometry["open"] is True
+    assert geometry["hitPopover"] is True
+    assert geometry["overflow"] == "visible"
+    assert geometry["borderWidth"] == "0px"
+    assert geometry["badgeInViewport"] is True
+    assert geometry["count"] == (geometry["headCount"] if geometry["headCount"] != "0" else None)
+    return geometry["itemCount"]
+
+
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_invite_registration_browser_roundtrip_three_clean_contexts(
@@ -774,9 +814,12 @@ async def test_invite_registration_browser_roundtrip_three_clean_contexts(
                     assert callback.status == 200
                     assert page.url == f"{base_url}/app"
                     assert "Мой JobHunter" in await page.content()
-                    notifications = page.locator("[data-notifications]")
-                    await notifications.locator("summary").click()
-                    assert await notifications.evaluate("element => element.open") is True
+                    assert (
+                        await _assert_notification_popover_visible(page, width=1365, height=768) > 0
+                    )
+                    assert (
+                        await _assert_notification_popover_visible(page, width=390, height=844) > 0
+                    )
                     await page.goto(f"{base_url}/app?view=settings")
                     await page.locator("form[action='/app/profiles'] input[name='name']").fill(
                         f"Browser candidate {index}"
@@ -872,13 +915,44 @@ async def test_admin_notification_acknowledgement_three_clean_browser_contexts(
                         wait_until="domcontentloaded",
                     )
                     assert response is not None and response.status == 200
-                    await page.locator("summary[aria-label='Уведомления']").click()
+                    assert (
+                        await _assert_notification_popover_visible(page, width=1365, height=768) > 0
+                    )
+                    dashboard_count = await page.locator(".notification-head .badge").text_content()
+                    assert (
+                        await _assert_notification_popover_visible(page, width=390, height=844) > 0
+                    )
+                    await page.goto(f"{base_url}/admin/accounts")
+                    assert await page.locator(".app-shell .sidebar").is_visible()
+                    title = await page.locator(".topbar .topbar-title strong").inner_text()
+                    assert title == "Пользователи"
+                    active_link = await page.locator(".side-nav .nav-link.is-active").inner_text()
+                    assert active_link == "Пользователи"
+                    icons = await page.locator(".side-nav .nav-svg").evaluate_all(
+                        "elements => elements.map(element => { "
+                        "const r = element.getBoundingClientRect(); "
+                        "return [r.width, r.height]; })"
+                    )
+                    assert icons == [[20, 20]] * 6
+                    assert (
+                        await page.locator(".notification-head .badge").text_content()
+                        == dashboard_count
+                    )
+                    assert (
+                        await _assert_notification_popover_visible(page, width=1365, height=768) > 0
+                    )
+                    assert (
+                        await _assert_notification_popover_visible(page, width=390, height=844) > 0
+                    )
                     assert await page.get_by_text(f"Browser alert {index}").is_visible()
                     await page.locator(
                         f"form[action='/admin/alerts/{alert_id}/acknowledge'] button"
                     ).click()
-                    assert "view=overview" in page.url
-                    assert "notice=alert_acknowledged" in page.url
+                    assert page.url == f"{base_url}/admin/accounts"
+                    assert (
+                        await _assert_notification_popover_visible(page, width=1365, height=768)
+                        == 0
+                    )
                     async with user_auth_context.session_factory() as session:
                         stored = await session.get(Alert, alert_id)
                         assert stored is not None and stored.acknowledged is True

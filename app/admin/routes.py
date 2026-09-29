@@ -1736,6 +1736,8 @@ async def acknowledge_alert(
         decision="acknowledged",
     )
     await session.commit()
+    if return_view == "accounts":
+        return RedirectResponse("/admin/accounts", status_code=303)
     target_view = return_view if return_view in _VIEW_TITLES else "diagnostics"
     target = f"/admin?view={target_view}&notice=alert_acknowledged"
     if profile_id is not None:

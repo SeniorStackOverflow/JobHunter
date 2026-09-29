@@ -6,14 +6,7 @@
 <div class="app-shell">
   <aside class="sidebar">
     <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Панель управления</span></div></div>
-    <nav class="side-nav" aria-label="Основная навигация">
-      <a class="nav-link {% if view == 'overview' %}is-active{% endif %}" href="/admin?view=overview&profile_id={{ selected_profile_id }}"><span class="nav-icon">⌂</span><span>Главная</span></a>
-      <a class="nav-link {% if view == 'decisions' %}is-active{% endif %}" href="/admin?view=decisions&profile_id={{ selected_profile_id }}"><span class="nav-icon">✓</span><span>Требуют решения</span>{% if counts.pending_review %}<span class="nav-count">{{ counts.pending_review }}</span>{% endif %}</a>
-      <a class="nav-link {% if view == 'history' %}is-active{% endif %}" href="/admin?view=history&profile_id={{ selected_profile_id }}"><span class="nav-icon">◷</span><span>История</span></a>
-      <a class="nav-link {% if view == 'settings' %}is-active{% endif %}" href="/admin?view=settings&profile_id={{ selected_profile_id }}"><span class="nav-icon">⚙</span><span>Настройки</span></a>
-      <a class="nav-link {% if view == 'calls' %}is-active{% endif %}" href="/admin?view=calls&profile_id={{ selected_profile_id }}"><span class="nav-icon">☎</span><span>Звонки</span>{% if counts.phone_review %}<span class="nav-count">{{ counts.phone_review }}</span>{% endif %}</a>
-      <a class="nav-link" href="/admin/accounts"><span class="nav-icon">◎</span><span>Пользователи</span></a>
-    </nav>
+    {% include "_admin_nav.html" %}
     <div class="sidebar-spacer"></div>
     <div class="sidebar-status">
       <span class="badge {{ 'warning' if preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Отправка на паузе' if preferences.global_pause else ('Автоотправка включена' if preferences.auto_send_enabled else 'Автоотправка выключена') }}</span>
@@ -26,16 +19,7 @@
     <header class="topbar">
       <div class="topbar-main"><button class="btn btn-icon btn-ghost mobile-menu" type="button" data-menu-toggle aria-label="Открыть меню">☰</button><div class="topbar-title"><strong>{{ view_title }}</strong><span>{{ now_local.strftime('%d.%m.%Y · %H:%M') }} · Кишинёв</span></div></div>
       <div class="topbar-actions">
-        <details class="notification-center" data-notifications>
-          <summary class="btn btn-icon" aria-label="Уведомления" title="Уведомления"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z"/><path d="M10 21h4"/></svg>{% if counts.notification_count %}<span class="notification-count">{{ counts.notification_count }}</span>{% endif %}</summary>
-          <div class="notification-popover" role="region" aria-label="Последние уведомления">
-            <div class="notification-head"><strong>Уведомления</strong><span class="badge {{ 'warning' if counts.notification_count else 'success' }}">{{ counts.notification_count }}</span></div>
-            {% if notification_alerts %}<div class="notification-list">{% for item in notification_alerts %}<div class="notification-item"><span class="status-dot {{ 'danger' if item.severity in ['high', 'error', 'critical'] else 'warning' }}"></span><span><strong>{{ alert_code_label(item.code) }}</strong><small>{{ item.message }}</small></span><form method="post" action="/admin/alerts/{{ item.id }}/acknowledge"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_view" value="{{ view }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><button class="btn btn-icon btn-ghost notification-ack" aria-label="Отметить уведомление просмотренным" title="Отметить просмотренным">✓</button></form></div>{% endfor %}</div>
-            {% else %}<div class="notification-empty">Новых системных предупреждений нет.</div>{% endif %}
-            {% if counts.unhealthy_sources > 0 %}<a class="notification-item" href="/admin?view=settings&profile_id={{ selected_profile_id }}"><span class="status-dot warning"></span><span><strong>Проверьте источники</strong><small>{{ counts.unhealthy_sources }} выбранных источников сейчас не работают штатно.</small></span></a>{% endif %}
-            <a class="notification-footer" href="/admin?view=diagnostics&profile_id={{ selected_profile_id }}">История и технические подробности →</a>
-          </div>
-        </details>
+        {% include "_admin_notifications.html" %}
         <form method="get" action="/admin"><input type="hidden" name="view" value="{{ view }}"><select name="profile_id" class="btn" data-profile-select aria-label="Выбрать профиль">{% for item in profiles %}<option value="{{ item.id }}" {% if item.id == selected_profile_id %}selected{% endif %}>{{ item.name }}{% if item.is_default %} · основной{% endif %}</option>{% endfor %}</select></form>
         <span class="badge {{ 'success' if settings.real_email_delivery_enabled else 'muted' }}">{{ 'Реальная отправка' if settings.real_email_delivery_enabled else 'Тестовый режим' }}</span>
       </div>

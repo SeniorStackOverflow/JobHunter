@@ -2,11 +2,11 @@ from __future__ import annotations
 
 # FastAPI declarative dependency/form defaults intentionally call Depends/Form.
 # ruff: noqa: B008
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.accounts import AccountService, InviteService, InviteUnavailable, invite_state
@@ -21,8 +21,27 @@ from app.admin.routes import (
 )
 from app.database import get_session
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
-from app.models.entities import Account, AccountIdentity, Invite, JobPreference, UserProfile
-from app.models.enums import AccountStatus, ProfileStatus
+from app.models.entities import (
+    Account,
+    AccountIdentity,
+    Alert,
+    Application,
+    CommunicationSession,
+    Invite,
+    JobPreference,
+    JobSource,
+    ProfileSourcePreference,
+    UserProfile,
+)
+from app.models.enums import (
+    AccountStatus,
+    ApplicationStatus,
+    CommunicationChannel,
+    PhoneSummaryState,
+    ProfileStatus,
+    SourceHealth,
+)
+from app.profiles import ProfileService
 
 router = APIRouter()
 
@@ -69,6 +88,69 @@ async def _accounts_context(
             )
         ).all()
     )
+    active_alert_cutoff = datetime.now(UTC) - timedelta(hours=24)
+    active_alerts = int(
+        await session.scalar(
+            select(func.count(Alert.id)).where(
+                Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff
+            )
+        )
+        or 0
+    )
+    notification_alerts = list(
+        (
+            await session.scalars(
+                select(Alert)
+                .where(Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff)
+                .order_by(desc(Alert.created_at))
+                .limit(5)
+            )
+        ).all()
+    )
+    selected_profile = await ProfileService().get_profile(session)
+    pending_review = 0
+    unhealthy_sources = 0
+    if selected_profile is not None:
+        pending_review = int(
+            await session.scalar(
+                select(func.count(Application.id)).where(
+                    Application.profile_id == selected_profile.id,
+                    Application.status == ApplicationStatus.PENDING_REVIEW,
+                )
+            )
+            or 0
+        )
+        disabled_source_ids = {
+            row.source_id
+            for row in (
+                await session.scalars(
+                    select(ProfileSourcePreference).where(
+                        ProfileSourcePreference.profile_id == selected_profile.id,
+                        ProfileSourcePreference.enabled.is_(False),
+                    )
+                )
+            ).all()
+        }
+        sources = (await session.scalars(select(JobSource))).all()
+        unhealthy_sources = sum(
+            1
+            for source in sources
+            if source.enabled
+            and source.id not in disabled_source_ids
+            and source.health_status != SourceHealth.HEALTHY
+        )
+    phone_review = int(
+        await session.scalar(
+            select(func.count(CommunicationSession.id)).where(
+                CommunicationSession.channel == CommunicationChannel.CALL,
+                or_(
+                    CommunicationSession.needs_review.is_(True),
+                    CommunicationSession.summary_state == PhoneSummaryState.FAILED,
+                ),
+            )
+        )
+        or 0
+    )
     return {
         "accounts": accounts,
         "identities_by_account": identities_by_account,
@@ -77,6 +159,15 @@ async def _accounts_context(
         "invite_state": invite_state,
         "created_link": created_link,
         "csrf_token": _csrf().issue(_session_token(request)),
+        "view": "accounts",
+        "selected_profile_id": selected_profile.id if selected_profile is not None else None,
+        "counts": {
+            "pending_review": pending_review,
+            "phone_review": phone_review,
+            "notification_count": active_alerts + int(unhealthy_sources > 0),
+            "unhealthy_sources": unhealthy_sources,
+        },
+        "notification_alerts": notification_alerts,
     }
 
 

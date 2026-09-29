@@ -1,12 +1,25 @@
 {% extends "base.html" %}
 {% block title %}Пользователи · JobHunter{% endblock %}
-{% block body_class %}detail-page{% endblock %}
+{% block body_class %}dashboard-page{% endblock %}
 {% block body %}
-<header class="detail-topbar">
-  <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Пользователи</span></div></div>
-  <div class="row-actions"><a class="btn" href="/admin">← Панель</a></div>
-</header>
-<main class="detail-content">
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Панель управления</span></div></div>
+    {% include "_admin_nav.html" %}
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-status">
+      <span class="badge info"><span class="badge-dot"></span>Управление доступом</span>
+      <div class="sidebar-status-row"><span>Пользователи</span><strong>{{ accounts|length }}</strong></div>
+      <div class="sidebar-status-row"><span>Приглашения</span><strong>{{ invites|length }}</strong></div>
+    </div>
+    <div class="sidebar-footer"><button class="btn btn-icon btn-ghost" type="button" data-theme-toggle title="Сменить тему">◐</button><form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-ghost">Выйти</button></form></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <div class="topbar-main"><button class="btn btn-icon btn-ghost mobile-menu" type="button" data-menu-toggle aria-label="Открыть меню">☰</button><div class="topbar-title"><strong>Пользователи</strong><span>Аккаунты и приглашения</span></div></div>
+      <div class="topbar-actions">{% include "_admin_notifications.html" %}</div>
+    </header>
+    <main class="content">
   <div class="section-heading">
     <div><h1>Пользователи</h1><p>Регистрация даёт аккаунт, но автоматические действия остаются закрыты, пока профиль не активирован и его настройки не разрешают работу.</p></div>
   </div>
@@ -130,5 +143,7 @@
   {% else %}
   <div class="panel"><div class="empty-state">Зарегистрированных пользователей пока нет.</div></div>
   {% endfor %}
-</main>
+    </main>
+  </div>
+</div>
 {% endblock %}

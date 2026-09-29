@@ -1,0 +1,9 @@
+{% from "_nav_icon.html" import icon %}
+<nav class="side-nav" aria-label="Основная навигация">
+  <a class="nav-link {{ 'is-active' if view == 'overview' else '' }}" href="/admin?view=overview{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('home') }}</span><span>Главная</span></a>
+  <a class="nav-link {{ 'is-active' if view == 'decisions' else '' }}" href="/admin?view=decisions{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('decisions') }}</span><span>Требуют решения</span>{% if counts.pending_review %}<span class="nav-count">{{ counts.pending_review }}</span>{% endif %}</a>
+  <a class="nav-link {{ 'is-active' if view == 'history' else '' }}" href="/admin?view=history{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('history') }}</span><span>История</span></a>
+  <a class="nav-link {{ 'is-active' if view == 'settings' else '' }}" href="/admin?view=settings{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('settings') }}</span><span>Настройки</span></a>
+  <a class="nav-link {{ 'is-active' if view == 'calls' else '' }}" href="/admin?view=calls{% if selected_profile_id %}&profile_id={{ selected_profile_id }}{% endif %}"><span class="nav-icon">{{ icon('calls') }}</span><span>Звонки</span>{% if counts.phone_review %}<span class="nav-count">{{ counts.phone_review }}</span>{% endif %}</a>
+  <a class="nav-link {{ 'is-active' if view == 'accounts' else '' }}" href="/admin/accounts"><span class="nav-icon">{{ icon('users') }}</span><span>Пользователи</span></a>
+</nav>
