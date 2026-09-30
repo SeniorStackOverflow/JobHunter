@@ -44,6 +44,7 @@ from app.email.retries import retry_delay
 from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.bindings import (
     evaluation_inputs_are_current,
+    preference_fingerprint,
     used_confirmed_facts_are_current,
 )
 from app.matching.freshness import evaluation_is_current
@@ -119,6 +120,35 @@ _AUTO_SEND_TRANSIENT_FAILURES = {
     "employer_application_slot_available",
     "distinct_employer_today",
 }
+
+
+def _send_authorization_snapshot(
+    *,
+    evaluation: MatchEvaluation,
+    preferences: JobPreference,
+    policy: PolicyResult,
+    automatic: bool,
+    attempt_no: int,
+    authorized_at: datetime | None,
+) -> dict[str, object]:
+    effective_threshold = (
+        policy.catchup_stage
+        if policy.catchup_stage is not None
+        else preferences.minimum_auto_send_score
+    )
+    return {
+        "evaluation_id": str(evaluation.id),
+        "overall_score": evaluation.overall_fit,
+        "evaluation_decision": evaluation.decision.value,
+        "effective_threshold": effective_threshold,
+        "normal_threshold": preferences.minimum_auto_send_score,
+        "catchup_stage": policy.catchup_stage,
+        "preference_fingerprint": preference_fingerprint(preferences),
+        "policy_version": policy.policy_version,
+        "authority": "automatic" if automatic else "manual",
+        "attempt_no": attempt_no,
+        "authorized_at": authorized_at.isoformat() if authorized_at else None,
+    }
 
 
 class EmailService:
@@ -1016,6 +1046,19 @@ class EmailService:
             delivery.last_attempt_at = utcnow()
             contact.last_delivery_attempt_at = delivery.last_attempt_at
             application.status = ApplicationStatus.SENDING
+            # Persist the evidence that authorized this provider attempt. Reports
+            # read it instead of whichever evaluation happens to be newest later.
+            application.policy_result = {
+                **dict(application.policy_result or {}),
+                "send_authorization": _send_authorization_snapshot(
+                    evaluation=evaluation,
+                    preferences=preferences,
+                    policy=policy,
+                    automatic=auto_send_authority,
+                    attempt_no=delivery.attempt_count,
+                    authorized_at=delivery.last_attempt_at,
+                ),
+            }
             # Reserve hard-maximum capacity under the same quota lock that
             # authorized this attempt, before the provider can transmit.
             send_attempt = await reserve_send_attempt(

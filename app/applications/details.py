@@ -149,6 +149,18 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
             )
             or {}
         ),
+        "match_evaluation_id": application.match_evaluation_id,
+        # The bound evaluation is the one policy and sending used; newer
+        # re-evaluations of the same job do not change this historical view.
+        "match_evaluation": _fields(
+            evaluation if match_evaluation_issue != "invalid_match_evaluation_binding" else None,
+            "id",
+            "overall_fit",
+            "resume_fit",
+            "preference_fit",
+            "decision",
+            "created_at",
+        ),
         "match_evaluation_issue": match_evaluation_issue,
         "failed_policy_rules": [str(item) for item in failed_rules],
         "employer_only_deferred": bool(failed_rules)

@@ -491,7 +491,19 @@ async def _generate(
     sent_applications: list[dict[str, Any]] = []
     automatically_sent = 0
     for delivery, application, job, source, resume, contact in sent_rows:
-        evaluation = await session.scalar(
+        # The historical score is the evaluation the send was authorized with.
+        # A later re-evaluation (even an invalid score 0) never rewrites it.
+        bound_evaluation = (
+            await session.get(MatchEvaluation, application.match_evaluation_id)
+            if application.match_evaluation_id is not None
+            else None
+        )
+        if bound_evaluation is not None and (
+            bound_evaluation.profile_id != application.profile_id
+            or bound_evaluation.canonical_job_id != application.canonical_job_id
+        ):
+            bound_evaluation = None
+        latest_evaluation = await session.scalar(
             select(MatchEvaluation)
             .where(
                 MatchEvaluation.profile_id == application.profile_id,
@@ -500,6 +512,8 @@ async def _generate(
             .order_by(MatchEvaluation.created_at.desc())
             .limit(1)
         )
+        authorization = (application.policy_result or {}).get("send_authorization")
+        authorization = authorization if isinstance(authorization, dict) else {}
         automatic = application.policy_decision == PolicyDecision.AUTO_APPROVED
         automatically_sent += int(automatic)
         sent_applications.append(
@@ -507,7 +521,22 @@ async def _generate(
                 "job_title": job.title,
                 "company": job.company,
                 "source": source.name,
-                "overall_score": evaluation.overall_fit if evaluation else None,
+                "overall_score": (
+                    bound_evaluation.overall_fit if bound_evaluation is not None else None
+                ),
+                "overall_score_source": (
+                    "bound_evaluation" if bound_evaluation is not None else "unknown"
+                ),
+                "match_evaluation_id": (
+                    str(bound_evaluation.id) if bound_evaluation is not None else None
+                ),
+                "send_threshold": authorization.get("effective_threshold"),
+                "latest_evaluation_score": (
+                    latest_evaluation.overall_fit if latest_evaluation is not None else None
+                ),
+                "latest_evaluation_id": (
+                    str(latest_evaluation.id) if latest_evaluation is not None else None
+                ),
                 "resume": resume.name,
                 "recipient": delivery.recipient or contact.value,
                 "delivery_method": delivery.provider,

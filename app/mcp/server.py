@@ -1373,6 +1373,7 @@ async def list_applications(limit: int = 50, profile_id: str | None = None) -> l
                 "profile_id",
                 "canonical_job_id",
                 "source_job_id",
+                "match_evaluation_id",
                 "resume_id",
                 "subject",
                 "language",

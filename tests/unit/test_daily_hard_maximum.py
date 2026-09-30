@@ -248,3 +248,89 @@ def test_local_day_key_uses_europe_chisinau_calendar() -> None:
     # 21:30 UTC on 29 September is already 30 September in Chisinau (UTC+3).
     assert local_day_key(datetime(2026, 9, 29, 21, 30, tzinfo=UTC)) == "2026-09-30"
     assert local_day_key(datetime(2026, 9, 29, 20, 59, tzinfo=UTC)) == "2026-09-29"
+
+
+async def test_report_keeps_the_score_that_authorized_a_send(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.applications.details import get_application_detail
+    from app.models.entities import MatchEvaluation
+    from app.models.enums import MatchDecision
+    from app.reports.service import _generate
+
+    application_id, _profile_id = await _approved_graph(sqlite_session_factory, tmp_path)
+    service = EmailService(settings(tmp_path), sqlite_session_factory, FakeGmailProvider())
+    await service.send_application(application_id)
+
+    async with sqlite_session_factory() as session:
+        application = await session.get(Application, application_id)
+        assert application is not None
+        bound = await session.get(MatchEvaluation, application.match_evaluation_id)
+        assert bound is not None and bound.overall_fit == 92
+        snapshot = application.policy_result["send_authorization"]
+        assert snapshot["evaluation_id"] == str(bound.id)
+        assert snapshot["overall_score"] == 92
+        assert snapshot["effective_threshold"] == 80
+        assert snapshot["authority"] == "automatic"
+        assert snapshot["attempt_no"] == 1
+
+        def reevaluation(score: int, decision: MatchDecision, risks: list[str], offset: int):
+            values = {
+                column.key: getattr(bound, column.key)
+                for column in MatchEvaluation.__table__.columns
+                if column.key != "id"
+            }
+            values.update(
+                overall_fit=score,
+                decision=decision,
+                risks=risks,
+                created_at=bound.created_at + timedelta(minutes=offset),
+            )
+            return MatchEvaluation(**values)
+
+        session.add(
+            reevaluation(
+                0,
+                MatchDecision.PREPARE_FOR_REVIEW,
+                ["llm_provider_failure:llmrouter:schema_validation:literal_error"],
+                1,
+            )
+        )
+        await session.commit()
+        report = await _generate(session, persist=False)
+        [sent] = report.summary["sent_applications"]
+        assert sent["overall_score"] == 92
+        assert sent["overall_score_source"] == "bound_evaluation"
+        assert sent["match_evaluation_id"] == str(bound.id)
+        assert sent["latest_evaluation_score"] == 0
+        assert sent["send_threshold"] == 80
+
+        session.add(reevaluation(80, MatchDecision.SKIP, [], 2))
+        await session.commit()
+        report = await _generate(session, persist=False)
+        [sent] = report.summary["sent_applications"]
+        assert sent["overall_score"] == 92
+        assert sent["latest_evaluation_score"] == 80
+
+        detail = await get_application_detail(session, application_id)
+        assert str(detail["match_evaluation"]["id"]) == str(bound.id)
+
+
+async def test_report_marks_score_unknown_without_a_bound_evaluation(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.reports.service import _generate
+
+    application_id, _profile_id = await _approved_graph(sqlite_session_factory, tmp_path)
+    service = EmailService(settings(tmp_path), sqlite_session_factory, FakeGmailProvider())
+    await service.send_application(application_id)
+    async with sqlite_session_factory() as session:
+        application = await session.get(Application, application_id)
+        assert application is not None
+        application.match_evaluation_id = None
+        await session.commit()
+        report = await _generate(session, persist=False)
+        [sent] = report.summary["sent_applications"]
+        assert sent["overall_score"] is None
+        assert sent["overall_score_source"] == "unknown"
+        assert sent["latest_evaluation_score"] == 92
