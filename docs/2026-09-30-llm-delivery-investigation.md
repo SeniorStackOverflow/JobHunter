@@ -1,0 +1,285 @@
+# Причины ошибок LLM, score 0 и расхождения sent/submitted
+
+Исследование 30 сентября 2026 года. Production использован только для чтения:
+PostgreSQL в read-only транзакциях, journal llmRouter и его SQLite через `mode=ro`.
+Письма, LLM-запросы, crawler-задачи, миграции и перезапуски не запускались.
+Изменения поведения в рамках исследования не внедрялись.
+
+Канонический DEV `main` и чистый PROD checkout: `40de08e`. Все семь сервисов
+JobHunter работают на `jobhunter-prod:4f04db049505`; последующий `40de08e` добавил
+документацию. Исследование выполнено в DEV поверх `45ed3b6` в ветке
+`investigate/llm-delivery-september-30`. llmRouter checkout: `59f3f7a`, чистый;
+это отдельный production-сервис, его код и настройки не менялись.
+
+## Воспроизведение исходного среза
+
+Исходные числа **точно воспроизведены**, а не заменены более поздними счётчиками.
+Начало локального дня: `2026-09-29 21:00:00 UTC` (00:00 в Кишинёве).
+Последняя включённая LLM-попытка: `2026-09-30 17:06:52.862215 UTC`
+(20:06:52.862215 в Кишинёве). Между ней и следующей попыткой в 17:06:57 UTC
+агрегаты совпадают с запросом: 1289 попыток, 408 успешных HTTP-ответов,
+881 ошибка, 393 logical requests, 368 затронутых и 368 recovered,
+0 transport-level final failures. Коды и разбивка по провайдерам также совпали.
+
+Для matching-оценок и отправок используется граница 17:06:53 UTC.
+SQL ограничивает историческую когорту, но читает текущие mutable статусы
+доставки и policy result; произвольное состояние на прошлую минуту этим
+запросом не восстанавливается. Привязанные оценки и их время сохранены отдельно.
+После неё production продолжал работать, поэтому «сейчас» и исходный срез
+нельзя смешивать. В дополнительном чтении в 17:53:22 UTC из исходных
+11 невалидных результатов три уже имели более новую валидную оценку,
+восемь ещё оставались невалидными. Это не исправление кода исследователем.
+
+Повторяемые запросы: [read-only SQL](2026-09-30-llm-delivery-evidence.sql).
+В документе нет резюме, профилей, текстов писем, секретов или полных адресов
+получателей. Идентификаторы двух инцидентов оставлены для адресной проверки.
+
+## 881 ошибка: большинство 502 синтетические
+
+| Что сохранено в JobHunter | Количество | Что установлено по Router/journal |
+| --- | ---: | --- |
+| Groq 502 | 718 | Реальные upstream HTTP **400**, преобразованные Router в 502 |
+| Google 502 | 18 | HTTP 200 с `finish_reason=length`; Router классифицировал обрезание как 502 |
+| NVIDIA 502 | 1 | Такой же обрезанный HTTP 200 |
+| Google 429 | 79 | Реальные rate-limit ответы; 73 относятся к `gemini-2.5-flash-lite` |
+| Google 503 | 48 | Реальные upstream 503 |
+| NVIDIA RouterAttemptTimeout | 13 | Исчерпан лимит времени одной попытки Router |
+| Google RouterAttemptTimeout | 4 | Такой же timeout |
+
+Итого 881, включая 737 «502». **Все 737 объясняются преобразованием 400 либо
+обрезанного 200, а не подтверждёнными upstream HTTP 502.** Для Groq journal
+содержит ровно 718 HTTP 400 и соответствующие 361/357 fallback-ошибок моделей
+`openai/gpt-oss-20b` / `openai/gpt-oss-120b`. SQLite Router независимо подтверждает
+718 `fail_uncounted` без `soft_fail` и 19 `fail_counted/truncated`.
+
+Механизм в `/srv/llmrouter/src/llmrouter/routing/router.py`, `Router.execute`:
+при выборе tier и JSON response format ошибка 400 становится `ProviderError(502)`
+с `router_synthetic=true` и `upstream_status=400`, чтобы перейти к следующему
+кандидату. `_attempt_error_trace` теряет upstream status и synthetic marker;
+JobHunter получает только 502. Исходные тела 400 не сохранены в journal,
+SQLite или `ExternalCallEvent`, поэтому конкретный текст отказа восстановить нельзя.
+
+**Подтверждённая несовместимость исходящего контракта:**
+`LLMRouterProvider._body` отправляет `strict=true` и необработанный
+`MatchResult.model_json_schema()`. В `properties` есть `soft_mismatches` и
+`optional_requirements_missing`, которых нет в `required` из-за default factory.
+Groq требует обязательности всех полей strict-схемы.
+[Официальные требования Groq](https://console.groq.com/docs/structured-outputs).
+Это воспроизводимый дефект контракта и обоснованная причина регулярных 400;
+без сохранённых тел ошибок нельзя утверждать, что каждый из 718 ответов
+содержал именно это сообщение, а не другой отказ проверки запроса.
+Кроме того, 12 Groq-ошибок произошли до 15:20 UTC, ещё до текущего rollout:
+одними добавленными в новом коде полями всю дневную историю объяснить нельзя.
+
+**Почему повторяется:** `LimitTracker.record_failure` исключает synthetic 502
+из server-5xx cooldown и сохраняет их как `fail_uncounted`, `soft_fail=NULL`.
+`health_score` не учитывает такие строки ни как samples, ни как ошибки.
+В текущем `model_state` GPT-OSS Groq нет соответствующего 5xx streak/quarantine.
+Поэтому Router снова предлагает те же модели для того же несовместимого контракта.
+Обычная защита от повторяющихся реальных 5xx этот случай не покрывает.
+
+Google 429 уже проходит rate-limit cooldown; 503 — отдельный класс upstream
+недоступности. За сохранёнными 429 нет информации о конкретной исчерпанной квоте;
+только по статусу нельзя назвать RPM, TPM или дневной бюджет. Timeout — лимит
+Router 20 секунд на попытку, а не доказательство общего падения NVIDIA/Google.
+
+Цена восстановления: 3,280 попытки на logical request, максимум 9;
+14 logical requests имели несколько успешных HTTP-ответов, суммарно 15 лишних
+HTTP-success после первого. Сумма `latency_ms` всех попыток — 2 964 370 мс,
+около 49 минут 24 секунд; p95 суммы на запрос — 24 872 мс. Это накопленное
+время попыток, не длительность дня и не полное пользовательское ожидание:
+backoff/ожидание очереди в эту сумму не входят. Денежную стоимость без billing
+и полной token usage восстановить нельзя.
+
+## 11 невалидных результатов после HTTP-восстановления
+
+В исходном срезе сохранены 11 fallback-оценок по 11 разным вакансиям:
+
+- **9 `schema_validation:literal_error`**. В `MatchResult` поле с Literal —
+  `soft_mismatches`: только `skills`, `preferred_experience`, `resume_relevance`,
+  `optional_requirement`. `decision` использует Enum с другим типом ошибки.
+  Локальный синтетический пример `soft_mismatches=["experience"]` воспроизводит
+  `literal_error` в `soft_mismatches[0]`; это пример, не извлечённый ответ production.
+- **2 `finish_reason:length`**. JobHunter отверг обрезанный ответ после HTTP 200.
+
+Связка по вакансии и ближайшему финальному событию в пределах пяти секунд
+до создания оценки показывает: у всех девяти literal failures последним был
+Cloudflare `@cf/ibm-granite/granite-4.0-h-micro`; у двух length failures — NVIDIA
+`openai/gpt-oss-20b`. Это временная корреляция, не сохранённый внешний ключ:
+`MatchEvaluation` не содержит `logical_request_id`. Для двух length случаев
+проверены и полные цепочки: по два HTTP-success NVIDIA, завершившиеся fallback.
+
+В резервном режиме после `all_providers_exhausted` JobHunter убирает structured
+response format и переносит JSON Schema в prompt. Router проверяет транспорт
+и общую форму chat-ответа, но не выполняет `MatchResult`-валидацию. В режиме
+без structured capability обрезание также может остаться HTTP-success.
+При повторе ошибки JobHunter обычно снова спрашивает ту же доступную модель
+с теми же instructions и бюджетом 1536 токенов, без обратной связи о поле ошибки.
+
+`_safe_fallback` ставит score 0, `prepare_for_review` и material risk
+`llm_provider_failure:*`. Это безопасный отказ оценки, не решение автоматически
+отправить письмо. Ни одна сегодняшняя отправка не привязана к такой оценке.
+`recovered` вычисляется по наличию transport failure + HTTP success и
+**не означает валидного matching-результата**. Метрики транспорта и приложения
+нужно показывать отдельно.
+
+`_schema_validation_failure` сохраняет только тип первой ошибки, без пути поля
+и входного значения; сырые ответы не сохраняются. Поэтому точные девять
+неподдерживаемых строк и содержание обрезанных ответов недоступны.
+
+## Откуда взялась «автоотправка со score 0»
+
+Application: `787d9f3d-10bd-4e21-ad1c-a4952b6c404b`.
+
+| Событие | UTC | Оценка |
+| --- | --- | ---: |
+| Привязанная оценка `974e7023-68b9-47be-b268-1b7d6bf50270`, `auto_apply` | 29.09 16:37:06.720719 | **80** |
+| Реальная отправка, audit actor `email_worker`, attempt 1 | 30.09 15:25:12.598765 | Привязка к оценке 80 |
+| Повторная оценка `c4e8c588-32b8-4dd1-8971-a7249e506037`, literal failure | 30.09 16:22:22.238195 | **0** |
+| Более новая валидная оценка `a8e1f297-db27-4e56-b8a3-a30d0f2c3cf9`, `skip` | 30.09 17:24:00.801010 | 80 |
+
+Policy snapshot отправки: `auto_approved`, версия
+`2026-09-30.1-distinct-employer-catchup`, `rules_failed=[]`;
+`overall_score_threshold`, `match_auto_apply`, `no_material_match_risk` прошли;
+`hard_safety_passed=true`, `content_ready=true`, `soft_match_passed=true`,
+`employer_slot_available=true`. `catchup_stage=null`, `minimum_remaining=0`.
+Это обычная автоотправка, без снижения порога ради добора.
+
+**Дефект именно в отчёте:** в `app/reports/service.py::_generate` поле
+`sent_applications[].overall_score` берётся из **самой новой оценки canonical job**,
+а не `Application.match_evaluation_id`. Поэтому после повторного matching
+историческая отправка с 80 показывалась как отправка с 0. Позднее она опять
+будет показываться с 80, но уже с другим решением. Детальная карточка
+`get_application_detail` использует правильную привязку.
+
+Проверена вся delivery cohort из 21 записи: привязка есть у всех; score при
+отправке 80–98; нулевых и LLM-fallback оценок нет; все 21 `auto_approved`,
+у всех `catchup_stage=null`. Сохранённый policy result не включает числовой
+score/threshold и полные preferences: score восстановлен из immutable оценки,
+а точный исторический threshold одним policy snapshot доказать нельзя.
+
+## Bounce unitesto.md: доменная проверка действительно отсутствует
+
+Application: `7bdef7cc-c980-4c29-a4bc-958ca29a9998`.
+Gmail принял письмо в 15:25:10.752130 UTC; DSN имеет время 15:25:13 UTC,
+импортирован в 15:26:59.829927 UTC. Класс `domain_not_found`, SMTP `5.1.2`,
+`permanent=true`, `retryable=false`. Сейчас delivery `domain_rejected`,
+Application `failed` с сохранённым `sent_at`, контакт `source_ok/rejected`;
+`attempt_count=1`, `next_retry_at=NULL`. Повтор этой заявки не запланирован.
+
+Происхождение контакта проверено: Rabota.md, `job_detail_explicit_email`,
+evidence URL совпадает со страницей вакансии; primary email, список дополнительных
+email и выбранный контакт совпадают с recipient. Вакансия впервые замечена
+23 сентября в 16:05:25 UTC, заявка подготовлена в 16:12:37 UTC того же дня.
+Данные указывают на опубликованный адрес источника, а не на замену recipient
+генератором письма.
+
+Свежий DNS-read из DEV вернул **NXDOMAIN** для MX, A и AAAA `unitesto.md`,
+rcode 3, SOA зоны `md.`. Это подтверждает отсутствие домена сейчас;
+историческое отсутствие в момент отправки отдельно подтверждено Gmail DSN.
+
+`app/contacts/service.py::validate_public_email` вызывает
+`validate_email(check_deliverability=False, test_environment=True)`.
+Этот адрес успешно проходит такую локальную проверку. `SOURCE_VERIFIED`
+подтверждает явное наличие адреса в вакансии; policy и sender проверяют
+синтаксис, provenance и прежние отказы, **не DNS**. При первом письме ещё не было
+истории отказа, поэтому эти проверки пропустили несуществующий домен.
+Gmail API acceptance — приём сообщения на отправку, а не доставка в ящик.
+
+Нужно проверять mail routing домена перед отправкой. MX/A/AAAA-проверка помогает
+отсеять этот инцидент, но не доказывает существование конкретного ящика.
+[Границы DNS-проверки email-validator](https://github.com/JoshData/python-email-validator).
+Есть дополнительный пробел: cross-contact propagation применяется лишь к
+`recipient_not_found` / `recipient_rejected`, а не `domain_not_found`.
+Существующий контакт заблокирован, но другой адрес этого же мёртвого домена
+не получает доменного запрета автоматически.
+
+## 20 sent / 21 submitted: сохранение истории и дефект лимита
+
+Одна и та же когорта, один профиль, один день:
+
+```text
+21 submitted = 21 первоначально provider accepted
+             = 20 сейчас provider_accepted + 1 domain_rejected
+Applications = 20 sent + 1 failed (sent_at сохранён)
+Permanent bounce rate = 1 / 21 = 4,76%
+```
+
+Утраченного письма или лишней дублированной delivery-записи здесь нет.
+`submitted_at`/`provider_accepted_at` сохраняют первоначальную передачу,
+а актуальный sent исключает bounce. Сделать оба счётчика равными означало бы
+стереть факт попытки либо засчитать подтверждённый отказ как успех.
+20 accepted также не доказывают 20 доставок в реальные ящики.
+
+**При этом фактический максимум исходящих был превышен:**
+`PolicyEngine.evaluate` считает `attempts_today` по `EmailDelivery.created_at`
+и текущим статусам `sent/provider_accepted/delivered/sending/delivery_unknown`.
+После DSN строка стала `domain_rejected` и исчезла из проверки `daily_limit`.
+До импорта DSN было 16 submitted, после — ещё 5: система добрала до
+20 текущих принятых, но за день передала провайдеру 21 письмо.
+Отдельная атомарная блокировка не помогает, когда слот освобождает такой фильтр.
+Также дата создания delivery не равна дате повторной передачи провайдеру.
+
+Это расходится с правилом в `auto-send-policy.md`: failed освобождает максимум
+только когда provider однозначно не принял сообщение. Тут acceptance сохранён.
+Минимум успешных отправок и жёсткий максимум реальных отправок требуют разных
+счётчиков. Текст `daily-minimum-catchup.md` о сохранении статуса `SENT` после bounce
+также устарел: реальный код сохраняет `sent_at`, но меняет статус на `FAILED`.
+
+Отдельный дефект страницы «Пользователи» — подсчёт всех `sent_at`, включая failed —
+исправлен локальным `45ed3b6`; этот коммит ещё не выкладывался. Он унифицирует
+панельный sent с главной страницей, но закономерно не переписывает ledger submitted.
+
+## Что исправлять дальше
+
+1. **До provider submission добавить отдельный bounded DNS preflight**, сохранив
+   синтаксический normalizer. NXDOMAIN/null MX/no mail routing — отказ; timeout,
+   SERVFAIL и недоступность resolver — отложенная попытка, не «проверено» и не
+   постоянное уничтожение контакта. Кешировать с TTL, распространять доменный
+   отказ на контакты домена; резолвер внедрять зависимостью для offline-тестов.
+2. **Максимум считать по факту отправки/неопределённости**, сохраняя слот после
+   принятого провайдером письма, даже если оно позже bounced. Учитывать локальное
+   окно по submission/acceptance и in-flight резерв под существующей блокировкой.
+   Добор минимума может исключать permanent bounce; максимум не должен освобождаться.
+3. **В sent report выбирать bound evaluation ID**, а последнюю переоценку показывать
+   отдельным полем. Добавить в send snapshot ID оценки, score, effective threshold
+   и fingerprint настроек для воспроизводимости исторического разрешения.
+4. **Исправить исходящую strict-схему**, отдельно от локальной Pydantic-валидации;
+   не снимать проверки и не превращать неизвестные literals в auto_apply.
+   Router должен учитывать повторные contract/capability failures и сохранять
+   upstream status, synthetic marker и безопасный код отказа. Эти изменения
+   относятся к отдельному репозиторию llmRouter.
+5. **Добавить application-level telemetry и управляемый repair/retry**: путь поля
+   и тип ошибки без CV/сырого ответа; не повторять детерминированный 400;
+   после invalid output дать ограниченную обратную связь или выбрать совместимую
+   модель; после length пересмотреть бюджет для этой модели с верхней границей.
+   HTTP recovered и schema validated учитывать раздельно.
+
+Критерии будущей проверки: NXDOMAIN не вызывает sender; timeout не помечается
+валидным; late bounce не освобождает hard maximum; параллельные workers не выходят
+за него; новая fallback-оценка не меняет score исторической отправки; строгий
+контракт принимается совместимыми моделями; invalid/length никогда не авторизуют
+auto-send. LLM/email/DNS endpoints в тестах должны быть локальными или fake.
+Перед production-изменениями обязательны локальные проверки, E2E и отдельное
+разрешение оператора согласно [AGENTS.md](../AGENTS.md).
+
+## Проверки исследования
+
+Локально воспроизведены принятие синтаксического email с NXDOMAIN-доменом,
+необязательные поля исходящей strict-схемы и Literal-ошибка синтетического ответа.
+Запросы исходного среза сверены с сохранёнными данными и независимым journal/SQLite
+Router. Все семь SELECT в приложенном SQL успешно выполнены внутри одной
+read-only repeatable-read транзакции; результат ещё раз совпал с исходными числами.
+
+Project checks на Python 3.12 успешно завершены:
+
+- `ruff check .` и `ruff format --check .`;
+- `mypy app fixture_site`: 167 файлов, без ошибок;
+- `pytest`: **1450 passed, 21 skipped**, 708,85 секунды.
+
+JUnit: `/tmp/jobhunter-llm-delivery-investigation.xml`. Отключены чтение
+developer `.env`, real email, live crawling и real-call integrations; providers
+в тестах mock/fake. Пропуски: 9 PostgreSQL/Redis checks, 2 opt-in browser checks,
+2 live crawler/PhoneGate checks и 8 real GSM checks. Это проверка неизменённого
+приложения, а не доказательство исправления найденных дефектов.
+Runtime исправления и production rollout не выполнялись.

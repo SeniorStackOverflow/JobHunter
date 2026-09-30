@@ -33,6 +33,7 @@
 и не подтверждают, что каждая предложенная функция реализована.
 
 - [Исследование недобора дневного минимума 27–28 сентября](2026-09-29-daily-minimum-investigation.md).
+- [Ошибки LLM, score 0 и sent/submitted 30 сентября](2026-09-30-llm-delivery-investigation.md).
 - [Первоначальная архитектура телефонного агента](phonegate-call-agent-architecture.md).
 - [Изменения turn-taking 2026-09-14](phone-turn-taking-2026-09-14.md).
 - [DEV acceptance Phase 2b](operations/phone-phase-2b-dev-acceptance.md).
