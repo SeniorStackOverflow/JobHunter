@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.accounts import AccountService, InviteService, InviteUnavailable, invite_state
@@ -20,11 +20,11 @@ from app.admin.routes import (
     templates,
 )
 from app.database import get_session
+from app.email.oauth import GmailOAuthService
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Account,
     AccountIdentity,
-    Alert,
     Application,
     CommunicationSession,
     Invite,
@@ -37,13 +37,15 @@ from app.models.enums import (
     AccountStatus,
     ApplicationStatus,
     CommunicationChannel,
-    PhoneSummaryState,
+    PhoneVerificationStatus,
     ProfileStatus,
     SourceHealth,
 )
 from app.profiles import ProfileService
 from app.settings import get_settings
 from app.ui.panel import Panel
+from app.ui.presentation import _LOCAL_TZ
+from app.ui.status import attention_status, panel_notifications, profile_attention
 
 router = APIRouter()
 
@@ -90,28 +92,11 @@ async def _accounts_context(
             )
         ).all()
     )
-    active_alert_cutoff = datetime.now(UTC) - timedelta(hours=24)
-    active_alerts = int(
-        await session.scalar(
-            select(func.count(Alert.id)).where(
-                Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff
-            )
-        )
-        or 0
-    )
-    notification_alerts = list(
-        (
-            await session.scalars(
-                select(Alert)
-                .where(Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff)
-                .order_by(desc(Alert.created_at))
-                .limit(5)
-            )
-        ).all()
-    )
     selected_profile = await ProfileService().get_profile(session)
     pending_review = 0
-    unhealthy_sources = 0
+    sources: list[JobSource] = []
+    disabled_source_ids = set()
+    enabled_sources = healthy_sources = 0
     if selected_profile is not None:
         pending_review = int(
             await session.scalar(
@@ -133,13 +118,15 @@ async def _accounts_context(
                 )
             ).all()
         }
-        sources = (await session.scalars(select(JobSource))).all()
-        unhealthy_sources = sum(
-            1
-            for source in sources
-            if source.enabled
+        sources = list((await session.scalars(select(JobSource).order_by(JobSource.name))).all())
+        enabled_sources = sum(
+            source.enabled and source.id not in disabled_source_ids for source in sources
+        )
+        healthy_sources = sum(
+            source.enabled
             and source.id not in disabled_source_ids
-            and source.health_status != SourceHealth.HEALTHY
+            and source.health_status == SourceHealth.HEALTHY
+            for source in sources
         )
     phone_review = int(
         await session.scalar(
@@ -147,14 +134,57 @@ async def _accounts_context(
                 CommunicationSession.channel == CommunicationChannel.CALL,
                 or_(
                     CommunicationSession.needs_review.is_(True),
-                    CommunicationSession.summary_state == PhoneSummaryState.FAILED,
+                    CommunicationSession.verification_status
+                    == PhoneVerificationStatus.NEEDS_REVIEW,
                 ),
             )
         )
         or 0
     )
+    panel = Panel(is_admin=True, profile_id=selected_profile.id if selected_profile else None)
+    counts = {
+        "pending_review": pending_review,
+        "phone_review": phone_review,
+        "enabled_sources": enabled_sources,
+        "healthy_sources": healthy_sources,
+        "unhealthy_sources": enabled_sources - healthy_sources,
+    }
+    attention = []
+    overview = {"sent_today": 0, "daily_limit": 0}
+    if selected_profile is not None:
+        service = ProfileService()
+        preferences = await service.get_preferences(session, selected_profile.id)
+        gmail_oauth = await GmailOAuthService(get_settings()).get_status(
+            session, account_id=selected_profile.owner_account_id
+        )
+        attention = await profile_attention(
+            session,
+            panel,
+            selected_profile,
+            preferences,
+            counts,
+            sources,
+            disabled_source_ids,
+            gmail_oauth,
+        )
+        local_now = datetime.now(_LOCAL_TZ)
+        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+        overview = {
+            "sent_today": int(
+                await session.scalar(
+                    select(func.count(Application.id)).where(
+                        Application.profile_id == selected_profile.id, Application.sent_at >= start
+                    )
+                )
+                or 0
+            ),
+            "daily_limit": preferences.maximum_daily_applications,
+        }
+    notifications = await panel_notifications(session, panel, attention)
+    counts["notification_count"] = len(notifications)
+    tone, title = attention_status(notifications)
     return {
-        "panel": Panel(is_admin=True, profile_id=selected_profile.id if selected_profile else None),
+        "panel": panel,
         "view_title": "Пользователи",
         "delivery_enabled": get_settings().real_email_delivery_enabled,
         "accounts": accounts,
@@ -166,13 +196,11 @@ async def _accounts_context(
         "csrf_token": _csrf().issue(_session_token(request)),
         "view": "accounts",
         "selected_profile_id": selected_profile.id if selected_profile is not None else None,
-        "counts": {
-            "pending_review": pending_review,
-            "phone_review": phone_review,
-            "notification_count": active_alerts + int(unhealthy_sources > 0),
-            "unhealthy_sources": unhealthy_sources,
-        },
-        "notification_alerts": notification_alerts,
+        "counts": counts,
+        "notifications": notifications,
+        "overall_tone": tone,
+        "overall_title": title,
+        "overview": overview,
     }
 
 

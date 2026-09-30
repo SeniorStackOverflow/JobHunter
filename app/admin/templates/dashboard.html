@@ -8,6 +8,5 @@
 {% elif view == 'history' %}{% include "dashboard_history.html" %}
 {% elif view == 'settings' %}{% include "dashboard_settings.html" %}
 {% elif panel.is_admin and view == 'calls' %}{% include "calls.html" %}
-{% elif panel.is_admin %}{% include "dashboard_diagnostics.html" %}
 {% endif %}
 {% endblock %}

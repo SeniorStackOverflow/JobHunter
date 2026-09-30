@@ -582,16 +582,20 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
             "decisions": "Требуют решения",
             "history": "История",
             "settings": "Критерии и лимиты",
-            "diagnostics": "Текущие проблемы",
         }.items():
             page = await client.get("/admin", params={"view": view})
             assert page.status_code == 200
             assert heading in page.text
             assert page.text.count('class="admin-section"') == 1
-            if view == "diagnostics":
-                assert len(HTMLParser(page.text).css(".archive-item")) == 1
-                assert "Отметить просмотренным" in page.text
-                assert "white-space:normal!important" in stylesheet.text
+        legacy = await client.get("/admin", params={"view": "diagnostics"})
+        assert legacy.status_code == 303
+        assert legacy.headers["location"] == "/admin?view=history&history_kind=alerts"
+        archive = await client.get(legacy.headers["location"])
+        assert len(HTMLParser(archive.text).css(".archive-item")) == 1
+        assert "Отметить прочитанным" in archive.text
+        assert "white-space:normal!important" in stylesheet.text
+        assert "view=diagnostics" not in archive.text
+        assert "Отправка доступна" not in archive.text
         feedback_page = await client.get("/admin", params={"notice": "preferences_saved"})
         assert "Настройки сохранены" in feedback_page.text
         assert "data-notice-dismiss" in feedback_page.text
@@ -4298,7 +4302,16 @@ async def test_shared_panel_browser_flows_three_clean_contexts_per_role(
                             == "14px"
                         )
                         await expect(page.locator(".side-nav .nav-link")).to_have_count(
-                            7 if base == "/admin" else 4
+                            6 if base == "/admin" else 4
+                        )
+                        assert await page.locator("[data-panel-status]").count() == 1
+                        assert "Отправка доступна" not in await page.locator(".topbar").inner_text()
+                        assert await page.locator("a[href*='view=diagnostics']").count() == 0
+                        assert (
+                            await page.locator(".notification-item")
+                            .filter(has_text="откликов ждут решения")
+                            .count()
+                            == 1
                         )
                         await page.locator("[data-theme-toggle]").click()
                         assert (
@@ -4370,6 +4383,12 @@ async def test_shared_panel_browser_flows_three_clean_contexts_per_role(
                         await page.locator("[data-confirm-accept]").click()
                         await expect(page.locator("[data-action-notice]")).to_be_visible()
                         await expect(page.locator("form[data-review-reject]")).to_have_count(0)
+                        assert (
+                            await page.locator(".notification-item")
+                            .filter(has_text="откликов ждут решения")
+                            .count()
+                            == 0
+                        )
                         await page.goto(
                             f"{base_url}{base}?view=history&history_kind=rejected&profile_id={profile_id}&q={suffix}"
                         )
@@ -4391,3 +4410,254 @@ async def test_shared_panel_browser_flows_three_clean_contexts_per_role(
             )
             assert feedback is not None and feedback.reason_code == ReviewReason.SALARY
             assert feedback.learning_eligible is True
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_panel_actions_and_confirmed_source_recovery_three_clean_contexts(
+    interface_app,
+    sqlite_session_factory,
+    fixture_site_client,
+    generic_source_configuration,
+    monkeypatch,
+    tmp_path,
+):
+    import asyncio
+    import socket
+
+    import uvicorn
+    from playwright.async_api import async_playwright, expect
+
+    from app.crawlers.pipeline import ScanService
+    from app.crawlers.registry.registry import build_default_registry
+    from tests.integration.test_scan_pipeline import FixtureSiteFetcher
+
+    application, settings = interface_app
+    monkeypatch.setattr("app.database.session.async_session_factory", sqlite_session_factory)
+    monkeypatch.setattr("app.scheduler.tasks.run_scan_task.delay", lambda _run_id: None)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    origin = f"http://localhost:{port}"
+    settings.public_base_url = origin
+    server = uvicorn.Server(
+        uvicorn.Config(application, host="127.0.0.1", port=port, log_level="error")
+    )
+    task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient() as client:
+            for _ in range(100):
+                try:
+                    if (await client.get(origin + "/login")).status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("panel UX browser server did not start")
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch()
+            try:
+                for index in range(3):
+                    seeded = await _seed_review_application(
+                        sqlite_session_factory, settings, suffix=f"ux-recovery-{index}"
+                    )
+                    async with sqlite_session_factory() as session:
+                        source = await session.get(JobSource, seeded["source_id"])
+                        source.adapter_type = "generic_html"
+                        source.base_url = "https://fixture-site"
+                        source.configuration = generic_source_configuration
+                        source.health_status = SourceHealth.DEGRADED
+                        source.automatic_actions_paused = True
+                        resume = await session.get(Resume, seeded["resume_id"])
+                        resume.verified = False
+                        preferences = await session.scalar(
+                            select(JobPreference).where(
+                                JobPreference.profile_id == seeded["profile_id"]
+                            )
+                        )
+                        preferences.global_pause = True
+                        alert = Alert(
+                            source_id=source.id,
+                            code="adapter_degradation",
+                            severity="high",
+                            message=f"Source warning {index}",
+                            created_at=datetime.now(UTC) - timedelta(minutes=1),
+                        )
+                        session.add(alert)
+                        await session.commit()
+                        alert_id = alert.id
+                    context = await browser.new_context(viewport={"width": 1365, "height": 900})
+                    try:
+                        token = SessionSigner(settings.secret_key.get_secret_value()).issue(
+                            settings.admin_username
+                        )
+                        await context.add_cookies(
+                            [{"name": settings.session_cookie_name, "value": token, "url": origin}]
+                        )
+                        page = await context.new_page()
+                        profile_id = seeded["profile_id"]
+                        url = f"{origin}/admin?profile_id={profile_id}"
+                        await page.goto(url + "&view=overview")
+                        await expect(page.locator(".side-nav .nav-link")).to_have_count(6)
+                        assert await page.locator("a[href*='view=diagnostics']").count() == 0
+                        assert "Отправка доступна" not in await page.locator(".topbar").inner_text()
+                        await page.locator(".owner-status button").click()
+                        await page.locator("[data-confirm-accept]").click()
+                        await expect(
+                            page.locator(".notification-item").filter(
+                                has_text="Автоотправка на паузе"
+                            )
+                        ).to_have_count(0)
+                        await page.goto(url + "&view=settings")
+                        await page.locator(
+                            f"form[action='/admin/resumes/{seeded['resume_id']}/verify'] button"
+                        ).click()
+                        await expect(
+                            page.locator(".notification-item").filter(has_text="Проверьте резюме")
+                        ).to_have_count(0)
+                        await page.locator(
+                            f"#source-{seeded['source_id']} [action$='/scan/incremental'] button"
+                        ).click()
+                        assert (
+                            str(profile_id) in page.url
+                            and f"#source-{seeded['source_id']}" in page.url
+                        )
+                        assert await page.locator(f"[data-alert-id='{alert_id}']").count() == 1
+                        async with sqlite_session_factory() as session:
+                            run = await session.scalar(
+                                select(ScanRun).where(
+                                    ScanRun.source_id == seeded["source_id"],
+                                    ScanRun.status == RunStatus.QUEUED,
+                                )
+                            )
+                            assert run is not None
+                            run_id = run.id
+                            stored = await session.get(Alert, alert_id)
+                            assert not stored.acknowledged
+                        service = ScanService(
+                            sqlite_session_factory,
+                            build_default_registry(
+                                client_factory=lambda _source: FixtureSiteFetcher(
+                                    fixture_site_client
+                                )
+                            ),
+                        )
+                        completed = await service.run_scan(run_id)
+                        assert completed.status == RunStatus.SUCCEEDED
+                        await page.reload()
+                        assert await page.locator(f"[data-alert-id='{alert_id}']").count() == 0
+                        async with sqlite_session_factory() as session:
+                            stored = await session.get(Alert, alert_id)
+                            assert stored.acknowledged and stored.safe_diagnostics["resolution"][
+                                "scan_id"
+                            ] == str(run_id)
+                        await page.goto(url + "&view=history&history_kind=alerts")
+                        await expect(page.locator(f"#alert-{alert_id}")).to_have_attribute(
+                            "data-alert-state", "resolved"
+                        )
+                        await expect(page.locator(f"#alert-{alert_id}")).to_contain_text(
+                            "Устранено"
+                        )
+                        await page.goto(url + "&view=history&history_kind=audit")
+                        await expect(page.locator(".tab.is-active")).to_contain_text(
+                            "Журнал системы"
+                        )
+                        await page.goto(url + "&view=diagnostics")
+                        assert "view=history" in page.url and "history_kind=alerts" in page.url
+                        await page.goto(url + "&view=overview")
+                        if index == 2:
+                            await page.screenshot(
+                                path="/tmp/jobhunter-panel-ux-desktop.png", full_page=True
+                            )
+                        await page.set_viewport_size({"width": 390, "height": 844})
+                        await page.locator("[data-notifications] summary").click()
+                        assert await page.locator(".notification-popover").is_visible()
+                        assert await page.evaluate(
+                            "document.documentElement.scrollWidth <= innerWidth"
+                        )
+                        if index == 2:
+                            await page.screenshot(
+                                path="/tmp/jobhunter-panel-ux-mobile.png", full_page=True
+                            )
+                    finally:
+                        await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await task
+
+
+async def test_operator_notification_history_read_state_search_pagination_and_account_isolation(
+    interface_app,
+    sqlite_session_factory,
+):
+    application, settings = interface_app
+    seeded = await _seed_review_application(
+        sqlite_session_factory, settings, suffix="alert-history"
+    )
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        alerts = [
+            Alert(
+                code="archive_test",
+                severity="warning",
+                message=f"Private event {index}",
+                created_at=now - timedelta(minutes=index),
+            )
+            for index in range(27)
+        ]
+        session.add_all(alerts)
+        await session.commit()
+        target_id = alerts[25].id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="https://testserver"
+    ) as client:
+        await _login_admin(client, settings)
+        page = await client.get("/admin?view=history&history_kind=alerts")
+        assert len(HTMLParser(page.text).css(".archive-item")) == 20
+        second = await client.get("/admin?view=history&history_kind=alerts&page=2")
+        assert len(HTMLParser(second.text).css(".archive-item")) == 7
+        exact = await client.get(
+            "/admin", params={"view": "history", "history_kind": "alerts", "q": str(target_id)}
+        )
+        assert len(HTMLParser(exact.text).css(".archive-item")) == 1
+        assert 'data-alert-state="unread"' in exact.text
+        denied = await client.post(
+            f"/admin/alerts/{target_id}/acknowledge", data={"csrf_token": "invalid"}
+        )
+        assert denied.status_code == 403
+        read = await client.post(
+            f"/admin/alerts/{target_id}/acknowledge",
+            data={
+                "csrf_token": _csrf_token(exact.text),
+                "profile_id": str(seeded["profile_id"]),
+                "return_view": "history",
+                "history_kind": "alerts",
+            },
+        )
+        assert read.status_code == 303 and "history_kind=alerts" in read.headers["location"]
+        exact = await client.get(
+            "/admin", params={"view": "history", "history_kind": "alerts", "q": str(target_id)}
+        )
+        assert 'data-alert-state="read"' in exact.text
+        assert 'data-alert-state="resolved"' not in exact.text
+        legacy = await client.get(
+            "/admin", params={"view": "diagnostics", "profile_id": str(seeded["profile_id"])}
+        )
+        assert legacy.status_code == 303 and str(seeded["profile_id"]) in legacy.headers["location"]
+    settings.user_accounts_enabled = True
+    _, _, user_token = await _account_panel_seed(
+        sqlite_session_factory, settings, suffix="history-reader"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="https://testserver"
+    ) as client:
+        client.cookies.set(settings.user_session_cookie_name, user_token)
+        for kind in ("alerts", "audit"):
+            response = await client.get("/app", params={"view": "history", "history_kind": kind})
+            assert response.status_code == 200
+            assert "Private event" not in response.text
+            assert "Журнал системы" not in response.text
+            assert "Отметить прочитанным" not in response.text

@@ -116,10 +116,10 @@
       </div>
     </div>
 
-    <details class="settings-section" open><summary><span><strong>Источники для {{ profile.name }}</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} выбранных источников работают штатно. Выбор не влияет на других пользователей.</small></span><span>Открыть</span></summary><div class="details-body settings-body">
+    <details class="settings-section" id="sources" open><summary><span><strong>Источники для {{ profile.name }}</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} выбранных источников работают штатно. Выбор не влияет на других пользователей.</small></span><span>Открыть</span></summary><div class="details-body settings-body">
       <div class="compact-list">
         {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}{% set chosen = item.id not in disabled_source_ids %}
-        <div class="compact-row">
+        <div class="compact-row" id="source-{{ item.id }}">
           <div>
             <strong>{% if source_link %}<a href="{{ source_link }}" rel="noreferrer" target="_blank">{{ item.name }} ↗</a>{% else %}{{ item.name }}{% endif %}</strong>
             <span>{{ 'Доступен для поиска' if item.enabled else 'Администратор временно остановил обход' }}</span>
@@ -131,6 +131,7 @@
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="enabled" value="{{ 'false' if chosen else 'true' }}">
               <button class="btn btn-sm">{{ 'Исключить' if chosen else 'Включить для профиля' }}</button>
             </form>
+            {% if panel.is_admin and item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><button class="btn btn-sm">{{ 'Проверить снова' if item.health_status.value != 'healthy' else 'Обновить сейчас' }}</button></form>{% endif %}
           </div>
         </div>
         {% else %}<div class="empty-state compact">Источники ещё не настроены.</div>{% endfor %}

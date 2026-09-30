@@ -40,11 +40,11 @@ from app.models.enums import (
     CommunicationChannel,
     JobStatus,
     MatchDecision,
-    PhoneSummaryState,
-    ProfileStatus,
+    PhoneVerificationStatus,
     RunStatus,
     SourceHealth,
 )
+from app.notifications import resolved_alert_ids
 from app.profiles import ProfileService
 from app.security.auth import CsrfProtector
 from app.settings import Settings
@@ -58,6 +58,7 @@ from app.ui.presentation import (
     _pagination,
     templates,
 )
+from app.ui.status import attention_status, panel_notifications, profile_attention
 
 
 async def _empty_dashboard(
@@ -238,7 +239,8 @@ async def render_dashboard(
         "running_scans": int(
             await session.scalar(
                 select(func.count(ScanRun.id)).where(
-                    ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])
+                    ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
+                    ScanRun.source_id.in_(selected_source_ids),
                 )
             )
             or 0
@@ -253,51 +255,18 @@ async def render_dashboard(
             and item.id not in disabled_source_ids
             and item.health_status == SourceHealth.HEALTHY
         ),
-        "unacknowledged_alerts": (
-            int(
-                await session.scalar(
-                    select(func.count(Alert.id)).where(Alert.acknowledged.is_(False))
-                )
-                or 0
-            )
-            if is_admin
-            else 0
-        ),
     }
     counts["unhealthy_sources"] = counts["enabled_sources"] - counts["healthy_sources"]
-    active_alert_cutoff = datetime.now(UTC) - timedelta(hours=24)
-    notification_alerts: list[Alert] = []
-    counts.update(active_alerts=0, notification_count=0, phone_review=0)
+    counts.update(notification_count=0, phone_review=0)
     if is_admin:
-        active_alert_cutoff = datetime.now(UTC) - timedelta(hours=24)
-        counts["active_alerts"] = int(
-            await session.scalar(
-                select(func.count(Alert.id)).where(
-                    Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff
-                )
-            )
-            or 0
-        )
-        notification_alerts = list(
-            (
-                await session.scalars(
-                    select(Alert)
-                    .where(Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff)
-                    .order_by(desc(Alert.created_at))
-                    .limit(5)
-                )
-            ).all()
-        )
-        counts["notification_count"] = counts["active_alerts"] + int(
-            counts["unhealthy_sources"] > 0
-        )
         counts["phone_review"] = int(
             await session.scalar(
                 select(func.count(CommunicationSession.id)).where(
                     CommunicationSession.channel == CommunicationChannel.CALL,
                     or_(
                         CommunicationSession.needs_review.is_(True),
-                        CommunicationSession.summary_state == PhoneSummaryState.FAILED,
+                        CommunicationSession.verification_status
+                        == PhoneVerificationStatus.NEEDS_REVIEW,
                     ),
                 )
             )
@@ -334,162 +303,13 @@ async def render_dashboard(
     gmail_oauth = await GmailOAuthService(settings).get_status(
         session, account_id=profile.owner_account_id
     )
-    attention_items: list[dict[str, str]] = []
-    if not gmail_oauth["configured"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": "Google OAuth не настроен",
-                "detail": "Вход через Google и автономная отправка Gmail недоступны.",
-                "href": panel.view("settings"),
-                "action": "Открыть настройки",
-            }
-        )
-    elif not gmail_oauth["connected"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": "Google-аккаунт не подключён",
-                "detail": "Для этого профиля нужен Gmail его владельца.",
-                "href": (
-                    panel.gmail_connect
-                    if not is_admin or profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "/admin/accounts"
-                ),
-                "action": (
-                    "Подключить"
-                    if not is_admin or profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "Открыть пользователей"
-                ),
-            }
-        )
-    elif gmail_oauth["reauth_required"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": "Gmail требует переподключения",
-                "detail": "Автоотправка остановлена до получения нового OAuth-доступа.",
-                "href": (
-                    panel.gmail_connect
-                    if not is_admin or profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "/admin/accounts"
-                ),
-                "action": (
-                    "Переподключить Gmail"
-                    if not is_admin or profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "Открыть пользователей"
-                ),
-            }
-        )
-    elif not gmail_oauth["identity_verified"]:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Подтвердите Google-аккаунт",
-                "detail": "Доступ к Gmail есть, но личность владельца ещё не подтверждена.",
-                "href": panel.gmail_connect,
-                "action": "Войти через Google",
-            }
-        )
-    if counts["active_alerts"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": f"{counts['active_alerts']} свежих системных предупреждений",
-                "detail": "Появились за последние 24 часа и ещё не просмотрены.",
-                "href": panel.view("diagnostics" if is_admin else "settings"),
-                "action": "Проверить",
-            }
-        )
-    unhealthy_sources = counts["unhealthy_sources"]
-    if unhealthy_sources:
-        unhealthy_names = ", ".join(
-            item.name
-            for item in sources
-            if item.enabled
-            and item.id not in disabled_source_ids
-            and item.health_status != SourceHealth.HEALTHY
-        )
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": f"{unhealthy_sources} источников требуют проверки",
-                "detail": unhealthy_names,
-                "href": panel.view("diagnostics" if is_admin else "settings"),
-                "action": "Диагностика",
-            }
-        )
-    if counts["pending_review"]:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": f"{counts['pending_review']} откликов ждут решения",
-                "detail": "Нейросеть подготовила их, но финальное действие остаётся за вами.",
-                "href": panel.view("decisions"),
-                "action": "Открыть очередь",
-            }
-        )
-    if preferences.global_pause:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Автоотправка на паузе",
-                "detail": "Автоматизация продолжит анализ, но не отправит новые отклики.",
-                "href": panel.view("settings"),
-                "action": "Управление",
-            }
-        )
-    ready_resume = await session.scalar(
-        select(Resume.id)
-        .where(
-            Resume.profile_id == profile.id,
-            Resume.active.is_(True),
-            Resume.verified.is_(True),
-            Resume.archived.is_(False),
-        )
-        .limit(1)
+    attention_items = await profile_attention(
+        session, panel, profile, preferences, counts, sources, disabled_source_ids, gmail_oauth
     )
-    if ready_resume is None:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Проверьте резюме",
-                "detail": "Подтверждённое PDF нужно для откликов.",
-                "href": panel.view("settings"),
-                "action": "Открыть",
-            }
-        )
-    if not selected_source_ids:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Выберите источники",
-                "detail": "Сейчас нет включённых источников для этого профиля.",
-                "href": panel.view("settings"),
-                "action": "Открыть",
-            }
-        )
-    if profile.status != ProfileStatus.ACTIVE:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Запустите поиск"
-                if profile.status == ProfileStatus.DRAFT
-                else "Поиск приостановлен",
-                "detail": "Подготовьте профиль и резюме перед запуском поиска."
-                if profile.status == ProfileStatus.DRAFT
-                else "Для возобновления обратитесь к администратору.",
-                "href": panel.view("settings"),
-                "action": "Открыть",
-            }
-        )
-    attention_tone = (
-        "danger"
-        if any(item["tone"] == "danger" for item in attention_items)
-        else "warning"
-        if attention_items
-        else "success"
-    )
+    notifications = await panel_notifications(session, panel, attention_items)
+    counts["notification_count"] = len(notifications)
+    attention_tone, overall_title = attention_status(notifications)
+    overall_tone = attention_tone
     source_names = {item.id: item.name for item in sources}
 
     applications: list[Application] = []
@@ -503,11 +323,10 @@ async def render_dashboard(
     resumes: list[Resume] = []
     resume_usage: dict[UUID, int] = {}
     audits: list[AuditEvent] = []
-    active_alerts: list[Alert] = []
+    alert_states: dict[UUID, str] = {}
     historical_alerts: list[Alert] = []
     learning_summary = None
     learning_scores: dict[UUID, LearnedReviewScore] = {}
-    phone_health: dict[str, Any] = {}
     calls_context: dict[str, Any] = {}
     pagination = _pagination(0, 1, 10)
 
@@ -677,10 +496,64 @@ async def render_dashboard(
             )
     elif view == "history":
         valid_history_kinds = {"all", "sent", "rejected", "jobs", "matches", "scans"}
+        if is_admin:
+            valid_history_kinds.update({"alerts", "audit"})
         history_kind = history_kind if history_kind in valid_history_kinds else "sent"
         history_per_page = 20 if is_admin else 25
         pattern = f"%{q}%"
-        if history_kind in {"all", "sent", "rejected"}:
+        if history_kind == "alerts":
+            conditions = [or_(Alert.message.ilike(pattern), Alert.code.ilike(pattern))] if q else []
+            if q:
+                try:
+                    alert_id = UUID(q)
+                except ValueError:
+                    pass
+                else:
+                    conditions = [Alert.id == alert_id]
+            total = int(await session.scalar(select(func.count(Alert.id)).where(*conditions)) or 0)
+            pagination = _pagination(total, page, history_per_page)
+            historical_alerts = list(
+                (
+                    await session.scalars(
+                        select(Alert)
+                        .where(*conditions)
+                        .order_by(desc(Alert.created_at), desc(Alert.id))
+                        .offset((int(pagination["page"]) - 1) * history_per_page)
+                        .limit(history_per_page)
+                    )
+                ).all()
+            )
+            resolved = await resolved_alert_ids(session, historical_alerts)
+            alert_states = {
+                alert.id: "resolved"
+                if alert.id in resolved
+                else "read"
+                if alert.acknowledged
+                else "unread"
+                for alert in historical_alerts
+            }
+        elif history_kind == "audit":
+            conditions = (
+                [or_(AuditEvent.action.ilike(pattern), AuditEvent.actor.ilike(pattern))]
+                if q
+                else []
+            )
+            total = int(
+                await session.scalar(select(func.count(AuditEvent.id)).where(*conditions)) or 0
+            )
+            pagination = _pagination(total, page, history_per_page)
+            audits = list(
+                (
+                    await session.scalars(
+                        select(AuditEvent)
+                        .where(*conditions)
+                        .order_by(desc(AuditEvent.timestamp), desc(AuditEvent.id))
+                        .offset((int(pagination["page"]) - 1) * history_per_page)
+                        .limit(history_per_page)
+                    )
+                ).all()
+            )
+        elif history_kind in {"all", "sent", "rejected"}:
             history_statuses = (
                 [ApplicationStatus.SENT]
                 if history_kind == "sent"
@@ -830,51 +703,6 @@ async def render_dashboard(
             query=q,
             session_id=request.query_params.get("session"),
         )
-    else:
-        active_alerts = list(
-            (
-                await session.scalars(
-                    select(Alert)
-                    .where(
-                        Alert.acknowledged.is_(False),
-                        Alert.created_at >= active_alert_cutoff,
-                    )
-                    .order_by(desc(Alert.created_at))
-                    .limit(20)
-                )
-            ).all()
-        )
-        historical_alerts = list(
-            (
-                await session.scalars(
-                    select(Alert)
-                    .where(
-                        or_(
-                            Alert.acknowledged.is_(True),
-                            Alert.created_at < active_alert_cutoff,
-                        )
-                    )
-                    .order_by(desc(Alert.created_at))
-                    .limit(20)
-                )
-            ).all()
-        )
-        total = int(await session.scalar(select(func.count(AuditEvent.id))) or 0)
-        pagination = _pagination(total, page, 20)
-        audits = list(
-            (
-                await session.scalars(
-                    select(AuditEvent)
-                    .order_by(desc(AuditEvent.timestamp))
-                    .offset((int(pagination["page"]) - 1) * 20)
-                    .limit(20)
-                )
-            ).all()
-        )
-        from app.admin.phone_routes import phone_health_context
-
-        phone_health = await phone_health_context(session)
-
     displayed_applications = applications or recent_applications
     application_job_ids = {item.source_job_id for item in displayed_applications}
     if application_job_ids:
@@ -926,16 +754,6 @@ async def render_dashboard(
             ).all()
         }
 
-    if not gmail_oauth["configured"] or not gmail_oauth["connected"] or unhealthy_sources:
-        overall_tone = "danger"
-        overall_title = "Требуется ваше внимание"
-    elif counts["active_alerts"] or preferences.global_pause or counts["pending_review"]:
-        overall_tone = "warning"
-        overall_title = "Работает, но есть решения для вас"
-    else:
-        overall_tone = "success"
-        overall_title = "Всё работает штатно"
-
     identity = (
         await session.scalar(
             select(AccountIdentity).where(AccountIdentity.account_id == owner_id).limit(1)
@@ -948,7 +766,7 @@ async def render_dashboard(
         "account": account,
         "identity_email": identity.email if identity else None,
         "invite_token": invite_token,
-        "notifications": attention_items,
+        "notifications": notifications,
         "delivery_enabled": settings.real_email_delivery_enabled,
         "can_connect_gmail": not is_admin or profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
     }
@@ -985,15 +803,13 @@ async def render_dashboard(
             "learning_summary": learning_summary,
             "learning_scores": learning_scores,
             "scans": scans,
-            "active_alerts": active_alerts,
-            "notification_alerts": notification_alerts,
+            "alert_states": alert_states,
             "historical_alerts": historical_alerts,
             "audits": audits,
-            "phone_health": phone_health,
             "counts": counts,
             "overview": overview,
             "gmail_oauth": gmail_oauth,
-            "attention_items": attention_items,
+            "attention_items": notifications,
             "attention_tone": attention_tone,
             "overall_tone": overall_tone,
             "overall_title": overall_title,

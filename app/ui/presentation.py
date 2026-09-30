@@ -94,7 +94,6 @@ _VIEW_TITLES = {
     "decisions": "Требуют решения",
     "history": "История",
     "settings": "Настройки",
-    "diagnostics": "Диагностика",
     "calls": "Звонки",
 }
 
@@ -125,7 +124,10 @@ _AUDIT_ACTION_LABELS = {
 
 _ALERT_CODE_LABELS = {
     "adapter_degradation": "Источник работает нестабильно",
+    "adapter_access_degraded": "Источник временно недоступен",
     "mass_absence_suppressed": "Защитная проверка массового исчезновения вакансий",
+    "email_retry_queue_stuck": "Отправка писем задерживается",
+    "email_authentication_failure": "Проверьте доступ к Gmail",
 }
 
 _FEEDBACK_NOTICES = {
@@ -179,7 +181,7 @@ _FEEDBACK_NOTICES = {
     ),
     "alert_acknowledged": (
         "Уведомление просмотрено",
-        "Оно сохранено в архиве диагностики.",
+        "Оно сохранено в истории уведомлений. Просмотр не означает устранение проблемы.",
     ),
     "source_enabled": ("Источник включён", "Новые обходы снова разрешены."),
     "source_selection_saved": (
@@ -300,6 +302,8 @@ def _audit_action_label(value: str) -> str:
 
 
 def _alert_code_label(value: str) -> str:
+    if value.startswith("email_permanent_delivery_failure:"):
+        return "Не удалось доставить отклик"
     return _ALERT_CODE_LABELS.get(value, "Системное уведомление")
 
 

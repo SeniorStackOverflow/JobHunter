@@ -236,8 +236,14 @@ async def dashboard(
     google: str | None = None,
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
+) -> Response:
     from app.ui.dashboard import render_dashboard
+
+    if view == "diagnostics":
+        target = "/admin?view=history&history_kind=alerts"
+        if profile_id is not None:
+            target += f"&profile_id={profile_id}"
+        return RedirectResponse(target, status_code=303)
 
     return await render_dashboard(
         request,
@@ -598,7 +604,8 @@ async def acknowledge_alert(
     alert_id: UUID,
     request: Request,
     csrf_token: str = Form(...),
-    return_view: str = Form("diagnostics"),
+    return_view: str = Form("history"),
+    history_kind: str = Form("alerts"),
     profile_id: UUID | None = Form(None),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
@@ -618,8 +625,11 @@ async def acknowledge_alert(
     await session.commit()
     if return_view == "accounts":
         return RedirectResponse("/admin/accounts", status_code=303)
-    target_view = return_view if return_view in _VIEW_TITLES else "diagnostics"
+    target_view = return_view if return_view in _VIEW_TITLES else "history"
     target = f"/admin?view={target_view}&notice=alert_acknowledged"
+    if target_view == "history":
+        valid_kinds = {"alerts", "audit", "all", "sent", "rejected", "jobs", "matches", "scans"}
+        target += f"&history_kind={history_kind if history_kind in valid_kinds else 'alerts'}"
     if profile_id is not None:
         target += f"&profile_id={profile_id}"
     return RedirectResponse(target, status_code=303)
@@ -898,6 +908,7 @@ async def admin_start_scan(
     scan_type: ScanType,
     request: Request,
     csrf_token: str = Form(...),
+    profile_id: UUID | None = Form(None),
     _: str = Depends(require_admin),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
@@ -917,7 +928,10 @@ async def admin_start_scan(
                 stored.diagnostics = {"queue_error": type(exc).__name__}
                 await session.commit()
         raise HTTPException(status_code=503, detail="task queue unavailable") from exc
-    return RedirectResponse("/admin?view=diagnostics&notice=scan_started", status_code=303)
+    target = "/admin?view=settings&notice=scan_started"
+    if profile_id is not None:
+        target += f"&profile_id={profile_id}"
+    return RedirectResponse(f"{target}#source-{source_id}", status_code=303)
 
 
 @router.get("/admin/applications/{application_id}", response_class=HTMLResponse)

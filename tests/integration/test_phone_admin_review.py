@@ -154,6 +154,7 @@ async def test_fact_review_requires_csrf_and_confirms_manual_value(review_contex
     )
     assert invalid.status_code == 403
     page = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
+    assert "1 звонков ждут проверки" in page.text
     csrf = HTMLParser(page.text).css_first("input[name='csrf_token']").attributes["value"]
     response = await client.post(
         f"/admin/phone/calls/{call_id}/facts/interview_date/review",
@@ -181,6 +182,8 @@ async def test_fact_review_requires_csrf_and_confirms_manual_value(review_contex
         call = await db.get(CommunicationSession, call_id)
         assert call is not None
         assert call.verification_status is PhoneVerificationStatus.CONFIRMED
+    page = await client.get("/admin?view=overview")
+    assert "звонков ждут проверки" not in page.text
 
 
 @pytest.mark.asyncio
@@ -621,3 +624,101 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
         await page.add_style_tag(content=stylesheet.text)
         assert await page.get_by_text("Факты ещё не извлечены. Требуется проверка.").count() == 1
         await browser.close()
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_phone_review_task_closes_three_clean_browser_contexts(review_context, monkeypatch):
+    import socket
+
+    import uvicorn
+    from playwright.async_api import async_playwright, expect
+
+    from tests.fixtures.fake_redis import FakeAsyncRedis
+
+    client, call_id, _sms_id, factory = review_context
+    monkeypatch.setattr(admin_routes, "_phone_redis", lambda: FakeAsyncRedis())
+    assert isinstance(client._transport, httpx.ASGITransport)
+    application = client._transport.app
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    origin = f"http://localhost:{port}"
+    server = uvicorn.Server(
+        uvicorn.Config(application, host="127.0.0.1", port=port, log_level="error")
+    )
+    task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient() as readiness:
+            for _ in range(100):
+                try:
+                    if (await readiness.get(origin + "/login")).status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("phone review browser server did not start")
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch()
+            try:
+                for _ in range(3):
+                    async with factory() as db:
+                        call = await db.get(CommunicationSession, call_id)
+                        call.verification_status = PhoneVerificationStatus.NEEDS_REVIEW
+                        call.needs_review = True
+                        call.summary_state = PhoneSummaryState.FAILED
+                        for fact in (
+                            await db.scalars(select(CallFact).where(CallFact.session_id == call_id))
+                        ).all():
+                            fact.state = CallFactState.UNKNOWN
+                            fact.normalized_value = None
+                        await db.commit()
+                    context = await browser.new_context(viewport={"width": 390, "height": 844})
+                    try:
+                        await context.add_cookies(
+                            [
+                                {"name": name, "value": value, "url": origin}
+                                for name, value in client.cookies.items()
+                            ]
+                        )
+                        page = await context.new_page()
+                        await page.goto(origin + "/admin?view=overview")
+                        await page.locator("[data-notifications] summary").click()
+                        notification = page.locator(".notification-item").filter(
+                            has_text="звонков ждут проверки"
+                        )
+                        await expect(notification).to_have_count(1)
+                        await notification.get_by_role("link", name="Открыть звонки").click()
+                        assert "filter=needs_review" in page.url
+                        await page.locator(f"a.queue-card[href*='session={call_id}']").click()
+                        for field, value in [
+                            ("interview_date", "03.09.2026"),
+                            ("interview_time", "14:00"),
+                        ]:
+                            form = page.locator(f"form[action$='/facts/{field}/review']").filter(
+                                has=page.locator("input[name=action][value=correct]")
+                            )
+                            await form.locator("input[name=value]").fill(value)
+                            await form.get_by_role("button").click()
+                            await page.wait_for_load_state("networkidle")
+                        await expect(
+                            page.locator(".notification-item").filter(
+                                has_text="звонков ждут проверки"
+                            )
+                        ).to_have_count(0)
+                        assert await page.evaluate(
+                            "document.documentElement.scrollWidth <= innerWidth"
+                        )
+                        async with factory() as db:
+                            call = await db.get(CommunicationSession, call_id)
+                            assert call.verification_status is PhoneVerificationStatus.CONFIRMED
+                            assert not call.needs_review
+                            assert call.summary_state is PhoneSummaryState.FAILED
+                    finally:
+                        await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await task

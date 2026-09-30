@@ -40,6 +40,7 @@ from app.models.entities import (
     SourceJob,
 )
 from app.models.enums import JobStatus, RunStatus, ScanType, SourceHealth
+from app.notifications import resolve_source_alerts
 from app.security.ssrf import UnsafeURLError
 from app.settings import get_settings
 
@@ -778,6 +779,7 @@ class ScanService:
             run.finished_at = datetime.now(UTC)
             run.heartbeat_at = run.finished_at
             run.owner_task_id = None
+            await resolve_source_alerts(session, run)
             await record_audit_event(
                 session,
                 actor="worker",

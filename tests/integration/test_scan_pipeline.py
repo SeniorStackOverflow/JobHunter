@@ -922,6 +922,18 @@ async def test_successful_scan_recovers_automatic_pause_after_degradation(
     )
     service = ScanService(sqlite_session_factory, registry)
 
+    async with sqlite_session_factory() as session:
+        alert = Alert(
+            source_id=source_id,
+            code="adapter_degradation",
+            severity="high",
+            message="Recovered warning",
+            created_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        session.add(alert)
+        await session.commit()
+        alert_id = alert.id
+
     run = await run_full_scan(service, source_id)
 
     assert run.status == RunStatus.SUCCEEDED
@@ -930,3 +942,6 @@ async def test_successful_scan_recovers_automatic_pause_after_degradation(
         assert stored_source is not None
         assert stored_source.health_status == SourceHealth.HEALTHY
         assert stored_source.automatic_actions_paused is False
+        alert = await session.get(Alert, alert_id)
+        assert alert is not None and alert.acknowledged
+        assert alert.safe_diagnostics["resolution"]["scan_id"] == str(run.id)

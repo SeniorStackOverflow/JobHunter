@@ -12,8 +12,9 @@
     {% block sidebar_status %}
     {% if profile %}<div class="sidebar-status">
       <span class="badge {{ 'warning' if profile.status.value != 'active' or preferences.global_pause else ('success' if preferences.auto_send_enabled else 'muted') }}"><span class="badge-dot"></span>{{ 'Поиск не запущен' if profile.status.value != 'active' else ('Отправка на паузе' if preferences.global_pause else ('Автоотправка включена' if preferences.auto_send_enabled else 'Автоотправка выключена')) }}</span>
-      <div class="sidebar-status-row"><span>Источники</span><strong>{{ counts.healthy_sources }} из {{ counts.enabled_sources }}</strong></div>
-      <div class="sidebar-status-row"><span>Gmail</span><strong>{{ 'переподключить' if gmail_oauth.reauth_required else ('готов' if gmail_oauth.delivery_ready else 'не подключён') }}</strong></div>
+      <a class="sidebar-status-row" href="{{ panel.view('settings') }}#sources"><span>Источники</span><strong>{{ counts.healthy_sources }} из {{ counts.enabled_sources }}</strong></a>
+      <a class="sidebar-status-row" href="{{ panel.view('settings') }}#gmail"><span>Gmail</span><strong>{{ 'переподключить' if gmail_oauth.reauth_required else ('готов' if gmail_oauth.delivery_ready else 'не подключён') }}</strong></a>
+      <a class="sidebar-status-row" href="{{ panel.view('history', history_kind='scans') }}"><span>Проверки</span><strong>{{ counts.running_scans }} в работе</strong></a>
     </div>{% endif %}
     {% endblock %}
     <div class="sidebar-footer"><button class="btn btn-icon btn-ghost" type="button" data-theme-toggle aria-label="Сменить тему" title="Сменить тему">◐</button><form method="post" action="{{ panel.action('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-ghost">Выйти</button></form></div>
@@ -24,7 +25,8 @@
       <div class="topbar-actions">
         {% include "_panel_notifications.html" %}
         {% if profiles %}<form method="get" action="{{ panel.base }}"><input type="hidden" name="view" value="{{ view }}"><select name="profile_id" class="btn profile-select" data-profile-select aria-label="Выбрать профиль">{% for item in profiles %}<option value="{{ item.id }}" {% if item.id == selected_profile_id %}selected{% endif %}>{{ item.name }}{% if item.is_default %} · основной{% endif %}</option>{% endfor %}</select></form>{% endif %}
-        <span class="badge {{ 'success' if delivery_enabled else 'muted' }}">{{ 'Отправка доступна' if delivery_enabled else 'Тестовый режим' }}</span>
+        <a class="header-status {{ overall_tone or 'warning' }}" href="{{ panel.view('overview') }}#attention" data-panel-status aria-label="{{ overall_title or 'Подготовьте профиль для поиска' }} · {{ notifications|length }} задач" title="{{ overall_title or 'Подготовьте профиль для поиска' }}"><span class="status-dot {{ overall_tone or 'warning' }}"></span><span>{{ 'Нужно внимание · ' ~ (notifications|length) if notifications else 'Всё в порядке' }}</span></a>
+        {% if overview %}<a class="header-quota" href="{{ panel.view('history', history_kind='sent') }}" aria-label="Отправлено сегодня {{ overview.sent_today }} из {{ overview.daily_limit }}"><span>Сегодня</span><strong>{{ overview.sent_today }}<small>/{{ overview.daily_limit }}</small></strong></a>{% endif %}
       </div>
     </header>
     <main class="content" id="main-content" tabindex="-1">

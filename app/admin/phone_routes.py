@@ -985,7 +985,7 @@ async def phone_auto_answer_toggle(
         session, f"phone.auto_answer.{action}", "phone_channel", "auto_answer"
     )
     await session.commit()
-    return RedirectResponse("/admin?view=diagnostics", status_code=303)
+    return RedirectResponse("/admin?view=calls", status_code=303)
 
 
 @router.get("/admin/phone/evidence/{session_id}/{transcript_id}.wav")
@@ -1053,4 +1053,4 @@ async def phone_call_action(
         session, f"phone.call.{action}", "communication_session", str(session_id)
     )
     await session.commit()
-    return RedirectResponse("/admin?view=diagnostics", status_code=303)
+    return RedirectResponse("/admin?view=calls", status_code=303)

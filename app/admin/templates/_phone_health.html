@@ -1,10 +1,10 @@
-<section class="card">
-  <h3>Phone channel
-    <span class="badge badge-{{ status_tone(phone_health.channel) }}">
-      {{ status_label(phone_health.channel) }}</span>
-  </h3>
+<section class="panel phone-health-panel">
+  <div class="panel-head"><div><div class="panel-title">Телефонный агент</div><div class="panel-subtitle">Связь, автоответ и управление текущим звонком</div></div>
+    <span class="badge {{ status_tone(phone_health.channel) }}">{{ status_label(phone_health.channel) }}</span>
+  </div>
+  <div class="panel-pad">
   {% if not phone_health.configured %}
-  <p class="muted">Телефонный агент выключен (PHONE_AGENT_ENABLED=false).</p>
+  <p class="panel-subtitle">Телефонный агент выключен.</p>
   {% endif %}
   {% if phone_health.device %}
   <p class="muted">
@@ -14,10 +14,10 @@
     · {{ format_dt(phone_health.device.updated_at) if phone_health.device.updated_at else 'never' }}
   </p>
   {% endif %}
-  <ul class="component-list">
+  <details class="settings-section"><summary><span><strong>Состояние связи и компонентов</strong><small>Подробности для проверки телефонии</small></span><span>Открыть</span></summary><ul class="component-list">
     {% for c in phone_health.components %}
     <li>
-      <span class="status-dot status-dot-{{ status_tone(c.status) }}"></span>
+      <span class="status-dot {{ status_tone(c.status) }}"></span>
       <code>{{ c.component }}</code>
       <span>{{ status_label(c.status) }}</span>
       {% if c.detail %}<span class="muted">{{ c.detail }}</span>{% endif %}
@@ -27,13 +27,13 @@
     {% if not phone_health.components %}
     <li class="muted">Нет данных — агент ещё не опрашивал PhoneGate.</li>
     {% endif %}
-  </ul>
+  </ul></details>
   {% if phone_health.auto_answer %}
   <div class="phone-auto-answer">
-    <span class="badge badge-{{ 'success' if phone_health.auto_answer.enabled else 'muted' }}">
+    <span class="badge {{ 'success' if phone_health.auto_answer.enabled else 'muted' }}">
       Авто-ответ: {{ 'вкл' if phone_health.auto_answer.enabled else 'выкл' }}</span>
     {% if phone_health.auto_answer.stopped %}
-    <span class="badge badge-danger">остановлен оператором</span>
+    <span class="badge danger">остановлен оператором</span>
     <form method="post" action="/admin/phone/auto-answer/resume">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="btn btn-sm">Возобновить</button></form>
@@ -56,4 +56,5 @@
       <button class="btn btn-sm">Замолчать</button></form>
   </div>
   {% endif %}
+  </div>
 </section>

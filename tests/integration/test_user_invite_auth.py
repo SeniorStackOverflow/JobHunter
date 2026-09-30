@@ -524,8 +524,9 @@ async def test_admin_source_selection_is_profile_scoped_and_keeps_crawler_enable
     assert first_overview.status_code == second_overview.status_code == 200
     assert 'Новых вакансий сегодня</div><div class="metric-value">0</div>' in first_overview.text
     assert 'Новых вакансий сегодня</div><div class="metric-value">7</div>' in second_overview.text
-    assert 'class="notification-count">' not in first_overview.text
-    assert 'class="notification-count">1</span>' in second_overview.text
+    assert "источников требуют проверки" not in first_overview.text
+    assert "1 источников требуют проверки" in second_overview.text
+    assert "Выберите источники" in first_overview.text
 
 
 @pytest.mark.asyncio
@@ -940,7 +941,7 @@ async def test_admin_notification_acknowledgement_three_clean_browser_contexts(
                         "const r = element.getBoundingClientRect(); "
                         "return [r.width, r.height]; })"
                     )
-                    assert icons == [[20, 20]] * 7
+                    assert icons == [[20, 20]] * 6
                     assert (
                         await page.locator(".notification-head .badge").text_content()
                         == dashboard_count
@@ -956,10 +957,11 @@ async def test_admin_notification_acknowledgement_three_clean_browser_contexts(
                         f"form[action='/admin/alerts/{alert_id}/acknowledge'] button"
                     ).click()
                     assert page.url == f"{base_url}/admin/accounts"
-                    assert (
-                        await _assert_notification_popover_visible(page, width=1365, height=768)
-                        == 0
+                    remaining = await _assert_notification_popover_visible(
+                        page, width=1365, height=768
                     )
+                    assert remaining == int(dashboard_count or "0") - 1
+                    assert await page.locator(f"[data-alert-id='{alert_id}']").count() == 0
                     async with user_auth_context.session_factory() as session:
                         stored = await session.get(Alert, alert_id)
                         assert stored is not None and stored.acknowledged is True
