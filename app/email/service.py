@@ -11,7 +11,12 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
-from app.contacts import contact_is_source_verified, validate_public_email
+from app.contacts import (
+    contact_is_source_verified,
+    propagate_email_domain_failure,
+    validate_public_email,
+)
+from app.contacts.mail_routing import MailRoutingChecker, default_mail_routing_checker
 from app.delivery_ledger import (
     OUTCOME_DELIVERY_UNKNOWN,
     OUTCOME_NOT_TRANSMITTED,
@@ -122,10 +127,13 @@ class EmailService:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         provider: EmailProvider | None = None,
+        *,
+        mail_routing: MailRoutingChecker | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self._provider = provider
+        self._mail_routing = mail_routing
         self.employer_relationships = EmployerRelationshipService()
 
     @staticmethod
@@ -430,6 +438,81 @@ class EmailService:
             counts[reason] = counts.get(reason, 0) + 1
         await session.flush()
         return counts
+
+    def _mail_routing_checker(self) -> MailRoutingChecker | None:
+        if self._mail_routing is not None:
+            return self._mail_routing
+        # The fake provider is test-only and never reaches a real mail server.
+        if (
+            not self.settings.mail_routing_preflight_enabled
+            or self.settings.email_provider == "fake"
+        ):
+            return None
+        return default_mail_routing_checker(
+            timeout_seconds=self.settings.mail_routing_timeout_seconds,
+            cache_ttl_seconds=self.settings.mail_routing_cache_ttl_seconds,
+        )
+
+    async def _require_mail_routing(
+        self,
+        session: AsyncSession,
+        application: Application,
+        contact: EmployerContact,
+    ) -> None:
+        """Block dead recipient domains and postpone unverifiable ones before submission."""
+
+        checker = self._mail_routing_checker()
+        if checker is None:
+            return
+        result = await checker.check_email(contact.value)
+        if result.temporary_failure:
+            logger.warning(
+                "email_mail_routing_deferred",
+                application_id=str(application.id),
+                domain=result.domain,
+                detail=result.detail,
+            )
+            raise EmailSendBlocked(
+                "recipient mail routing could not be verified; retry later",
+                reason="mail_routing_temporarily_unavailable",
+            )
+        if not result.permanent_failure:
+            return
+        from app.database.base import utcnow
+
+        now = utcnow()
+        failure_reason = f"mail_routing:{result.status.value}"
+        propagated = await propagate_email_domain_failure(
+            session,
+            domain=result.domain,
+            occurred_at=now,
+            failure_reason=failure_reason,
+        )
+        await record_audit_event(
+            session,
+            actor="email_worker",
+            action="email.mail_routing_rejected",
+            entity_type="application",
+            entity_id=str(application.id),
+            correlation_id=str(application.id),
+            decision=result.status.value,
+            details={
+                "domain": result.domain,
+                "detail": result.detail,
+                "contacts_marked_rejected": propagated,
+            },
+        )
+        await self._persist_safe_stop(
+            session,
+            application,
+            status=ApplicationStatus.BLOCKED,
+            reason="recipient_domain_unroutable",
+            failed_rules=("contact_mail_routing",),
+        )
+        raise EmailSendBlocked(
+            "recipient domain has no usable mail routing",
+            reason="recipient_domain_unroutable",
+        )
 
     async def _provider_for(
         self,
@@ -747,6 +830,7 @@ class EmailService:
                     "application content is not validated",
                     reason="application_content_not_validated",
                 )
+            await self._require_mail_routing(session, application, contact)
             policy = await PolicyEngine(self.settings).evaluate(
                 session, application, preferences, evaluation, job, resume, contact, profile
             )

@@ -31,6 +31,8 @@ def _hermetic_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     configured, which breaks tests that rely on the CI defaults.
     """
     monkeypatch.setitem(Settings.model_config, "env_file", None)
+    # Never resolve real DNS from tests; preflight tests inject an offline checker.
+    monkeypatch.setenv("MAIL_ROUTING_PREFLIGHT_ENABLED", "false")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

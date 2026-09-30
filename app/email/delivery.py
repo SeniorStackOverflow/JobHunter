@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.audit import record_audit_event
 from app.contacts import (
     propagate_email_delivery_failure,
+    propagate_email_domain_failure,
     select_best_email_contact,
     validate_public_email,
 )
@@ -222,7 +223,18 @@ def classify_smtp_failure(
         delivery_status = (
             DeliveryStatus.BOUNCED_TRANSIENT if retryable else DeliveryStatus.SPAM_REJECTED
         )
-    elif any(marker in folded for marker in ("domain not found", "no such domain", "dns")):
+    elif any(
+        marker in folded
+        for marker in (
+            "domain not found",
+            "domain name not found",
+            "no such domain",
+            "host not found",
+            "name service error",
+            "dns",
+            "5.1.2",
+        )
+    ):
         failure_class = "domain_not_found"
         delivery_status = (
             DeliveryStatus.BOUNCED_TRANSIENT if retryable else DeliveryStatus.DOMAIN_REJECTED
@@ -977,6 +989,18 @@ class EmailDeliveryReconciliationService:
                     occurred_at=notice.occurred_at,
                     smtp_status=classification.smtp_status,
                     failure_reason=classification.failure_class,
+                )
+            elif classification.permanent and classification.failure_class in {
+                "domain_not_found",
+                "routing_failure",
+            }:
+                # A dead domain rejects every mailbox: do not try its other contacts.
+                await propagate_email_domain_failure(
+                    session,
+                    domain=(delivery.final_recipient or delivery.recipient).rsplit("@", 1)[-1],
+                    occurred_at=notice.occurred_at,
+                    failure_reason=classification.failure_class,
+                    smtp_status=classification.smtp_status,
                 )
         await record_audit_event(
             session,

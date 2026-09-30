@@ -1034,3 +1034,51 @@ async def test_daily_report_has_smtp_failure_breakdown(
             "550 5.4.1:recipient_rejected": 1
         }
         assert report.summary["email_delivery"]["alerts"] == []
+
+
+@pytest.mark.asyncio
+async def test_domain_not_found_bounce_rejects_every_contact_of_that_domain(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_session_factory() as session:
+        _application, delivery, contact, employer = await _delivery_graph(session)
+        sibling = EmployerContact(
+            canonical_job_id=contact.canonical_job_id,
+            employer_id=employer.id,
+            source_job_id=contact.source_job_id,
+            value="hr@sincer.md",
+            contact_type=ContactType.EMAIL,
+            discovery_source="fixture",
+            verification_status=VerificationStatus.VERIFIED,
+            confidence=1,
+            evidence_url="https://jobs.example/sincer-1",
+        )
+        session.add(sibling)
+        await session.commit()
+        sibling_id = sibling.id
+        delivery_id = delivery.id
+    message = MailboxMessage(
+        message_id="gmail-bounce-domain",
+        thread_id="bounce-thread",
+        history_id="2",
+        raw=_dsn(
+            original_message_id="<application-fixture@job-agent.invalid>",
+            recipient="job@sincer.md",
+            diagnostic="550 5.1.2 Host or domain name not found. Name service error",
+            when=datetime(2026, 9, 21, 8, 17, tzinfo=UTC),
+        ),
+        inbox=True,
+    )
+    service = EmailDeliveryReconciliationService(
+        _settings(), sqlite_session_factory, StaticMailbox(message)
+    )
+    await service.reconcile()
+
+    async with sqlite_session_factory() as session:
+        refreshed = await session.get(EmailDelivery, delivery_id)
+        sibling_contact = await session.get(EmployerContact, sibling_id)
+        assert refreshed is not None and sibling_contact is not None
+        assert refreshed.status is DeliveryStatus.DOMAIN_REJECTED
+        assert refreshed.next_retry_at is None
+        assert sibling_contact.delivery_state is ContactDeliveryState.REJECTED
+        assert sibling_contact.last_failure_reason == "domain_not_found"

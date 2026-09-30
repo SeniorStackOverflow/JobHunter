@@ -207,6 +207,51 @@ async def propagate_email_delivery_failure(
             contact.last_failure_reason = failure_reason
 
 
+async def propagate_email_domain_failure(
+    session: AsyncSession,
+    *,
+    domain: str,
+    occurred_at: datetime,
+    failure_reason: str,
+    smtp_status: str | None = None,
+) -> int:
+    """Mark every email contact of a domain without mail routing as rejected.
+
+    A dead domain rejects every mailbox, so a second contact of the same domain
+    must not be tried. Suppressed/invalid contacts keep their stronger state.
+    """
+
+    normalized = domain.strip().rstrip(".").casefold()
+    if not normalized:
+        return 0
+    contacts = list(
+        (
+            await session.scalars(
+                select(EmployerContact).where(
+                    EmployerContact.contact_type == ContactType.EMAIL,
+                    EmployerContact.value.like(f"%@{normalized}"),
+                )
+            )
+        ).all()
+    )
+    changed = 0
+    for contact in contacts:
+        if contact.value.rsplit("@", maxsplit=1)[-1].casefold() != normalized:
+            continue
+        if contact.delivery_state in {
+            ContactDeliveryState.SUPPRESSED,
+            ContactDeliveryState.INVALID,
+        }:
+            continue
+        contact.delivery_state = ContactDeliveryState.REJECTED
+        contact.last_delivery_failure_at = occurred_at
+        contact.last_failure_reason = failure_reason
+        if smtp_status is not None:
+            contact.last_smtp_status = smtp_status
+        changed += 1
+    return changed
+
+
 class ContactDiscoveryService:
     async def discover_email_contacts(
         self, session: AsyncSession, job: SourceJob

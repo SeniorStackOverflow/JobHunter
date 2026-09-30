@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     gmail_delivery_monitor_days: int = Field(default=14, ge=1, le=90)
     email_delivery_max_attempts: int = Field(default=4, ge=1, le=10)
     email_recipient_fallback_enabled: bool = True
+    # DNS mail-routing preflight before every real provider submission.
+    mail_routing_preflight_enabled: bool = True
+    mail_routing_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    mail_routing_cache_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     employer_max_active_applications: int = Field(default=1, ge=1, le=10)
     freeze_new_applications_to_active_employer: bool = True
 
