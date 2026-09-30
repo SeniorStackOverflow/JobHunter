@@ -7,10 +7,7 @@
 
   <div class="owner-status {{ overall_tone }}">
     <div class="owner-status-copy"><span class="status-dot {{ overall_tone }}"></span><div><strong>{{ overall_title }}</strong><p>{% if profile.status.value == 'draft' %}Профиль в черновике. Подготовьте резюме и запустите поиск.{% elif profile.status.value != 'active' %}Поиск приостановлен. Обратитесь к администратору.{% elif preferences.global_pause %}Автоматическая отправка остановлена владельцем.{% elif preferences.auto_send_enabled %}JobHunter может отправлять безопасные отклики в пределах лимита.{% else %}Автоотправка выключена, анализ вакансий продолжается.{% endif %}</p></div></div>
-    {% if panel.is_admin or profile.status.value == 'active' %}<form method="post" action="{{ panel.auto_send(not preferences.global_pause) }}" data-confirm-title="{{ 'Возобновить автоотправку?' if preferences.global_pause else 'Поставить автоотправку на паузу?' }}" data-confirm="{{ 'JobHunter снова сможет отправлять подходящие отклики в пределах дневного лимита.' if preferences.global_pause else 'Новые письма не будут отправляться, пока вы не снимете паузу.' }}" data-confirm-action="{{ 'Возобновить' if preferences.global_pause else 'Поставить на паузу' }}" data-confirm-tone="{{ 'default' if preferences.global_pause else 'danger' }}">
-      <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="btn {{ 'btn-primary' if preferences.global_pause else 'btn-danger' }}">{{ 'Возобновить отправку' if preferences.global_pause else 'Поставить на паузу' }}</button>
-    </form>{% else %}<a class="btn" href="{{ panel.view('settings') }}">Настроить профиль</a>{% endif %}
+    {% include "_auto_send_button.html" %}
   </div>
 
   <div class="grid grid-3 overview-metrics">

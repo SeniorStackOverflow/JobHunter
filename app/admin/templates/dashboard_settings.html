@@ -1,6 +1,12 @@
 <section class="admin-section">
   <div class="section-heading"><div><h1>Настройки</h1><p>Критерии поиска, ограничения безопасности, профиль, резюме и источники.</p></div></div>
   <div class="settings-stack">
+    <div class="panel panel-pad" id="auto-send">
+      <div class="settings-summary">
+        <div><div class="panel-title">Автоматическая отправка</div><p class="panel-subtitle">{{ 'На паузе' if preferences.global_pause else ('Включена' if preferences.auto_send_enabled else 'Выключена') }} · отклики отправляются только после проверок и в пределах дневного лимита.</p></div>
+        {% include "_auto_send_button.html" %}
+      </div>
+    </div>
     {% include "_gmail_settings.html" %}
 
     <div class="panel">

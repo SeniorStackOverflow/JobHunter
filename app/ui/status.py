@@ -112,14 +112,16 @@ async def profile_attention(
                 "action": "Открыть очередь",
             }
         )
-    if preferences.global_pause:
+    if preferences.global_pause or not preferences.auto_send_enabled:
         attention_items.append(
             {
                 "tone": "warning",
-                "title": "Автоотправка на паузе",
+                "title": "Автоотправка на паузе"
+                if preferences.global_pause
+                else "Автоотправка выключена",
                 "detail": "Автоматизация продолжит анализ, но не отправит новые отклики.",
-                "href": panel.view("settings"),
-                "action": "Управление",
+                "href": panel.view("settings") + "#auto-send",
+                "action": "Управление автоотправкой",
             }
         )
     ready_resume = await session.scalar(

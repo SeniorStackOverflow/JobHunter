@@ -24,7 +24,14 @@
       <div class="topbar-main"><button class="btn btn-icon btn-ghost mobile-menu" type="button" data-menu-toggle aria-controls="panel-sidebar" aria-expanded="false" aria-label="Открыть меню">☰</button><div class="topbar-title"><strong>{{ view_title }}</strong><span>{{ identity_email or 'Поиск работы и отклики' }}</span></div></div>
       <div class="topbar-actions">
         {% include "_panel_notifications.html" %}
-        {% if profiles %}<form method="get" action="{{ panel.base }}"><input type="hidden" name="view" value="{{ view }}"><select name="profile_id" class="btn profile-select" data-profile-select aria-label="Выбрать профиль">{% for item in profiles %}<option value="{{ item.id }}" {% if item.id == selected_profile_id %}selected{% endif %}>{{ item.name }}{% if item.is_default %} · основной{% endif %}</option>{% endfor %}</select></form>{% endif %}
+        {% if profiles %}
+        <details class="profile-picker" data-profile-picker>
+          <summary class="btn profile-select" aria-label="Выбрать профиль"><span>{{ profile.name }}{% if profile.is_default %} · основной{% endif %}</span><span aria-hidden="true">⌄</span></summary>
+          <nav class="profile-popover" aria-label="Профили">
+            {% for item in profiles %}<a href="{{ panel.view(view, profile_id=item.id|string) }}" {% if item.id == selected_profile_id %}aria-current="page"{% endif %}>{{ item.name }}{% if item.is_default %}<small>основной</small>{% endif %}</a>{% endfor %}
+          </nav>
+        </details>
+        {% endif %}
         <a class="header-status {{ overall_tone or 'warning' }}" href="{{ panel.view('overview') }}#attention" data-panel-status aria-label="{{ overall_title or 'Подготовьте профиль для поиска' }} · {{ notifications|length }} задач" title="{{ overall_title or 'Подготовьте профиль для поиска' }}"><span class="status-dot {{ overall_tone or 'warning' }}"></span><span>{{ 'Нужно внимание · ' ~ (notifications|length) if notifications else 'Всё в порядке' }}</span></a>
         {% if overview %}<a class="header-quota" href="{{ panel.view('history', history_kind='sent') }}" aria-label="Отправлено сегодня {{ overview.sent_today }} из {{ overview.daily_limit }}"><span>Сегодня</span><strong>{{ overview.sent_today }}<small>/{{ overview.daily_limit }}</small></strong></a>{% endif %}
       </div>

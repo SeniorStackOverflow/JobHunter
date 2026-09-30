@@ -4,7 +4,7 @@ import contextlib
 
 # FastAPI's declarative dependency/form parameters intentionally call Depends/File.
 # ruff: noqa: B008
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -29,7 +29,13 @@ from app.crawlers.source_control import (
     enable_source_record,
 )
 from app.database import get_session
-from app.email.oauth import GmailOAuthService
+from app.email.oauth import (
+    GMAIL_OAUTH_BINDING_COOKIE,
+    GOOGLE_ADMIN_OAUTH_ACTOR,
+    OAUTH_STATE_TTL_SECONDS,
+    GmailOAuthError,
+    GmailOAuthService,
+)
 from app.email.service import EmailSendBlocked, EmailService
 from app.learning import (
     ReviewLearningService,
@@ -181,8 +187,46 @@ async def legacy_admin_login(oauth_error: str | None = None) -> RedirectResponse
 
 
 @router.get("/admin/auth/google")
-async def legacy_google_admin_login_start() -> RedirectResponse:
+async def legacy_google_admin_login_start(consent: bool = False) -> RedirectResponse:
+    if consent:
+        return RedirectResponse("/admin/oauth/gmail/connect", status_code=303)
     return RedirectResponse("/auth/google/login", status_code=303)
+
+
+@router.get("/admin/oauth/gmail/connect")
+async def admin_gmail_connect(
+    actor: str = Depends(require_admin_page),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    service = GmailOAuthService(get_settings())
+    try:
+        authorization = await service.create_authorization_request(
+            session, actor=GOOGLE_ADMIN_OAUTH_ACTOR, force_consent=True
+        )
+    except GmailOAuthError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=503, detail=exc.code) from exc
+    await _audit_admin(
+        session,
+        "oauth.gmail.started",
+        "oauth_authorization_request",
+        str(authorization.request_id),
+        decision="redirected",
+        details={"provider": "gmail", "actor": actor},
+    )
+    await session.commit()
+    response = RedirectResponse(authorization.authorization_url, status_code=302)
+    response.set_cookie(
+        GMAIL_OAUTH_BINDING_COOKIE,
+        authorization.binding_token,
+        max_age=OAUTH_STATE_TTL_SECONDS,
+        path="/api/v1/oauth/gmail/callback",
+        secure=service.secure_cookie,
+        httponly=True,
+        samesite="lax",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.post("/admin/login")
@@ -493,6 +537,7 @@ async def set_pause(
     request: Request,
     profile_id: UUID | None = Form(None),
     csrf_token: str = Form(...),
+    return_view: Literal["overview", "settings"] = Form("overview"),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
@@ -517,7 +562,8 @@ async def set_pause(
     await session.commit()
     notice = "auto_send_paused" if paused else "auto_send_resumed"
     return RedirectResponse(
-        f"/admin?view=overview&profile_id={preferences.profile_id}&notice={notice}", status_code=303
+        f"/admin?view={return_view}&profile_id={preferences.profile_id}&notice={notice}",
+        status_code=303,
     )
 
 

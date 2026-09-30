@@ -1,8 +1,12 @@
 {% extends "panel.html" %}
-{% block sidebar_status %}<div class="sidebar-status"><span class="badge info">Управление доступом</span><div class="sidebar-status-row"><span>Пользователи</span><strong>{{ accounts|length }}</strong></div><div class="sidebar-status-row"><span>Приглашения</span><strong>{{ invites|length }}</strong></div></div>{% endblock %}
 {% block panel_content %}
   <div class="section-heading">
     <div><h1>Пользователи</h1><p>Регистрация даёт аккаунт, но автоматические действия остаются закрыты, пока профиль не активирован и его настройки не разрешают работу.</p></div>
+  </div>
+
+  <div class="grid grid-2" style="margin-bottom:16px" aria-label="Управление доступом">
+    <div class="metric-card"><div class="metric-label">Пользователи</div><div class="metric-value">{{ accounts|length }}</div></div>
+    <div class="metric-card"><div class="metric-label">Приглашения</div><div class="metric-value">{{ invites|length }}</div></div>
   </div>
 
   <section class="panel" style="margin-bottom:16px">

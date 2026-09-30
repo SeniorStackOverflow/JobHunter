@@ -21,6 +21,9 @@ class Panel:
         if self.profile_id is not None:
             query["profile_id"] = str(self.profile_id)
         query.update(params)
+        if self.is_admin and view == "accounts":
+            query.pop("view")
+            return "/admin/accounts" + (f"?{urlencode(query)}" if query else "")
         return f"{self.base}?{urlencode(query)}"
 
     def application(self, application_id: UUID | str, action: str | None = None) -> str:
@@ -60,7 +63,7 @@ class Panel:
 
     @property
     def gmail_connect(self) -> str:
-        return "/admin/auth/google?consent=1" if self.is_admin else "/app/gmail/connect"
+        return "/admin/oauth/gmail/connect" if self.is_admin else "/app/gmail/connect"
 
     @property
     def gmail_disconnect(self) -> str:

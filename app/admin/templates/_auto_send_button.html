@@ -1,0 +1,8 @@
+{% set sending_enabled = preferences.auto_send_enabled and not preferences.global_pause %}
+{% set enable_label = 'Возобновить отправку' if preferences.auto_send_enabled else 'Включить автоотправку' %}
+{% if panel.is_admin or profile.status.value == 'active' %}
+<form method="post" action="{{ panel.auto_send(sending_enabled) }}" data-confirm-title="{{ 'Поставить автоотправку на паузу?' if sending_enabled else enable_label ~ '?' }}" data-confirm="{{ 'Новые письма не будут отправляться, пока вы не снимете паузу.' if sending_enabled else 'JobHunter сможет отправлять подходящие отклики в пределах дневного лимита после всех проверок безопасности.' }}" data-confirm-action="{{ 'Поставить на паузу' if sending_enabled else enable_label }}" data-confirm-tone="{{ 'danger' if sending_enabled else 'default' }}">
+  <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_view" value="{{ view }}">
+  <button class="btn {{ 'btn-danger' if sending_enabled else 'btn-primary' }}">{{ 'Поставить на паузу' if sending_enabled else enable_label }}</button>
+</form>
+{% else %}<span class="panel-subtitle">Сначала активируйте профиль для поиска.</span>{% endif %}

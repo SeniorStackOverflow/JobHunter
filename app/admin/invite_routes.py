@@ -2,7 +2,8 @@ from __future__ import annotations
 
 # FastAPI declarative dependency/form defaults intentionally call Depends/Form.
 # ruff: noqa: B008
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -19,6 +20,7 @@ from app.admin.routes import (
     require_csrf,
     templates,
 )
+from app.applications.daily_target import daily_target_state
 from app.database import get_session
 from app.email.oauth import GmailOAuthService
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
@@ -31,6 +33,7 @@ from app.models.entities import (
     JobPreference,
     JobSource,
     ProfileSourcePreference,
+    ScanRun,
     UserProfile,
 )
 from app.models.enums import (
@@ -39,12 +42,12 @@ from app.models.enums import (
     CommunicationChannel,
     PhoneVerificationStatus,
     ProfileStatus,
+    RunStatus,
     SourceHealth,
 )
 from app.profiles import ProfileService
 from app.settings import get_settings
 from app.ui.panel import Panel
-from app.ui.presentation import _LOCAL_TZ
 from app.ui.status import attention_status, panel_notifications, profile_attention
 
 router = APIRouter()
@@ -55,6 +58,7 @@ async def _accounts_context(
     session: AsyncSession,
     *,
     created_link: str | None = None,
+    profile_id: UUID | None = None,
 ) -> dict[str, object]:
     accounts = list(
         (
@@ -92,7 +96,11 @@ async def _accounts_context(
             )
         ).all()
     )
-    selected_profile = await ProfileService().get_profile(session)
+    service = ProfileService()
+    profiles = await service.list_profiles(session)
+    selected_profile = await service.get_profile(session, profile_id)
+    if selected_profile is None and profile_id is not None:
+        raise HTTPException(status_code=404, detail="profile not found")
     pending_review = 0
     sources: list[JobSource] = []
     disabled_source_ids = set()
@@ -148,11 +156,23 @@ async def _accounts_context(
         "enabled_sources": enabled_sources,
         "healthy_sources": healthy_sources,
         "unhealthy_sources": enabled_sources - healthy_sources,
+        "running_scans": int(
+            await session.scalar(
+                select(func.count(ScanRun.id)).where(
+                    ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
+                    ScanRun.source_id.in_(
+                        [source.id for source in sources if source.id not in disabled_source_ids]
+                    ),
+                )
+            )
+            or 0
+        ),
     }
     attention = []
     overview = {"sent_today": 0, "daily_limit": 0}
+    preferences = None
+    gmail_oauth = None
     if selected_profile is not None:
-        service = ProfileService()
         preferences = await service.get_preferences(session, selected_profile.id)
         gmail_oauth = await GmailOAuthService(get_settings()).get_status(
             session, account_id=selected_profile.owner_account_id
@@ -167,17 +187,9 @@ async def _accounts_context(
             disabled_source_ids,
             gmail_oauth,
         )
-        local_now = datetime.now(_LOCAL_TZ)
-        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+        target = await daily_target_state(session, preferences)
         overview = {
-            "sent_today": int(
-                await session.scalar(
-                    select(func.count(Application.id)).where(
-                        Application.profile_id == selected_profile.id, Application.sent_at >= start
-                    )
-                )
-                or 0
-            ),
+            "sent_today": target.sent,
             "daily_limit": preferences.maximum_daily_applications,
         }
     notifications = await panel_notifications(session, panel, attention)
@@ -196,6 +208,10 @@ async def _accounts_context(
         "csrf_token": _csrf().issue(_session_token(request)),
         "view": "accounts",
         "selected_profile_id": selected_profile.id if selected_profile is not None else None,
+        "profile": selected_profile,
+        "profiles": profiles,
+        "preferences": preferences,
+        "gmail_oauth": gmail_oauth,
         "counts": counts,
         "notifications": notifications,
         "overall_tone": tone,
@@ -290,13 +306,14 @@ async def revoke_admin_invite(
 @router.get("/admin/accounts", response_class=HTMLResponse)
 async def admin_accounts(
     request: Request,
+    profile_id: UUID | None = None,
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     response = templates.TemplateResponse(
         request=request,
         name="accounts.html",
-        context=await _accounts_context(request, session),
+        context=await _accounts_context(request, session, profile_id=profile_id),
     )
     response.headers["Cache-Control"] = "no-store"
     return response

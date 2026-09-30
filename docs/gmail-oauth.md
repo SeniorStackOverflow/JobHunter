@@ -124,11 +124,12 @@ API endpoints требуют операторский Bearer credential, кро�
 активного account session; `POST /app/gmail/disconnect` требует session-bound
 CSRF. Owner/account ID определяется сервером. Администратор отключает свою
 credential через `POST /admin/oauth/gmail/disconnect` с CSRF. Существующий
-операторский consent path доступен через authenticated API start, но текущая UI
-ссылка `/admin/auth/google?consent=1` перенаправляет в identity login без
-сохранения `consent`. Поэтому кнопка в admin settings сейчас не запускает Gmail
-consent; её нельзя использовать как доказательство успешного reconnect. Это
-известное ограничение runtime, требующее отдельной исправляющей правки.
+операторский consent path доступен через authenticated API start и защищённый
+admin-сессией `/admin/oauth/gmail/connect`. Кнопка в настройках использует
+этот маршрут: запрашиваются `openid`, `email`, Gmail send/read-only, явный
+consent и выбор аккаунта. Callback проверяет allowlist identity, nonce,
+PKCE и привязку к браузеру. Legacy `/admin/auth/google?consent=1` ведёт к тому же
+подключению; без `consent` legacy URL по-прежнему открывает обычный identity login.
 Для чужого владельца UI направляет оператора к аккаунтам, не подменяет его Gmail.
 
 Local disconnect не отзывает grant у Google. Для полного отзыва владелец удаляет

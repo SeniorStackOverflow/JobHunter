@@ -573,7 +573,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert 'href="javascript:' not in dashboard.text.casefold()
         assert "data-confirm-dialog" in dashboard.text
         assert 'src="/admin-assets/admin.js?v=' in dashboard.text
-        assert "data-profile-select" in dashboard.text
+        assert "data-profile-picker" in dashboard.text
         assert " onchange=" not in dashboard.text.casefold()
         stylesheet = await client.get(admin_routes._admin_asset_url("panel.css"))
         assert stylesheet.status_code == 200

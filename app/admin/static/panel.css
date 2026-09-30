@@ -144,7 +144,16 @@
 .skip-link{position:fixed;top:8px;left:8px;z-index:100;padding:10px 16px;background:var(--panel);color:var(--text);border:2px solid var(--accent);border-radius:10px;transform:translateY(-150%)}
 .skip-link:focus{transform:none}
 :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
-.profile-select{max-width:260px;min-width:0;text-overflow:ellipsis}
+.profile-picker{position:relative;min-width:0;overflow:visible;border:0;border-radius:0;background:transparent}
+.profile-select{max-width:260px;min-width:0;list-style:none;transform:none!important}
+.profile-select::-webkit-details-marker{display:none}
+.profile-select>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.profile-popover{position:absolute;right:0;top:calc(100% + 8px);z-index:40;width:max-content;min-width:100%;max-width:min(320px,calc(100vw - 28px));max-height:60vh;overflow-y:auto;padding:6px;border:1px solid var(--border);border-radius:12px;background:var(--panel);box-shadow:var(--shadow)}
+.profile-popover a{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border-radius:8px;font-size:12px;overflow-wrap:anywhere}
+.profile-popover a:hover,.profile-popover a:focus-visible{background:var(--panel-2);outline:2px solid var(--accent);outline-offset:-2px}
+.profile-popover a[aria-current="page"]{background:var(--accent-soft);color:var(--accent)}
+.profile-popover small{color:var(--muted);font-size:10px}
+#auto-send{scroll-margin-top:90px}
 .token{overflow-wrap:anywhere}
 .letter-preview,.vacancy-copy{overflow-wrap:anywhere}
 .compact-add input[type=file]{max-width:100%;min-width:0}

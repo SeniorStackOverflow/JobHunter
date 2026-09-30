@@ -48,19 +48,22 @@
     ) setSidebar(false);
   });
 
-  document.querySelectorAll('[data-profile-select]').forEach((select) => {
-    select.addEventListener('change', () => select.form?.requestSubmit());
-  });
-
-  const notifications = document.querySelector('[data-notifications]');
-  document.addEventListener('click', (event) => {
-    if (notifications?.open && !notifications.contains(event.target)) notifications.open = false;
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && notifications?.open) {
-      notifications.open = false;
-      notifications.querySelector('summary')?.focus();
-    }
+  const popovers = document.querySelectorAll('[data-notifications], [data-profile-picker]');
+  popovers.forEach((popover) => {
+    popover.addEventListener('toggle', () => {
+      if (popover.open) popovers.forEach((other) => {
+        if (other !== popover) other.open = false;
+      });
+    });
+    document.addEventListener('click', (event) => {
+      if (popover.open && !popover.contains(event.target)) popover.open = false;
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && popover.open) {
+        popover.open = false;
+        popover.querySelector('summary')?.focus();
+      }
+    });
   });
 
   document.querySelectorAll('[data-daily-limit-range]').forEach((control) => {

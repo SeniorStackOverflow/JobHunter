@@ -6,6 +6,7 @@ from __future__ import annotations
 # ruff: noqa: B008
 import contextlib
 from collections.abc import Sequence
+from typing import Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -321,6 +322,7 @@ async def change_user_auto_send(
     action: str,
     request: Request,
     csrf_token: str = Form(...),
+    return_view: Literal["overview", "settings"] = Form("overview"),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_user_feature()
@@ -344,7 +346,7 @@ async def change_user_auto_send(
     await session.commit()
     return RedirectResponse(
         _url(
-            "overview",
+            return_view,
             profile.id,
             notice=f"auto_send_{'paused' if action == 'pause' else 'resumed'}",
         ),

@@ -80,7 +80,7 @@ def test_admin_javascript_initializes_every_custom_control() -> None:
     for hook in (
         "data-theme-toggle",
         "data-menu-toggle",
-        "data-profile-select",
+        "data-profile-picker",
         "data-daily-limit-range",
         "data-password-toggle",
         "data-notice-dismiss",
