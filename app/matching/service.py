@@ -37,6 +37,7 @@ from app.matching.prefilter import DeterministicPrefilter
 from app.matching.providers import (
     MATCHING_RULES_VERSION,
     GeminiCompatibleProvider,
+    LLMCallTrace,
     LLMProvider,
     LLMProviderUnavailable,
     LLMRouterProvider,
@@ -651,7 +652,8 @@ class MatchingService:
         resume_summary: str | None = None,
         minimum_auto_send_score: int | None = None,
         allow_soft_catchup: bool = False,
-    ) -> tuple[MatchResult, str | None, list[dict[str, Any]]]:
+    ) -> tuple[MatchResult, LLMCallTrace | None]:
+        """Return the reconciled result and the LLM call trace (None if no LLM call)."""
         deterministic = self.prefilter.evaluate(
             job,
             preference,
@@ -660,7 +662,7 @@ class MatchingService:
             allow_soft_catchup=allow_soft_catchup,
         )
         if not deterministic.eligible_for_ai:
-            return deterministic.to_match_result(), None, []
+            return deterministic.to_match_result(), None
         request = build_match_request(
             job,
             profile,
@@ -669,14 +671,25 @@ class MatchingService:
             resume_category=resume_category,
             resume_summary=resume_summary,
         )
+        trace: LLMCallTrace
         if isinstance(self.provider, LLMRouterProvider):
-            llm_result, logical_request_id, telemetry = await self.provider.evaluate_with_telemetry(
-                request
-            )
+            llm_result, trace = await self.provider.evaluate_with_trace(request)
         else:
             llm_result = await self.provider.evaluate(request)
-            logical_request_id = None
-            telemetry = []
+            failure = next(
+                (
+                    risk.removeprefix("llm_provider_failure:").split(":", 1)[-1]
+                    for risk in llm_result.risks
+                    if risk.startswith("llm_provider_failure:")
+                ),
+                None,
+            )
+            trace = LLMCallTrace(
+                logical_request_id="",
+                attempts=[],
+                schema_valid=failure is None,
+                failure_code=failure,
+            )
         return (
             reconcile_match_result(
                 deterministic,
@@ -687,8 +700,7 @@ class MatchingService:
                     else minimum_auto_send_score
                 ),
             ),
-            logical_request_id,
-            telemetry,
+            trace,
         )
 
     async def evaluate(
@@ -701,7 +713,7 @@ class MatchingService:
         resume_category: str | None = None,
         resume_summary: str | None = None,
     ) -> MatchResult:
-        result, _logical_request_id, _telemetry = await self.evaluate_with_telemetry(
+        result, _trace = await self.evaluate_with_telemetry(
             job,
             preference,
             profile,
@@ -748,15 +760,13 @@ class MatchingService:
         resume = await _select_resume(session, profile.id, job)
         resume_category = resume.category if resume is not None else None
         resume_fit = _estimate_resume_fit(job, profile, resume_category)
-        telemetry_request_id: str | None = None
-        telemetry_attempts: list[dict[str, Any]] = []
         minimum_catchup_active = await _minimum_catchup_active(session, preference, profile.id)
         effective_auto_send_score = (
             minimum_catchup_score(preference)
             if minimum_catchup_active
             else preference.minimum_auto_send_score
         )
-        result, telemetry_request_id, telemetry_attempts = await self.evaluate_with_telemetry(
+        result, llm_trace = await self.evaluate_with_telemetry(
             job,
             preference,
             profile,
@@ -838,10 +848,22 @@ class MatchingService:
                 self.prefilter.hard_requirements.evaluate(job, profile)
             ),
             hard_requirement_rules_version=HARD_REQUIREMENT_RULES_VERSION,
+            llm_logical_request_id=(llm_trace.logical_request_id or None) if llm_trace else None,
+            llm_outcome=(
+                "not_called"
+                if llm_trace is None
+                else "valid"
+                if llm_trace.schema_valid
+                else "invalid_output"
+            ),
+            llm_failure_code=llm_trace.failure_code if llm_trace else None,
+            llm_failure_path=llm_trace.failure_path if llm_trace else None,
+            llm_attempts=llm_trace.app_attempts if llm_trace and llm_trace.app_attempts else None,
         )
         session.add(evaluation)
         await session.flush()
-        if telemetry_request_id and telemetry_attempts:
+        if llm_trace is not None and llm_trace.logical_request_id and llm_trace.attempts:
+            telemetry_attempts = llm_trace.attempts
             has_failure = any(item.get("outcome") != "success" for item in telemetry_attempts)
             has_success = any(item.get("outcome") == "success" for item in telemetry_attempts)
             await record_external_call_attempts(
@@ -850,12 +872,22 @@ class MatchingService:
                 subsystem="matching",
                 operation="llm_match",
                 upstream_service="llmrouter",
-                logical_request_id=telemetry_request_id,
-                correlation_id=telemetry_request_id,
+                logical_request_id=llm_trace.logical_request_id,
+                correlation_id=llm_trace.logical_request_id,
                 entity_type="source_job",
                 entity_id=job.id,
+                # Transport-level: some provider attempt failed and a later one
+                # returned HTTP success. It says nothing about schema validity.
                 recovered=has_failure and has_success,
-                metadata={"profile_id": str(profile.id)},
+                metadata={
+                    "profile_id": str(profile.id),
+                    "match_evaluation_id": str(evaluation.id),
+                    "schema_validated": llm_trace.schema_valid,
+                    "app_failure_code": llm_trace.failure_code,
+                    "app_failure_path": llm_trace.failure_path,
+                    "app_attempts": llm_trace.app_attempts,
+                    "repairs": list(llm_trace.repairs),
+                },
             )
         return evaluation
 

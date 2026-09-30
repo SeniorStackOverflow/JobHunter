@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 from urllib.parse import quote
@@ -20,7 +21,7 @@ from openai import (
 )
 from pydantic import ValidationError
 
-from app.matching.schemas import MatchRequest, MatchResult
+from app.matching.schemas import MATCH_RESULT_OUTBOUND_SCHEMA, MatchRequest, MatchResult
 from app.models.enums import MatchDecision
 
 MATCHING_RULES_VERSION = "matching-v8-soft-catchup"
@@ -162,6 +163,42 @@ def _schema_validation_failure(exc: ValidationError) -> str:
     t = str(errors[0].get("type") or "unknown")
     t = "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in t)
     return f"schema_validation:{t or 'unknown'}"
+
+
+def _schema_validation_path(exc: ValidationError) -> str | None:
+    """Return the first failing field path (names/indices only, never the value)."""
+
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    if not errors:
+        return None
+    path = ".".join(str(part) for part in errors[0].get("loc", ()))
+    safe = "".join(c if c.isalnum() or c in {"_", "-", "."} else "_" for c in path)
+    return safe[:255] or None
+
+
+def _repair_note(failure_code: str, failure_path: str | None) -> str:
+    """Bounded feedback for one corrected retry; contains no raw model output."""
+
+    location = f" at field `{failure_path}`" if failure_path else ""
+    return (
+        "Your previous answer was rejected by validation "
+        f"({failure_code}){location}. Return exactly one complete JSON object that "
+        "satisfies the JSON Schema: include every field, use only the allowed enum "
+        "values, and add no other keys or text."
+    )
+
+
+@dataclass(frozen=True)
+class LLMCallTrace:
+    """Application-level outcome of one logical matching request."""
+
+    logical_request_id: str
+    attempts: list[dict[str, Any]]
+    schema_valid: bool
+    failure_code: str | None = None
+    failure_path: str | None = None
+    app_attempts: int = 0
+    repairs: tuple[str, ...] = ()
 
 
 def _request_payload(request: MatchRequest) -> str:
@@ -408,11 +445,24 @@ class LLMRouterProvider:
     def endpoint(self) -> str:
         return f"{self.base_url}/v1/chat/completions"
 
-    def _body(self, request: MatchRequest, *, structured: bool = True) -> dict[str, Any]:
+    # MatchResult is compact, but some reasoning backends need headroom before
+    # emitting it. 1536 avoided the 4K TPM inflation while covering observed 1K
+    # truncation; after finish_reason=length one bounded larger budget is tried.
+    BASE_MAX_TOKENS: ClassVar[int] = 1536
+    MAX_TOKENS_CEILING: ClassVar[int] = 3072
+
+    def _body(
+        self,
+        request: MatchRequest,
+        *,
+        structured: bool = True,
+        repair_note: str | None = None,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
         system_instructions = _SYSTEM_INSTRUCTIONS
         if not structured:
             schema = json.dumps(
-                MatchResult.model_json_schema(),
+                MATCH_RESULT_OUTBOUND_SCHEMA,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -425,12 +475,11 @@ class LLMRouterProvider:
             "messages": [
                 {"role": "system", "content": system_instructions},
                 {"role": "user", "content": _request_payload(request)},
+                *([{"role": "user", "content": repair_note}] if repair_note else []),
             ],
             "stream": False,
             "temperature": 0,
-            # MatchResult is compact, but some reasoning backends need headroom before
-            # emitting it. 1536 avoided the 4K TPM inflation while covering observed 1K truncation.
-            "max_tokens": 1536,
+            "max_tokens": max_tokens or self.BASE_MAX_TOKENS,
         }
         if structured:
             body["response_format"] = {
@@ -438,18 +487,22 @@ class LLMRouterProvider:
                 "json_schema": {
                     "name": "job_match_result",
                     "strict": True,
-                    "schema": MatchResult.model_json_schema(),
+                    "schema": MATCH_RESULT_OUTBOUND_SCHEMA,
                 },
             }
         return body
 
     async def evaluate(self, request: MatchRequest) -> MatchResult:
-        result, _logical_request_id, _telemetry = await self.evaluate_with_telemetry(request)
+        result, _trace = await self.evaluate_with_trace(request)
         return result
 
     async def evaluate_with_telemetry(
         self, request: MatchRequest
     ) -> tuple[MatchResult, str, list[dict[str, Any]]]:
+        result, trace = await self.evaluate_with_trace(request)
+        return result, trace.logical_request_id, trace.attempts
+
+    async def evaluate_with_trace(self, request: MatchRequest) -> tuple[MatchResult, LLMCallTrace]:
         logical_request_id = str(uuid4())
         if self._client is not None:
             return await self._evaluate_with_client(
@@ -504,7 +557,7 @@ class LLMRouterProvider:
         request: MatchRequest,
         *,
         logical_request_id: str,
-    ) -> tuple[MatchResult, str, list[dict[str, Any]]]:
+    ) -> tuple[MatchResult, LLMCallTrace]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "X-LLMRouter-Prefer": self.prefer,
@@ -512,17 +565,44 @@ class LLMRouterProvider:
         }
         telemetry: list[dict[str, Any]] = []
         last_failure = "unknown"
+        last_path: str | None = None
         structured = True
+        # Retries are bounded by max_attempts per output mode. A transport or
+        # 5xx/429 failure may repeat the same request; an invalid model output is
+        # retried only with a changed request (validation feedback or a larger,
+        # capped token budget), never unchanged.
+        repair_note: str | None = None
+        max_tokens = self.BASE_MAX_TOKENS
+        app_attempts = 0
+        repairs: list[str] = []
+
+        def trace(*, valid: bool) -> LLMCallTrace:
+            return LLMCallTrace(
+                logical_request_id=logical_request_id,
+                attempts=telemetry,
+                schema_valid=valid,
+                failure_code=None if valid else last_failure,
+                failure_path=None if valid else last_path,
+                app_attempts=app_attempts,
+                repairs=tuple(repairs),
+            )
+
         while True:
             switch_to_unstructured = False
             for attempt in range(self.max_attempts):
                 retryable = True
                 retry_after_seconds = 0.0
+                app_attempts += 1
                 try:
                     response = await client.post(
                         self.endpoint,
                         headers=headers,
-                        json=self._body(request, structured=structured),
+                        json=self._body(
+                            request,
+                            structured=structured,
+                            repair_note=repair_note,
+                            max_tokens=max_tokens,
+                        ),
                     )
                     try:
                         response_payload: Any = response.json()
@@ -612,17 +692,32 @@ class LLMRouterProvider:
                                 logical_request_id=logical_request_id,
                             )
                     else:
-                        return (
-                            _llmrouter_result(response_payload),
-                            logical_request_id,
-                            telemetry,
-                        )
+                        return _llmrouter_result(response_payload), trace(valid=True)
                 except InvalidLLMResponse as exc:
                     last_failure = exc.code
+                    last_path = None
+                    if exc.code == "finish_reason:length":
+                        larger = min(max_tokens * 2, self.MAX_TOKENS_CEILING)
+                        if larger > max_tokens:
+                            max_tokens = larger
+                            repairs.append("length_budget")
+                        else:
+                            # The capped budget is exhausted; an identical retry
+                            # would be truncated again.
+                            retryable = False
+                    else:
+                        repair_note = _repair_note(exc.code, None)
+                        repairs.append("output_feedback")
                 except ValidationError as exc:
                     last_failure = _schema_validation_failure(exc)
+                    last_path = _schema_validation_path(exc)
+                    repair_note = _repair_note(last_failure, last_path)
+                    repairs.append("schema_feedback")
                 except json.JSONDecodeError:
                     last_failure = "response_json_invalid"
+                    last_path = None
+                    repair_note = _repair_note(last_failure, None)
+                    repairs.append("output_feedback")
                 except httpx.RequestError as exc:
                     last_failure = type(exc).__name__
                     telemetry.append(
@@ -635,7 +730,9 @@ class LLMRouterProvider:
                             retryable=True,
                         )
                     )
-                if retryable and attempt + 1 < self.max_attempts:
+                if not retryable:
+                    break
+                if attempt + 1 < self.max_attempts:
                     delay = max(self.retry_delay_seconds * (2**attempt), retry_after_seconds)
                     if delay:
                         await asyncio.sleep(delay)
@@ -649,11 +746,7 @@ class LLMRouterProvider:
                     telemetry=telemetry,
                     logical_request_id=logical_request_id,
                 )
-            return (
-                _safe_fallback("llmrouter", last_failure),
-                logical_request_id,
-                telemetry,
-            )
+            return _safe_fallback("llmrouter", last_failure), trace(valid=False)
 
 
 def _gemini_result(payload: Any) -> MatchResult:
@@ -745,7 +838,7 @@ class GeminiCompatibleProvider:
             ],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseJsonSchema": MatchResult.model_json_schema(),
+                "responseJsonSchema": MATCH_RESULT_OUTBOUND_SCHEMA,
             },
         }
         last_failure = "unknown"

@@ -563,6 +563,14 @@ class MatchEvaluation(UUIDPrimaryKeyMixin, Base):
         JSON, default=list, nullable=False
     )
     hard_requirement_rules_version: Mapped[str | None] = mapped_column(String(64))
+    # Application-level LLM outcome. Transport recovery (ExternalCallEvent) and
+    # schema validation are separate facts; this row records the latter and the
+    # durable link to the logical request instead of a time-based correlation.
+    llm_logical_request_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    llm_outcome: Mapped[str | None] = mapped_column(String(32))
+    llm_failure_code: Mapped[str | None] = mapped_column(String(128))
+    llm_failure_path: Mapped[str | None] = mapped_column(String(255))
+    llm_attempts: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

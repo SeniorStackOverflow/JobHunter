@@ -65,7 +65,33 @@ def normalize_external_attempt(raw: dict[str, Any], *, attempt_no: int) -> dict[
         "retryable": bool(raw.get("retryable", False)),
         "retry_after_seconds": _as_int(raw.get("retry_after_seconds"), minimum=0),
         "latency_ms": _as_int(raw.get("latency_ms"), minimum=0),
+        "router": _router_classification(raw, http_status),
     }
+
+
+def _router_classification(raw: dict[str, Any], http_status: int | None) -> dict[str, Any]:
+    """Keep the upstream status and synthetic marker that Router reports.
+
+    Router converts an upstream 400 for structured output and a truncated HTTP
+    200 into a synthetic 502 to move to the next candidate. Without these
+    fields a converted 400/200 is indistinguishable from a real upstream 502.
+    """
+
+    upstream_status = _as_int(raw.get("upstream_status"), minimum=100)
+    if upstream_status is not None and upstream_status > 999:
+        upstream_status = None
+    synthetic = raw.get("router_synthetic")
+    failure_class = _as_text(raw.get("failure_class"), 64)
+    result: dict[str, Any] = {}
+    if upstream_status is not None:
+        result["upstream_status"] = upstream_status
+    if isinstance(synthetic, bool):
+        result["router_synthetic"] = synthetic
+    elif upstream_status is not None and http_status is not None:
+        result["router_synthetic"] = upstream_status != http_status
+    if failure_class:
+        result["failure_class"] = failure_class
+    return result
 
 
 async def record_external_call_attempts(
@@ -106,7 +132,7 @@ async def record_external_call_attempts(
             latency_ms=normalized["latency_ms"],
             recovered=recovered,
             is_final_attempt=index == total,
-            event_metadata=dict(metadata or {}),
+            event_metadata={**dict(metadata or {}), **normalized["router"]},
             occurred_at=normalized["occurred_at"],
         )
         session.add(row)
@@ -160,6 +186,18 @@ async def external_call_metrics(
     exceptions = Counter(row.exception_type for row in failures if row.exception_type)
     provider_errors = Counter((row.provider or "unknown") for row in failures)
     subsystem_errors = Counter(row.subsystem for row in failures)
+    synthetic_failures = [
+        row for row in failures if (row.event_metadata or {}).get("router_synthetic") is True
+    ]
+    upstream_by_reported = Counter(
+        f"{row.http_status}<-{(row.event_metadata or {}).get('upstream_status')}"
+        for row in synthetic_failures
+    )
+    schema_state: dict[str, bool] = {}
+    for row in rows:
+        validated = (row.event_metadata or {}).get("schema_validated")
+        if isinstance(validated, bool):
+            schema_state[row.logical_request_id] = validated
     return {
         "total_attempts": len(rows),
         "successful_attempts": len(rows) - len(failures),
@@ -174,4 +212,13 @@ async def external_call_metrics(
         "by_exception_type": dict(sorted(exceptions.items())),
         "errors_by_provider": dict(sorted(provider_errors.items())),
         "errors_by_subsystem": dict(sorted(subsystem_errors.items())),
+        # Transport recovery and schema validation are different facts: a request
+        # can be transport-recovered (HTTP success after failures) and still end
+        # with an invalid model output that fell back to manual review.
+        "transport_recovered_requests": len(recovered_requests),
+        "schema_checked_requests": len(schema_state),
+        "schema_validated_requests": sum(schema_state.values()),
+        "schema_invalid_requests": sum(not value for value in schema_state.values()),
+        "router_synthetic_failures": len(synthetic_failures),
+        "router_synthetic_by_status": dict(sorted(upstream_by_reported.items())),
     }

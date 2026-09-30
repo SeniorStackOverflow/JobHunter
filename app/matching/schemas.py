@@ -149,3 +149,81 @@ class MatchRequest(BaseModel):
     resume_summary: str | None = None
     preference_context: dict[str, JsonValue] = Field(default_factory=dict)
     deterministic_context: DeterministicFilterResult | None = None
+
+
+# Keywords that some strict structured-output providers reject. They stay
+# enforced by the local Pydantic model; outbound they become description hints.
+_VALIDATION_ONLY_KEYWORDS = frozenset(
+    {
+        "default",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+        "pattern",
+        "title",
+    }
+)
+
+
+def _bounds_hint(node: dict[str, object]) -> str | None:
+    hints: list[str] = []
+    if "minimum" in node and "maximum" in node:
+        hints.append(f"Integer from {node['minimum']} to {node['maximum']}.")
+    if "maxItems" in node:
+        hints.append(f"At most {node['maxItems']} items.")
+    if "maxLength" in node:
+        hints.append(f"At most {node['maxLength']} characters.")
+    return " ".join(hints) or None
+
+
+def _portable_node(node: object, defs: dict[str, object]) -> object:
+    if isinstance(node, list):
+        return [_portable_node(item, defs) for item in node]
+    if not isinstance(node, dict):
+        return node
+    reference = node.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/$defs/"):
+        return _portable_node(defs[reference.removeprefix("#/$defs/")], defs)
+    result: dict[str, object] = {}
+    for key, value in node.items():
+        if key in _VALIDATION_ONLY_KEYWORDS or key == "$defs":
+            continue
+        if key == "properties" and isinstance(value, dict):
+            result[key] = {name: _portable_node(item, defs) for name, item in value.items()}
+        else:
+            result[key] = _portable_node(value, defs)
+    hint = _bounds_hint(node)
+    if hint is not None:
+        description = result.get("description")
+        result["description"] = f"{description} {hint}" if description else hint
+    if result.get("type") == "object" or "properties" in result:
+        properties = result.get("properties")
+        # Strict structured output requires every property to be required.
+        result["required"] = list(properties) if isinstance(properties, dict) else []
+        result["additionalProperties"] = False
+    return result
+
+
+def strict_outbound_schema(model: type[BaseModel]) -> dict[str, object]:
+    """Return a provider-portable strict JSON Schema for ``model``.
+
+    Every property is required (fields with local defaults must still be sent),
+    ``additionalProperties`` is false at every object level, ``$ref`` is inlined
+    and validation-only keywords are dropped. The local model keeps validating
+    Literal values, bounds and lengths; this only shapes what providers see.
+    """
+
+    schema = model.model_json_schema()
+    defs = schema.get("$defs", {})
+    portable = _portable_node(schema, defs if isinstance(defs, dict) else {})
+    assert isinstance(portable, dict)
+    return portable
+
+
+MATCH_RESULT_OUTBOUND_SCHEMA = strict_outbound_schema(MatchResult)

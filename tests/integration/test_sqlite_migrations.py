@@ -277,11 +277,24 @@ def test_send_attempt_ledger_backfill_preserves_hard_maximum_history(
         finally:
             await engine.dispose()
 
+    # The ORM seeds with head models; add later, unrelated evaluation columns
+    # so the insert works at this older revision. The ledger migration reads
+    # only email_deliveries/applications.
+    with closing(sqlite3.connect(database_path)) as connection:
+        for column, kind in (
+            ("llm_logical_request_id", "VARCHAR(128)"),
+            ("llm_outcome", "VARCHAR(32)"),
+            ("llm_failure_code", "VARCHAR(128)"),
+            ("llm_failure_path", "VARCHAR(255)"),
+            ("llm_attempts", "INTEGER"),
+        ):
+            connection.execute(f"ALTER TABLE match_evaluations ADD COLUMN {column} {kind}")
+        connection.commit()
     identifiers = asyncio.run(seed())
 
     get_settings.cache_clear()
     try:
-        command.upgrade(Config("alembic.ini"), "head")
+        command.upgrade(Config("alembic.ini"), "a3e9c2d7b4f1")
     finally:
         get_settings.cache_clear()
 
