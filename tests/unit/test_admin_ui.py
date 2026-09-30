@@ -100,7 +100,7 @@ def test_admin_javascript_keeps_mandatory_daily_minimum_editable() -> None:
 
 def test_admin_preferences_use_independent_columns() -> None:
     markup = Path("app/admin/templates/dashboard_settings.html").read_text(encoding="utf-8")
-    styles = Path("app/admin/templates/base.html").read_text(encoding="utf-8")
+    styles = Path("app/admin/static/panel.css").read_text(encoding="utf-8")
 
     assert 'class="preference-columns full"' in markup
     assert markup.count('class="preference-column"') == 2

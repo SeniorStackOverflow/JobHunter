@@ -10,6 +10,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from pydantic import SecretStr
 from selectolax.parser import HTMLParser
 from sqlalchemy import select
@@ -71,6 +72,7 @@ async def review_context(
     application = FastAPI()
     application.include_router(auth_routes.router)
     application.include_router(admin_router)
+    application.mount("/admin-assets", StaticFiles(directory="app/admin/static"))
 
     async def override_session():
         async with sqlite_session_factory() as db:
@@ -540,10 +542,13 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
         await db.commit()
     response = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
     assert response.status_code == 200
+    stylesheet = await client.get(admin_routes._admin_asset_url("panel.css"))
+    assert stylesheet.status_code == 200
     async with playwright_api.async_playwright() as runtime:
         browser = await runtime.chromium.launch()
         page = await browser.new_page(viewport={"width": 390, "height": 844})
         await page.set_content(response.text, wait_until="domcontentloaded")
+        await page.add_style_tag(content=stylesheet.text)
         assert await page.get_by_text("Проверка фактов").count() == 1
         assert await page.get_by_text("Нужна проверка").count() >= 1
         assert await page.get_by_text("Аудиодоказательство отсутствует").count() >= 1
@@ -566,6 +571,7 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
             await db.commit()
         processing = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
         await page.set_content(processing.text, wait_until="domcontentloaded")
+        await page.add_style_tag(content=stylesheet.text)
         assert await page.get_by_text("Обработка выполняется").count() >= 1
 
         async with factory() as db:
@@ -595,6 +601,7 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
             await db.commit()
         failed = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
         await page.set_content(failed.text, wait_until="domcontentloaded")
+        await page.add_style_tag(content=stylesheet.text)
         assert await page.get_by_text("резюме: ошибка").count() == 1
         assert await page.get_by_text("Нужна проверка: конфликт").count() == 1
         assert await page.get_by_text("ambiguous").count() >= 1
@@ -611,5 +618,6 @@ async def test_admin_review_playwright_narrow_view_and_state_panels(review_conte
             await db.commit()
         empty = await client.get(f"/admin?view=calls&tab=history&session={call_id}")
         await page.set_content(empty.text, wait_until="domcontentloaded")
+        await page.add_style_tag(content=stylesheet.text)
         assert await page.get_by_text("Факты ещё не извлечены. Требуется проверка.").count() == 1
         await browser.close()

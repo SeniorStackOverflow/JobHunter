@@ -1,17 +1,11 @@
 <section class="admin-section">
   <div class="section-heading"><div><h1>Настройки</h1><p>Критерии поиска, ограничения безопасности, профиль, резюме и источники.</p></div></div>
   <div class="settings-stack">
-    <div class="panel panel-pad google-settings">
-      <div class="settings-summary">
-        <div class="identity-line"><div class="identity-avatar">G</div><div class="identity-copy"><strong>Gmail для откликов</strong><span>{% if gmail_oauth.reauth_required %}Требуется переподключение · автоотправка Gmail остановлена{% elif gmail_oauth.delivery_ready %}Готов к отправке · {{ gmail_oauth.identity_email or 'Google-аккаунт подключён' }}{% else %}Gmail не подключён{% endif %}</span>{% if gmail_oauth.last_refresh_ok %}<span>Последняя успешная проверка OAuth: {{ format_dt(gmail_oauth.last_refresh_ok) }}</span>{% endif %}{% if gmail_oauth.last_refresh_error %}<span>Последняя ошибка: {{ gmail_oauth.last_refresh_error }}</span>{% endif %}</div></div>
-        <div class="section-actions">{% if profile_is_admin_owned %}<a class="btn {{ 'btn-primary' if gmail_oauth.reauth_required or not gmail_oauth.connected else '' }}" href="/admin/auth/google?consent=1">{{ 'Переподключить Gmail' if gmail_oauth.connected else 'Подключить Gmail' }}</a>{% if gmail_oauth.connected %}<form method="post" action="/admin/oauth/gmail/disconnect" data-confirm-title="Отключить Gmail?" data-confirm="Вход по текущей сессии сохранится, но отправка Gmail остановится до повторного подключения аккаунта." data-confirm-action="Отключить" data-confirm-tone="danger"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отключить</button></form>{% endif %}{% else %}<a class="btn" href="/admin/accounts">Управление пользователем</a>{% endif %}</div>
-      </div>
-      <p class="panel-subtitle">{% if profile_is_admin_owned %}Обычный вход через Google автоматически запросит новый Gmail-доступ только когда JobHunter обнаружит истёкший или отозванный refresh token. При OAuth-приложении в режиме Testing Google может снова потребовать переподключение примерно через 7 дней.{% else %}Gmail подключает владелец профиля в своей панели. Администратор видит состояние, но не может подключить собственный ящик вместо пользователя.{% endif %}</p>
-    </div>
+    {% include "_gmail_settings.html" %}
 
     <div class="panel">
       <div class="panel-head"><div><div class="panel-title">Критерии и лимиты</div><div class="panel-subtitle">Главные правила, которыми руководствуется нейросеть</div></div></div>
-      <form method="post" action="/admin/preferences" class="panel-pad">
+      <form method="post" action="{{ panel.action('preferences') }}" class="panel-pad">
         <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="daily_application_rules_present" value="true">
         {% set daily_rules = preferences.additional_rules or {} %}
         {% set force_minimum_daily = daily_rules.get('force_minimum_daily_applications') is sameas true %}
@@ -46,22 +40,15 @@
       <div class="panel-head">
         <div><div class="panel-title">Профиль</div><div class="panel-subtitle">{{ profile.name }} · {{ profile.contact_email or 'почта не указана' }}</div></div>
         <details class="inline-create"><summary class="btn btn-sm">＋ Новый профиль</summary>
-          <form class="details-body" method="post" action="/admin/profiles" enctype="multipart/form-data">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <div class="form-grid">
-              <label class="field">Название<input type="text" name="name" required></label>
-              <label class="switch-row"><span class="switch-copy"><strong>Сделать основным</strong></span><span class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></span></label>
-            </div>
-            <div class="form-grid">
-              <label class="field">Резюме — название<input type="text" name="resume_name"></label>
-              <label class="field">Резюме — категория<input type="text" name="resume_category"></label>
-              <label class="field full">Резюме — PDF (необязательно)<input type="file" name="resume_file" accept="application/pdf,.pdf"></label>
-            </div>
-            <button class="btn btn-primary">Создать профиль</button>
-          </form>
+          {% include "_profile_create.html" %}
         </details>
       </div>
-      <form method="post" action="/admin/profile" class="panel-pad">
+      <div class="panel-pad row-actions">
+        <span class="badge {{ status_tone(profile.status) }}">{{ status_label(profile.status) }}</span>
+        {% if not panel.is_admin and profile.status.value == 'draft' %}<form method="post" action="/app/profiles/{{ profile.id }}/activate" data-confirm="Поиск начнётся после проверки профиля и подтверждённого резюме." data-confirm-title="Запустить поиск?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Запустить поиск</button></form>{% endif %}
+        {% if not profile.is_default %}<form method="post" action="{{ '/admin/profiles/' ~ profile.id ~ '/default' if panel.is_admin else panel.action('default') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn">Сделать основным</button></form>{% endif %}
+      </div>
+      <form method="post" action="{{ panel.action('profile') }}" class="panel-pad">
         <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="form-grid">
           <label class="field">Имя<input type="text" name="name" value="{{ profile.name }}" required></label>
@@ -88,17 +75,17 @@
               {% if item.verified and item.active %}<span class="badge success">Подтверждено</span>
               {% elif item.verified and not item.active %}<span class="badge muted">Неактивно</span>
               {% else %}<span class="badge warning">Проверьте</span>{% endif %}
-              {% if not item.storage_key.startswith('pending/') %}<a class="btn btn-sm" href="/admin/resumes/{{ item.id }}/file?profile_id={{ selected_profile_id }}" target="_blank" rel="noopener">Открыть</a>{% endif %}
-              {% if not item.verified %}<form method="post" action="/admin/resumes/{{ item.id }}/verify"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Подтвердить</button></form>{% endif %}
-              {% if item.active %}<form method="post" action="/admin/resumes/{{ item.id }}/deactivate" data-confirm-title="Деактивировать резюме?" data-confirm="Оно перестанет использоваться для новых откликов. Активировать можно обратно." data-confirm-action="Деактивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Деактивировать</button></form>
-              {% else %}<form method="post" action="/admin/resumes/{{ item.id }}/activate"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Активировать</button></form>{% endif %}
-              {% if resume_usage.get(item.id, 0) == 0 %}<form method="post" action="/admin/resumes/{{ item.id }}/delete" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>
-              {% else %}<form method="post" action="/admin/resumes/{{ item.id }}/archive" data-confirm-title="Заархивировать резюме?" data-confirm="Используется в {{ resume_usage[item.id] }} записях — будет скрыто из списка, строка и история сохранятся. Восстановить можно." data-confirm-action="Заархивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Архивировать</button></form>{% endif %}
+              {% if not item.storage_key.startswith('pending/') %}<a class="btn btn-sm" href="{{ panel.resume(item.id, 'file') }}" target="_blank" rel="noopener">Открыть</a>{% endif %}
+              {% if not item.verified %}<form method="post" action="{{ panel.resume(item.id, 'verify') }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Подтвердить</button></form>{% endif %}
+              {% if item.active %}<form method="post" action="{{ panel.resume(item.id, 'deactivate') }}" data-confirm-title="Деактивировать резюме?" data-confirm="Оно перестанет использоваться для новых откликов. Активировать можно обратно." data-confirm-action="Деактивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Деактивировать</button></form>
+              {% else %}<form method="post" action="{{ panel.resume(item.id, 'activate') }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Активировать</button></form>{% endif %}
+              {% if resume_usage.get(item.id, 0) == 0 %}<form method="post" action="{{ panel.resume(item.id, 'delete') }}" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>
+              {% else %}<form method="post" action="{{ panel.resume(item.id, 'archive') }}" data-confirm-title="Заархивировать резюме?" data-confirm="Используется в {{ resume_usage[item.id] }} записях — будет скрыто из списка, строка и история сохранятся. Восстановить можно." data-confirm-action="Заархивировать" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Архивировать</button></form>{% endif %}
             </div>
           </div>
           {% else %}<div class="empty-state compact">Резюме ещё не загружены.</div>{% endfor %}
         </div>
-        <form class="compact-add" method="post" action="/admin/resumes" enctype="multipart/form-data">
+        <form class="compact-add" method="post" action="{{ panel.action('resumes') }}" enctype="multipart/form-data">
           <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="text" name="name" placeholder="Название" required>
           <input type="text" name="category" placeholder="Категория" required>
@@ -117,9 +104,9 @@
               </div>
               <div class="row-actions">
                 <span class="badge muted">В архиве</span>
-                {% if not item.storage_key.startswith('pending/') %}<a class="btn btn-sm" href="/admin/resumes/{{ item.id }}/file?profile_id={{ selected_profile_id }}" target="_blank" rel="noopener">Открыть</a>{% endif %}
-                <form method="post" action="/admin/resumes/{{ item.id }}/restore"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Восстановить</button></form>
-                {% if resume_usage.get(item.id, 0) == 0 %}<form method="post" action="/admin/resumes/{{ item.id }}/delete" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>{% endif %}
+                {% if not item.storage_key.startswith('pending/') %}<a class="btn btn-sm" href="{{ panel.resume(item.id, 'file') }}" target="_blank" rel="noopener">Открыть</a>{% endif %}
+                <form method="post" action="{{ panel.resume(item.id, 'restore') }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Восстановить</button></form>
+                {% if resume_usage.get(item.id, 0) == 0 %}<form method="post" action="{{ panel.resume(item.id, 'delete') }}" data-confirm-title="Удалить резюме?" data-confirm="Файл и запись будут удалены безвозвратно." data-confirm-action="Удалить" data-confirm-tone="danger"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-danger">Удалить</button></form>{% endif %}
               </div>
             </div>
             {% endfor %}
@@ -129,7 +116,7 @@
       </div>
     </div>
 
-    <details class="settings-section"><summary><span><strong>Источники для {{ profile.name }}</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} выбранных источников работают штатно. Выбор не влияет на других пользователей.</small></span><span>Открыть</span></summary><div class="details-body settings-body">
+    <details class="settings-section" open><summary><span><strong>Источники для {{ profile.name }}</strong><small>{{ counts.healthy_sources }} из {{ counts.enabled_sources }} выбранных источников работают штатно. Выбор не влияет на других пользователей.</small></span><span>Открыть</span></summary><div class="details-body settings-body">
       <div class="compact-list">
         {% for item in sources %}{% set source_link = safe_external_link(item.base_url) %}{% set chosen = item.id not in disabled_source_ids %}
         <div class="compact-row">
@@ -140,7 +127,7 @@
           <div class="row-actions">
             <span class="badge {{ status_tone(item.health_status) }}">{{ status_label(item.health_status) }}</span>
             <span class="badge {{ 'success' if chosen else 'muted' }}">{{ 'В моём поиске' if chosen else 'Исключён' }}</span>
-            <form method="post" action="/admin/profile-sources/{{ item.id }}/selection">
+            <form method="post" action="{{ panel.source_selection(item.id) }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="enabled" value="{{ 'false' if chosen else 'true' }}">
               <button class="btn btn-sm">{{ 'Исключить' if chosen else 'Включить для профиля' }}</button>
             </form>
@@ -149,6 +136,7 @@
         {% else %}<div class="empty-state compact">Источники ещё не настроены.</div>{% endfor %}
       </div>
     </div></details>
+    {% if panel.is_admin %}
     <details class="settings-section"><summary><span><strong>Управление общим обходом</strong><small>Только для администратора · влияет на всех пользователей</small></span><span>Открыть</span></summary><div class="details-body settings-body">
         <p class="panel-subtitle">Эти действия влияют на всех пользователей и используются при обслуживании источника.</p>
         <div class="compact-list">{% for item in sources %}<div class="compact-row"><div><strong>{{ item.name }}</strong><span>{{ 'Обход включён' if item.enabled else 'Обход остановлен' }}</span></div><div class="row-actions">
@@ -156,5 +144,7 @@
           {% if item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm">Обновить сейчас</button></form>{% endif %}
         </div></div>{% endfor %}</div>
     </div></details>
+    {% endif %}
+    {% if account and account.invite_allowance > 0 %}<div class="panel panel-pad"><div class="panel-title">Пригласить человека</div><p>Персональная ссылка привязана к подтверждённому Google email.</p><form method="post" action="{{ panel.action('invites') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="field">Email<input type="email" name="target_email" required></label><button class="btn">Создать приглашение</button></form></div>{% endif %}
   </div>
 </section>

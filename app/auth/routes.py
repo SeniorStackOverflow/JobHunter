@@ -6,7 +6,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,7 +71,7 @@ from app.profiles.schemas import UserProfileInput
 from app.security.auth import SessionSigner
 
 router = APIRouter(tags=["user-auth"])
-templates = Jinja2Templates(directory="app/auth/templates")
+templates = admin_templates
 
 JOIN_COOKIE = "jobhunter_join"
 JOIN_TTL_SECONDS = 30 * 60
@@ -422,6 +421,9 @@ async def user_home(
     view: str = "overview",
     profile_id: UUID | None = None,
     page: int = 1,
+    q: str = "",
+    status_filter: str = "pending_review",
+    history_kind: str = "all",
     notice: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
@@ -438,6 +440,9 @@ async def user_home(
         view=view,
         profile_id=profile_id,
         page=page,
+        q=q,
+        status_filter=status_filter,
+        history_kind=history_kind,
         notice=notice,
     )
 

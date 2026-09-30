@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -150,6 +151,7 @@ async def user_auth_context(
     application.include_router(api_routes.router)
     application.include_router(auth_routes.router)
     application.include_router(admin_router)
+    application.mount("/admin-assets", StaticFiles(directory="app/admin/static"))
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         async with sqlite_session_factory() as session:
@@ -669,7 +671,7 @@ async def test_user_history_and_decisions_paginate_all_owned_applications(
         account.id, account.session_version
     )
     user_auth_context.client.cookies.set(user_auth_context.settings.user_session_cookie_name, token)
-    for view, row_class in (("history", "history-row"), ("decisions", "compact-row")):
+    for view, row_class in (("history", "history-row"), ("decisions", "queue-card")):
         first = await user_auth_context.client.get(
             "/app", params={"view": view, "profile_id": profile_id}
         )
@@ -933,7 +935,7 @@ async def test_admin_notification_acknowledgement_three_clean_browser_contexts(
                         "const r = element.getBoundingClientRect(); "
                         "return [r.width, r.height]; })"
                     )
-                    assert icons == [[20, 20]] * 6
+                    assert icons == [[20, 20]] * 7
                     assert (
                         await page.locator(".notification-head .badge").text_content()
                         == dashboard_count

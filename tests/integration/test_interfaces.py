@@ -16,6 +16,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from pydantic import SecretStr
 from selectolax.parser import HTMLParser
 from sqlalchemy import select
@@ -113,6 +114,7 @@ async def interface_app(
     application.include_router(api_routes.router)
     application.include_router(auth_routes.router)
     application.include_router(admin_routes.router)
+    application.mount("/admin-assets", StaticFiles(directory="app/admin/static"))
 
     async def override_session() -> AsyncIterator[Any]:
         async with sqlite_session_factory() as session:
@@ -573,7 +575,9 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         assert 'src="/admin-assets/admin.js?v=' in dashboard.text
         assert "data-profile-select" in dashboard.text
         assert " onchange=" not in dashboard.text.casefold()
-        assert ".confirm-reason[hidden]{display:none}" in dashboard.text
+        stylesheet = await client.get(admin_routes._admin_asset_url("panel.css"))
+        assert stylesheet.status_code == 200
+        assert ".confirm-reason[hidden]{display:none}" in stylesheet.text
         for view, heading in {
             "decisions": "Требуют решения",
             "history": "История",
@@ -587,7 +591,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
             if view == "diagnostics":
                 assert len(HTMLParser(page.text).css(".archive-item")) == 1
                 assert "Отметить просмотренным" in page.text
-                assert "white-space:normal!important" in page.text
+                assert "white-space:normal!important" in stylesheet.text
         feedback_page = await client.get("/admin", params={"notice": "preferences_saved"})
         assert "Настройки сохранены" in feedback_page.text
         assert "data-notice-dismiss" in feedback_page.text
@@ -3619,11 +3623,13 @@ async def test_settings_page_playwright_narrow_view(
         page_html = (
             await client.get(f"/admin?view=settings&profile_id={seeded['profile_id']}")
         ).text
+        stylesheet = await client.get(admin_routes._admin_asset_url("panel.css"))
 
     async with playwright_api.async_playwright() as runtime:
         browser = await runtime.chromium.launch()
         page = await browser.new_page(viewport={"width": 390, "height": 844})
         await page.set_content(page_html, wait_until="domcontentloaded")
+        await page.add_style_tag(content=stylesheet.text)
         assert await page.get_by_text("Резюме этого профиля").count() == 1
         assert await page.locator("input[name='resume_file']").count() == 1
         assert await page.locator("form[action='/admin/resumes'] input[name='file']").count() == 1
@@ -4069,3 +4075,319 @@ async def test_settings_page_archived_resume_section(
             depth += 1 if token == "<details" else -1
             max_depth = max(max_depth, depth)
         assert max_depth <= 1
+
+
+async def _account_panel_seed(
+    session_factory: Any, settings: Settings, *, suffix: str
+) -> tuple[dict[str, Any], UUID, str]:
+    from app.models.entities import Account
+    from app.models.enums import AccountRole, AccountStatus
+    from app.security.auth import AccountSessionSigner
+
+    seeded = await _seed_review_application(session_factory, settings, suffix=suffix)
+    async with session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(account)
+        await session.flush()
+        profile = await session.get(UserProfile, seeded["profile_id"])
+        assert profile is not None
+        profile.owner_account_id = account.id
+        token = AccountSessionSigner(settings.secret_key.get_secret_value()).issue(
+            account.id, account.session_version
+        )
+        account_id = account.id
+        await session.commit()
+    return seeded, account_id, token
+
+
+async def test_shared_panel_scopes_search_history_details_and_learning(
+    interface_app: tuple[FastAPI, Settings], sqlite_session_factory: Any
+) -> None:
+    application, settings = interface_app
+    settings.user_accounts_enabled = True
+    own, account_id, token = await _account_panel_seed(
+        sqlite_session_factory, settings, suffix="owned-panel"
+    )
+    foreign, _, _ = await _account_panel_seed(
+        sqlite_session_factory, settings, suffix="foreign-panel"
+    )
+    async with sqlite_session_factory() as session:
+        foreign_source = await session.get(JobSource, foreign["source_id"])
+        assert foreign_source is not None
+        foreign_source.name = "Public catalog source"
+        session.add(Alert(code="private-operator-alert", severity="error", message="Operator only"))
+        await session.commit()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="https://testserver"
+    ) as client:
+        client.cookies.set(settings.user_session_cookie_name, token)
+        for view in ("overview", "decisions", "history", "settings"):
+            response = await client.get("/app", params={"view": view})
+            assert response.status_code == 200
+            html = HTMLParser(response.text)
+            assert len(html.css(".app-shell")) == 1
+            assert len(html.css(".side-nav .nav-link")) == 4
+            assert html.css_first("link[rel=stylesheet]") is not None
+            assert "foreign-panel" not in response.text
+            assert "Operator only" not in response.text
+            assert "/admin/" not in response.text
+        assert (
+            await client.get("/app", params={"profile_id": foreign["profile_id"]})
+        ).status_code == 404
+        for view in ("calls", "diagnostics", "accounts"):
+            assert (await client.get("/app", params={"view": view})).status_code == 404
+        assert (
+            await client.get(f"/app/applications/{foreign['application_id']}")
+        ).status_code == 404
+        own_search = await client.get("/app?view=decisions&q=owned-panel")
+        assert len(HTMLParser(own_search.text).css(".queue-card")) == 1
+        foreign_search = await client.get("/app?view=decisions&q=foreign-panel")
+        assert not HTMLParser(foreign_search.text).css(".queue-card")
+        jobs = await client.get("/app?view=history&history_kind=jobs")
+        assert "https://jobs.example.test/jobs/owned-panel" in jobs.text
+        assert "foreign-panel" not in jobs.text
+        evaluations = await client.get("/app?view=history&history_kind=matches")
+        assert "Example Company owned-panel" in evaluations.text
+        assert "foreign-panel" not in evaluations.text
+        detail = await client.get(f"/app/applications/{own['application_id']}")
+        assert "Build and maintain a Python service." in detail.text
+        assert "Проверка безопасности" in detail.text
+        assert "data-review-reject" in detail.text
+        assert "Технические подробности" not in detail.text
+        csrf_token = _csrf_token(detail.text)
+        foreign_influence = await client.post(
+            "/app/review-learning/influence",
+            data={
+                "profile_id": str(foreign["profile_id"]),
+                "enabled": "false",
+                "csrf_token": csrf_token,
+            },
+        )
+        assert foreign_influence.status_code == 404
+        assert (
+            await client.post(
+                "/app/review-learning/influence",
+                data={"profile_id": str(own["profile_id"]), "enabled": "false"},
+            )
+        ).status_code == 422
+        updated = await client.post(
+            "/app/review-learning/influence",
+            data={
+                "profile_id": str(own["profile_id"]),
+                "enabled": "false",
+                "csrf_token": csrf_token,
+            },
+        )
+        assert updated.status_code == 303
+        rejected = await client.post(
+            f"/app/applications/{own['application_id']}/reject",
+            data={"csrf_token": csrf_token, "reason_code": "salary", "learn_from_review": "false"},
+        )
+        assert rejected.status_code == 303
+        history = await client.get("/app?view=history&history_kind=rejected&q=owned-panel")
+        assert "Example Company owned-panel" in history.text
+    async with sqlite_session_factory() as session:
+        feedback = await session.scalar(
+            select(ReviewFeedbackEvent).where(
+                ReviewFeedbackEvent.application_id == own["application_id"]
+            )
+        )
+        assert feedback is not None
+        assert feedback.actor == f"account:{account_id}"
+        assert feedback.reason_code == ReviewReason.SALARY
+        assert feedback.learning_eligible is False
+        setting = await session.scalar(
+            select(ReviewLearningSetting).where(
+                ReviewLearningSetting.profile_id == own["profile_id"]
+            )
+        )
+        assert setting is not None and setting.influence_enabled is False
+
+
+@pytest.mark.e2e
+async def test_shared_panel_browser_flows_three_clean_contexts_per_role(
+    interface_app: tuple[FastAPI, Settings],
+    sqlite_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asyncio
+    import socket
+
+    import uvicorn
+    from playwright.async_api import async_playwright, expect
+
+    from app import main as main_module
+
+    application, settings = interface_app
+    settings.user_accounts_enabled = True
+    monkeypatch.setattr(main_module, "settings", settings)
+    application.add_middleware(main_module.SecurityMiddleware)
+    fixtures = []
+    for index in range(3):
+        user_seed, _, user_token = await _account_panel_seed(
+            sqlite_session_factory, settings, suffix=f"unified-user-{index}"
+        )
+        admin_seed = await _seed_review_application(
+            sqlite_session_factory, settings, suffix=f"unified-admin-{index}"
+        )
+        admin_token = SessionSigner(settings.secret_key.get_secret_value()).issue(
+            settings.admin_username
+        )
+        fixtures.extend(
+            [
+                (
+                    "/app",
+                    settings.user_session_cookie_name,
+                    user_token,
+                    user_seed,
+                    f"unified-user-{index}",
+                ),
+                (
+                    "/admin",
+                    settings.session_cookie_name,
+                    admin_token,
+                    admin_seed,
+                    f"unified-admin-{index}",
+                ),
+            ]
+        )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    base_url = f"http://localhost:{port}"
+    server = uvicorn.Server(
+        uvicorn.Config(application, host="127.0.0.1", port=port, log_level="error")
+    )
+    task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient() as client:
+            for _ in range(100):
+                try:
+                    if (await client.get(base_url + "/login")).status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("shared panel server did not start")
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch()
+            try:
+                for base, cookie_name, token, seeded, suffix in fixtures:
+                    context = await browser.new_context(viewport={"width": 1365, "height": 900})
+                    try:
+                        await context.add_cookies(
+                            [{"name": cookie_name, "value": token, "url": base_url}]
+                        )
+                        page = await context.new_page()
+                        errors: list[str] = []
+                        page.on(
+                            "pageerror",
+                            lambda error, collected=errors: collected.append(str(error)),
+                        )
+                        profile_id = seeded["profile_id"]
+                        response = await page.goto(
+                            f"{base_url}{base}?view=overview&profile_id={profile_id}"
+                        )
+                        assert response is not None and response.status == 200
+                        assert "content-security-policy" in response.headers
+                        assert (
+                            await page.evaluate("getComputedStyle(document.body).fontSize")
+                            == "14px"
+                        )
+                        await expect(page.locator(".side-nav .nav-link")).to_have_count(
+                            7 if base == "/admin" else 4
+                        )
+                        await page.locator("[data-theme-toggle]").click()
+                        assert (
+                            await page.evaluate("document.documentElement.dataset.theme") == "light"
+                        )
+                        await page.set_viewport_size({"width": 390, "height": 844})
+                        for view in ("overview", "decisions", "history", "settings"):
+                            await page.goto(f"{base_url}{base}?view={view}&profile_id={profile_id}")
+                            assert (
+                                await page.evaluate("document.documentElement.dataset.theme")
+                                == "light"
+                            )
+                            assert await page.evaluate(
+                                "document.documentElement.scrollWidth <= innerWidth"
+                            )
+                            await page.locator("[data-menu-toggle]").click()
+                            await expect(page.locator("[data-menu-toggle]")).to_have_attribute(
+                                "aria-expanded", "true"
+                            )
+                            await page.keyboard.press("Escape")
+                            await expect(page.locator("[data-menu-toggle]")).to_have_attribute(
+                                "aria-expanded", "false"
+                            )
+                        await page.locator("input[name=minimum_daily_applications]").fill("1")
+                        preference_form = page.locator("form").filter(
+                            has=page.locator("input[name=maximum_daily_applications]")
+                        )
+                        await preference_form.get_by_role(
+                            "button", name="Сохранить критерии"
+                        ).click()
+                        await expect(page.locator("[data-action-notice]")).to_be_visible()
+                        source_form = page.locator(f"form[action*='{seeded['source_id']}']").filter(
+                            has=page.locator("input[name=enabled]")
+                        )
+                        await source_form.get_by_role("button").click()
+                        await expect(
+                            page.locator(f"form[action*='{seeded['source_id']}']").filter(
+                                has=page.locator("input[name=enabled]")
+                            )
+                        ).to_contain_text("Включить")
+                        await (
+                            page.locator(f"form[action*='{seeded['source_id']}']")
+                            .filter(has=page.locator("input[name=enabled]"))
+                            .get_by_role("button")
+                            .click()
+                        )
+                        await page.goto(f"{base_url}{base}?view=decisions&profile_id={profile_id}")
+                        await page.locator("input[name=q]").fill(suffix)
+                        await page.get_by_role("button", name="Найти", exact=True).click()
+                        await expect(page.locator(".queue-card")).to_have_count(1)
+                        await page.get_by_role("link", name="Проверить письмо").click()
+                        await expect(
+                            page.get_by_text("Build and maintain a Python service.", exact=True)
+                        ).to_be_visible()
+                        assert await page.evaluate(
+                            "document.documentElement.scrollWidth <= innerWidth"
+                        )
+                        await page.screenshot(
+                            path=str(tmp_path / f"{suffix}-mobile.png"), full_page=True
+                        )
+                        reject = page.locator("form[data-review-reject] button")
+                        await reject.click()
+                        await expect(page.locator("[data-confirm-dialog]")).to_be_visible()
+                        await (
+                            page.locator("[data-review-reason-field] label")
+                            .filter(has=page.locator("input[value=salary]"))
+                            .click()
+                        )
+                        await page.locator("[data-confirm-accept]").click()
+                        await expect(page.locator("[data-action-notice]")).to_be_visible()
+                        await expect(page.locator("form[data-review-reject]")).to_have_count(0)
+                        await page.goto(
+                            f"{base_url}{base}?view=history&history_kind=rejected&profile_id={profile_id}&q={suffix}"
+                        )
+                        await expect(page.locator(".history-row")).to_have_count(1)
+                        assert not errors
+                    finally:
+                        await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await task
+    async with sqlite_session_factory() as session:
+        for _, _, _, seeded, _ in fixtures:
+            feedback = await session.scalar(
+                select(ReviewFeedbackEvent).where(
+                    ReviewFeedbackEvent.application_id == seeded["application_id"]
+                )
+            )
+            assert feedback is not None and feedback.reason_code == ReviewReason.SALARY
+            assert feedback.learning_eligible is True

@@ -1,23 +1,16 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import UTC, datetime, time, timedelta
-from functools import lru_cache
-from hashlib import sha256
-from pathlib import Path
 
 # FastAPI's declarative dependency/form parameters intentionally call Depends/File.
 # ruff: noqa: B008
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from fastapi.templating import Jinja2Templates
-from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications import (
@@ -39,38 +32,22 @@ from app.database import get_session
 from app.email.oauth import GmailOAuthService
 from app.email.service import EmailSendBlocked, EmailService
 from app.learning import (
-    LearnedReviewScore,
-    ReviewJobInput,
     ReviewLearningService,
-    ReviewLearningSummary,
     fixed_preference_dimensions,
 )
-from app.matching.freshness import count_profile_matching_backlog, evaluation_is_current
-from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
 from app.models.entities import (
     Alert,
     Application,
-    AuditEvent,
-    CommunicationSession,
     JobSource,
-    MatchEvaluation,
-    ProfileSourcePreference,
     Resume,
     ScanRun,
-    SourceJob,
     UserProfile,
 )
 from app.models.enums import (
-    ApplicationStatus,
-    CommunicationChannel,
-    JobStatus,
-    MatchDecision,
-    PhoneSummaryState,
     ReviewOutcome,
     ReviewReason,
     RunStatus,
     ScanType,
-    SourceHealth,
 )
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
@@ -82,388 +59,46 @@ from app.security.files import (
     read_verified_resume,
     validate_resume_upload,
 )
-from app.security.ssrf import public_url_shape_is_safe
 from app.settings import get_settings
+from app.ui.presentation import (
+    _FEEDBACK_NOTICE_TONES as _FEEDBACK_NOTICE_TONES,
+)
+from app.ui.presentation import (
+    _FEEDBACK_NOTICES as _FEEDBACK_NOTICES,
+)
+from app.ui.presentation import (
+    _VIEW_TITLES as _VIEW_TITLES,
+)
+from app.ui.presentation import (
+    _admin_asset_url as _admin_asset_url,
+)
+from app.ui.presentation import (
+    _application_approval_issue as _application_approval_issue,
+)
+from app.ui.presentation import (
+    _approval_failure_notice as _approval_failure_notice,
+)
+from app.ui.presentation import (
+    _format_dt as _format_dt,
+)
+from app.ui.presentation import (
+    _pagination as _pagination,
+)
+from app.ui.presentation import (
+    _safe_external_link as _safe_external_link,
+)
+from app.ui.presentation import (
+    _status_label as _status_label,
+)
+from app.ui.presentation import (
+    _status_tone as _status_tone,
+)
+from app.ui.presentation import (
+    templates as templates,
+)
 
 router = APIRouter(tags=["admin"])
-templates = Jinja2Templates(directory="app/admin/templates")
-_ADMIN_STATIC_ROOT = Path(__file__).with_name("static")
-
 logger = structlog.get_logger(__name__)
-
-
-@lru_cache
-def _admin_asset_url(filename: str) -> str:
-    """Return a content-versioned URL so a deploy cannot reuse stale browser JavaScript."""
-    if Path(filename).name != filename:
-        raise ValueError("admin asset filename must not contain a path")
-    content = (_ADMIN_STATIC_ROOT / filename).read_bytes()
-    version = sha256(content).hexdigest()[:16]
-    return f"/admin-assets/{quote(filename)}?v={version}"
-
-
-def _safe_external_link(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-    except ValueError:
-        return None
-    if not hostname or not public_url_shape_is_safe(value, (hostname,)):
-        return None
-    return value
-
-
-templates.env.globals["safe_external_link"] = _safe_external_link
-templates.env.globals["admin_asset_url"] = _admin_asset_url
-
-
-_LOCAL_TZ = ZoneInfo("Europe/Chisinau")
-_STATUS_LABELS = {
-    "healthy": "Работает",
-    "degraded": "Есть проблемы",
-    "unavailable": "Недоступно",
-    "paused": "На паузе",
-    "disabled": "Выключен",
-    "unknown": "Неизвестно",
-    "queued": "В очереди",
-    "running": "Выполняется",
-    "succeeded": "Успешно",
-    "partial": "Частично",
-    "failed": "Ошибка",
-    "cancelled": "Отменено",
-    "active": "Активна",
-    "possibly_closed": "Возможно закрыта",
-    "closed": "Закрыта",
-    "incomplete": "Неполная",
-    "auto_apply": "Подходит для автоотправки",
-    "prepare_for_review": "Нужна проверка",
-    "skip": "Пропустить",
-    "block": "Заблокировано правилами",
-    "prepared": "Подготовлен",
-    "skipped": "Пропущен",
-    "pending_review": "На проверке",
-    "approved": "Одобрен",
-    "auto_approved": "Одобрен автоматически",
-    "sending": "Отправляется",
-    "sent": "Отправлен",
-    "delivery_unknown": "Доставка неизвестна",
-    "temporary_failure": "Временная ошибка",
-    "permanent_failure": "Ошибка доставки",
-    "blocked": "Заблокирован",
-    "incremental": "Инкрементальный",
-    "full": "Полный",
-    "recheck": "Перепроверка",
-    "authenticated": "Вход выполнен",
-    "connected": "Подключено",
-    "disconnected": "Отключено",
-    "enabled_and_resumed": "Включено и возобновлено",
-    "redirected": "Переход к Google",
-}
-
-_VIEW_TITLES = {
-    "overview": "Главная",
-    "decisions": "Требуют решения",
-    "history": "История",
-    "settings": "Настройки",
-    "diagnostics": "Диагностика",
-    "calls": "Звонки",
-}
-
-_AUDIT_ACTION_LABELS = {
-    "admin.login.google": "Выполнен вход через Google",
-    "application.approved": "Отклик одобрен",
-    "application.blocked_closed_vacancy": "Отклик остановлен: вакансия закрыта",
-    "application.rejected_by_owner": "Отклик отклонён",
-    "application.send_requested": "Запрошена отправка отклика",
-    "auto_send.paused": "Автоотправка поставлена на паузу",
-    "auto_send.resumed": "Автоотправка возобновлена",
-    "email.delivery": "Обновлено состояние доставки",
-    "oauth.gmail.connected": "Google-аккаунт подключён",
-    "oauth.gmail.disconnected": "Google-аккаунт отключён",
-    "preferences.updated": "Настройки поиска обновлены",
-    "profile.created": "Профиль создан",
-    "profile.updated": "Профиль обновлён",
-    "resume.activated": "Резюме снова активно",
-    "resume.archived": "Резюме заархивировано",
-    "resume.deactivated": "Резюме деактивировано",
-    "resume.deleted": "Резюме удалено",
-    "resume.restored": "Резюме восстановлено",
-    "resume.uploaded": "Резюме загружено",
-    "resume.verified": "Резюме подтверждено",
-    "source.disabled": "Источник выключен",
-    "source.enabled": "Источник включён",
-}
-
-_ALERT_CODE_LABELS = {
-    "adapter_degradation": "Источник работает нестабильно",
-    "mass_absence_suppressed": "Защитная проверка массового исчезновения вакансий",
-}
-
-_FEEDBACK_NOTICES = {
-    "google_connected": (
-        "Google подключён",
-        "Вход подтверждён, доступ к Gmail сохранён на сервере.",
-    ),
-    "profile_saved": ("Профиль сохранён", "Изменения данных профиля применены."),
-    "profile_created": ("Профиль создан", "Новый профиль готов к настройке."),
-    "profile_default": ("Основной профиль изменён", "Он будет выбран по умолчанию."),
-    "preferences_saved": (
-        "Настройки сохранены",
-        "Критерии поиска и ограничения обновлены.",
-    ),
-    "auto_send_paused": (
-        "Автоотправка приостановлена",
-        "Новые письма не будут отправляться до возобновления.",
-    ),
-    "auto_send_resumed": (
-        "Автоотправка возобновлена",
-        "JobHunter снова применяет заданные правила и дневной лимит.",
-    ),
-    "resume_uploaded": (
-        "Резюме загружено",
-        "Проверьте его перед использованием в автоматических откликах.",
-    ),
-    "resume_verified": ("Резюме подтверждено", "Оно доступно для подготовки откликов."),
-    "resume_deactivated": (
-        "Резюме деактивировано",
-        "Оно больше не используется для новых откликов; активировать можно обратно.",
-    ),
-    "resume_activated": ("Резюме активно", "Оно снова доступно для подготовки откликов."),
-    "resume_archived": (
-        "Резюме заархивировано",
-        "Оно скрыто из списка; строка и история сохранены. Можно восстановить.",
-    ),
-    "resume_restored": ("Резюме восстановлено", "Оно снова в списке, неактивно."),
-    "resume_deleted": ("Резюме удалено", "Файл и запись удалены безвозвратно."),
-    "profile_and_resume_created": (
-        "Профиль и резюме созданы",
-        "Проверьте резюме перед использованием в автоматических откликах.",
-    ),
-    "google_disconnected": (
-        "Google отключён",
-        "Отправка через Gmail остановлена до повторного подключения.",
-    ),
-    "alert_acknowledged": (
-        "Уведомление просмотрено",
-        "Оно сохранено в архиве диагностики.",
-    ),
-    "source_enabled": ("Источник включён", "Новые обходы снова разрешены."),
-    "source_selection_saved": (
-        "Источники профиля обновлены",
-        "Выбор действует только для этого профиля; общие обходы не изменились.",
-    ),
-    "source_disabled": (
-        "Источник выключен",
-        "Новые обходы остановлены, собранные вакансии сохранены.",
-    ),
-    "scan_started": ("Проверка запущена", "Результат появится в истории обходов."),
-    "application_approved": (
-        "Отклик одобрен",
-        "Он прошёл ручную проверку и готов к следующему этапу.",
-    ),
-    "application_approval_no_email": (
-        "Одобрение недоступно",
-        "У вакансии нет публичного email. JobHunter не отправляет отклики "
-        "через внутреннюю форму сайта.",
-    ),
-    "application_approval_invalid_content": (
-        "Письмо не прошло проверку",
-        "Отклик остался в очереди и не будет отправлен. Проверьте его технические подробности.",
-    ),
-    "application_approval_inactive_vacancy": (
-        "Одобрение недоступно",
-        "Вакансия больше не активна. Отклик остался в безопасном состоянии.",
-    ),
-    "application_approval_stale_evaluation": (
-        "Требуется повторный анализ",
-        "Вакансия или данные профиля изменились. Одобрение станет доступно после переоценки.",
-    ),
-    "application_approval_unavailable": (
-        "Одобрение не выполнено",
-        "Состояние отклика изменилось или он не готов к одобрению. "
-        "Обновите карточку и проверьте его ещё раз.",
-    ),
-    "application_rejected": (
-        "Отклик отклонён",
-        "Он отменён и не попадёт в отправку.",
-    ),
-    "application_sent": ("Письмо отправлено", "Состояние доставки сохранено в журнале."),
-    "review_learning_enabled": (
-        "Обучение включено",
-        "Новые решения снова влияют на подсказки и порядок очереди.",
-    ),
-    "review_learning_paused": (
-        "Влияние обучения приостановлено",
-        "Решения сохраняются, но не меняют подсказки и порядок очереди.",
-    ),
-    "delivery_reconciled": (
-        "Состояние зафиксировано",
-        "Повторная отправка не выполнялась.",
-    ),
-}
-
-_FEEDBACK_NOTICE_TONES = {
-    "application_approval_no_email": "warning",
-    "application_approval_invalid_content": "danger",
-    "application_approval_inactive_vacancy": "warning",
-    "application_approval_stale_evaluation": "warning",
-    "application_approval_unavailable": "danger",
-}
-
-
-def _enum_value(value: Any) -> str:
-    return str(getattr(value, "value", value) or "unknown")
-
-
-def _status_label(value: Any) -> str:
-    raw = _enum_value(value)
-    return _STATUS_LABELS.get(raw, raw.replace("_", " ").capitalize())
-
-
-def _status_tone(value: Any) -> str:
-    raw = _enum_value(value)
-    if raw in {"healthy", "succeeded", "active", "auto_apply", "approved", "auto_approved", "sent"}:
-        return "success"
-    if raw in {
-        "queued",
-        "running",
-        "partial",
-        "pending_review",
-        "prepared",
-        "sending",
-        "possibly_closed",
-        "unknown",
-        "prepare_for_review",
-        "temporary_failure",
-    }:
-        return "warning"
-    if raw in {
-        "failed",
-        "blocked",
-        "block",
-        "permanent_failure",
-        "delivery_unknown",
-        "degraded",
-        "unavailable",
-    }:
-        return "danger"
-    if raw in {"disabled", "cancelled", "closed", "skip", "skipped"}:
-        return "muted"
-    return "info"
-
-
-def _format_dt(value: datetime | None, include_date: bool = True) -> str:
-    if value is None:
-        return "—"
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    local = value.astimezone(_LOCAL_TZ)
-    return local.strftime("%d.%m.%Y %H:%M" if include_date else "%H:%M")
-
-
-def _audit_action_label(value: str) -> str:
-    return _AUDIT_ACTION_LABELS.get(value, value.replace("_", " ").replace(".", " · "))
-
-
-def _alert_code_label(value: str) -> str:
-    return _ALERT_CODE_LABELS.get(value, "Системное уведомление")
-
-
-def _application_failed_policy_rules(application: Any) -> set[str]:
-    if isinstance(application, dict):
-        policy_result = application.get("policy_result")
-    else:
-        policy_result = getattr(application, "policy_result", None)
-    if not isinstance(policy_result, dict):
-        return set()
-    raw_rules = policy_result.get("rules_failed", [])
-    if not isinstance(raw_rules, list):
-        return set()
-    return {str(item) for item in raw_rules}
-
-
-def _application_content_validated(application: Any) -> bool:
-    if isinstance(application, dict):
-        return application.get("content_validated") is True
-    return getattr(application, "content_validated", False) is True
-
-
-def _application_safe_stop_reason(application: Any) -> str | None:
-    if isinstance(application, dict):
-        policy_result = application.get("policy_result")
-    else:
-        policy_result = getattr(application, "policy_result", None)
-    if not isinstance(policy_result, dict):
-        return None
-    reason = policy_result.get("safe_stop_reason")
-    return reason if isinstance(reason, str) and reason else None
-
-
-def _application_approval_issue(
-    application: Any,
-    match_evaluation_issue: str | None = None,
-) -> str | None:
-    """Explain why a review cannot currently become an approved email application."""
-
-    safe_stop_reason = _application_safe_stop_reason(application)
-    if match_evaluation_issue is None:
-        if isinstance(application, dict):
-            match_evaluation_issue = application.get("match_evaluation_issue")
-        else:
-            match_evaluation_issue = getattr(application, "match_evaluation_issue", None)
-    if (
-        safe_stop_reason == "match_evaluation_stale"
-        or match_evaluation_issue == "match_evaluation_stale"
-    ):
-        return "Вакансия изменилась — JobHunter выполняет повторный анализ."
-    if safe_stop_reason == "match_evaluation_inputs_stale":
-        return "Профиль или настройки изменились — JobHunter выполняет повторный анализ."
-    if match_evaluation_issue == "invalid_match_evaluation_binding":
-        return "Проверка соответствия вакансии недоступна — JobHunter выполняет повторный анализ."
-    if _application_content_validated(application):
-        return None
-    if "verified_email_contact" in _application_failed_policy_rules(application):
-        return (
-            "У вакансии нет публичного email — JobHunter не отправляет отклики "
-            "через внутреннюю форму сайта."
-        )
-    return "Письмо или получатель не прошли проверку безопасности."
-
-
-def _approval_failure_notice(application: Application | None, error: Exception) -> str:
-    message = str(error)
-    if application is not None and not _application_content_validated(application):
-        if "verified_email_contact" in _application_failed_policy_rules(application):
-            return "application_approval_no_email"
-        return "application_approval_invalid_content"
-    if message == "vacancy is no longer active":
-        return "application_approval_inactive_vacancy"
-    if message == "match evaluation is stale":
-        return "application_approval_stale_evaluation"
-    return "application_approval_unavailable"
-
-
-def _pagination(total: int, requested_page: int, per_page: int) -> dict[str, int | bool]:
-    pages = max(1, (total + per_page - 1) // per_page)
-    page = min(max(1, requested_page), pages)
-    return {
-        "page": page,
-        "pages": pages,
-        "per_page": per_page,
-        "total": total,
-        "has_previous": page > 1,
-        "has_next": page < pages,
-    }
-
-
-templates.env.globals["status_label"] = _status_label
-templates.env.globals["status_tone"] = _status_tone
-templates.env.globals["format_dt"] = _format_dt
-templates.env.globals["audit_action_label"] = _audit_action_label
-templates.env.globals["alert_code_label"] = _alert_code_label
-templates.env.globals["application_approval_issue"] = _application_approval_issue
 
 
 def _signer() -> SessionSigner:
@@ -599,780 +234,22 @@ async def dashboard(
     _: str = Depends(require_admin_page),
     session: AsyncSession = Depends(get_session),
 ) -> HTMLResponse:
-    token = _session_token(request)
-    view = view if view in _VIEW_TITLES else "overview"
-    q = q.strip()[:120]
-    profile_service = ProfileService()
-    profiles = await profile_service.list_profiles(session)
-    profile = await profile_service.get_profile(session, profile_id)
-    if profile is None:
-        raise HTTPException(status_code=404, detail="profile not found")
-    selected_profile_id = profile.id
-    preferences = await profile_service.get_preferences(session, selected_profile_id)
-    sources = list((await session.scalars(select(JobSource).order_by(JobSource.name))).all())
-    disabled_source_ids = {
-        row.source_id
-        for row in (
-            await session.scalars(
-                select(ProfileSourcePreference).where(
-                    ProfileSourcePreference.profile_id == selected_profile_id,
-                    ProfileSourcePreference.enabled.is_(False),
-                )
-            )
-        ).all()
-    }
-    selected_source_ids = {
-        item.id for item in sources if item.enabled and item.id not in disabled_source_ids
-    }
+    from app.ui.dashboard import render_dashboard
 
-    now_local = datetime.now(_LOCAL_TZ)
-    start_local = datetime.combine(now_local.date(), time.min, _LOCAL_TZ)
-    start = start_local.astimezone(UTC)
-    end = (start_local + timedelta(days=1)).astimezone(UTC)
-    today_scans = list(
-        (
-            await session.scalars(
-                select(ScanRun).where(
-                    ScanRun.source_id.in_(selected_source_ids),
-                    ScanRun.started_at >= start,
-                    ScanRun.started_at < end,
-                )
-            )
-        ).all()
-    )
-    decision_rows = (
-        await session.execute(
-            select(MatchEvaluation.decision, func.count(MatchEvaluation.id))
-            .where(
-                MatchEvaluation.profile_id == selected_profile_id,
-                MatchEvaluation.created_at >= start,
-                MatchEvaluation.created_at < end,
-            )
-            .group_by(MatchEvaluation.decision)
-        )
-    ).all()
-    decisions = {decision: int(count) for decision, count in decision_rows}
-    counts = {
-        "jobs": int(await session.scalar(select(func.count(SourceJob.id))) or 0),
-        "active_jobs": int(
-            await session.scalar(
-                select(func.count(SourceJob.id)).where(SourceJob.status == JobStatus.ACTIVE)
-            )
-            or 0
-        ),
-        "applications": int(
-            await session.scalar(
-                select(func.count(Application.id)).where(
-                    Application.profile_id == selected_profile_id
-                )
-            )
-            or 0
-        ),
-        "pending_review": int(
-            await session.scalar(
-                select(func.count(Application.id)).where(
-                    Application.profile_id == selected_profile_id,
-                    Application.status == ApplicationStatus.PENDING_REVIEW,
-                )
-            )
-            or 0
-        ),
-        "running_scans": int(
-            await session.scalar(
-                select(func.count(ScanRun.id)).where(
-                    ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])
-                )
-            )
-            or 0
-        ),
-        "enabled_sources": sum(
-            1 for item in sources if item.enabled and item.id not in disabled_source_ids
-        ),
-        "healthy_sources": sum(
-            1
-            for item in sources
-            if item.enabled
-            and item.id not in disabled_source_ids
-            and item.health_status == SourceHealth.HEALTHY
-        ),
-        "unacknowledged_alerts": int(
-            await session.scalar(select(func.count(Alert.id)).where(Alert.acknowledged.is_(False)))
-            or 0
-        ),
-    }
-    active_alert_cutoff = datetime.now(UTC) - timedelta(hours=24)
-    counts["active_alerts"] = int(
-        await session.scalar(
-            select(func.count(Alert.id)).where(
-                Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff
-            )
-        )
-        or 0
-    )
-    notification_alerts = list(
-        (
-            await session.scalars(
-                select(Alert)
-                .where(Alert.acknowledged.is_(False), Alert.created_at >= active_alert_cutoff)
-                .order_by(desc(Alert.created_at))
-                .limit(5)
-            )
-        ).all()
-    )
-    counts["unhealthy_sources"] = counts["enabled_sources"] - counts["healthy_sources"]
-    counts["notification_count"] = counts["active_alerts"] + int(counts["unhealthy_sources"] > 0)
-    counts["phone_review"] = int(
-        await session.scalar(
-            select(func.count(CommunicationSession.id)).where(
-                CommunicationSession.channel == CommunicationChannel.CALL,
-                or_(
-                    CommunicationSession.needs_review.is_(True),
-                    CommunicationSession.summary_state == PhoneSummaryState.FAILED,
-                ),
-            )
-        )
-        or 0
-    )
-    matching_backlog = await count_profile_matching_backlog(
+    return await render_dashboard(
+        request,
         session,
-        profile,
-        preferences,
         get_settings(),
+        _session_token(request),
+        profile_id=profile_id,
+        view=view,
+        page=page,
+        q=q,
+        status_filter=status_filter,
+        history_kind=history_kind,
+        notice=notice,
+        google=google,
     )
-    sent_today = int(
-        await session.scalar(
-            select(func.count(Application.id)).where(
-                Application.profile_id == selected_profile_id,
-                Application.sent_at >= start,
-                Application.sent_at < end,
-            )
-        )
-        or 0
-    )
-    overview = {
-        "today_found": sum(item.found_jobs for item in today_scans),
-        "today_new": sum(item.new_jobs for item in today_scans),
-        "today_matches": sum(decisions.values()),
-        "auto_apply": decisions.get(MatchDecision.AUTO_APPLY, 0),
-        "review": decisions.get(MatchDecision.PREPARE_FOR_REVIEW, 0),
-        "skip": decisions.get(MatchDecision.SKIP, 0),
-        "block": decisions.get(MatchDecision.BLOCK, 0),
-        "sent_today": sent_today,
-        "daily_limit": preferences.maximum_daily_applications,
-        "matching_backlog": matching_backlog,
-    }
-    gmail_oauth = await GmailOAuthService(get_settings()).get_status(
-        session, account_id=profile.owner_account_id
-    )
-    attention_items: list[dict[str, str]] = []
-    if not gmail_oauth["configured"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": "Google OAuth не настроен",
-                "detail": "Вход через Google и автономная отправка Gmail недоступны.",
-                "href": "/admin?view=settings",
-                "action": "Открыть настройки",
-            }
-        )
-    elif not gmail_oauth["connected"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": "Google-аккаунт не подключён",
-                "detail": "Для этого профиля нужен Gmail его владельца.",
-                "href": (
-                    "/admin/auth/google"
-                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "/admin/accounts"
-                ),
-                "action": (
-                    "Подключить"
-                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "Открыть пользователей"
-                ),
-            }
-        )
-    elif gmail_oauth["reauth_required"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": "Gmail требует переподключения",
-                "detail": "Автоотправка остановлена до получения нового OAuth-доступа.",
-                "href": (
-                    "/admin/auth/google?consent=1"
-                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "/admin/accounts"
-                ),
-                "action": (
-                    "Переподключить Gmail"
-                    if profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID
-                    else "Открыть пользователей"
-                ),
-            }
-        )
-    elif not gmail_oauth["identity_verified"]:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Подтвердите Google-аккаунт",
-                "detail": "Доступ к Gmail есть, но личность владельца ещё не подтверждена.",
-                "href": "/admin/auth/google",
-                "action": "Войти через Google",
-            }
-        )
-    if counts["active_alerts"]:
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": f"{counts['active_alerts']} свежих системных предупреждений",
-                "detail": "Появились за последние 24 часа и ещё не просмотрены.",
-                "href": "/admin?view=diagnostics",
-                "action": "Проверить",
-            }
-        )
-    unhealthy_sources = counts["unhealthy_sources"]
-    if unhealthy_sources:
-        unhealthy_names = ", ".join(
-            item.name
-            for item in sources
-            if item.enabled
-            and item.id not in disabled_source_ids
-            and item.health_status != SourceHealth.HEALTHY
-        )
-        attention_items.append(
-            {
-                "tone": "danger",
-                "title": f"{unhealthy_sources} источников требуют проверки",
-                "detail": unhealthy_names,
-                "href": "/admin?view=diagnostics",
-                "action": "Диагностика",
-            }
-        )
-    if counts["pending_review"]:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": f"{counts['pending_review']} откликов ждут решения",
-                "detail": "Нейросеть подготовила их, но финальное действие остаётся за вами.",
-                "href": "/admin?view=decisions",
-                "action": "Открыть очередь",
-            }
-        )
-    if preferences.global_pause:
-        attention_items.append(
-            {
-                "tone": "warning",
-                "title": "Автоотправка на паузе",
-                "detail": "Автоматизация продолжит анализ, но не отправит новые отклики.",
-                "href": "/admin?view=settings",
-                "action": "Управление",
-            }
-        )
-    attention_tone = (
-        "danger"
-        if any(item["tone"] == "danger" for item in attention_items)
-        else "warning"
-        if attention_items
-        else "success"
-    )
-    source_names = {item.id: item.name for item in sources}
-
-    applications: list[Application] = []
-    recent_applications: list[Application] = []
-    application_jobs: dict[UUID, SourceJob] = {}
-    application_match_evaluation_issues: dict[UUID, str] = {}
-    jobs: list[SourceJob] = []
-    matches: list[MatchEvaluation] = []
-    match_jobs: dict[UUID, SourceJob] = {}
-    scans: list[ScanRun] = []
-    resumes: list[Resume] = []
-    resume_usage: dict[UUID, int] = {}
-    audits: list[AuditEvent] = []
-    active_alerts: list[Alert] = []
-    historical_alerts: list[Alert] = []
-    learning_summary = None
-    learning_scores: dict[UUID, LearnedReviewScore] = {}
-    phone_health: dict[str, Any] = {}
-    calls_context: dict[str, Any] = {}
-    pagination = _pagination(0, 1, 10)
-
-    if view == "overview":
-        recent_applications = list(
-            (
-                await session.scalars(
-                    select(Application)
-                    .where(Application.profile_id == selected_profile_id)
-                    .order_by(desc(Application.created_at))
-                    .limit(5)
-                )
-            ).all()
-        )
-        audits = list(
-            (
-                await session.scalars(
-                    select(AuditEvent)
-                    .where(AuditEvent.action.in_(tuple(_AUDIT_ACTION_LABELS)))
-                    .order_by(desc(AuditEvent.timestamp))
-                    .limit(6)
-                )
-            ).all()
-        )
-    elif view == "decisions":
-        learning_service = ReviewLearningService()
-        ignored_learning_dimensions = fixed_preference_dimensions(preferences.allowed_cities)
-        learning_summary = await learning_service.summary(
-            session,
-            selected_profile_id,
-            ignored_dimensions=ignored_learning_dimensions,
-        )
-        decision_statuses = {
-            "pending_review": [ApplicationStatus.PENDING_REVIEW, ApplicationStatus.PREPARED],
-            "approved": [ApplicationStatus.APPROVED, ApplicationStatus.AUTO_APPROVED],
-            "problems": [
-                ApplicationStatus.DELIVERY_UNKNOWN,
-                ApplicationStatus.FAILED,
-                ApplicationStatus.BLOCKED,
-            ],
-            "cancelled": [ApplicationStatus.CANCELLED],
-            "all": list(ApplicationStatus),
-        }
-        status_filter = status_filter if status_filter in decision_statuses else "pending_review"
-        conditions = [
-            Application.profile_id == selected_profile_id,
-            Application.status.in_(decision_statuses[status_filter]),
-        ]
-        if q:
-            pattern = f"%{q}%"
-            conditions.append(
-                or_(
-                    SourceJob.title.ilike(pattern),
-                    SourceJob.company.ilike(pattern),
-                    Application.subject.ilike(pattern),
-                )
-            )
-        total = int(
-            await session.scalar(
-                select(func.count(Application.id))
-                .select_from(Application)
-                .join(SourceJob, SourceJob.id == Application.source_job_id)
-                .where(*conditions)
-            )
-            or 0
-        )
-        pagination = _pagination(total, page, 10)
-        if (
-            status_filter == "pending_review"
-            and learning_summary.influence_enabled
-            and learning_summary.approved + learning_summary.rejected > 0
-        ):
-            feature_rows = (
-                await session.execute(
-                    select(
-                        Application.id,
-                        Application.created_at,
-                        Resume.category.label("resume_category"),
-                        SourceJob.title,
-                        SourceJob.company,
-                        SourceJob.category,
-                        SourceJob.categories_seen,
-                        SourceJob.cities,
-                        SourceJob.location,
-                        SourceJob.schedule,
-                        SourceJob.workplace_type,
-                        SourceJob.employment_type,
-                        SourceJob.required_experience,
-                        SourceJob.no_experience,
-                        SourceJob.salary_min,
-                        SourceJob.salary_max,
-                        SourceJob.salary_text,
-                    )
-                    .join(SourceJob, SourceJob.id == Application.source_job_id)
-                    .join(Resume, Resume.id == Application.resume_id)
-                    .where(*conditions)
-                    .order_by(desc(Application.created_at))
-                )
-            ).all()
-            ranked_ids: list[tuple[UUID, int, int]] = []
-            summaries_by_resume_category: dict[str, ReviewLearningSummary] = {}
-            for original_order, row in enumerate(feature_rows):
-                category_summary = summaries_by_resume_category.get(row.resume_category)
-                if category_summary is None:
-                    category_summary = await learning_service.summary(
-                        session,
-                        selected_profile_id,
-                        ignored_dimensions=ignored_learning_dimensions,
-                        resume_category=row.resume_category,
-                    )
-                    summaries_by_resume_category[row.resume_category] = category_summary
-                score = learning_service.score(
-                    category_summary,
-                    ReviewJobInput(
-                        title=row.title,
-                        company=row.company,
-                        category=row.category,
-                        categories_seen=tuple(row.categories_seen or ()),
-                        cities=tuple(row.cities or ()),
-                        location=row.location,
-                        schedule=row.schedule,
-                        workplace_type=row.workplace_type,
-                        employment_type=row.employment_type,
-                        required_experience=row.required_experience,
-                        no_experience=row.no_experience,
-                        salary_text=row.salary_text,
-                        salary_min=row.salary_min,
-                        salary_max=row.salary_max,
-                    ),
-                )
-                if score is not None:
-                    learning_scores[row.id] = score
-                ranked_ids.append(
-                    (row.id, score.value if score is not None else 50, original_order)
-                )
-            ranked_ids.sort(key=lambda item: (-item[1], item[2]))
-            offset = (int(pagination["page"]) - 1) * 10
-            page_ids = [item[0] for item in ranked_ids[offset : offset + 10]]
-            if page_ids:
-                page_items = {
-                    item.id: item
-                    for item in (
-                        await session.scalars(
-                            select(Application).where(Application.id.in_(page_ids))
-                        )
-                    ).all()
-                }
-                applications = [page_items[item_id] for item_id in page_ids]
-        else:
-            applications = list(
-                (
-                    await session.scalars(
-                        select(Application)
-                        .join(SourceJob, SourceJob.id == Application.source_job_id)
-                        .where(*conditions)
-                        .order_by(desc(Application.created_at))
-                        .offset((int(pagination["page"]) - 1) * 10)
-                        .limit(10)
-                    )
-                ).all()
-            )
-    elif view == "history":
-        valid_history_kinds = {"sent", "rejected", "jobs", "matches", "scans"}
-        history_kind = history_kind if history_kind in valid_history_kinds else "sent"
-        history_per_page = 20
-        pattern = f"%{q}%"
-        if history_kind in {"sent", "rejected"}:
-            history_statuses = (
-                [ApplicationStatus.SENT]
-                if history_kind == "sent"
-                else [ApplicationStatus.CANCELLED, ApplicationStatus.BLOCKED]
-            )
-            conditions = [
-                Application.profile_id == selected_profile_id,
-                Application.status.in_(history_statuses),
-            ]
-            if q:
-                conditions.append(
-                    or_(
-                        SourceJob.title.ilike(pattern),
-                        SourceJob.company.ilike(pattern),
-                        Application.subject.ilike(pattern),
-                    )
-                )
-            total = int(
-                await session.scalar(
-                    select(func.count(Application.id))
-                    .select_from(Application)
-                    .join(SourceJob, SourceJob.id == Application.source_job_id)
-                    .where(*conditions)
-                )
-                or 0
-            )
-            pagination = _pagination(total, page, history_per_page)
-            applications = list(
-                (
-                    await session.scalars(
-                        select(Application)
-                        .join(SourceJob, SourceJob.id == Application.source_job_id)
-                        .where(*conditions)
-                        .order_by(desc(Application.sent_at), desc(Application.created_at))
-                        .offset((int(pagination["page"]) - 1) * history_per_page)
-                        .limit(history_per_page)
-                    )
-                ).all()
-            )
-        elif history_kind == "jobs":
-            conditions = []
-            if q:
-                conditions.append(
-                    or_(
-                        SourceJob.title.ilike(pattern),
-                        SourceJob.company.ilike(pattern),
-                        SourceJob.location.ilike(pattern),
-                    )
-                )
-            total = int(
-                await session.scalar(select(func.count(SourceJob.id)).where(*conditions)) or 0
-            )
-            pagination = _pagination(total, page, history_per_page)
-            jobs = list(
-                (
-                    await session.scalars(
-                        select(SourceJob)
-                        .where(*conditions)
-                        .order_by(desc(SourceJob.last_seen_at))
-                        .offset((int(pagination["page"]) - 1) * history_per_page)
-                        .limit(history_per_page)
-                    )
-                ).all()
-            )
-        elif history_kind == "matches":
-            conditions = [MatchEvaluation.profile_id == selected_profile_id]
-            if q:
-                conditions.append(
-                    or_(SourceJob.title.ilike(pattern), SourceJob.company.ilike(pattern))
-                )
-            total = int(
-                await session.scalar(
-                    select(func.count(MatchEvaluation.id))
-                    .select_from(MatchEvaluation)
-                    .join(SourceJob, SourceJob.id == MatchEvaluation.source_job_id)
-                    .where(*conditions)
-                )
-                or 0
-            )
-            pagination = _pagination(total, page, history_per_page)
-            matches = list(
-                (
-                    await session.scalars(
-                        select(MatchEvaluation)
-                        .join(SourceJob, SourceJob.id == MatchEvaluation.source_job_id)
-                        .where(*conditions)
-                        .order_by(desc(MatchEvaluation.created_at))
-                        .offset((int(pagination["page"]) - 1) * history_per_page)
-                        .limit(history_per_page)
-                    )
-                ).all()
-            )
-        else:
-            conditions = []
-            if q:
-                conditions.append(JobSource.name.ilike(pattern))
-            total = int(
-                await session.scalar(
-                    select(func.count(ScanRun.id))
-                    .select_from(ScanRun)
-                    .join(JobSource, JobSource.id == ScanRun.source_id)
-                    .where(*conditions)
-                )
-                or 0
-            )
-            pagination = _pagination(total, page, history_per_page)
-            scans = list(
-                (
-                    await session.scalars(
-                        select(ScanRun)
-                        .join(JobSource, JobSource.id == ScanRun.source_id)
-                        .where(*conditions)
-                        .order_by(desc(ScanRun.started_at))
-                        .offset((int(pagination["page"]) - 1) * history_per_page)
-                        .limit(history_per_page)
-                    )
-                ).all()
-            )
-    elif view == "settings":
-        resumes = list(
-            (
-                await session.scalars(
-                    select(Resume)
-                    .where(Resume.profile_id == selected_profile_id)
-                    .order_by(desc(Resume.created_at))
-                )
-            ).all()
-        )
-        resume_ids = [item.id for item in resumes]
-        resume_usage = dict.fromkeys(resume_ids, 0)
-        # One grouped-count query per referencing table (no N+1); sum per resume.
-        if resume_ids:
-            for column in (Application.resume_id, MatchEvaluation.resume_id):
-                usage_rows = await session.execute(
-                    select(column, func.count()).where(column.in_(resume_ids)).group_by(column)
-                )
-                for reference_id, reference_count in usage_rows.all():
-                    if reference_id is not None:
-                        resume_usage[reference_id] += int(reference_count)
-    elif view == "calls":
-        from app.admin.phone_routes import build_calls_context
-
-        calls_context = await build_calls_context(
-            session,
-            tab=(request.query_params.get("tab") or "live"),
-            page=page,
-            filter_=(request.query_params.get("filter") or "all"),
-            query=q,
-            session_id=request.query_params.get("session"),
-        )
-    else:
-        active_alerts = list(
-            (
-                await session.scalars(
-                    select(Alert)
-                    .where(
-                        Alert.acknowledged.is_(False),
-                        Alert.created_at >= active_alert_cutoff,
-                    )
-                    .order_by(desc(Alert.created_at))
-                    .limit(20)
-                )
-            ).all()
-        )
-        historical_alerts = list(
-            (
-                await session.scalars(
-                    select(Alert)
-                    .where(
-                        or_(
-                            Alert.acknowledged.is_(True),
-                            Alert.created_at < active_alert_cutoff,
-                        )
-                    )
-                    .order_by(desc(Alert.created_at))
-                    .limit(20)
-                )
-            ).all()
-        )
-        total = int(await session.scalar(select(func.count(AuditEvent.id))) or 0)
-        pagination = _pagination(total, page, 20)
-        audits = list(
-            (
-                await session.scalars(
-                    select(AuditEvent)
-                    .order_by(desc(AuditEvent.timestamp))
-                    .offset((int(pagination["page"]) - 1) * 20)
-                    .limit(20)
-                )
-            ).all()
-        )
-        from app.admin.phone_routes import phone_health_context
-
-        phone_health = await phone_health_context(session)
-
-    displayed_applications = applications or recent_applications
-    application_job_ids = {item.source_job_id for item in displayed_applications}
-    if application_job_ids:
-        application_jobs = {
-            item.id: item
-            for item in (
-                await session.scalars(
-                    select(SourceJob).where(SourceJob.id.in_(application_job_ids))
-                )
-            ).all()
-        }
-    if view == "decisions" and applications:
-        evaluation_ids = {
-            item.match_evaluation_id
-            for item in applications
-            if item.match_evaluation_id is not None
-        }
-        evaluations = {
-            item.id: item
-            for item in (
-                await session.scalars(
-                    select(MatchEvaluation).where(MatchEvaluation.id.in_(evaluation_ids))
-                )
-            ).all()
-        }
-        for item in applications:
-            job = application_jobs.get(item.source_job_id)
-            evaluation = (
-                evaluations.get(item.match_evaluation_id)
-                if item.match_evaluation_id is not None
-                else None
-            )
-            if (
-                job is None
-                or evaluation is None
-                or evaluation.profile_id != item.profile_id
-                or evaluation.source_job_id != item.source_job_id
-                or evaluation.canonical_job_id != item.canonical_job_id
-            ):
-                application_match_evaluation_issues[item.id] = "invalid_match_evaluation_binding"
-            elif not await evaluation_is_current(session, evaluation, job):
-                application_match_evaluation_issues[item.id] = "match_evaluation_stale"
-    match_job_ids = {item.source_job_id for item in matches}
-    if match_job_ids:
-        match_jobs = {
-            item.id: item
-            for item in (
-                await session.scalars(select(SourceJob).where(SourceJob.id.in_(match_job_ids)))
-            ).all()
-        }
-
-    if not gmail_oauth["configured"] or not gmail_oauth["connected"] or unhealthy_sources:
-        overall_tone = "danger"
-        overall_title = "Требуется ваше внимание"
-    elif counts["active_alerts"] or preferences.global_pause or counts["pending_review"]:
-        overall_tone = "warning"
-        overall_title = "Работает, но есть решения для вас"
-    else:
-        overall_tone = "success"
-        overall_title = "Всё работает штатно"
-
-    feedback_key = "google_connected" if google == "connected" else notice or ""
-    response = templates.TemplateResponse(
-        request=request,
-        name="dashboard.html",
-        context={
-            "csrf_token": _csrf().issue(token),
-            "profile": profile,
-            "profile_is_admin_owned": profile.owner_account_id == BOOTSTRAP_ADMIN_ACCOUNT_ID,
-            "profiles": profiles,
-            "selected_profile_id": selected_profile_id,
-            "view": view,
-            "view_title": _VIEW_TITLES[view],
-            "q": q,
-            "status_filter": status_filter,
-            "history_kind": history_kind,
-            "pagination": pagination,
-            "preferences": preferences,
-            "sources": sources,
-            "disabled_source_ids": disabled_source_ids,
-            "source_names": source_names,
-            "resumes": resumes,
-            "resume_usage": resume_usage,
-            "jobs": jobs,
-            "matches": matches,
-            "match_jobs": match_jobs,
-            "applications": applications,
-            "recent_applications": recent_applications,
-            "application_jobs": application_jobs,
-            "application_match_evaluation_issues": application_match_evaluation_issues,
-            "learning_summary": learning_summary,
-            "learning_scores": learning_scores,
-            "scans": scans,
-            "active_alerts": active_alerts,
-            "notification_alerts": notification_alerts,
-            "historical_alerts": historical_alerts,
-            "audits": audits,
-            "phone_health": phone_health,
-            "counts": counts,
-            "overview": overview,
-            "gmail_oauth": gmail_oauth,
-            "attention_items": attention_items,
-            "attention_tone": attention_tone,
-            "overall_tone": overall_tone,
-            "overall_title": overall_title,
-            "now_local": now_local,
-            "settings": get_settings(),
-            "feedback_notice": _FEEDBACK_NOTICES.get(feedback_key),
-            "feedback_notice_tone": _FEEDBACK_NOTICE_TONES.get(feedback_key, "success"),
-            # ``calls_context`` is empty for every non-calls view, so this merge
-            # (tab/filter/query/calls_health/active_call/call_rows/pagination) is
-            # inert elsewhere and never disturbs the existing five views.
-            **calls_context,
-        },
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 def _items(value: str) -> list[str]:
@@ -2052,19 +929,21 @@ async def admin_application_detail(
         detail = await get_application_detail(session, application_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="application not found") from exc
-    token = _session_token(request)
-    response = templates.TemplateResponse(
-        request=request,
-        name="application_detail.html",
-        context={
-            "application": detail,
-            "csrf_token": _csrf().issue(token),
-            "feedback_notice": _FEEDBACK_NOTICES.get(notice or ""),
-            "feedback_notice_tone": _FEEDBACK_NOTICE_TONES.get(notice or "", "success"),
-        },
+    from app.ui.dashboard import render_dashboard
+
+    application = await session.get(Application, application_id)
+    assert application is not None
+    return await render_dashboard(
+        request,
+        session,
+        get_settings(),
+        _session_token(request),
+        profile_id=application.profile_id,
+        view="decisions",
+        notice=notice,
+        template_name="application_detail.html",
+        extra_context={"application": detail, "view_title": "Проверка отклика"},
     )
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 @router.post("/admin/applications/{application_id}/approve")

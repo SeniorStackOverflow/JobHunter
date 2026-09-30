@@ -42,6 +42,8 @@ from app.models.enums import (
     SourceHealth,
 )
 from app.profiles import ProfileService
+from app.settings import get_settings
+from app.ui.panel import Panel
 
 router = APIRouter()
 
@@ -152,6 +154,9 @@ async def _accounts_context(
         or 0
     )
     return {
+        "panel": Panel(is_admin=True, profile_id=selected_profile.id if selected_profile else None),
+        "view_title": "Пользователи",
+        "delivery_enabled": get_settings().real_email_delivery_enabled,
         "accounts": accounts,
         "identities_by_account": identities_by_account,
         "profiles_by_account": profiles_by_account,

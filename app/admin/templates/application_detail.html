@@ -1,14 +1,9 @@
-{% extends "base.html" %}
+{% extends "panel.html" %}
 {% block title %}Отклик · JobHunter{% endblock %}
-{% block body_class %}detail-page{% endblock %}
-{% block body %}
-<header class="detail-topbar">
-  <div class="brand"><div class="brand-mark">JH</div><div class="brand-copy"><strong>JobHunter</strong><span>Проверка отклика</span></div></div>
-  <a class="btn" href="/admin?view=decisions">← К очереди</a>
-</header>
-<main class="detail-content">
+{% block panel_content %}
+<a class="btn" href="{{ panel.view(view) }}">← К откликам</a>
   {% set vacancy_active = application.job and application.job.status == 'active' %}
-  {% if feedback_notice %}<div class="action-notice {{ feedback_notice_tone }}" role="status" data-action-notice><div class="action-notice-icon" aria-hidden="true">{{ '✓' if feedback_notice_tone == 'success' else '!' }}</div><div><strong>{{ feedback_notice[0] }}</strong><span>{{ feedback_notice[1] }}</span></div><button class="action-notice-close" type="button" data-notice-dismiss aria-label="Закрыть уведомление">×</button></div>{% endif %}
+
   <div class="section-heading">
     <div><h1>{{ application.job.title if application.job else application.subject }}</h1><p>{{ application.job.company if application.job and application.job.company else application.subject }}</p></div>
     <span class="badge {{ status_tone(application.status) }}"><span class="badge-dot"></span>{{ status_label(application.status) }}</span>
@@ -28,16 +23,16 @@
     {% endif %}
     <div class="section-actions">
       {% if vacancy_active and not approval_issue %}
-      <form method="post" action="/admin/applications/{{ application.id }}/approve" data-confirm-title="Одобрить отклик?" data-confirm="Вы проверили вакансию, получателя и письмо. После одобрения отклик сможет быть отправлен." data-confirm-action="Одобрить"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Одобрить</button></form>
+      <form method="post" action="{{ panel.application(application.id, 'approve') }}" data-confirm-title="Одобрить отклик?" data-confirm="Вы проверили вакансию, получателя и письмо. После одобрения отклик сможет быть отправлен." data-confirm-action="Одобрить"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Одобрить</button></form>
       {% else %}
       <button class="btn btn-primary" type="button" disabled>Одобрение недоступно</button>
       {% endif %}
-      <form method="post" action="/admin/applications/{{ application.id }}/reject" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Конкретная причина поможет точнее разбирать следующие вакансии." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Необязательная заметка" data-review-reject><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="reason_code" value="other"><input type="hidden" name="learn_from_review" value="true"><button class="btn btn-danger">Отклонить</button></form>
+      <form method="post" action="{{ panel.application(application.id, 'reject') }}" data-confirm-title="Отклонить отклик?" data-confirm="Он будет отменён и не попадёт в отправку. Конкретная причина поможет точнее разбирать следующие вакансии." data-confirm-action="Отклонить" data-confirm-tone="danger" data-confirm-reason="Необязательная заметка" data-review-reject><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="reason_code" value="other"><input type="hidden" name="learn_from_review" value="true"><button class="btn btn-danger">Отклонить</button></form>
     </div>
   </div>
   {% elif application.status == 'approved' %}
   {% if vacancy_active %}
-  <div class="detail-decision-bar warning"><div><strong>Отклик одобрен</strong><span>Вы можете отправить его работодателю вручную.</span></div><form method="post" action="/admin/applications/{{ application.id }}/send" data-confirm-title="Отправить письмо работодателю?" data-confirm="Это реальная отправка через подключённый Gmail. Отменить уже отправленное письмо будет нельзя." data-confirm-action="Отправить письмо" data-confirm-tone="danger"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отправить работодателю</button></form></div>
+  <div class="detail-decision-bar warning"><div><strong>Отклик одобрен</strong><span>Вы можете отправить его работодателю вручную.</span></div><form method="post" action="{{ panel.application(application.id, 'send') }}" data-confirm-title="Отправить письмо работодателю?" data-confirm="Это реальная отправка через подключённый Gmail. Отменить уже отправленное письмо будет нельзя." data-confirm-action="Отправить письмо" data-confirm-tone="danger"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Отправить работодателю</button></form></div>
   {% else %}
   <div class="detail-decision-bar danger"><div><strong>Отправка остановлена</strong><span>После одобрения вакансия перестала быть активной. Отправить письмо нельзя.</span></div></div>
   {% endif %}
@@ -56,10 +51,9 @@
     </div>
     <div class="detail-stack">
       <div class="panel"><div class="panel-head"><div><div class="panel-title">Письмо работодателю</div><div class="panel-subtitle">Язык: {{ application.language|upper }}</div></div></div><div class="panel-pad"><div class="cell-meta">Тема</div><div class="cell-title letter-subject">{{ application.subject }}</div><div class="letter-preview">{{ application.body }}</div></div></div>
-      {% if application.delivery and application.delivery.can_reconcile_unknown %}<div class="panel panel-pad"><div class="notice warning">Состояние доставки неизвестно. Повторно отправлять письмо нельзя.</div><form class="detail-form-action" method="post" action="/admin/applications/{{ application.id }}/reconcile-delivery-unknown" data-confirm-title="Зафиксировать неизвестную доставку?" data-confirm="Повторной отправки не будет. Отклик останется в безопасном состоянии для ручной проверки Gmail." data-confirm-action="Зафиксировать" data-confirm-tone="warning"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-warning">Зафиксировать без повтора</button></form></div>{% endif %}
+      {% if panel.is_admin and application.delivery and application.delivery.can_reconcile_unknown %}<div class="panel panel-pad"><div class="notice warning">Состояние доставки неизвестно. Повторно отправлять письмо нельзя.</div><form class="detail-form-action" method="post" action="{{ panel.application(application.id) }}/reconcile-delivery-unknown" data-confirm-title="Зафиксировать неизвестную доставку?" data-confirm="Повторной отправки не будет. Отклик останется в безопасном состоянии для ручной проверки Gmail." data-confirm-action="Зафиксировать" data-confirm-tone="warning"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-warning">Зафиксировать без повтора</button></form></div>{% endif %}
     </div>
   </div>
 
-  <details class="diagnostic-details"><summary><span><strong>Технические подробности</strong><small>Правила, идентификаторы и данные доставки</small></span><span>Открыть</span></summary><div class="details-body settings-body"><p><strong>Непройденные правила:</strong> {{ application.failed_policy_rules|join(', ') if application.failed_policy_rules else 'нет' }}</p><pre>{{ application.policy_result }}</pre>{% if application.resume %}<pre>SHA-256: {{ application.resume.sha256 }}</pre>{% endif %}{% if application.delivery %}<pre>{{ application.delivery.provider }} | {{ application.delivery.provider_message_id or '—' }} | {{ application.delivery.thread_id or '—' }}</pre>{% endif %}</div></details>
-</main>
+  {% if panel.is_admin %}<details class="diagnostic-details"><summary><span><strong>Технические подробности</strong><small>Правила, идентификаторы и данные доставки</small></span><span>Открыть</span></summary><div class="details-body settings-body"><p><strong>Непройденные правила:</strong> {{ application.failed_policy_rules|join(', ') if application.failed_policy_rules else 'нет' }}</p><pre>{{ application.policy_result }}</pre>{% if application.resume %}<pre>SHA-256: {{ application.resume.sha256 }}</pre>{% endif %}{% if application.delivery %}<pre>{{ application.delivery.provider }} | {{ application.delivery.provider_message_id or '—' }} | {{ application.delivery.thread_id or '—' }}</pre>{% endif %}</div></details>{% endif %}
 {% endblock %}

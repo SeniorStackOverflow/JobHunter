@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 # FastAPI declarative dependency/form defaults intentionally call Depends/Form.
-# ruff: noqa: B008, RUF001
+# ruff: noqa: B008
 import contextlib
 from collections.abc import Sequence
 from urllib.parse import quote
@@ -12,15 +12,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from pydantic import ValidationError
-from sqlalchemy import desc, func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.accounts import AccountService
-from app.admin.routes import templates
+from app.admin.routes import _daily_application_rules
+from app.applications import get_application_detail
 from app.applications.service import ApplicationPreparationError, ApplicationService
 from app.audit import record_audit_event
 from app.auth.access import (
-    csrf,
     require_account,
     require_owned_profile,
     require_user_csrf,
@@ -29,22 +28,19 @@ from app.auth.access import (
 )
 from app.database import get_session
 from app.database.session import async_session_factory
-from app.email.oauth import GmailOAuthService
 from app.email.service import EmailSendBlocked, EmailService
-from app.learning import ReviewLearningService
+from app.learning import ReviewLearningService, fixed_preference_dimensions
 from app.models.entities import (
     Account,
-    AccountIdentity,
     Application,
-    EmployerContact,
-    JobSource,
-    MatchEvaluation,
-    ProfileSourcePreference,
     Resume,
-    SourceJob,
     UserProfile,
 )
-from app.models.enums import ApplicationStatus, ProfileStatus, ReviewOutcome, SourceHealth
+from app.models.enums import (
+    ProfileStatus,
+    ReviewOutcome,
+    ReviewReason,
+)
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeDeletion, ResumeInUseError
@@ -52,31 +48,6 @@ from app.profiles.sources import set_source_selected
 from app.security.files import UnsafeResumeError, read_verified_resume
 
 router = APIRouter(tags=["user-workspace"])
-_VIEWS = {
-    "overview": "Главная",
-    "decisions": "Решения",
-    "history": "История",
-    "settings": "Настройки",
-}
-_NOTICES = {
-    "profile_created": "Профиль создан. Заполните данные и запустите поиск.",
-    "profile_saved": "Профиль сохранён.",
-    "profile_activated": "Поиск для профиля запущен. Автоотправка остаётся на паузе.",
-    "profile_default": "Основной профиль изменён.",
-    "preferences_saved": "Критерии поиска сохранены.",
-    "source_selection_saved": "Выбор источников сохранён только для этого профиля.",
-    "auto_send_paused": "Автоотправка поставлена на паузу.",
-    "auto_send_resumed": "Автоотправка включена для профиля с действующими ограничениями.",
-    "resume_uploaded": "Резюме загружено. Откройте файл и подтвердите его.",
-    "resume_updated": "Состояние резюме обновлено.",
-    "resume_deleted": "Резюме удалено.",
-    "gmail_connected": "Gmail подключён к вашему аккаунту.",
-    "gmail_disconnected": "Gmail отключён.",
-    "invite_created": "Приглашение создано. Скопируйте ссылку сейчас.",
-    "application_approved": "Отклик одобрен. Теперь его можно отправить.",
-    "application_rejected": "Отклик отклонён.",
-    "application_sent": "Запрос на отправку обработан.",
-}
 
 
 def _items(value: str) -> list[str]:
@@ -127,245 +98,27 @@ async def render_user_dashboard(
     page: int = 1,
     notice: str | None = None,
     invite_token: str | None = None,
+    q: str = "",
+    status_filter: str = "pending_review",
+    history_kind: str = "all",
 ) -> Response:
-    view = view if view in _VIEWS else "overview"
-    page = max(1, page)
-    profiles = await AccountService().list_owned_profiles(session, account.id)
-    if profile_id is not None:
-        profile = next((item for item in profiles if item.id == profile_id), None)
-        if profile is None:
-            raise HTTPException(status_code=404, detail="profile not found")
-    else:
-        profile = next(
-            (item for item in profiles if item.is_default), profiles[0] if profiles else None
-        )
-    selected_profile_id = profile.id if profile else None
-    preference = await ProfileService().get_preferences(session, profile.id) if profile else None
-    resumes: list[Resume] = []
-    resume_usage: dict[UUID, int] = {}
-    applications: list[Application] = []
-    pending_applications: list[Application] = []
-    source_jobs: dict[UUID, SourceJob] = {}
-    contacts: dict[UUID, EmployerContact] = {}
-    disabled_source_ids: set[UUID] = set()
-    matched_count = 0
-    pending_count = 0
-    page_count = 1
-    if profile is not None:
-        resumes = list(
-            (
-                await session.scalars(
-                    select(Resume)
-                    .where(Resume.profile_id == profile.id)
-                    .order_by(desc(Resume.created_at))
-                )
-            ).all()
-        )
-        resume_usage = {
-            resume_id: int(count)
-            for resume_id, count in (
-                await session.execute(
-                    select(Application.resume_id, func.count(Application.id))
-                    .where(Application.profile_id == profile.id)
-                    .group_by(Application.resume_id)
-                )
-            ).all()
-        }
-        pending_count = int(
-            await session.scalar(
-                select(func.count(Application.id)).where(
-                    Application.profile_id == profile.id,
-                    Application.status == ApplicationStatus.PENDING_REVIEW,
-                )
-            )
-            or 0
-        )
-        if view == "history":
-            total = int(
-                await session.scalar(
-                    select(func.count(Application.id)).where(Application.profile_id == profile.id)
-                )
-                or 0
-            )
-            page_count = max(1, (total + 24) // 25)
-            page = min(page, page_count)
-            application_query = (
-                select(Application)
-                .where(Application.profile_id == profile.id)
-                .order_by(desc(Application.created_at), desc(Application.id))
-                .offset((page - 1) * 25)
-                .limit(25)
-            )
-            applications = list((await session.scalars(application_query)).all())
-        elif view == "decisions":
-            page_count = max(1, (pending_count + 24) // 25)
-            page = min(page, page_count)
-            pending_applications = list(
-                (
-                    await session.scalars(
-                        select(Application)
-                        .where(
-                            Application.profile_id == profile.id,
-                            Application.status == ApplicationStatus.PENDING_REVIEW,
-                        )
-                        .order_by(desc(Application.created_at), desc(Application.id))
-                        .offset((page - 1) * 25)
-                        .limit(25)
-                    )
-                ).all()
-            )
-        elif view == "overview":
-            applications = list(
-                (
-                    await session.scalars(
-                        select(Application)
-                        .where(Application.profile_id == profile.id)
-                        .order_by(desc(Application.created_at), desc(Application.id))
-                        .limit(5)
-                    )
-                ).all()
-            )
-        shown_applications = [*applications, *pending_applications]
-        job_ids = {item.source_job_id for item in shown_applications}
-        if job_ids:
-            source_jobs = {
-                item.id: item
-                for item in (
-                    await session.scalars(select(SourceJob).where(SourceJob.id.in_(job_ids)))
-                ).all()
-            }
-        contact_ids = {item.recipient_contact_id for item in shown_applications}
-        if contact_ids:
-            contacts = {
-                item.id: item
-                for item in (
-                    await session.scalars(
-                        select(EmployerContact).where(EmployerContact.id.in_(contact_ids))
-                    )
-                ).all()
-            }
-        disabled_source_ids = {
-            row.source_id
-            for row in (
-                await session.scalars(
-                    select(ProfileSourcePreference).where(
-                        ProfileSourcePreference.profile_id == profile.id,
-                        ProfileSourcePreference.enabled.is_(False),
-                    )
-                )
-            ).all()
-        }
-        matched_count = int(
-            await session.scalar(
-                select(func.count(MatchEvaluation.id)).where(
-                    MatchEvaluation.profile_id == profile.id
-                )
-            )
-            or 0
-        )
-    sources = list((await session.scalars(select(JobSource).order_by(JobSource.name))).all())
-    selected_sources = [
-        item for item in sources if item.enabled and item.id not in disabled_source_ids
-    ]
-    gmail_oauth = await GmailOAuthService(settings()).get_status(session, account_id=account.id)
-    identity = await session.scalar(
-        select(AccountIdentity).where(AccountIdentity.account_id == account.id).limit(1)
+    from app.ui.dashboard import render_dashboard
+
+    return await render_dashboard(
+        request,
+        session,
+        settings(),
+        session_token,
+        account=account,
+        view=view,
+        profile_id=profile_id,
+        page=page,
+        notice=notice,
+        invite_token=invite_token,
+        q=q,
+        status_filter=status_filter,
+        history_kind=history_kind,
     )
-    notifications: list[dict[str, str]] = []
-    if profile is None:
-        notifications.append(
-            {
-                "title": "Создайте профиль",
-                "detail": "Добавьте данные о себе, чтобы начать поиск.",
-                "href": "/app?view=settings",
-            }
-        )
-    elif profile.status == ProfileStatus.DRAFT:
-        notifications.append(
-            {
-                "title": "Запустите поиск",
-                "detail": "Профиль пока в черновике.",
-                "href": _url("settings", profile.id),
-            }
-        )
-    if not gmail_oauth["connected"] or gmail_oauth["reauth_required"]:
-        notifications.append(
-            {
-                "title": "Подключите Gmail",
-                "detail": "Для отправки откликов нужен ваш Google-аккаунт.",
-                "href": _url("settings", selected_profile_id),
-            }
-        )
-    if profile and not any(item.active and item.verified and not item.archived for item in resumes):
-        notifications.append(
-            {
-                "title": "Проверьте резюме",
-                "detail": "Подтверждённое PDF нужно для откликов.",
-                "href": _url("settings", profile.id),
-            }
-        )
-    if profile and not selected_sources:
-        notifications.append(
-            {
-                "title": "Выберите источники",
-                "detail": "Сейчас вакансии для профиля не ищутся.",
-                "href": _url("settings", profile.id),
-            }
-        )
-    unhealthy_count = sum(item.health_status != SourceHealth.HEALTHY for item in selected_sources)
-    if unhealthy_count:
-        notifications.append(
-            {
-                "title": "Проблема с источником",
-                "detail": (
-                    f"{unhealthy_count} выбранных источников требуют проверки администратора."
-                ),
-                "href": _url("settings", selected_profile_id),
-            }
-        )
-    if pending_count:
-        notifications.append(
-            {
-                "title": "Отклики ждут решения",
-                "detail": f"Подготовлено: {pending_count}.",
-                "href": _url("decisions", selected_profile_id),
-            }
-        )
-    response = templates.TemplateResponse(
-        request=request,
-        name="user_dashboard.html",
-        context={
-            "account": account,
-            "identity_email": identity.email if identity else None,
-            "profiles": profiles,
-            "profile": profile,
-            "selected_profile_id": selected_profile_id,
-            "preferences": preference,
-            "resumes": resumes,
-            "resume_usage": resume_usage,
-            "sources": sources,
-            "disabled_source_ids": disabled_source_ids,
-            "selected_sources": selected_sources,
-            "applications": applications,
-            "pending_applications": pending_applications,
-            "pending_count": pending_count,
-            "page": page,
-            "page_count": page_count,
-            "source_jobs": source_jobs,
-            "contacts": contacts,
-            "matched_count": matched_count,
-            "gmail_oauth": gmail_oauth,
-            "notifications": notifications,
-            "view": view,
-            "view_title": _VIEWS[view],
-            "notice": _NOTICES.get(notice or ""),
-            "invite_token": invite_token,
-            "csrf_token": csrf().issue(session_token),
-            "delivery_enabled": settings().real_email_delivery_enabled,
-        },
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 @router.post("/app/profiles/{profile_id}/update")
@@ -478,6 +231,8 @@ async def update_user_preferences(
     auto_send_categories: str = Form(""),
     forbidden_categories: str = Form(""),
     allowed_cities: str = Form(""),
+    minimum_daily_applications: int = Form(0, ge=0, le=100),
+    daily_application_rules_present: bool = Form(False),
     maximum_daily_applications: int = Form(3, ge=0, le=100),
     minimum_auto_send_score: int = Form(85, ge=0, le=100),
     remote_allowed: bool = Form(False),
@@ -489,6 +244,10 @@ async def update_user_preferences(
     require_user_feature()
     require_user_csrf(request, csrf_token)
     account, profile = await _actor_profile(request, session, profile_id)
+    if daily_application_rules_present and minimum_daily_applications > maximum_daily_applications:
+        raise HTTPException(
+            status_code=422, detail="minimum daily applications cannot exceed maximum"
+        )
     payload = JobPreferenceUpdateInput(
         allowed_categories=_items(allowed_categories),
         auto_send_categories=_items(auto_send_categories),
@@ -500,7 +259,11 @@ async def update_user_preferences(
         consider_outside_primary_resume=consider_outside_primary_resume,
         willing_without_experience=willing_without_experience,
     )
-    await ProfileService().update_preferences(session, payload, profile.id)
+    preferences = await ProfileService().update_preferences(session, payload, profile.id)
+    if daily_application_rules_present:
+        preferences.additional_rules = _daily_application_rules(
+            preferences.additional_rules, minimum=minimum_daily_applications, force_minimum=False
+        )
     await record_audit_event(
         session,
         actor=f"account:{account.id}",
@@ -778,21 +541,21 @@ async def user_application_detail(
     account, session_token = await require_account(request, session)
     application = await _owned_application(session, account.id, application_id)
     profile = await require_owned_profile(session, account.id, application.profile_id)
-    response = templates.TemplateResponse(
-        request=request,
-        name="user_application_detail.html",
-        context={
-            "application": application,
-            "profile": profile,
-            "job": await session.get(SourceJob, application.source_job_id),
-            "contact": await session.get(EmployerContact, application.recipient_contact_id),
-            "resume": await session.get(Resume, application.resume_id),
-            "csrf_token": csrf().issue(session_token),
-            "notice": _NOTICES.get(notice or ""),
-        },
+    from app.ui.dashboard import render_dashboard
+
+    detail = await get_application_detail(session, application.id)
+    return await render_dashboard(
+        request,
+        session,
+        settings(),
+        session_token,
+        account=account,
+        profile_id=profile.id,
+        view="decisions",
+        notice=notice,
+        template_name="application_detail.html",
+        extra_context={"application": detail, "view_title": "Проверка отклика"},
     )
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 @router.post("/app/applications/{application_id}/approve")
@@ -836,6 +599,8 @@ async def reject_user_application(
     application_id: UUID,
     request: Request,
     reason: str = Form(""),
+    reason_code: str = Form("other"),
+    learn_from_review: bool = Form(True),
     csrf_token: str = Form(...),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
@@ -843,6 +608,10 @@ async def reject_user_application(
     require_user_csrf(request, csrf_token)
     account, _ = await require_account(request, session)
     await _owned_application(session, account.id, application_id)
+    try:
+        review_reason = ReviewReason(reason_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid review reason") from exc
     try:
         application = await ApplicationService(settings()).reject(session, application_id)
     except ApplicationPreparationError as exc:
@@ -852,7 +621,9 @@ async def reject_user_application(
         application,
         outcome=ReviewOutcome.REJECTED,
         actor=f"account:{account.id}",
+        reason=review_reason,
         reason_text=reason.strip()[:500],
+        learn=learn_from_review,
     )
     await record_audit_event(
         session,
@@ -866,6 +637,44 @@ async def reject_user_application(
     await session.commit()
     return RedirectResponse(
         f"/app/applications/{application.id}?notice=application_rejected", status_code=303
+    )
+
+
+@router.post("/app/review-learning/influence")
+async def set_user_learning_influence(
+    request: Request,
+    profile_id: UUID = Form(...),
+    enabled: bool = Form(...),
+    csrf_token: str = Form(...),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_user_feature()
+    require_user_csrf(request, csrf_token)
+    account, profile = await _actor_profile(request, session, profile_id)
+    preferences = await ProfileService().get_preferences(session, profile.id)
+    await ReviewLearningService().set_influence(
+        session,
+        profile.id,
+        enabled=enabled,
+        ignored_dimensions=fixed_preference_dimensions(preferences.allowed_cities),
+    )
+    await record_audit_event(
+        session,
+        actor=f"account:{account.id}",
+        action="review_learning.influence_changed",
+        entity_type="profile",
+        entity_id=str(profile.id),
+        correlation_id=str(profile.id),
+        decision="enabled" if enabled else "paused",
+    )
+    await session.commit()
+    return RedirectResponse(
+        _url(
+            "decisions",
+            profile.id,
+            notice="review_learning_enabled" if enabled else "review_learning_paused",
+        ),
+        status_code=303,
     )
 
 

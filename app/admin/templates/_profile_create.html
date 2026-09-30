@@ -1,0 +1,13 @@
+<form class="details-body" method="post" action="{{ panel.action('profiles') }}" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-grid">
+              <label class="field">Название<input type="text" name="name" required></label>
+              {% if panel.is_admin %}<label class="switch-row"><span class="switch-copy"><strong>Сделать основным</strong></span><span class="switch"><input type="checkbox" name="make_default"><span class="switch-ui"></span></span></label>{% else %}<label class="field">Контактный email<input type="email" name="contact_email"></label>{% endif %}
+            </div>
+            {% if panel.is_admin %}<div class="form-grid">
+              <label class="field">Резюме — название<input type="text" name="resume_name"></label>
+              <label class="field">Резюме — категория<input type="text" name="resume_category"></label>
+              <label class="field full">Резюме — PDF (необязательно)<input type="file" name="resume_file" accept="application/pdf,.pdf"></label>
+            </div>
+            {% endif %}<button class="btn btn-primary">Создать профиль</button>
+          </form>

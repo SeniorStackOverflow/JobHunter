@@ -1,15 +1,15 @@
 <section class="admin-section">
   <div class="section-heading">
     <div><h1>Главная</h1><p>Короткая сводка и только те действия, где нужен владелец.</p></div>
-    {% if counts.pending_review %}<a class="btn btn-primary" href="/admin?view=decisions&profile_id={{ selected_profile_id }}">Разобрать очередь</a>{% endif %}
+    {% if counts.pending_review %}<a class="btn btn-primary" href="{{ panel.view('decisions') }}">Разобрать очередь</a>{% endif %}
   </div>
 
   <div class="owner-status {{ overall_tone }}">
-    <div class="owner-status-copy"><span class="status-dot {{ overall_tone }}"></span><div><strong>{{ overall_title }}</strong><p>{% if preferences.global_pause %}Автоматическая отправка остановлена владельцем.{% elif preferences.auto_send_enabled %}JobHunter может отправлять безопасные отклики в пределах лимита.{% else %}Автоотправка выключена, анализ вакансий продолжается.{% endif %}</p></div></div>
-    <form method="post" action="/admin/pause/{{ 'false' if preferences.global_pause else 'true' }}" data-confirm-title="{{ 'Возобновить автоотправку?' if preferences.global_pause else 'Поставить автоотправку на паузу?' }}" data-confirm="{{ 'JobHunter снова сможет отправлять подходящие отклики в пределах дневного лимита.' if preferences.global_pause else 'Новые письма не будут отправляться, пока вы не снимете паузу.' }}" data-confirm-action="{{ 'Возобновить' if preferences.global_pause else 'Поставить на паузу' }}" data-confirm-tone="{{ 'default' if preferences.global_pause else 'danger' }}">
+    <div class="owner-status-copy"><span class="status-dot {{ overall_tone }}"></span><div><strong>{{ overall_title }}</strong><p>{% if profile.status.value == 'draft' %}Профиль в черновике. Подготовьте резюме и запустите поиск.{% elif profile.status.value != 'active' %}Поиск приостановлен. Обратитесь к администратору.{% elif preferences.global_pause %}Автоматическая отправка остановлена владельцем.{% elif preferences.auto_send_enabled %}JobHunter может отправлять безопасные отклики в пределах лимита.{% else %}Автоотправка выключена, анализ вакансий продолжается.{% endif %}</p></div></div>
+    {% if panel.is_admin or profile.status.value == 'active' %}<form method="post" action="{{ panel.auto_send(not preferences.global_pause) }}" data-confirm-title="{{ 'Возобновить автоотправку?' if preferences.global_pause else 'Поставить автоотправку на паузу?' }}" data-confirm="{{ 'JobHunter снова сможет отправлять подходящие отклики в пределах дневного лимита.' if preferences.global_pause else 'Новые письма не будут отправляться, пока вы не снимете паузу.' }}" data-confirm-action="{{ 'Возобновить' if preferences.global_pause else 'Поставить на паузу' }}" data-confirm-tone="{{ 'default' if preferences.global_pause else 'danger' }}">
       <input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="btn {{ 'btn-primary' if preferences.global_pause else 'btn-danger' }}">{{ 'Возобновить отправку' if preferences.global_pause else 'Поставить на паузу' }}</button>
-    </form>
+    </form>{% else %}<a class="btn" href="{{ panel.view('settings') }}">Настроить профиль</a>{% endif %}
   </div>
 
   <div class="grid grid-3 overview-metrics">
@@ -26,10 +26,10 @@
       <div class="panel-pad attention-list">{% for item in attention_items %}<div class="attention-item"><span class="attention-signal {{ item.tone }}"></span><div class="attention-copy"><strong>{{ item.title }}</strong><span>{{ item.detail }}</span></div><a class="btn btn-sm" href="{{ item.href }}">{{ item.action }}</a></div>{% else %}<div class="empty-state compact">Сейчас от вас ничего не требуется.</div>{% endfor %}</div>
     </div>
     <div class="panel">
-      <div class="panel-head"><div><div class="panel-title">Последние важные события</div><div class="panel-subtitle">Успешная рутина скрыта</div></div><a class="btn btn-sm" href="/admin?view=history&profile_id={{ selected_profile_id }}">Вся история</a></div>
+      <div class="panel-head"><div><div class="panel-title">Последние важные события</div><div class="panel-subtitle">Успешная рутина скрыта</div></div><a class="btn btn-sm" href="{{ panel.view('history') }}">Вся история</a></div>
       <div class="panel-pad activity-list">{% for item in audits %}<div class="activity-item"><div class="activity-time">{{ format_dt(item.timestamp) }}</div><div><div class="activity-title">{{ audit_action_label(item.action) }}</div><div class="activity-meta">{{ status_label(item.decision) if item.decision else 'Выполнено' }}</div></div></div>{% else %}<div class="empty-state compact">Важных событий пока нет.</div>{% endfor %}</div>
     </div>
   </div>
 
-  {% if recent_applications %}<div class="panel recent-panel"><div class="panel-head"><div><div class="panel-title">Недавние отклики</div><div class="panel-subtitle">Последние пять изменений</div></div><a class="btn btn-sm" href="/admin?view=history&profile_id={{ selected_profile_id }}">Открыть историю</a></div><div class="compact-list">{% for item in recent_applications %}{% set job = application_jobs.get(item.source_job_id) %}<a class="compact-row" href="/admin/applications/{{ item.id }}"><div><strong>{{ job.title if job else item.subject }}</strong><span>{{ job.company if job and job.company else 'Компания не указана' }}</span></div><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></a>{% endfor %}</div></div>{% endif %}
+  {% if recent_applications %}<div class="panel recent-panel"><div class="panel-head"><div><div class="panel-title">Недавние отклики</div><div class="panel-subtitle">Последние пять изменений</div></div><a class="btn btn-sm" href="{{ panel.view('history') }}">Открыть историю</a></div><div class="compact-list">{% for item in recent_applications %}{% set job = application_jobs.get(item.source_job_id) %}<a class="compact-row" href="{{ panel.application(item.id) }}"><div><strong>{{ job.title if job else item.subject }}</strong><span>{{ job.company if job and job.company else 'Компания не указана' }}</span></div><span class="badge {{ status_tone(item.status) }}">{{ status_label(item.status) }}</span></a>{% endfor %}</div></div>{% endif %}
 </section>

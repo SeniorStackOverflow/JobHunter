@@ -1,11 +1,12 @@
-{% extends "base_user.html" %}
+{% extends "base.html" %}
 {% block title %}Приглашение · JobHunter{% endblock %}
-{% block body %}
-<div class="card">
+{% block body_class %}login-page{% endblock %}
+{% block body %}<main class="login-card">
+<div>
   <h1>Приглашение в JobHunter</h1>
-  {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+  {% if error %}<div class="notice danger" role="alert">{{ error }}</div>{% endif %}
   {% if invite %}
-    <p>Приглашение действительно до {{ invite.expires_at }}.</p>
+    <p>Приглашение действительно до {{ format_dt(invite.expires_at) }}.</p>
     <p class="muted">Google-аккаунт: {{ masked_email }}</p>
     <a class="btn btn-primary" href="/auth/google/register">Продолжить через Google</a>
   {% else %}
@@ -13,4 +14,4 @@
     <a class="btn" href="/login">Уже есть аккаунт? Войти</a>
   {% endif %}
 </div>
-{% endblock %}
+</main>{% endblock %}
