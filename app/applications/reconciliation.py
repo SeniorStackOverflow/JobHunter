@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import record_audit_event
 from app.database.base import utcnow
+from app.delivery_ledger import mark_in_flight_attempts_unknown
 from app.models.entities import Application, EmailDelivery
 from app.models.enums import ApplicationStatus, DeliveryStatus
 
@@ -74,6 +75,7 @@ async def reconcile_stale_delivery_unknown(
         delivery.status = DeliveryStatus.DELIVERY_UNKNOWN
         delivery.error = "operator reconciled a stale sending attempt as delivery_unknown"
         delivery.updated_at = utcnow()
+        await mark_in_flight_attempts_unknown(session, delivery_id=delivery.id)
         decision = DeliveryStatus.DELIVERY_UNKNOWN.value
 
     await record_audit_event(

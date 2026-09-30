@@ -936,6 +936,40 @@ class EmailDelivery(UUIDPrimaryKeyMixin, Base):
     )
 
 
+class EmailSendAttempt(UUIDPrimaryKeyMixin, Base):
+    """Append-only ledger of provider submissions used for the daily hard maximum.
+
+    A row is reserved in the same serialized transaction that authorizes the
+    provider call, and its outcome records what the provider did at submission
+    time. Later DSN/bounce processing changes ``EmailDelivery`` only, so an
+    accepted message keeps consuming the maximum of the local day it was sent.
+    """
+
+    __tablename__ = "email_send_attempts"
+    __table_args__ = (
+        UniqueConstraint("delivery_id", "attempt_no", name="uq_email_send_attempt_delivery_no"),
+        Index("ix_email_send_attempts_profile_day", "profile_id", "local_day"),
+    )
+
+    delivery_id: Mapped[UUID] = mapped_column(
+        ForeignKey("email_deliveries.id", ondelete="CASCADE"), nullable=False
+    )
+    application_id: Mapped[UUID] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Europe/Chisinau calendar day (YYYY-MM-DD) of the actual submission attempt.
+    local_day: Mapped[str] = mapped_column(String(10), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class EmailDeliveryEvent(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "email_delivery_events"
     __table_args__ = (

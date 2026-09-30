@@ -16,6 +16,7 @@ from app.applications.daily_target import (
     minimum_catchup_scores,
     minimum_daily_requirement,
 )
+from app.delivery_ledger import local_day_key, transmissions_on_day
 from app.matching.freshness import count_profile_matching_backlog
 from app.models.entities import (
     Alert,
@@ -172,26 +173,8 @@ async def _daily_limit_metrics(
     target = await daily_target_state(session, preference, now=start)
     sent = target.sent
     progress = sent + target.reserved
-    limit_used = int(
-        await session.scalar(
-            select(func.count(EmailDelivery.id))
-            .join(Application, Application.id == EmailDelivery.application_id)
-            .where(
-                Application.profile_id == profile.id,
-                EmailDelivery.created_at >= start,
-                EmailDelivery.created_at < end,
-                EmailDelivery.status.in_(
-                    {
-                        DeliveryStatus.SENT,
-                        DeliveryStatus.PROVIDER_ACCEPTED,
-                        DeliveryStatus.DELIVERED,
-                        DeliveryStatus.SENDING,
-                        DeliveryStatus.DELIVERY_UNKNOWN,
-                    }
-                ),
-            )
-        )
-        or 0
+    limit_used = await transmissions_on_day(
+        session, profile_id=profile.id, day=local_day_key(start)
     )
     return {
         "daily_limit": preference.maximum_daily_applications,

@@ -5,12 +5,14 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 
+from app.delivery_ledger import OUTCOME_PROVIDER_ACCEPTED, local_day_key
 from app.matching.source_version import compute_source_matching_hash
 from app.models.entities import (
     Application,
     CanonicalJob,
     DailyReport,
     EmailDelivery,
+    EmailSendAttempt,
     EmployerContact,
     ExternalCallEvent,
     JobPreference,
@@ -227,15 +229,25 @@ async def test_daily_report_counts_real_merges_and_distinguishes_auto_send(
         )
         session.add(application)
         await session.flush()
+        sent_delivery = EmailDelivery(
+            application_id=application.id,
+            provider="fake_gmail",
+            recipient=contact.value,
+            provider_message_id="message-1",
+            thread_id="thread-1",
+            status=DeliveryStatus.SENT,
+            sanitized_provider_response={},
+        )
+        session.add(sent_delivery)
+        await session.flush()
         session.add(
-            EmailDelivery(
+            EmailSendAttempt(
+                delivery_id=sent_delivery.id,
                 application_id=application.id,
-                provider="fake_gmail",
-                recipient=contact.value,
-                provider_message_id="message-1",
-                thread_id="thread-1",
-                status=DeliveryStatus.SENT,
-                sanitized_provider_response={},
+                profile_id=application.profile_id,
+                attempt_no=1,
+                local_day=local_day_key(),
+                outcome=OUTCOME_PROVIDER_ACCEPTED,
             )
         )
         await session.flush()

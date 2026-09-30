@@ -214,3 +214,98 @@ def test_fresh_sqlite_database_migrations_round_trip(
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert revision == (expected_revision,)
+
+
+def test_send_attempt_ledger_backfill_preserves_hard_maximum_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.models.entities import EmailDelivery
+    from app.models.enums import DeliveryStatus
+    from tests.unit.test_daily_minimum import additional_candidate
+    from tests.unit.test_policy_and_email import make_graph
+
+    database_path = tmp_path / "ledger.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
+    get_settings.cache_clear()
+    try:
+        command.upgrade(Config("alembic.ini"), "d830a4b26f19")
+    finally:
+        get_settings.cache_clear()
+
+    submitted = datetime(2026, 9, 29, 21, 30, tzinfo=UTC)  # 30 Sept in Chisinau
+
+    async def seed() -> dict[str, str]:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with factory() as session:
+                graph = await make_graph(session, tmp_path / "storage")
+                graphs = [graph]
+                for company in ("Second", "Third", "Fourth"):
+                    graphs.append(
+                        await additional_candidate(session, graph, company=company, score=90)
+                    )
+                states = [
+                    (DeliveryStatus.DOMAIN_REJECTED, submitted),
+                    (DeliveryStatus.TEMPORARY_FAILURE, None),
+                    (DeliveryStatus.DELIVERY_UNKNOWN, None),
+                    (DeliveryStatus.SENDING, None),
+                ]
+                identifiers: dict[str, str] = {}
+                for item, (status, submitted_at) in zip(graphs, states, strict=True):
+                    delivery = EmailDelivery(
+                        application_id=item[-1].id,
+                        provider="gmail",
+                        recipient="jobs@example.com",
+                        status=status,
+                        sanitized_provider_response={},
+                        attempt_count=2 if status is DeliveryStatus.DOMAIN_REJECTED else 1,
+                        submitted_at=submitted_at,
+                        provider_accepted_at=submitted_at,
+                        last_attempt_at=submitted,
+                        created_at=submitted,
+                    )
+                    session.add(delivery)
+                    await session.flush()
+                    identifiers[status.value] = delivery.id.hex
+                await session.commit()
+                return identifiers
+        finally:
+            await engine.dispose()
+
+    identifiers = asyncio.run(seed())
+
+    get_settings.cache_clear()
+    try:
+        command.upgrade(Config("alembic.ini"), "head")
+    finally:
+        get_settings.cache_clear()
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        rows = {
+            delivery_id: (attempt_no, local_day, outcome)
+            for delivery_id, attempt_no, local_day, outcome in connection.execute(
+                "SELECT delivery_id, attempt_no, local_day, outcome FROM email_send_attempts"
+            )
+        }
+    assert rows == {
+        identifiers["domain_rejected"]: (2, "2026-09-30", "provider_accepted"),
+        identifiers["temporary_failure"]: (1, "2026-09-30", "not_transmitted"),
+        identifiers["delivery_unknown"]: (1, "2026-09-30", "delivery_unknown"),
+        identifiers["sending"]: (1, "2026-09-30", "in_flight"),
+    }
+
+    get_settings.cache_clear()
+    try:
+        command.downgrade(Config("alembic.ini"), "d830a4b26f19")
+    finally:
+        get_settings.cache_clear()
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone() == (4,)
+        assert "email_send_attempts" not in {
+            row[0] for row in connection.execute("SELECT name FROM sqlite_master")
+        }

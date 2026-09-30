@@ -88,3 +88,70 @@ async def test_parallel_promotions_reserve_only_missing_distinct_companies(tmp_p
         async with control.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await control.dispose()
+
+
+async def test_parallel_senders_never_exceed_hard_maximum(tmp_path):
+    from app.delivery_ledger import transmissions_on_day
+    from app.email.providers import FakeGmailProvider
+    from app.email.service import EmailSendBlocked, EmailService
+    from app.models.entities import EmailDelivery, EmailSendAttempt
+    from app.models.enums import DeliveryStatus, MatchDecision, PolicyDecision
+
+    database_url = os.environ["MINIMUM_TEST_DATABASE_URL"]
+    schema_name = f"maximum_test_{uuid4().hex}"
+    control = create_async_engine(database_url)
+    engine = create_async_engine(
+        database_url, connect_args={"server_settings": {"search_path": schema_name}}
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with control.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory() as session:
+            graph = await make_graph(session, tmp_path)
+            preference = graph[2]
+            preference.maximum_daily_applications = 1
+            second = await additional_candidate(
+                session,
+                graph,
+                score=92,
+                company="Second Company",
+                decision=MatchDecision.AUTO_APPLY,
+            )
+            applications = [graph[-1], second[-1]]
+            for application in applications:
+                application.status = ApplicationStatus.AUTO_APPROVED
+                application.policy_decision = PolicyDecision.AUTO_APPROVED
+            identifiers = [application.id for application in applications]
+            profile_id = graph[1].id
+            await session.commit()
+
+        provider = FakeGmailProvider()
+
+        async def send(identifier):
+            service = EmailService(settings(tmp_path), factory, provider)
+            try:
+                return await service.send_application(identifier)
+            except EmailSendBlocked as exc:
+                return exc
+
+        results = await asyncio.wait_for(
+            asyncio.gather(*(send(identifier) for identifier in identifiers)), timeout=30
+        )
+        accepted = [
+            item
+            for item in results
+            if isinstance(item, EmailDelivery) and item.status is DeliveryStatus.PROVIDER_ACCEPTED
+        ]
+        assert len(accepted) == 1
+        assert len(provider.outbox) == 1
+        async with factory() as session:
+            assert await transmissions_on_day(session, profile_id=profile_id) == 1
+            assert len((await session.scalars(select(EmailSendAttempt))).all()) == 1
+    finally:
+        await engine.dispose()
+        async with control.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await control.dispose()

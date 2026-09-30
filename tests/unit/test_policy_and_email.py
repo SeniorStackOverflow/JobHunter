@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import func, select
 from structlog.testing import capture_logs
 
+from app.delivery_ledger import OUTCOME_DELIVERY_UNKNOWN, local_day_key
 from app.email.oauth import GmailOAuthError, GmailOAuthService
 from app.email.providers import (
     GMAIL_READONLY_SCOPE,
@@ -33,6 +34,7 @@ from app.models.entities import (
     AuditEvent,
     CanonicalJob,
     EmailDelivery,
+    EmailSendAttempt,
     EmployerContact,
     JobPreference,
     JobSource,
@@ -446,13 +448,24 @@ async def test_global_pause_daily_limit_and_delivery_unknown_block_auto_send(
         )
         assert "daily_limit" in limited.rules_failed
         preference.maximum_daily_applications = 1
+        unknown_delivery = EmailDelivery(
+            application_id=application.id,
+            provider="fake",
+            recipient=contact.value,
+            status=DeliveryStatus.DELIVERY_UNKNOWN,
+            sanitized_provider_response={},
+        )
+        session.add(unknown_delivery)
+        await session.flush()
+        # The sender reserves the hard maximum before every provider call.
         session.add(
-            EmailDelivery(
+            EmailSendAttempt(
+                delivery_id=unknown_delivery.id,
                 application_id=application.id,
-                provider="fake",
-                recipient=contact.value,
-                status=DeliveryStatus.DELIVERY_UNKNOWN,
-                sanitized_provider_response={},
+                profile_id=application.profile_id,
+                attempt_no=1,
+                local_day=local_day_key(),
+                outcome=OUTCOME_DELIVERY_UNKNOWN,
             )
         )
         await session.flush()

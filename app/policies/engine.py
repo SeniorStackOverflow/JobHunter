@@ -15,6 +15,7 @@ from app.crawlers.parsing.normalization import (
     detect_scam_indicators,
     normalize_for_fingerprint,
 )
+from app.delivery_ledger import transmissions_on_day
 from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.hard_requirements import (
     HARD_REQUIREMENT_RULES_VERSION,
@@ -51,7 +52,6 @@ from app.observability.metrics import (
 from app.policies.schemas import PolicyResult
 from app.profiles.sources import source_selected
 from app.settings import Settings
-from app.time_utils import local_day_bounds
 
 POLICY_VERSION = "2026-09-30.1-distinct-employer-catchup"
 
@@ -131,24 +131,9 @@ class PolicyEngine:
             )
             if value
         )
-        _start_local, start_of_day, _end_of_day = local_day_bounds()
-        attempts_today = await session.scalar(
-            select(func.count(EmailDelivery.id))
-            .join(Application, Application.id == EmailDelivery.application_id)
-            .where(
-                EmailDelivery.created_at >= start_of_day,
-                Application.profile_id == application.profile_id,
-                EmailDelivery.status.in_(
-                    {
-                        DeliveryStatus.SENT,
-                        DeliveryStatus.PROVIDER_ACCEPTED,
-                        DeliveryStatus.DELIVERED,
-                        DeliveryStatus.SENDING,
-                        DeliveryStatus.DELIVERY_UNKNOWN,
-                    }
-                ),
-            )
-        )
+        # Hard maximum: provider submissions of this local day, including accepted
+        # messages that bounced later, in-flight reservations and unknown outcomes.
+        attempts_today = await transmissions_on_day(session, profile_id=application.profile_id)
         target = await daily_target_state(
             session, preferences, exclude_application_id=application.id
         )

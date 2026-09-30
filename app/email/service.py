@@ -7,11 +7,19 @@ from pathlib import Path
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
 from app.contacts import contact_is_source_verified, validate_public_email
+from app.delivery_ledger import (
+    OUTCOME_DELIVERY_UNKNOWN,
+    OUTCOME_NOT_TRANSMITTED,
+    OUTCOME_PROVIDER_ACCEPTED,
+    finish_send_attempt,
+    reserve_send_attempt,
+    transmissions_by_profile,
+)
 from app.email.oauth import GmailOAuthService
 from app.email.providers import (
     GMAIL_READONLY_SCOPE,
@@ -924,6 +932,14 @@ class EmailService:
             delivery.last_attempt_at = utcnow()
             contact.last_delivery_attempt_at = delivery.last_attempt_at
             application.status = ApplicationStatus.SENDING
+            # Reserve hard-maximum capacity under the same quota lock that
+            # authorized this attempt, before the provider can transmit.
+            send_attempt = await reserve_send_attempt(
+                session,
+                delivery=delivery,
+                application=application,
+                now=delivery.last_attempt_at,
+            )
             await session.commit()
 
             try:
@@ -937,6 +953,7 @@ class EmailService:
                     "reauth_original_application_status": authorized_status.value,
                 }
                 application.status = ApplicationStatus.FAILED
+                finish_send_attempt(send_attempt, OUTCOME_NOT_TRANSMITTED)
                 await GmailOAuthService(self.settings).mark_reauthorization_required(
                     session,
                     account_id=active_profile.owner_account_id,
@@ -947,6 +964,7 @@ class EmailService:
                 delivery.error = str(exc)
                 delivery.error_code = None
                 application.status = ApplicationStatus.DELIVERY_UNKNOWN
+                finish_send_attempt(send_attempt, OUTCOME_DELIVERY_UNKNOWN)
             except TemporaryDeliveryError as exc:
                 delivery.status = DeliveryStatus.TEMPORARY_FAILURE
                 delivery.error = str(exc)
@@ -957,6 +975,7 @@ class EmailService:
                     else None
                 )
                 application.status = ApplicationStatus.FAILED
+                finish_send_attempt(send_attempt, OUTCOME_NOT_TRANSMITTED)
                 contact.delivery_state = ContactDeliveryState.TRANSIENT_FAILURE
                 contact.last_delivery_failure_at = utcnow()
                 contact.failure_count += 1
@@ -965,6 +984,7 @@ class EmailService:
                 delivery.error = str(exc)
                 delivery.error_code = None
                 application.status = ApplicationStatus.FAILED
+                finish_send_attempt(send_attempt, OUTCOME_NOT_TRANSMITTED)
                 contact.delivery_state = ContactDeliveryState.REJECTED
                 contact.last_delivery_failure_at = utcnow()
                 contact.failure_count += 1
@@ -984,6 +1004,7 @@ class EmailService:
                     application.sent_at = accepted_at
                 delivery.submitted_at = accepted_at
                 delivery.provider_accepted_at = accepted_at
+                finish_send_attempt(send_attempt, OUTCOME_PROVIDER_ACCEPTED, now=accepted_at)
                 delivery.final_recipient = contact.value
                 await self.employer_relationships.record_event(
                     session,
@@ -1096,30 +1117,9 @@ async def send_auto_approved_applications() -> int:
         return 0
 
     service = EmailService(settings, async_session_factory)
-    _start_local, start_of_day, _end_of_day = local_day_bounds()
     async with async_session_factory() as session:
-        attempt_rows = (
-            await session.execute(
-                select(Application.profile_id, func.count(EmailDelivery.id))
-                .join(EmailDelivery, EmailDelivery.application_id == Application.id)
-                .where(
-                    EmailDelivery.created_at >= start_of_day,
-                    EmailDelivery.status.in_(
-                        {
-                            DeliveryStatus.SENT,
-                            DeliveryStatus.PROVIDER_ACCEPTED,
-                            DeliveryStatus.DELIVERED,
-                            DeliveryStatus.SENDING,
-                            DeliveryStatus.DELIVERY_UNKNOWN,
-                        }
-                    ),
-                )
-                .group_by(Application.profile_id)
-            )
-        ).all()
-        attempts_by_profile: dict[UUID, int] = {
-            profile_id: int(attempt_count) for profile_id, attempt_count in attempt_rows
-        }
+        # Pre-filter only: every send re-checks the same ledger under the quota lock.
+        attempts_by_profile = await transmissions_by_profile(session)
         preference_rows = (
             await session.execute(
                 select(
