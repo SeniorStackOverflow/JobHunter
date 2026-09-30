@@ -26,7 +26,12 @@ from app.contacts import (
     validate_public_email,
 )
 from app.email.oauth import GmailOAuthService
-from app.email.providers import GMAIL_READONLY_SCOPE
+from app.email.providers import (
+    GMAIL_READONLY_SCOPE,
+    GMAIL_REAUTH_REQUIRED_CODE,
+    GmailReauthorizationRequired,
+    TemporaryDeliveryError,
+)
 from app.email.retries import retry_delay
 from app.employers import EmployerRelationshipService
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
@@ -510,7 +515,11 @@ class GmailMailboxProvider:
                 )
             raise RuntimeError("Gmail delivery reconciliation failed") from exc
         except RefreshError as exc:
-            raise RuntimeError("Gmail delivery reconciliation failed") from exc
+            if exc.retryable:
+                raise TemporaryDeliveryError(
+                    "Gmail token refresh is temporarily unavailable"
+                ) from exc
+            raise GmailReauthorizationRequired("Gmail reauthorization is required") from exc
 
 
 class EmailDeliveryReconciliationService:
@@ -1010,11 +1019,32 @@ class EmailDeliveryReconciliationService:
                 }
             cursor = await session.get(EmailMailboxCursor, (account_id, "gmail"))
             start_history_id = cursor.history_id if cursor is not None else None
-        batch = await mailbox.fetch(
-            start_history_id=start_history_id,
-            max_results=self.settings.gmail_delivery_reconciliation_batch,
-            monitor_days=self.settings.gmail_delivery_monitor_days,
-        )
+        try:
+            batch = await mailbox.fetch(
+                start_history_id=start_history_id,
+                max_results=self.settings.gmail_delivery_reconciliation_batch,
+                monitor_days=self.settings.gmail_delivery_monitor_days,
+            )
+        except GmailReauthorizationRequired:
+            async with self.session_factory() as session:
+                await GmailOAuthService(self.settings).mark_reauthorization_required(
+                    session,
+                    account_id=account_id,
+                )
+                await session.commit()
+            return {
+                "status": GMAIL_REAUTH_REQUIRED_CODE,
+                "fetched": 0,
+                "processed": 0,
+                "correlated": 0,
+            }
+        except TemporaryDeliveryError:
+            return {
+                "status": "gmail_refresh_temporary_failure",
+                "fetched": 0,
+                "processed": 0,
+                "correlated": 0,
+            }
         processed = 0
         correlated = 0
         async with self.session_factory() as session:
@@ -1091,15 +1121,29 @@ class EmailDeliveryReconciliationService:
         processed = 0
         correlated = 0
         ok_mailboxes = 0
+        reauth_mailboxes = 0
+        temporary_mailboxes = 0
         for account_id in account_ids:
             result = await self.reconcile(account_id=account_id)
             fetched += int(result.get("fetched", 0))
             processed += int(result.get("processed", 0))
             correlated += int(result.get("correlated", 0))
             ok_mailboxes += int(result.get("status") == "ok")
+            reauth_mailboxes += int(result.get("status") == GMAIL_REAUTH_REQUIRED_CODE)
+            temporary_mailboxes += int(result.get("status") == "gmail_refresh_temporary_failure")
         return {
-            "status": "ok" if ok_mailboxes else "gmail_readonly_scope_required",
+            "status": (
+                "ok"
+                if ok_mailboxes
+                else GMAIL_REAUTH_REQUIRED_CODE
+                if reauth_mailboxes
+                else "gmail_refresh_temporary_failure"
+                if temporary_mailboxes
+                else "gmail_readonly_scope_required"
+            ),
             "mailboxes": len(account_ids),
+            "reauth_mailboxes": reauth_mailboxes,
+            "temporary_mailboxes": temporary_mailboxes,
             "fetched": fetched,
             "processed": processed,
             "correlated": correlated,

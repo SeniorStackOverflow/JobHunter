@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.session import remember_session
 from app.models.entities import Account, UserProfile
 from app.models.enums import AccountStatus
 from app.profiles.service import ProfileService
@@ -45,7 +46,10 @@ def has_admin_session(request: Request) -> bool:
     subject = SessionSigner(current.secret_key.get_secret_value()).verify(
         token, current.session_ttl_seconds
     )
-    return subject == current.admin_username
+    if subject != current.admin_username:
+        return False
+    remember_session(request, current, token)
+    return True
 
 
 async def current_account(request: Request, session: AsyncSession) -> tuple[Account, str] | None:
@@ -63,6 +67,7 @@ async def current_account(request: Request, session: AsyncSession) -> tuple[Acco
         or account.session_version != payload.version
     ):
         return None
+    remember_session(request, current, token, user=True)
     return account, token
 
 

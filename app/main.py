@@ -19,6 +19,7 @@ from app.admin import router as admin_router
 from app.api import router as api_router
 from app.api.phone_routes import router as phone_router
 from app.auth.routes import router as auth_router
+from app.auth.session import RememberSessionMiddleware
 from app.mcp.server import streamable_http_app
 from app.observability.health import router as health_router
 from app.observability.logging import configure_logging
@@ -175,6 +176,7 @@ class LocalRateLimitMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityMiddleware)
+app.add_middleware(RememberSessionMiddleware)
 app.add_middleware(LocalRateLimitMiddleware)
 app.add_middleware(ObservabilityMiddleware)
 app.include_router(health_router)

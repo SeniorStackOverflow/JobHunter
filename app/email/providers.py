@@ -129,6 +129,10 @@ class GmailApiProvider:
         except RefreshError as exc:
             # OAuth refresh happens before the Gmail send request, so a rejected
             # refresh is a known non-delivery outcome rather than an unknown send.
+            if exc.retryable:
+                raise TemporaryDeliveryError(
+                    "Gmail token refresh is temporarily unavailable"
+                ) from exc
             raise GmailReauthorizationRequired("Gmail reauthorization is required") from exc
         except HttpError as exc:
             status = getattr(exc.resp, "status", None)

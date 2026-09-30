@@ -4,7 +4,6 @@
   <a class="nav-link {{ 'is-active' if view == name else '' }}" href="{{ panel.view(name) }}" {% if view == name %}aria-current="page"{% endif %}><span class="nav-icon">{{ icon(glyph) }}</span><span>{{ label }}</span>{% if name == 'decisions' and counts.pending_review %}<span class="nav-count">{{ counts.pending_review }}</span>{% endif %}</a>
   {% endfor %}
   {% if panel.is_admin %}
-  <div class="nav-caption">Администрирование</div>
   {% for name, label, glyph in [('calls','Звонки','calls'),('accounts','Пользователи','users'),('diagnostics','Диагностика','settings')] %}
   <a class="nav-link {{ 'is-active' if view == name else '' }}" href="{{ '/admin/accounts' if name == 'accounts' else panel.view(name) }}" {% if view == name %}aria-current="page"{% endif %}><span class="nav-icon">{{ icon(glyph) }}</span><span>{{ label }}</span>{% if name == 'calls' and counts.phone_review %}<span class="nav-count">{{ counts.phone_review }}</span>{% endif %}</a>
   {% endfor %}

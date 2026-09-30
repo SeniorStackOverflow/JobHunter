@@ -1250,6 +1250,82 @@ async def test_gmail_reauthorization_is_not_retried_and_is_recoverable(
         assert status["last_refresh_ok"] is not None
 
 
+async def test_temporary_gmail_refresh_can_retry_without_reconnecting(
+    sqlite_session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.auth.exceptions import RefreshError
+
+    from app.email import providers
+
+    current_settings = settings(tmp_path)
+    token_key = "fixture-refresh-encryption-key-long-enough"
+    current_settings.token_encryption_key = token_key
+    async with sqlite_session_factory() as session:
+        graph = await make_graph(session, tmp_path)
+        application = graph[8]
+        application.status = ApplicationStatus.AUTO_APPROVED
+        application.policy_decision = PolicyDecision.AUTO_APPROVED
+        application_id = application.id
+        session.add(
+            OAuthCredential(
+                provider="gmail",
+                encrypted_refresh_token=SecretBox(token_key).encrypt("fixture-refresh-token"),
+                scopes=[GMAIL_SEND_SCOPE, GMAIL_READONLY_SCOPE],
+            )
+        )
+        await session.commit()
+    requests = []
+
+    class FixtureGmailAPI:
+        def users(self):
+            return self
+
+        def messages(self):
+            return self
+
+        def send(self, **_kwargs):
+            return self
+
+        def execute(self):
+            requests.append(True)
+            if len(requests) == 1:
+                raise RefreshError("temporarily unavailable", retryable=True)
+            return {"id": "known-provider-acceptance"}
+
+    monkeypatch.setattr(providers, "build", lambda *_args, **_kwargs: FixtureGmailAPI())
+
+    class FixtureProvider:
+        name = "gmail"
+
+        async def send(self, message):
+            return await providers.GmailApiProvider(
+                client_id="fixture", client_secret="fixture", refresh_token="fixture-refresh-token"
+            ).send(message)
+
+    service = EmailService(current_settings, sqlite_session_factory, FixtureProvider())
+    first = await service.send_application(application_id)
+    assert first.status == DeliveryStatus.TEMPORARY_FAILURE
+    assert first.error_code != GMAIL_REAUTH_REQUIRED_CODE
+    async with sqlite_session_factory() as session:
+        assert (await GmailOAuthService(current_settings).get_status(session))[
+            "reauth_required"
+        ] is False
+        delivery = await session.get(EmailDelivery, first.id)
+        assert delivery is not None
+        delivery.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    second = await service.send_application(application_id)
+    assert second.status == DeliveryStatus.PROVIDER_ACCEPTED
+    assert second.provider_message_id == "known-provider-acceptance"
+    assert second.attempt_count == 2
+    async with sqlite_session_factory() as session:
+        status = await GmailOAuthService(current_settings).get_status(session)
+        assert status["reauth_required"] is False
+        assert status["last_refresh_ok"] is not None
+
+
 async def test_periodic_prepare_revives_only_auto_skipped_cancelled_application(
     sqlite_session_factory,
     tmp_path: Path,

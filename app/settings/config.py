@@ -173,9 +173,9 @@ class Settings(BaseSettings):
     enable_live_rabota_smoke_test: bool = False
 
     session_cookie_name: str = "job_agent_session"
-    session_ttl_seconds: int = 8 * 60 * 60
+    session_ttl_seconds: int = Field(default=30 * 24 * 60 * 60, ge=60)
     user_session_cookie_name: str = "jobhunter_user_session"
-    user_session_ttl_seconds: int = 7 * 24 * 60 * 60
+    user_session_ttl_seconds: int = Field(default=30 * 24 * 60 * 60, ge=60)
     csrf_ttl_seconds: int = 60 * 60
 
     @field_validator("max_resume_bytes")

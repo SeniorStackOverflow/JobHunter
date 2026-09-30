@@ -5,9 +5,10 @@ import hmac
 import secrets
 import time
 from dataclasses import dataclass
+from typing import cast
 from uuid import UUID
 
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from itsdangerous import BadSignature, SignatureExpired, TimestampSigner, URLSafeTimedSerializer
 from pwdlib import PasswordHash
 
 password_hash = PasswordHash.recommended()
@@ -48,28 +49,60 @@ class SessionSigner:
         subject = payload.get("sub")
         return subject if isinstance(subject, str) else None
 
+    def renew(self, token: str, max_age: int) -> str | None:
+        return _renew(self._serializer, token, max_age)
+
+
+def _renew(serializer: URLSafeTimedSerializer, token: str, max_age: int) -> str | None:
+    """Extend a valid session, retaining its nonce for forms open in other tabs."""
+    try:
+        payload, issued_at = serializer.loads(token, max_age=max_age, return_timestamp=True)
+    except (BadSignature, SignatureExpired):
+        return None
+    age = cast(TimestampSigner, serializer.make_signer()).get_timestamp() - issued_at.timestamp()
+    if age < min(24 * 60 * 60, max_age / 2):
+        return None
+    return str(serializer.dumps(payload))
+
 
 class CsrfProtector:
     def __init__(self, secret_key: str) -> None:
         self._secret = secret_key.encode("utf-8")
 
+    def _binding(self, session_id: str) -> str:
+        # Verify the signed payload before using its stable nonce. The route still
+        # enforces age, account state and session version before checking CSRF.
+        for salt in ("job-agent-session", "jobhunter-user-session"):
+            try:
+                payload = URLSafeTimedSerializer(self._secret, salt=salt).loads(session_id)
+            except BadSignature:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("nonce"), str):
+                return f"{salt}:{payload.get('sub')}:{payload.get('ver')}:{payload['nonce']}"
+        return session_id
+
     def issue(self, session_id: str) -> str:
         timestamp = str(int(time.time()))
         nonce = secrets.token_urlsafe(16)
-        value = f"{session_id}:{timestamp}:{nonce}"
+        value = f"{self._binding(session_id)}:{timestamp}:{nonce}"
         signature = hmac.new(self._secret, value.encode(), hashlib.sha256).hexdigest()
         return f"{timestamp}.{nonce}.{signature}"
 
     def verify(self, token: str, session_id: str, max_age: int) -> bool:
         try:
             timestamp, nonce, signature = token.split(".", maxsplit=2)
-            if int(time.time()) - int(timestamp) > max_age:
+            if not 0 <= int(time.time()) - int(timestamp) <= max_age:
                 return False
         except (TypeError, ValueError):
             return False
-        value = f"{session_id}:{timestamp}:{nonce}"
-        expected = hmac.new(self._secret, value.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(signature, expected)
+        # Accept forms issued before stable bindings were introduced while their
+        # original cookie is still current; this fallback expires with the form.
+        for binding in (self._binding(session_id), session_id):
+            value = f"{binding}:{timestamp}:{nonce}"
+            expected = hmac.new(self._secret, value.encode(), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(signature, expected):
+                return True
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,3 +130,6 @@ class AccountSessionSigner:
         if version < 0:
             return None
         return AccountSession(account_id=account_id, version=version)
+
+    def renew(self, token: str, max_age: int) -> str | None:
+        return _renew(self._serializer, token, max_age)

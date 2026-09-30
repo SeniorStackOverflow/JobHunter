@@ -558,7 +558,7 @@ async def test_admin_login_mobile_page_and_csrf_enforcement(
         set_cookie = logged_in.headers["set-cookie"].casefold()
         assert "httponly" in set_cookie
         assert "secure" in set_cookie
-        assert "samesite=strict" in set_cookie
+        assert "samesite=lax" in set_cookie
         already_authenticated = await client.get("/login")
         assert already_authenticated.status_code == 303
         assert already_authenticated.headers["location"] == "/admin"

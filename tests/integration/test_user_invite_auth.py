@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import socket
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ import pytest_asyncio
 import uvicorn
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from itsdangerous import TimestampSigner
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -28,6 +30,7 @@ from app.auth import access as auth_access
 from app.auth import google as google_auth
 from app.auth import routes as auth_routes
 from app.auth.google import GOOGLE_IDENTITY_SCOPES, GoogleIdentityService
+from app.auth.session import RememberSessionMiddleware
 from app.database.session import get_session
 from app.email.oauth import GMAIL_DELIVERY_SCOPES, GmailOAuthService
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
@@ -58,6 +61,7 @@ from app.models.enums import (
     ScanType,
 )
 from app.security.auth import AccountSessionSigner, SessionSigner
+from app.security.crypto import SecretBox
 from app.settings import Settings
 
 pytestmark = pytest.mark.integration
@@ -148,6 +152,7 @@ async def user_auth_context(
     monkeypatch.setattr(admin_routes, "get_settings", lambda: settings)
 
     application = FastAPI()
+    application.add_middleware(RememberSessionMiddleware)
     application.include_router(api_routes.router)
     application.include_router(auth_routes.router)
     application.include_router(admin_router)
@@ -1299,3 +1304,227 @@ async def test_public_root_dispatches_by_session(
     admin_root = await user_auth_context.client.get("/")
     assert admin_root.status_code == 303
     assert admin_root.headers["location"] == "/admin"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoke_version", [False, True])
+async def test_aged_account_cookie_cannot_renew_after_access_is_revoked(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+    revoke_version: bool,
+) -> None:
+    async with user_auth_context.session_factory() as session:
+        account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(account)
+        await session.commit()
+        account_id = account.id
+    with monkeypatch.context() as clock:
+        issued_at = int(time.time()) - 25 * 24 * 60 * 60
+        clock.setattr(TimestampSigner, "get_timestamp", lambda _self: issued_at)
+        token = AccountSessionSigner(
+            user_auth_context.settings.secret_key.get_secret_value()
+        ).issue(account_id, 0)
+    async with user_auth_context.session_factory() as session:
+        account = await session.get(Account, account_id)
+        assert account is not None
+        if revoke_version:
+            account.session_version += 1
+        else:
+            account.status = AccountStatus.SUSPENDED
+        await session.commit()
+    user_auth_context.client.cookies.set(
+        user_auth_context.settings.user_session_cookie_name,
+        token,
+        domain="job-agent.example.test",
+        path="/",
+    )
+    response = await user_auth_context.client.get("/app")
+    assert response.status_code == 303 and response.headers["location"] == "/login"
+    assert not any(
+        user_auth_context.settings.user_session_cookie_name in header
+        for header in response.headers.get_list("set-cookie")
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_remembered_google_login_survives_browser_restart_and_renews_three_times_per_role(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from playwright.async_api import async_playwright, expect
+
+    from app import main as main_module
+
+    day = 24 * 60 * 60
+    clock = [int(time.time())]
+    monkeypatch.setattr(TimestampSigner, "get_timestamp", lambda _self: clock[0])
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    base_url = f"http://localhost:{port}"
+    settings = user_auth_context.settings.model_copy(update={"public_base_url": base_url})
+    for module in (api_routes, auth_access, admin_routes):
+        monkeypatch.setattr(module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "settings", settings)
+    user_auth_context.app.add_middleware(main_module.SecurityMiddleware)
+    box = SecretBox(settings.token_encryption_key or "")
+    mailbox_token = box.encrypt("remembered-mailbox-refresh-token")
+    async with user_auth_context.session_factory() as session:
+        session.add(UserProfile(name="Remembered operator", is_default=True))
+        session.add(
+            OAuthCredential(
+                account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID,
+                provider="gmail",
+                encrypted_refresh_token=mailbox_token,
+                scopes=list(GMAIL_DELIVERY_SCOPES),
+            )
+        )
+        users = []
+        for index in range(3):
+            account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+            session.add(account)
+            await session.flush()
+            email, subject = f"remember-{index}@example.test", f"remember-sub-{index}"
+            session.add(
+                AccountIdentity(
+                    account_id=account.id,
+                    provider="google",
+                    subject=subject,
+                    email=email,
+                    email_verified=True,
+                )
+            )
+            session.add(
+                OAuthCredential(
+                    account_id=account.id,
+                    provider="gmail",
+                    encrypted_refresh_token=mailbox_token,
+                    scopes=list(GMAIL_DELIVERY_SCOPES),
+                )
+            )
+            users.append((account.id, email, subject))
+        await session.commit()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            user_auth_context.app,
+            host="127.0.0.1",
+            port=port,
+            log_level="error",
+        )
+    )
+    server_task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient() as client:
+            for _ in range(100):
+                try:
+                    if (await client.get(base_url + "/login")).status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("remembered login server did not start")
+        async with async_playwright() as runtime:
+            for base in ("/admin", "/app"):
+                for index in range(3):
+                    clock[0] = int(time.time())
+                    account_id, email, subject = (
+                        (BOOTSTRAP_ADMIN_ACCOUNT_ID, "admin@example.com", "remember-admin")
+                        if base == "/admin"
+                        else users[index]
+                    )
+                    name = (
+                        settings.session_cookie_name
+                        if base == "/admin"
+                        else settings.user_session_cookie_name
+                    )
+                    directory = tmp_path / f"{base[1:]}-{index}"
+                    context = await runtime.chromium.launch_persistent_context(directory)
+                    try:
+                        page = await context.new_page()
+                        await page.goto(base_url + "/login")
+                        started = await context.request.get(
+                            base_url + "/auth/google/login", max_redirects=0
+                        )
+                        query = parse_qs(urlsplit(started.headers["location"]).query)
+                        assert set(query["scope"][0].split()) == set(GOOGLE_IDENTITY_SCOPES)
+                        _install_fake_identity(
+                            monkeypatch, email=email, subject=subject, nonce=query["nonce"][0]
+                        )
+                        await page.goto(
+                            base_url
+                            + "/api/v1/oauth/gmail/callback?"
+                            + urlencode(
+                                {
+                                    "code": "identity-route-code",
+                                    "state": query["state"][0],
+                                }
+                            )
+                        )
+                        assert page.url == base_url + base
+                        cookie = next(
+                            item for item in await context.cookies() if item["name"] == name
+                        )
+                        assert cookie["expires"] > time.time() + 29 * day
+                        assert cookie["httpOnly"] and cookie["sameSite"] == "Lax"
+                        original = cookie["value"]
+                        login_count = IdentityFakeFlow.fetch_count
+                    finally:
+                        await context.close()
+
+                    # Reopen Chromium with the same profile; no storage_state or
+                    # manually injected login cookie supplies this authentication.
+                    context = await runtime.chromium.launch_persistent_context(directory)
+                    try:
+                        page = await context.new_page()
+                        await page.goto(base_url + "/login")
+                        assert page.url == base_url + base
+                        assert IdentityFakeFlow.fetch_count == login_count
+                        await page.goto(base_url + base + "?view=settings")
+                        await expect(
+                            page.locator(".side-nav").get_by_text("Администрирование", exact=True)
+                        ).to_have_count(0)
+                        await expect(page.locator(".google-settings")).to_contain_text(
+                            "Готов к отправке"
+                        )
+                        # A second tab renews the aged cookie; the first tab's
+                        # already rendered logout form must still pass CSRF.
+                        clock[0] += 25 * day
+                        second = await context.new_page()
+                        await second.goto(base_url + "/login")
+                        assert second.url == base_url + base
+                        renewed = next(
+                            item for item in await context.cookies() if item["name"] == name
+                        )
+                        assert renewed["value"] != original
+                        assert IdentityFakeFlow.fetch_count == login_count
+
+                        # The original expired token cannot renew itself, even if
+                        # a client retains it longer than its cookie expiration.
+                        clock[0] += 6 * day
+                        await context.add_cookies([{**renewed, "value": original}])
+                        await second.goto(base_url + base)
+                        assert second.url == base_url + "/login"
+                        await context.add_cookies([renewed])
+                        await page.locator(f"form[action='{base}/logout'] button").click()
+                        assert page.url == base_url + "/login"
+                        assert not any(item["name"] == name for item in await context.cookies())
+                        await second.goto(base_url + base)
+                        assert second.url == base_url + "/login"
+                        async with user_auth_context.session_factory() as session:
+                            credential = await session.scalar(
+                                select(OAuthCredential).where(
+                                    OAuthCredential.account_id == account_id,
+                                    OAuthCredential.provider == "gmail",
+                                )
+                            )
+                            assert credential is not None
+                            assert credential.encrypted_refresh_token == mailbox_token
+                            assert set(credential.scopes) == set(GMAIL_DELIVERY_SCOPES)
+                    finally:
+                        await context.close()
+    finally:
+        server.should_exit = True
+        await server_task

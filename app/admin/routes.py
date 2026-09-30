@@ -121,6 +121,9 @@ def _session_token(request: Request) -> str:
     if subject != get_settings().admin_username:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="login required")
     assert token is not None
+    from app.auth.session import remember_session
+
+    remember_session(request, get_settings(), token)
     return token
 
 
@@ -206,7 +209,7 @@ async def login(
         max_age=settings.session_ttl_seconds,
         secure=settings.public_base_url.casefold().startswith("https://"),
         httponly=True,
-        samesite="strict",
+        samesite="lax",
         path="/",
     )
     return response
