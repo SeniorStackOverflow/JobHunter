@@ -622,6 +622,7 @@ async def _generate(session: AsyncSession, *, persist: bool = True) -> DailyRepo
         if search_active
         else limit_metrics["daily_minimum_normal_score"]
     )
+    matching_backlog: int | None
     if session.get_bind().dialect.name == "sqlite":
         matching_backlog = await _profile_matching_backlog(session, report_profile_id)
         matching_backlog_state = "ok"

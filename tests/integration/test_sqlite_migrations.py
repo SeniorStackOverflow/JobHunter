@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 from sqlalchemy.engine import create_engine
 from sqlalchemy.orm import Session
@@ -23,6 +24,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
     database_path = tmp_path / "fresh.db"
     database_url = f"sqlite+aiosqlite:///{database_path}"
     monkeypatch.setenv("DATABASE_URL", database_url)
+    expected_revision = ScriptDirectory.from_config(Config("alembic.ini")).get_current_head()
     get_settings.cache_clear()
     try:
         command.upgrade(Config("alembic.ini"), "head")
@@ -31,7 +33,7 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision == ("b6a2d0e4f913",)
+        assert revision == (expected_revision,)
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -211,4 +213,4 @@ def test_fresh_sqlite_database_migrations_round_trip(
 
     with closing(sqlite3.connect(database_path)) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert revision == ("b6a2d0e4f913",)
+    assert revision == (expected_revision,)

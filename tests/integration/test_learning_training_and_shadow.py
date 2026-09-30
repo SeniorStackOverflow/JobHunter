@@ -340,6 +340,20 @@ async def test_train_all_profiles_isolates_a_failing_profile(
         session.add_all([good, bad])
         await session.flush()
         good_id, bad_id = good.id, bad.id
+        for profile in (good, bad):
+            session.add(
+                Resume(
+                    profile_id=profile.id,
+                    name="Verified training resume",
+                    category="ops",
+                    storage_key=f"training-{profile.id}.pdf",
+                    original_filename="training.pdf",
+                    mime_type="application/pdf",
+                    sha256="a" * 64,
+                    active=True,
+                    verified=True,
+                )
+            )
         events = [
             _feedback(good_id, ReviewOutcome.APPROVED, "warehouses", d) for d in range(30)
         ] + [_feedback(good_id, ReviewOutcome.REJECTED, "sales", d) for d in range(30, 55)]
@@ -347,8 +361,10 @@ async def test_train_all_profiles_isolates_a_failing_profile(
         await session.commit()
 
     real_train_profile = training_module.train_profile
+    attempted = []
 
     async def flaky_train_profile(session, profile_id):
+        attempted.append(profile_id)
         if profile_id == bad_id:
             raise RuntimeError("boom")
         return await real_train_profile(session, profile_id)
@@ -358,6 +374,7 @@ async def test_train_all_profiles_isolates_a_failing_profile(
     written = await training_module.train_all_profiles()
 
     assert written == 1  # the good profile trained despite the bad one raising
+    assert set(attempted) == {good_id, bad_id}
     async with sqlite_session_factory() as session:
         versions = (await session.scalars(select(LearningModelVersion))).all()
         assert [v.profile_id for v in versions] == [good_id]

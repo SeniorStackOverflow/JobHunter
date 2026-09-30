@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import structlog
 from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.selectable import Exists
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
 from app.models.constants import BOOTSTRAP_ADMIN_ACCOUNT_ID
@@ -107,7 +108,7 @@ def choose_resume_for_job(resumes: list[Resume], job: SourceJob) -> Resume | Non
     )
 
 
-def _processing_resume_exists():
+def _processing_resume_exists() -> Exists:
     return exists(
         select(Resume.id).where(
             Resume.profile_id == UserProfile.id,
