@@ -1786,7 +1786,19 @@ async def get_run_summary(scan_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def get_daily_report() -> dict[str, Any]:
-    """Return today's Europe/Chisinau live report, backlog, and safe diagnostics."""
+    """Build today's (Europe/Chisinau) report live at call time; read-only.
+
+    This is not the last persisted DailyReport: every call recomputes the day
+    in one read-only REPEATABLE READ transaction (bounded backlog/minimum
+    diagnostics use their own short read transactions). It never writes, and
+    never starts matching, crawling or sending. ``summary.scopes`` states which
+    sections are system-wide vs default-profile, ``summary.counter_definitions``
+    explains each counter, and ``collection_started_at``/``snapshot_at`` bound
+    the collection. Key distinctions: provider attempts vs logical requests;
+    transport recovery vs schema validation; Router-synthetic 5xx with their
+    upstream status; initial provider acceptance vs current delivery outcome
+    (a bounced send leaves sent_applications but stays in provider_submissions).
+    """
     from datetime import UTC, datetime, timedelta
 
     from sqlalchemy import and_, text
@@ -1798,7 +1810,8 @@ async def get_daily_report() -> dict[str, Any]:
 
     async with async_session_factory() as session:
         if session.get_bind().dialect.name == "postgresql":
-            await session.execute(text("SET TRANSACTION READ ONLY"))
+            # One snapshot for every section read through this session.
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         item = await _generate(session, persist=False)
         start_local, start, end = local_day_bounds()
 
@@ -1893,6 +1906,12 @@ async def get_daily_report() -> dict[str, Any]:
                 "matching_backlog_state": item.summary.get("matching_backlog_state", "ok"),
                 "matching_rules_version": MATCHING_RULES_VERSION,
                 "scan_error_details": scan_error_details,
+                "report_source": "live",
+                "snapshot_consistency": (
+                    "repeatable_read_single_transaction"
+                    if session.get_bind().dialect.name == "postgresql"
+                    else "single_session"
+                ),
             }
         )
         return {"date": start_local.isoformat(), "summary": summary}

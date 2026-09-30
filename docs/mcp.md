@@ -198,6 +198,37 @@ Relationship commands используют profile context и аудируемы
 - `get_run_summary`
 - `get_daily_report`
 
+`get_daily_report` — **живой** отчёт текущего локального дня Europe/Chisinau,
+собранный в момент вызова, а не последний сохранённый `DailyReport`. Основные
+разделы читаются в одной read-only транзакции `REPEATABLE READ`
+(`summary.snapshot_consistency`); ограниченные по времени секции backlog и
+диагностики минимума используют свои короткие read-транзакции. Вызов ничего не
+пишет и не запускает matching, crawler или отправку. Время сбора —
+`collection_started_at` и `snapshot_at`; область каждой секции —
+`summary.scopes` (`external_calls`/`email_delivery` — вся система, `matching`,
+`daily_limit`, `daily_minimum` — профиль по умолчанию). Разные scopes нельзя
+складывать в одну когорту.
+
+Как читать счётчики (полный список — `summary.counter_definitions`):
+
+| Поле | Значение |
+| --- | --- |
+| `external_calls.total_attempts` / `logical_requests` | попытки провайдеров Router / логические запросы JobHunter |
+| `external_calls.transport_recovered_requests` (= `recovered_requests`) | попытка упала, следующая вернула HTTP success; о валидности ответа не говорит |
+| `external_calls.schema_invalid_requests` / `schema_validated_requests` | ответ модели не прошёл / прошёл локальную валидацию после ограниченного repair |
+| `external_calls.router_synthetic_failures`, `router_synthetic_by_status` | «5xx», синтезированные Router из upstream 400 (structured output) или обрезанного 200; ключ `502<-400` |
+| `llm_evaluation_outcomes` | оценки дня: `valid`, `invalid_output` (fallback в review), `not_called`, `unrecorded` (до миграции) |
+| `email_delivery.provider_submissions` | журнал hard maximum: переданные провайдеру за день (accepted, in-flight, unknown); bounce не освобождает |
+| `email_delivery.initially_accepted` | впервые принятые провайдером сегодня |
+| `email_delivery.submitted_cohort_current_status` | текущий статус этой когорты, например `{provider_accepted: 20, domain_rejected: 1}` при 21 принятом |
+| `sent_applications` | отправки дня с текущим статусом accepted/delivered/unknown; bounced сюда не входят, но остаются в `provider_submissions` |
+| `sent_applications[].overall_score` | score привязанной оценки, по которой разрешена отправка; `latest_evaluation_score` — более поздняя переоценка |
+| `daily_limit_used` / `daily_sent` | расход максимума / подтверждённые отправки для минимума (профиль по умолчанию) |
+
+Provider acceptance не доказывает доставку в ящик. Исторические оценки до
+миграции `b7f1e4c9a2d3` не имеют `llm_logical_request_id`; корреляция по
+времени не выдаётся за сохранённую связь.
+
 Ответы минимизируют PII; provider response предварительно санитизируется.
 Встроенного разграничения read/write ролей bearer нет: используйте эти tools
 только как привилегированный оператор. User isolation относится к browser routes.

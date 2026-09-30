@@ -16,7 +16,7 @@ from app.applications.daily_target import (
     minimum_catchup_scores,
     minimum_daily_requirement,
 )
-from app.delivery_ledger import local_day_key, transmissions_on_day
+from app.delivery_ledger import COUNTED_OUTCOMES, local_day_key, transmissions_on_day
 from app.matching.freshness import count_profile_matching_backlog
 from app.models.entities import (
     Alert,
@@ -24,6 +24,7 @@ from app.models.entities import (
     CanonicalJob,
     DailyReport,
     EmailDelivery,
+    EmailSendAttempt,
     EmployerContact,
     EmployerIdentityCandidate,
     EmployerRelationship,
@@ -48,6 +49,44 @@ from app.reports.phone_metrics import daily_phone_metrics
 from app.settings import get_settings
 from app.telemetry import external_call_metrics
 from app.time_utils import LOCAL_TIMEZONE_NAME, local_day_bounds
+
+REPORT_COUNTER_DEFINITIONS: dict[str, str] = {
+    "external_calls.total_attempts": "provider attempts (each Router candidate try)",
+    "external_calls.logical_requests": "application-level LLM requests",
+    "external_calls.recovered_requests": (
+        "legacy name of transport_recovered_requests: a provider attempt failed and a "
+        "later one returned HTTP success; says nothing about output validity"
+    ),
+    "external_calls.transport_recovered_requests": "same as recovered_requests",
+    "external_calls.final_failed_requests": "requests whose last transport attempt failed",
+    "external_calls.schema_invalid_requests": (
+        "requests whose model output failed local validation after bounded repair and fell "
+        "back to manual review (score 0)"
+    ),
+    "external_calls.router_synthetic_failures": (
+        "attempts reported as 5xx by Router but originating from another upstream status "
+        "(structured-output 400, truncated 200); see router_synthetic_by_status"
+    ),
+    "email_delivery.provider_submissions": (
+        "hard-maximum ledger for this local day: accepted, in-flight and unknown provider "
+        "submissions; a later bounce does not release it"
+    ),
+    "email_delivery.initially_accepted": "messages first accepted by the provider today",
+    "email_delivery.submitted_cohort_current_status": (
+        "current delivery status of messages first submitted today; provider acceptance "
+        "does not prove inbox delivery"
+    ),
+    "sent_applications": (
+        "today's sends whose current delivery status is still accepted/delivered/unknown; "
+        "bounced sends are excluded here but remain in provider_submissions"
+    ),
+    "sent_applications[].overall_score": (
+        "score of the evaluation the send was authorized with (bound evaluation); "
+        "latest_evaluation_score is a later re-evaluation, if any"
+    ),
+    "daily_limit_used": "provider_submissions of the default profile (hard maximum)",
+    "daily_sent": "confirmed successful sends of the default profile (daily minimum)",
+}
 
 
 async def get_run_summary(session: AsyncSession, scan_id: UUID) -> dict[str, Any]:
@@ -91,6 +130,7 @@ async def _daily_matching_metrics(
             MatchEvaluation.decision,
             MatchEvaluation.risks,
             MatchEvaluation.created_at,
+            MatchEvaluation.llm_outcome,
         )
         .where(
             MatchEvaluation.created_at >= start,
@@ -104,8 +144,11 @@ async def _daily_matching_metrics(
     latest_by_source: dict[UUID, tuple[MatchDecision, list[str] | None]] = {}
     failure_codes: dict[str, int] = {}
     failure_jobs: set[UUID] = set()
-    for source_job_id, decision, risks, _created_at in rows:
+    llm_outcomes: dict[str, int] = {}
+    for source_job_id, decision, risks, _created_at, llm_outcome in rows:
         latest_by_source[source_job_id] = (decision, risks)
+        outcome_key = llm_outcome or "unrecorded"
+        llm_outcomes[outcome_key] = llm_outcomes.get(outcome_key, 0) + 1
         codes = _llm_failure_codes(risks)
         if codes:
             failure_jobs.add(source_job_id)
@@ -145,6 +188,9 @@ async def _daily_matching_metrics(
             "unresolved_jobs": unresolved_failures,
             "by_code": failure_codes,
         },
+        # Per evaluation: valid (schema validated), invalid_output (fallback to
+        # review), not_called (deterministic result), unrecorded (pre-migration).
+        "llm_evaluation_outcomes": llm_outcomes,
     }
 
 
@@ -422,6 +468,7 @@ async def _bounded_minimum_diagnostics(
 async def _generate(
     session: AsyncSession, *, persist: bool = True, day: date | None = None
 ) -> DailyReport:
+    collection_started_at = datetime.now(UTC)
     start_local, start, end = local_day_bounds(day=day)
     current_local, _, _ = local_day_bounds()
     finalized = start_local.date() < current_local.date()
@@ -762,6 +809,26 @@ async def _generate(
         )
         or 0
     )
+    # Current outcome of the messages first handed to the provider today. The
+    # initial acceptance is a durable fact; the current status may change later
+    # through a DSN (e.g. 21 accepted = 20 still accepted + 1 domain_rejected).
+    submitted_cohort_rows = (
+        await session.execute(
+            select(EmailDelivery.status, func.count(EmailDelivery.id))
+            .where(EmailDelivery.submitted_at >= start, EmailDelivery.submitted_at < end)
+            .group_by(EmailDelivery.status)
+        )
+    ).all()
+    submitted_cohort_current = {status.value: int(count) for status, count in submitted_cohort_rows}
+    provider_submissions = int(
+        await session.scalar(
+            select(func.count(EmailSendAttempt.id)).where(
+                EmailSendAttempt.local_day == local_day_key(start),
+                EmailSendAttempt.outcome.in_(COUNTED_OUTCOMES),
+            )
+        )
+        or 0
+    )
     permanent_count = sum(permanent_breakdown.values())
     permanent_statuses = {
         DeliveryStatus.BOUNCED_PERMANENT,
@@ -961,6 +1028,13 @@ async def _generate(
             "relationship_review_count": relationship_review_count,
         },
         "email_delivery": {
+            # Hard-maximum ledger: provider submissions of this local day that
+            # consume the maximum (accepted, in-flight, unknown), all profiles.
+            "provider_submissions": provider_submissions,
+            # First provider acceptance recorded today (durable, not undone by a bounce).
+            "initially_accepted": provider_accepted_count,
+            # Current delivery status of the cohort first submitted today.
+            "submitted_cohort_current_status": submitted_cohort_current,
             "submitted": submitted_count,
             "provider_accepted": provider_accepted_count,
             "delivery_unknown": delivery_status_counts.get("delivery_unknown", 0),
@@ -1051,7 +1125,18 @@ async def _generate(
     ]
     summary["finalized"] = finalized
     summary["target_policy_version"] = TARGET_POLICY_VERSION
+    summary["collection_started_at"] = collection_started_at.isoformat()
     summary["snapshot_at"] = datetime.now(UTC).isoformat()
+    summary["scopes"] = {
+        "matching": "default_profile",
+        "daily_limit": "default_profile",
+        "daily_minimum": "default_profile",
+        "daily_targets": "per_profile",
+        "external_calls": "system",
+        "email_delivery": "system",
+        "sent_applications": "system",
+    }
+    summary["counter_definitions"] = REPORT_COUNTER_DEFINITIONS
     summary["local_date"] = start_local.date().isoformat()
     from app.applications.diagnostics import daily_minimum_audit
 
