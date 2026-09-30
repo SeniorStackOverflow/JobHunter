@@ -1,7 +1,7 @@
 # Gmail OAuth 2.0
 
-Gmail используется только для доставки уже подготовленной и разрешённой
-Application. LLM, crawler, MCP-клиент и пользовательский HTTP payload не получают
+Актуализировано 2026-09-30. Gmail используется для доставки подготовленной и
+разрешённой Application и read-only сверки DSN/bounce/ответов. LLM, crawler, MCP-клиент и пользовательский HTTP payload не получают
 access/refresh token и не формируют raw MIME.
 
 Реальные credentials не нужны для разработки и CI: там используется fake Gmail
@@ -44,27 +44,30 @@ Redirect URI должен полностью совпадать по scheme/host
 Для локальной разработки используйте отдельный OAuth client и только разрешённый
 localhost callback; production client не должен разрешать лишние origins/redirects.
 
-## Минимальные scopes
+## Вход и минимальные scopes
 
-Для отправки и read-only сверки результата нужны два Gmail scope:
+Обычный вход `/auth/google/login` и регистрация `/auth/google/register`
+используют отдельный `GoogleIdentityService`: только `openid` и `email`.
+Они не запрашивают Gmail consent и не заменяют сохранённую почтовую credential.
+Тот же callback `/api/v1/oauth/gmail/callback` различает provider/actor
+одноразового запроса. `/admin/auth/google` — legacy redirect на общий вход.
+
+Gmail подключается отдельным действием из настроек. Для доставки и мониторинга:
 
 ```text
 https://www.googleapis.com/auth/gmail.send
 https://www.googleapis.com/auth/gmail.readonly
 ```
 
-`gmail.readonly` используется только фоновым reconciler для DSN/bounce и ответов в
-уже известных thread; он не даёт права менять или удалять письма. Не запрашивайте
-изменение или полный доступ к почте. Вход в admin panel
-дополнительно использует стандартные OIDC scopes `openid email`: они нужны только
-для подписанного ID token и точной проверки `GOOGLE_ADMIN_EMAILS`, а не для чтения
-Google-профиля. Callback требует оба Gmail scope, допускает только эти
-identity scopes и отклоняет любой неожиданный scope до сохранения refresh token.
+`gmail.readonly` нужен reconciler для DSN/bounce и ответов в известных threads;
+он не разрешает менять или удалять письма. API-only подключение с двумя Gmail
+scopes не доказывает identity mailbox. Legacy операторский connect path может
+также запросить `openid`/`email` для проверки admin allowlist; это отдельное явное
+действие подключения, а не обычный вход.
 
-Следуйте актуальным требованиям Google к OAuth consent/verification для выбранного
-типа пользователей. Этот документ не утверждает, что конкретная конфигурация
-освобождена от проверки Google. Источник истины —
-[официальный перечень Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
+Текущие browser routes и хранение сессий описаны в
+[accounts-panel.md](accounts-panel.md) и [google-oauth-sessions.md](google-oauth-sessions.md).
+Список scopes Google: [официальная документация](https://developers.google.com/workspace/gmail/api/auth/scopes).
 
 ## Серверная конфигурация
 
@@ -84,76 +87,53 @@ OAuth callback, проверяется и сохраняется зашифро�
 
 ## Authorization code flow
 
-Ожидаемый безопасный flow:
+Общий механизм для identity и Gmail flows:
 
-1. оператор начинает вход через `/admin/auth/google` либо аутентифицированный API
-   actor вызывает отдельный endpoint подключения;
-2. сервер создаёт случайный непрозрачный `state`, отдельный browser-binding cookie
-   и PKCE code-verifier/challenge; в БД остаются только SHA-256 хеши `state`/binding,
-   actor, срок и зашифрованный verifier;
-3. браузер перенаправляется на Google authorization endpoint с минимальным scope;
-4. Google возвращает `code` и `state` только на точный callback;
-5. сервер одним условным `UPDATE` проверяет хеши `state`/binding, 10-минутный срок
-   и отсутствие предыдущего использования, атомарно отмечает запрос использованным,
-   затем расшифровывает и удаляет server-side PKCE verifier;
-6. только после commit одноразового перехода сервер обменивает authorization code
-   server-to-server; timeout/ошибка провайдера не разрешает повторное использование;
-7. для admin login проверяет подпись, issuer, audience, expiry и одноразовый nonce
-   ID token, затем `email_verified=true` и точное совпадение email с allowlist;
-8. проверяет наличие выданного refresh token, не раскрывая его браузеру;
-9. шифрует refresh token Fernet с текущим единственным encryption key;
-10. выдаёт отдельную `Secure`/`HttpOnly` admin-session cookie; access token остаётся
-    короткоживущим и не логируется;
-11. AuditEvent фиксирует start, success или безопасный error code без state, binding,
-    verifier, authorization code и token.
+1. Сервер создаёт случайные state и browser binding, server-side PKCE verifier,
+   actor и account binding. В БД сохраняются хеши state/binding и зашифрованный
+   verifier; срок запроса — 10 минут.
+2. Браузер направляется на Google; callback принимает code/state только на
+   настроенном URL и с правильным binding cookie.
+3. Условный UPDATE атомарно погашает state и очищает verifier до обмена code.
+   Сбой provider не позволяет повторно использовать уже погашенный запрос.
+4. Identity flow проверяет подпись, issuer, audience, expiry, nonce и verified
+   email ID token; затем определяет admin либо активный зарегистрированный user.
+   Gmail flow проверяет account/actor и необходимые Gmail scopes.
+5. Gmail refresh token сохраняется зашифрованно в credential соответствующего
+   аккаунта. Обновление не затрагивает Gmail другого владельца.
+6. Audit хранит результат и безопасный error code; code, state, verifier,
+   binding, tokens и ciphertext не возвращаются и не логируются.
 
-Admin login проверяет identity server-side и сохраняет подтверждённый email как
-несекретную metadata токена для operator console. API-only подключение с двумя
-Gmail scopes по-прежнему не может независимо определить mailbox и явно возвращает
-`identity_verified=false`; для production предпочтителен вход через Google.
+Binding cookie — HttpOnly/SameSite=Lax, ограничен callback path и Secure при
+HTTPS. Callback очищает cookie. Утраченный binding требует нового flow.
+Gmail connect намеренно запрашивает offline consent; обычный identity login не
+должен выпускать новый Gmail token. Источник параметров — `app/email/oauth.py`
+и `app/auth/google.py`.
 
-Для получения refresh token обычно требуется offline access; поведение выдачи
-refresh token зависит от уже выданного consent. Не пытайтесь извлекать его из
-браузерных storage или просить пользователя вставить его в чат.
+## REST и browser lifecycle
 
-Запрашивайте `access_type=offline`; принудительный `prompt=consent` применяйте
-только при первоначальном consent/явном переподключении, а не при каждом входе.
-Точные параметры и ограничения сверяйте с
-[Google OAuth для web-server applications](https://developers.google.com/identity/protocols/oauth2/web-server).
+API endpoints требуют операторский Bearer credential, кроме callback:
 
-Callback принимает только ожидаемый method/query, ограничивает частоту и не
-показывает provider error с чувствительными деталями. OAuth code одноразовый.
-Browser-binding хранится в `HttpOnly`, `SameSite=Lax`, host-only cookie, ограниченном
-путём callback; в HTTPS deployment также установлен `Secure`. Callback очищает cookie
-после успеха и после ошибки. Утерянный cookie требует начать новый OAuth flow.
+- `GET /api/v1/oauth/gmail/start` — отдельное Gmail authorization;
+- `GET /api/v1/oauth/gmail/callback` — общий callback identity/Gmail;
+- `GET /api/v1/oauth/gmail/status` — safe status bootstrap admin credential;
+- `DELETE /api/v1/oauth/gmail` — local disconnect bootstrap admin credential и
+  незавершённых Gmail requests. Это не tenant API с произвольным account ID.
 
-## REST lifecycle
+Пользователь подключает почту через `GET /app/gmail/connect` после проверки
+активного account session; `POST /app/gmail/disconnect` требует session-bound
+CSRF. Owner/account ID определяется сервером. Администратор отключает свою
+credential через `POST /admin/oauth/gmail/disconnect` с CSRF. Существующий
+операторский consent path доступен через authenticated API start, но текущая UI
+ссылка `/admin/auth/google?consent=1` перенаправляет в identity login без
+сохранения `consent`. Поэтому кнопка в admin settings сейчас не запускает Gmail
+consent; её нельзя использовать как доказательство успешного reconnect. Это
+известное ограничение runtime, требующее отдельной исправляющей правки.
+Для чужого владельца UI направляет оператора к аккаунтам, не подменяет его Gmail.
 
-Все управляющие endpoints, кроме самого Google callback, требуют настроенный Bearer
-API credential:
-
-- `GET /api/v1/oauth/gmail/start` — создаёт одноразовую server-side запись, ставит
-  binding cookie и возвращает redirect на Google;
-- `GET /api/v1/oauth/gmail/callback` — browser callback Google; самостоятельно не
-  принимает recipient, письмо, вложение или refresh token;
-- `GET /api/v1/oauth/gmail/status` — возвращает configured/connected, точный scope,
-  timestamps, число незавершённых flow и подтверждённую Google identity, если token
-  был получен через admin login;
-- `DELETE /api/v1/oauth/gmail` — удаляет локальный encrypted refresh token и
-  инвалидирует все незавершённые authorization requests.
-
-`DELETE` является локальным disconnect, а не подтверждением отзыва grant у Google;
-ответ явно содержит `remote_grant_revoked=false`. Для полного отзыва оператор также
-удаляет доступ приложения в Google Account security controls. Endpoint и callback не
-возвращают client secret, ciphertext, OAuth code, `state`, verifier или binding.
-
-Для browser operator flow:
-
-- `GET /admin/auth/google` — создаёт PKCE/state/binding и направляет в Google;
-- тот же `/api/v1/oauth/gmail/callback` завершает OIDC + Gmail consent, сверяет
-  allowlist и создаёт admin session;
-- `POST /admin/oauth/gmail/disconnect` с session-bound CSRF удаляет локальный token;
-- пароль остаётся аварийным fallback и не используется для получения Google token.
+Local disconnect не отзывает grant у Google. Для полного отзыва владелец удаляет
+доступ приложения в Google Account. Logout из JobHunter не disconnect Gmail.
+Ни один endpoint не принимает recipient, MIME или произвольный refresh token.
 
 ## Хранение токенов
 
@@ -211,7 +191,9 @@ Retry ограничен по количеству и использует за�
 
 - 429/некоторые 5xx: уважать `Retry-After`, ограниченно повторять;
 - refresh access token: выполнять внутри provider, refresh token не логировать;
-- revoked/invalid grant: остановить отправку и потребовать reconnect;
+- permanent refresh rejection (revoked/invalid grant): потребовать reconnect
+  только у затронутого аккаунта; temporary refresh failures допускают bounded
+  retry, не помечают grant отозванным и не продвигают mailbox cursor;
 - invalid recipient/payload: `failed`, не бесконечный retry;
 - timeout/connection loss после возможной передачи: `delivery_unknown`.
 
@@ -276,6 +258,9 @@ application, delivery или contact. Employer backfill сначала запу�
 2. Проверьте consent/verification requirements Google.
 3. На экране Google consent вручную проверьте ожидаемый аккаунт; при admin login
    сервер проверяет подписанный ID token и точное совпадение email с allowlist.
+   После входа отдельно подключите Gmail по соответствующему connect flow
+   (для admin UI учитывайте описанное ограничение); одна identity-сессия не
+   предоставляет доступ к отправке или чтению почты.
 4. Настройте verified resumes/contacts и консервативную policy.
 5. Проверьте глобальную паузу.
 6. Явно включите real Gmail provider/server-side switch.
@@ -296,7 +281,8 @@ application, delivery или contact. Employer backfill сначала запу�
 6. проверьте queued/sending/delivery_unknown Applications.
 
 При reconnect не меняйте исторические EmailDelivery. Текущая схема обновляет
-единственную Gmail credential и её timestamps; отдельной key version в записи нет.
+Gmail credential соответствующего аккаунта и её timestamps; отдельной key version
+в записи нет. Reconnect state и durable mailbox cursor также изолированы по владельцу.
 
 ## Ротация encryption key
 

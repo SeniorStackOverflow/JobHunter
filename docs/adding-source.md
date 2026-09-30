@@ -1,5 +1,8 @@
 # Добавление источника
 
+Сверено 2026-09-30 по `app/crawlers/schemas.py` и default registry.
+Текущий Rabota transport — [sources/rabota-md.md](sources/rabota-md.md).
+
 Новый сайт подключается на уровне source adapter. Matching, policy engine,
 Application, Gmail, общий scheduler и универсальные MCP-инструменты не должны
 знать его имя и не должны содержать ветки вида `if source == ...`.
@@ -23,7 +26,7 @@ Application, Gmail, общий scheduler и универсальные MCP-ин�
 
 ## Типы реестра
 
-Реестр должен уметь создавать как минимум:
+Default registry уже регистрирует:
 
 ```text
 rabota_md
@@ -46,17 +49,19 @@ fixture_source
 
 ```python
 class JobSourceAdapter(Protocol):
+    async def aclose(self) -> None: ...
+
     async def validate_source(self) -> SourceValidationResult: ...
     async def check_access_policy(self) -> AccessPolicyResult: ...
     async def discover_locales(self) -> list[SourceLocale]: ...
     async def discover_regions(self) -> list[SourceRegion]: ...
     async def discover_categories(self) -> list[SourceCategoryData]: ...
 
-    async def iterate_full_scan(
+    def iterate_full_scan(
         self, checkpoint: ScanCheckpoint | None
     ) -> AsyncIterator[RawJobReference]: ...
 
-    async def iterate_incremental_scan(
+    def iterate_incremental_scan(
         self, checkpoint: ScanCheckpoint | None
     ) -> AsyncIterator[RawJobReference]: ...
 
@@ -87,6 +92,10 @@ adapter. Методы не сохраняют Application и не отправл
 - opt-in live smoke test и его границы.
 
 Не утверждайте, что можно получить удалённые, закрытые или непубличные вакансии.
+
+Регистрация типа не доказывает работоспособность config. `generic_api`, `rss` и
+`sitemap` реализованы в `app/crawlers/adapters/structured.py`, `company_careers`
+использует `GenericHtmlSourceAdapter`.
 
 ## `GenericHtmlSourceAdapter`
 
@@ -134,6 +143,13 @@ source:
     max_pages: 1000
 ```
 
+Проверка файла без сети: `job-agent validate-source-config config/sources/example.yaml`
+(замените путь своим YAML). Этот skeleton проходит shape validation, но null
+listing selectors требуют заполнения до успешного `validate_source`. Проверка
+CLI Rabota пока использует legacy projection и не проверяет explicit transport;
+её успех не доказывает browser-free runtime. Проверяйте `RabotaMdConfig` и actual
+DB config отдельно.
+
 Конфигурация должна пройти Pydantic validation до сохранения/включения. Нужны
 проверки:
 
@@ -163,7 +179,11 @@ Full scan объединяет, а затем дедуплицирует referen
 контекст не теряется, но подробная страница не должна загружаться повторно без
 необходимости.
 
-Checkpoint должен быть JSON-сериализуемым, версионированным и содержать достаточно
+`ScanCheckpoint` содержит `entrypoint_index`, `page_url`, `cursor`,
+`yielded_external_ids`, `completed_entrypoints`, `adapter_state`. При изменении
+семантики версию своего состояния храните в `adapter_state`: отдельного поля
+version в текущем DTO нет. Checkpoint должен быть JSON-сериализуемым и содержать
+достаточно
 данных для продолжения: очередь/entrypoint, page/cursor, обработанные устойчивые
 references и агрегаты. Сохраняйте его после ограниченной порции работы, а не только
 в конце. Временная ошибка не обнуляет checkpoint.

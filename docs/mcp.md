@@ -1,5 +1,7 @@
 # MCP Streamable HTTP
 
+Актуализировано 2026-09-30 по зарегистрированным tools `app/mcp/server.py`.
+
 `job-agent` предоставляет удалённый MCP endpoint по `/mcp`. MCP — интерфейс
 управления и чтения, а не планировщик: Celery Beat/worker продолжает работу без
 подключённого AI-клиента.
@@ -37,7 +39,9 @@ OIDC/OAuth-aware gateway либо расширьте сервер моделью
 встроенный ключ read-only: такой семантики в текущей схеме нет.
 
 Тот же hash allowlist используется bearer-аутентификацией REST API; это не
-отдельная роль. Административная HTML-панель использует собственную session auth.
+отдельная роль. HTML-панель имеет отдельные admin/user session и ownership checks; они не
+создают bearer scopes. MCP/API остаётся операторским интерфейсом, а не транспортом
+пользовательской cookie.
 Отзыв bearer выполняется удалением hash из конфигурации и перезапуском API. Один
 ключ можно заменить с коротким overlap двух hash, но приложение не ведёт историю
 выдачи/отзыва.
@@ -86,6 +90,11 @@ policy/idempotency проверки.
 - `get_system_status`
 - `get_user_profile`
 - `update_user_profile`
+- `list_user_profiles`
+- `create_user_profile`
+- `get_profile_by_id`
+- `update_profile_by_id`
+- `set_default_profile`
 - `get_job_preferences`
 - `update_job_preferences`
 - `pause_auto_send`
@@ -100,6 +109,9 @@ policy/idempotency проверки.
 - `upload_resume_metadata`
 - `activate_resume`
 - `deactivate_resume`
+- `archive_resume`
+- `restore_resume`
+- `delete_resume`
 
 `upload_resume_metadata` не даёт LLM выбрать файл на сервере и не заменяет
 защищённую загрузку PDF через панель/REST. Metadata связывается только с уже
@@ -151,6 +163,7 @@ Source configuration проходит Pydantic/SSRF/domain validation. MCP не 
 - `list_applications`
 - `get_review_queue`
 - `get_review_learning_status`
+- `get_learning_model_status`
 - `set_review_learning_influence`
 - `get_application_status`
 
@@ -165,13 +178,29 @@ Approval не обходит hard safety rules. `send_application(application_id
 решений. Обучение влияет только на сортировку и подсказки. Оно не меняет профиль,
 подтверждённые факты, hard safety rules или состояние доставки.
 
+### Работодатели и доставка
+
+- `get_employer_relationship`
+- `list_employer_relationships`
+- `get_employer_history`
+- `suppress_employer`
+- `unsuppress_employer`
+- `list_delivery_failures`
+- `reconcile_stale_application_delivery`
+
+Relationship commands используют profile context и аудируемые overrides;
+они не удаляют историю decline. Delivery reconciliation проверяет сохранённую
+попытку и не означает «повторить письмо». Подробности —
+[employer-relationships.md](employer-relationships.md) и [gmail-oauth.md](gmail-oauth.md).
+
 ### Отчёты
 
 - `get_run_summary`
 - `get_daily_report`
 
-Ответы минимизируют PII. Recipient в отчёте доступен только роли, которой он
-необходим; provider response предварительно санитизируется.
+Ответы минимизируют PII; provider response предварительно санитизируется.
+Встроенного разграничения read/write ролей bearer нет: используйте эти tools
+только как привилегированный оператор. User isolation относится к browser routes.
 
 ## MCP Inspector
 

@@ -1,5 +1,8 @@
 # Безопасность
 
+Актуализировано 2026-09-30; browser roles — [accounts-panel.md](accounts-panel.md),
+окружения и DB roles — [environments.md](environments.md).
+
 `job-agent` обрабатывает персональные данные, резюме, недоверенный HTML и право
 отправлять письма от имени пользователя. Безопасность построена по принципам
 минимальных привилегий, fail closed, разделения ответственности, defence in depth
@@ -37,14 +40,20 @@ MFA и короткий список операторов.
 - случайный session identifier/подписанный токен достаточной энтропии;
 - `Secure`, `HttpOnly`, подходящий `SameSite`;
 - ротация после login/изменения привилегий;
-- абсолютный и idle timeout;
-- invalidation при logout/компрометации;
+- по умолчанию 30-дневный sliding TTL, renewal после суток либо половины
+  короткого TTL; отдельного абсолютного предела поверх renewal нет;
+- logout удаляет browser cookie; suspension/session version инвалидирует user
+  session, замена общего signing key — все сессии; отдельного server-side
+  denylist для скопированной admin cookie нет;
 - отсутствие токена в URL/логах.
 
 MCP и REST API используют один настроенный allowlist SHA-256 hash bearer keys.
 Каждый валидный key имеет доступ ко всем опубликованным API/MCP операциям: в
 текущей реализации нет owner, read/write roles, scopes или записи отзыва в БД.
-HTML-панель использует отдельную подписанную admin session. Основной login получает
+HTML-панель использует раздельные подписанные admin/user sessions.
+User routes проверяют активный аккаунт, session version и owner/profile для чтения
+и каждого POST/file download. Renderer и скрытая кнопка не заменяют эти проверки.
+Основной admin login получает
 её после server-side проверки Google ID token, одноразового nonce и точного email
 allowlist; password login сохранён как аварийный fallback. Google access/refresh
 token никогда не становится значением admin session. Если deployment требует
@@ -297,9 +306,9 @@ Gmail call. Atomically reserved daily slot, unique idempotency key и lock за�
 
 - PostgreSQL/Redis не публикуются в интернет;
 - TLS/auth применяются для внешних managed services;
-- корневой Compose сейчас использует один DB credential для runtime и migration;
-  production с более строгой моделью должен создать отдельные runtime/migration
-  roles и выдать DDL только одноразовому migration service;
+- базовый DEV Compose допускает один DB credential; PROD требует
+  `jobhunter_app` для runtime и `jobhunter_migrator` для миграций;
+  startup preflight проверяет роль, build flavor и app revision;
 - SQLAlchemy parameterization, без конкатенации пользовательского SQL;
 - DB constraints дублируют критическую идемпотентность/state integrity;
 - Redis keys namespaced, locks имеют owner token/TTL;

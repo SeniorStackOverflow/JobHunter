@@ -1,5 +1,8 @@
 # Политика автоматической отправки
 
+Сверено 2026-09-30; аккаунты — [accounts-panel.md](accounts-panel.md),
+память работодателей — [employer-relationships.md](employer-relationships.md).
+
 Автоотправка в `job-agent` — детерминированное серверное решение. LLM оценивает
 совпадение и помогает подготовить письмо, но не может включить отправку, выбрать
 произвольного получателя/файл или обойти правило.
@@ -70,7 +73,12 @@ Policy получает immutable/snapshot-согласованное состо
 - Resume active, verified и выбран серверной логикой;
 - письмо прошло проверку языка, должности, компании и подтверждённых фактов;
 - нет неподтверждённых утверждений;
-- на CanonicalJob ранее не отправлялся отклик;
+- на CanonicalJob ранее не отправлялся отклик в области данного профиля;
+- владелец и профиль активны, есть пригодное verified active резюме, источник
+  выбран профилем;
+- Gmail credential владельца допускает send и read-only monitoring;
+- employer relationship не suppress-ит отклик, а active slot работодателя
+  доступен для этого профиля; иначе Application откладывается как `deferred`;
 - нет `delivery_unknown` по этой CanonicalJob/Application;
 - дневной лимит ещё не достигнут;
 - idempotency key уникален;
@@ -182,7 +190,8 @@ timezone. Проверка и резервирование слота выпол
 ли provider сообщение, статус становится `delivery_unknown`. Автоматический retry
 запрещён. Оператор проверяет Gmail Sent/provider state и либо связывает найденный
 message id, либо принимает отдельное осознанное решение. Наличие такого статуса
-блокирует автоотправку на ту же CanonicalJob.
+блокирует автоотправку на ту же CanonicalJob в области профиля; возможная
+отправка также сохраняет занятость employer application slot.
 
 ## Prompt injection
 
@@ -247,5 +256,8 @@ review очереди. Никогда не снимайте паузу авто�
 - prompt injection не меняет recipient/attachment/limit;
 - повторный pipeline не отправляет дважды;
 - `delivery_unknown` не retry-ится;
-- межсайтовый дубль CanonicalJob получает не более одного отклика;
+- межсайтовый дубль CanonicalJob получает не более одного отклика от профиля;
+- чужая Gmail credential не выбирается для отправки/мониторинга;
+- suspended account, inactive/draft profile и исключённый source не обрабатываются;
+- employer slot, suppression и delivery retry повторно проходят relationship gates;
 - ручное approve не обходит hard safety rules.

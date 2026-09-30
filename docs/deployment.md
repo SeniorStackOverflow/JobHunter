@@ -1,6 +1,8 @@
 # Развёртывание
 
-Этот документ описывает ожидаемый production-процесс для `job-agent`. Источником
+Актуализировано 2026-09-30. Процедуры выполняются после локальной проверки и
+разрешения оператора согласно `AGENTS.md`. DEV/PROD границы и текущий снимок —
+[environments.md](environments.md). Источником
 истины для имён контейнеров и переменных остаются `docker-compose.prod.yml` и
 `.env.example`: перед первым развёртыванием сверяйте команды ниже с ними. Ни один
 пример не содержит рабочего секрета.
@@ -10,7 +12,11 @@
 Проект разворачивается как модульный монолит с отдельными процессами:
 
 - FastAPI обслуживает REST, административную панель, OAuth callback и MCP;
-- Celery worker выполняет обходы, анализ, подготовку и отправку;
+- `worker` — очереди `crawling,celery`;
+- `matching-worker` — `matching,applications`;
+- `proxy-worker` — `proxy-maintenance`;
+- `control-worker` — `email,reports,maintenance,phone`;
+- `call-agent` — отдельный процесс телефонного канала;
 - Celery Beat публикует периодические задания;
 - PostgreSQL хранит бизнес-данные, checkpoints и аудит;
 - Redis используется как broker/result backend и для распределённых блокировок;
@@ -63,14 +69,19 @@ secrets; `.env` допустим только на защищённом хост
 
 ## Первое production-развёртывание
 
-Следующие команды являются ожидаемым интерфейсом корневых Compose-файлов:
+Команды выполняются из `/srv/jobhunter-prod`; на установленном host нужен `sudo`.
+Перед первой установкой оператор отдельно создаёт runtime/migrator PostgreSQL
+roles, защищённый `/etc/jobhunter/migrator.env` и корректный `.env`. Compose
+не является автоматическим provisioning этих credentials. После согласования:
 
 ```bash
-./deploy/prod-compose.sh build --pull
-./deploy/prod-compose.sh up -d postgres redis
-./deploy/prod-compose.sh run --rm migrate
-./deploy/prod-compose.sh up -d
-./deploy/prod-compose.sh ps
+sudo ./deploy/prod-compose.sh config --quiet
+sudo ./deploy/prod-compose.sh build --pull api
+sudo ./deploy/prod-compose.sh up -d postgres redis
+sudo ./deploy/prod-compose.sh run --rm migrate
+sudo ./deploy/prod-compose.sh up -d --no-build --wait --wait-timeout 180 \
+  api worker matching-worker proxy-worker control-worker beat call-agent
+sudo ./deploy/prod-compose.sh ps
 ```
 
 Production-сервисы приложения используют отдельный immutable-style namespace
@@ -115,6 +126,10 @@ fast-forward:
 завершается до Alembic/application startup.
 
 ### PhoneGate без нового host listener
+
+Первичная активация — отдельная авторизованная PROD-процедура оператора.
+JobHunter DEV не запускает её ради live-тестов и не меняет `/srv/phonegate/.env`,
+credentials или `phonegate.service`. Токен для DEV передаёт оператор отдельно.
 
 PhoneGate остаётся привязан к `127.0.0.1:8888`. JobHunter обращается к уже
 существующему HTTPS endpoint Caddy через `docker-compose.phonegate.prod.yml`;
@@ -164,8 +179,9 @@ HTTP следует перенаправлять на HTTPS. За proxy долж
 доверять им от произвольного клиента.
 
 В поставляемом Compose Uvicorn запущен с `--forwarded-allow-ips=*`. Это допустимо
-только потому, что порт API не публикуется на host, а Caddy является единственным
-доверенным ingress в изолированной backend-сети. Wildcard остаётся широкой
+только при контролируемом ingress. PROD публикует API исключительно на
+`127.0.0.1:8091`; системный Caddy на текущем host проксирует его снаружи.
+Compose Caddy включается отдельно профилем `container-edge`. Wildcard остаётся широкой
 границей доверия: любой скомпрометированный или недоверенный контейнер в этой сети
 может подделать forwarded-заголовки. Не подключайте к backend-сети посторонние
 контейнеры; для общей или мультиарендной сети замените wildcard точным адресом/CIDR
@@ -192,7 +208,7 @@ curl --fail --silent --show-error https://job-agent.example/ready
 
 ```bash
 ./deploy/prod-compose.sh ps
-./deploy/prod-compose.sh logs --tail=100 api worker beat caddy
+./deploy/prod-compose.sh logs --tail=100 api worker matching-worker proxy-worker control-worker beat call-agent
 ./deploy/prod-compose.sh exec -T api alembic current
 ./deploy/prod-compose.sh exec -T worker celery -A app.scheduler.celery_app:celery_app inspect ping
 ```
@@ -201,16 +217,20 @@ curl --fail --silent --show-error https://job-agent.example/ready
 команды контейнера. Успешный HTTP health сам по себе не доказывает работу Beat,
 worker, locks или Gmail.
 
-После входа в панель выполните безопасную приёмку:
+На production после rollout проверяйте страницы и сохранённые данные read-only:
+входные страницы, обе панели, разделы, отсутствие ошибок, intended image digest,
+health/readiness и очередь. Смотрите Gmail status без mint нового token и не
+создавайте/отмечайте реальные alerts ради smoke.
 
-1. создайте профиль без чувствительных тестовых данных;
-2. оставьте auto-send выключенным и глобальную паузу включённой;
-3. проверьте fixture source или единичную opt-in smoke-проверку;
-4. убедитесь, что scan run, source health и audit event появились;
-5. проверьте fake Gmail в staging, не реальный аккаунт;
-6. выполните вход через разрешённый `GOOGLE_ADMIN_EMAILS` аккаунт и проверьте в
-   панели подтверждённую Google identity и Gmail token по инструкции `gmail-oauth.md`;
-7. снимайте глобальную паузу только после проверки политики.
+Приёмку с изменением тестовых данных выполняйте в DEV/staging до rollout:
+
+1. создайте тестовый профиль, оставьте real send выключенным;
+2. загрузите и подтвердите тестовое резюме, проверьте lifecycle gates;
+3. выполните fixture scan и проверьте source health/audit;
+4. выполните application/email E2E с fake Gmail;
+5. проверьте общий Google-вход и отдельно Gmail connect по
+   [gmail-oauth.md](gmail-oauth.md); учитывайте известное ограничение admin link;
+6. для browser integration выполните три последовательных прохода в чистых contexts.
 
 ## Постоянные данные
 
@@ -229,36 +249,77 @@ Redis не является источником истины для вакан�
 Никогда не включайте каталог резюме в публичную статику. Резюме выдаётся только
 авторизованным кодом и выбирается сервером по `resume_id` из Application.
 
-## Обновление без потери данных
+## Проверка и обновление
 
-Перед обновлением:
+Разработку выполняйте в DEV. До любой PROD mutation завершите relevant focused
+checks, `ruff check .`, `ruff format --check .`, `mypy app fixture_site`, `pytest`
+и локальный E2E. Browser/auth/OAuth/cookie изменения требуют три подряд успешных
+Playwright прохода в чистых contexts. Production smoke не заменяет этот gate.
+Сообщите оператору результаты и план rollout/rollback; получите разрешение на
+конкретное изменение. Предыдущее разрешение не распространяется на новый runtime.
 
-1. прочитайте release notes и миграции;
-2. создайте и проверьте резервную копию PostgreSQL;
-3. убедитесь, что нет активного full scan или отправки;
-4. включите глобальную паузу auto-send;
-5. сохраните предыдущий digest образа для отката.
-
-Ожидаемая последовательность:
+Перед rollout проверьте чистый PROD `main`, DEV canonical `main`, active scans,
+email tasks и активные звонки. Для schema/backfill изменений нужен проверенный
+backup и согласованная пауза. Зафиксируйте старый image SHA/digest и совместимость
+схемы. Не прерывайте активный звонок для обычного обновления.
 
 ```bash
-./deploy/prod-compose.sh build --pull
-./deploy/prod-compose.sh stop worker beat
-./deploy/prod-compose.sh run --rm migrate
-./deploy/prod-compose.sh up -d --remove-orphans
-./deploy/prod-compose.sh ps
+cd /srv/jobhunter-prod
+./deploy/check-code-sync.sh
+./deploy/sync-prod-code.sh
+sudo ./deploy/prod-compose.sh config --quiet
+sudo ./deploy/prod-compose.sh build api
+sudo ./deploy/prod-compose.sh run --rm migrate
+sudo ./deploy/prod-compose.sh up -d --no-deps --no-build --wait --wait-timeout 180 \
+  api worker matching-worker proxy-worker control-worker beat call-agent
 ```
 
-Worker и Beat останавливаются до изменения схемы, чтобы старый код не выполнял
-задачи против частично обновлённой БД. При несовместимой с прежним API миграции
-переведите proxy в maintenance mode и остановите также `api` до миграции. Если
-миграция завершилась ошибкой, не запускайте worker/beat и не снимайте глобальную
-паузу до восстановления согласованного состояния.
+Все семь app services используют один image, поэтому его достаточно собрать через
+`build api`. При несовместимой миграции сначала остановите все затронутые процессы
+(четыре worker, beat, call-agent и при необходимости API), а не только crawler.
+`--no-deps` для переключения допустим после успешного migration и проверки
+PostgreSQL/Redis. Ошибка migration запрещает запуск старого кода против новой схемы.
 
-Не откатывайте приложение поверх необратимо изменённой схемы. Для отката сначала
-проверьте совместимость предыдущего образа с текущей схемой; если её нет,
-восстанавливайте согласованный backup в отдельную БД и только затем переключайте
-трафик.
+Сравните `.Image` каждого app container с intended digest, `APP_REVISION` и label,
+проверьте HTTP health/readiness, четыре Celery pong и обе панели desktop/mobile.
+Не считайте Docker process health отдельного worker доказательством работы очереди.
+Source recovery и notification actions сначала проверяются в локальном E2E;
+не отмечайте реальные PROD alerts прочитанными только ради smoke.
+
+## Откат и Docker hygiene
+
+Сохраните максимум один предыдущий JobHunter image на явно установленное окно
+(обычно 24 часа). На текущем host автоматическая cleanup удаляет unused старые
+images; для окна отката удерживайте предыдущий image созданным, но не запущенным
+container без secrets/network/volumes. После окна удалите holder и image, если
+он не используется. Не удаляйте image, на котором реально выполнен rollback.
+
+Rollback должен сохранить чистую fast-forward PROD `main`. Используйте отдельный
+временный Compose override для **всех семи** services: старый `image` плюс
+соответствующий `EXPECTED_APP_REVISION`. Базовый wrapper ожидает SHA текущего Git
+HEAD, поэтому подмена одного image/tag без override revision не является откатом.
+Не делайте reset/cherry-pick/new commit в PROD. Применяйте override после штатных
+Compose files и PhoneGate overlay, затем `up -d --no-deps --no-build --wait` для
+семи services. Перед этим обязательно докажите совместимость старого кода с БД.
+Для несовместимой схемы восстанавливайте согласованный backup отдельно по runbook.
+
+После успешной сборки/rollout проверьте:
+
+```bash
+docker system df
+df -h /
+```
+
+Удалите только obsolete unused JobHunter images/dangling layers и unused build
+cache (`docker buildx prune --all --force`), сохранив один rollback image.
+Не используйте `docker system prune -a`, не prune-ьте named volumes, PostgreSQL,
+резюме и unrelated images. Заполнение `/` выше 70% требует расследования до
+следующей сборки. Все app services должны остаться на одном intended digest.
+
+Обновление только `docs` после checks переносится через DEV `main` → PROD
+fast-forward, без image build, миграции и restart: `docs` не включены в runtime
+Dockerfile. Зафиксируйте текущую running app revision отдельно от docs-коммита;
+при следующем runtime rollout wrapper соберёт image для новой canonical `main`.
 
 ## Масштабирование
 

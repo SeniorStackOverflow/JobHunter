@@ -1,8 +1,14 @@
 # Rabota.md browser fallback: optional emergency profile
 
+Сверено с текущей реализацией 2026-09-30.
+
 Production normally runs Rabota.md with `waf_http`, the A14 primary egress and the validated free-proxy reserve. Chromium is not installed in the standard image and `RABOTA_BROWSER_FALLBACK_MODE=none` is forced by `docker-compose.prod.yml`.
 
 The browser fallback code is retained for emergency use. `docker-compose.browser.yml` replaces only the crawler `worker` with `jobhunter-prod-browser:<revision>`, builds that image with the `playwright` extra plus Chromium, and sets `RABOTA_BROWSER_FALLBACK_MODE=stealth_browser`. Other services keep the normal production image.
+
+This is an explicit operator-authorized emergency exception to the normal
+single application image rule. Finish local checks and report rollout/rollback
+before activation; do not activate it from DEV against PhoneGate production.
 
 Enable the emergency crawler profile with:
 
@@ -13,8 +19,14 @@ sudo ./deploy/prod-browser-compose.sh up -d --build worker
 Return to the standard browser-free crawler with:
 
 ```sh
-sudo ./deploy/prod-compose.sh up -d --build worker
+sudo ./deploy/prod-compose.sh build api
+sudo ./deploy/prod-compose.sh up -d --no-deps --no-build --wait --wait-timeout 180 \
+  api worker matching-worker proxy-worker control-worker beat call-agent
 ```
+
+After returning, verify all seven app containers use the intended standard image
+digest. Remove the unused emergency image and build cache, preserve at most one
+previous standard image for the agreed rollback window, and inspect disk usage.
 
 The source configuration should remain `transport: waf_http` and `fallback_transport: none`; the emergency profile is a runtime override, so activation does not require mutating the source row. Free proxies never receive Chromium fallback; their transport remains pure HTTP/WAF solver only.
 

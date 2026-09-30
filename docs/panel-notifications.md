@@ -1,5 +1,7 @@
 # Panel status and notifications
 
+Сверено с текущей реализацией 2026-09-30.
+
 The account and operator panels share their navigation, status header and notification
 menu. The operator has two extra pages: calls and accounts. There is no diagnostics page.
 Authenticated legacy `view=diagnostics` URLs redirect to the alerts tab in History,
@@ -47,3 +49,8 @@ Browser checks cover both roles on desktop/mobile, three clean contexts per role
 task completion and manual acknowledgement. The recovery scenario additionally
 executes the actual local scan pipeline against the in-process fixture site three
 times, ensuring no live crawling or real email delivery is needed.
+
+Telephone review uses the same predicate as the Calls queue: `needs_review` or
+`verification_status=needs_review`. Successful manual fact confirmation removes
+the task even when an earlier automatic summary still has technical `failed`
+state. That failure stays in call history rather than reopening completed work.

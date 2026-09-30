@@ -1,5 +1,10 @@
 # JobHunter Phone Call Agent Architecture
 
+> Исторический design/spike/acceptance record. Даты, результаты и предложения ниже
+> относятся к моменту записи и не заменяют текущую эксплуатацию. Актуальное
+> состояние на 2026-09-30: [инструкция](phone-agent.md).
+
+
 Status: proposed architecture, benchmark-backed
 
 Benchmark baseline: 2026-09-01

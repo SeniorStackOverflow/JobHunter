@@ -1,5 +1,8 @@
 # Краулеры и обнаружение вакансий
 
+Сверено 2026-09-30. Актуальный source-specific transport —
+[sources/rabota-md.md](sources/rabota-md.md).
+
 Crawler subsystem получает только публично доступные данные с разрешённой
 глубиной, нормализует их и передаёт в общий pipeline. Он не оценивает кандидата,
 не выбирает резюме и не отправляет отклики.
@@ -32,7 +35,9 @@ canonical deduplication → matching pipeline
 - допустимость `base_url` и allowlist доменов;
 - собственные умеренные rate limits;
 - зафиксированные публичные условия;
-- отсутствие login/CAPTCHA/anti-bot обхода;
+- отсутствие login/CAPTCHA обхода; site-specific WAF transport требует
+  зафиксированной операторской access-policy проверки и не является общей
+  гарантией юридической разрешённости;
 - разрешённые API/feed/sitemap/HTML entrypoints;
 - rate/concurrency и redirect policy.
 
@@ -80,7 +85,8 @@ found/new/updated/unchanged, parsing/network errors и checkpoint. Ограни�
 ## Checkpoint и возобновление
 
 Checkpoint хранится в PostgreSQL в `ScanRun`, является JSON-сериализуемым и
-версионированным. Типичное содержимое:
+с adapter-specific состоянием. Текущий DTO `ScanCheckpoint` не имеет отдельного
+поля version: adapter хранит свою версию в `adapter_state`. Содержимое:
 
 - версия adapter/config;
 - scan mode;
@@ -118,7 +124,8 @@ run помечается требующим controlled restart, старый che
 
 Fetch layer обеспечивает:
 
-- один идентифицируемый user agent без маскировки человека;
+- ограниченный user agent/fingerprint выбранного transport; generic HTTP и
+  site-specific WAF/browser transports имеют разные настройки;
 - per-source token bucket/rate limiter;
 - ограниченную concurrency;
 - timeouts и ограниченные retries только для безопасных GET;
@@ -129,8 +136,9 @@ Fetch layer обеспечивает:
 - метрики без сохранения лишнего body.
 
 HTML parser предпочитается browser automation. Playwright разрешён только для
-конкретного adapter/config, с теми же URL/egress ограничениями, без login и обхода
-защит.
+конкретного adapter/config, с теми же URL/egress ограничениями, без login и
+CAPTCHA обхода. Для Rabota standard PROD fallback выключен; emergency browser
+профиль требует отдельного разрешения.
 
 Нормализация сохраняет `None`, если поле отсутствует. Даты приводятся к UTC с
 сохранением исходного значения/locale metadata, salary — к min/max/currency без
@@ -160,7 +168,8 @@ localized URL. Затем общий dedup связывает SourceJob с Canon
 dates, content hash и semantic similarity.
 
 Слабое сходство не приводит к необратимому merge. Исходные SourceJob сохраняются,
-relation можно разъединить. Уникальность отклика контролируется на CanonicalJob,
+relation можно разъединить. Уникальность отклика контролируется на CanonicalJob
+в области профиля,
 а не только на URL публикации.
 
 ## Recheck активных вакансий

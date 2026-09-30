@@ -1,5 +1,8 @@
 # Модель угроз
 
+Актуализировано 2026-09-30; browser roles — [accounts-panel.md](accounts-panel.md),
+окружения и DB roles — [environments.md](environments.md).
+
 ## Область и цель
 
 Модель охватывает `job-agent`: FastAPI/admin/MCP, Celery/Beat, crawler adapters,
@@ -59,8 +62,9 @@ Google, LLM provider, облачная платформа и job boards счит
 - TLS private key не скомпрометирован;
 - PostgreSQL обеспечивает требуемые транзакции/constraints;
 - публичная доступность данных не заменяет юридическую проверку их использования;
-- система одно-пользовательская либо tenant isolation добавлена до multi-user
-  эксплуатации.
+- browser accounts изолируются серверными owner/profile checks; общий каталог
+  источников и операторский bearer остаются общими привилегированными областями.
+  User isolation не превращает REST/MCP bearer в tenant-scoped credential.
 
 Нарушение предположения требует отдельной архитектурной проверки.
 
@@ -98,7 +102,7 @@ Admin / MCP ─authn/authz/audit─► services ─► Celery/Redis
 | T7 | Превышение дневного лимита | массовая отправка | atomic slot reservation, sending/unknown учитываются, final check | неверный timezone/config; нужен audit/alert |
 | T8 | Подмена recipient/attachment | утечка/неверное письмо | sender принимает только application_id, server loads verified records | компрометация БД/admin остаётся высокорисковой |
 | T9 | Broken adapter массово закрывает jobs | потеря вакансий/ошибочные решения | degradation circuit breaker, absence threshold, snapshots, no mass close | медленный частичный drift может обойти baseline |
-| T10 | Обход auth/CSRF | изменение политики/отправка | admin session, CSRF, bearer auth, Origin checks, process-local baseline limiter; внешний gateway для RBAC/distributed limits | stolen admin session или bearer до отзыва/restart |
+| T10 | Обход auth/CSRF | изменение политики/отправка | admin/user session, ownership checks, CSRF, privileged bearer, process-local limiter; gateway для bearer scopes/distributed limits | stolen admin session или bearer до отзыва/restart |
 | T11 | MCP tool abuse | scan DoS, policy/source changes, send attempts | hashed bearer allowlist, schemas, audit, server policy; optional scoped/rate-limiting gateway | встроенный ключ имеет доступ ко всем tools и должен считаться привилегированным |
 | T12 | XSS через HTML/filename/error | кража admin session | escaping/sanitizer, CSP, safe headers/filenames | sanitizer/browser bypass |
 | T13 | SQL/command/template injection | DB/host compromise | parameterized ORM, no shell transforms, strict config, sandboxed containers | уязвимость зависимости/новый unsafe code path |
@@ -193,8 +197,9 @@ multi-party approval нельзя.
 
 - Spoofing: credential theft → secure session, hashed bearer allowlist,
   operator-managed revoke/restart; встроенных bearer scopes нет.
-- Tampering: CSRF/parameter manipulation → CSRF, schemas, audit; RBAC требует
-  внешнего gateway или новой серверной модели.
+- Tampering: CSRF/parameter manipulation → CSRF, schemas, audit и admin/user ownership
+  checks. Read/write scopes для bearer требуют внешнего gateway или отдельной
+  серверной модели; browser role не создаёт bearer scope.
 - Repudiation: отрицание approve/send → actor/correlation AuditEvent.
 - Information disclosure: over-broad responses → field-level minimization/redaction.
 - Denial of service: scans/large uploads → rate/body/task limits.
@@ -240,9 +245,9 @@ multi-party approval нельзя.
 - Disclosure: volume/backup theft → host access controls; encryption/off-host
   retention должен настроить оператор.
 - DoS: disk/queue exhaustion → quotas/alerts/backpressure.
-- Elevation: migration/runtime credential слишком широк → поставляемый Compose не
-  разделяет эти DB roles; production deployment должен разделить их до расширения
-  круга операторов/тенантов.
+- Elevation: migration/runtime credential слишком широк → PROD Compose разделяет
+  `jobhunter_app` и `jobhunter_migrator` и проверяет роль при старте. Базовый DEV
+  credential не используется как production runtime credential.
 
 ## Privacy threats
 
@@ -251,12 +256,14 @@ multi-party approval нельзя.
 - отправка чрезмерного объёма профиля LLM/provider;
 - хранение вакансий/контактов/резюме дольше цели;
 - раскрытие PII в daily report/metrics;
-- межпользовательское смешение данных при будущем multi-tenant режиме;
+- межпользовательское смешение данных из-за пропущенной owner/profile проверки
+  в новом route, worker или Gmail path;
 - использование публичного личного email вне цели публикации.
 
 Меры: data minimization, purpose limitation, field-level auth, retention/delete
-workflow, no PII metric labels, tenant key во всех constraints/queries до
-multi-user запуска, review contact purpose/evidence.
+workflow, no PII metric labels, owner/profile checks в каждом browser action,
+account-scoped Gmail credential/cursor, background lifecycle gates и negative
+изоляционные тесты; review contact purpose/evidence.
 
 ## Availability и safe failure
 
@@ -283,7 +290,8 @@ multi-user запуска, review contact purpose/evidence.
   но неверный merge может блокировать второй отклик.
 - Условия сайта и право меняются; техническая реализация не является юридическим
   заключением.
-- Single-admin deployment имеет высокий insider risk.
+- Привилегированный оператор и любой валидный REST/MCP bearer сохраняют высокий
+  insider risk даже при изолированных browser user accounts.
 - Docker/host root может читать процессы, volumes и secrets.
 - Backup с PII остаётся чувствительным даже после удаления live-записи до истечения
   retention.

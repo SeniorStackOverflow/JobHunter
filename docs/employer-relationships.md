@@ -1,5 +1,7 @@
 # Employer relationship memory
 
+Сверено с текущей реализацией 2026-09-30.
+
 JobHunter resolves each source vacancy to a `CanonicalEmployer` using exact source
 profile identifiers, verified domains, public email addresses, and known phone
 numbers. A normalized company name is review evidence only and never merges two

@@ -1,58 +1,67 @@
-# Rabota.md
+# Rabota.md: текущий источник и транспорт
 
-Дата актуализации реализации: 2026-08-11.
+Актуализировано 2026-09-30 по `app/crawlers/adapters/rabota_md`,
+`config/sources/rabota-md.yaml` и production Compose. Это описание реализации,
+а не результат нового live crawl или проверки публичных условий сайта.
 
 ## Рабочая поверхность
 
-Crawler читает публичные страницы `https://www.rabota.md/ru/vacancies` и
-верхнеуровневые категории вида `/ru/vacancies/category/<slug>`. Ссылки на
-вложенные профессии намеренно не становятся отдельными entrypoint.
+Источник `rabota_md` читает публичную `/ru/vacancies` и верхнеуровневые категории
+`/ru/vacancies/category/<slug>`. Вложенные профессии не создают отдельный entrypoint.
+Основной PROD transport — `waf_http`: HTTP fetcher, bounded pure-Python AWS WAF
+solver и egress validation. Стандартный image без Chromium, runtime fallback —
+`none`. Старое утверждение «persistent Chromium — основной транспорт» не актуально.
 
-Для Rabota.md используется один persistent Chromium context с
-`playwright-stealth`. Он сохраняет cookies между listing/detail запросами и
-закрывается в конце scan. Встроенный HTTP adapter остаётся только тестовым и
-аварийным transport.
+Production использует primary egress и proven proxy reserve. Успешный сетевой
+ответ сам по себе не делает proxy ready: необходимы landing + pagination proof.
+Maintenance обслуживает отдельный `proxy-worker`; параметры и bounded failure
+states описаны в [emergency/reserve runbook](../operations/rabota-browser-emergency.md).
 
-## Пагинация
+Browser transport сохранён как отдельно разрешаемый emergency profile. Его
+активация меняет crawler image и является исключением из обычного single-image
+rollout; это не автоматический fallback основного PROD. Не устанавливайте Chromium
+в основной image и не запускайте live smoke без разрешения ради проверки docs.
 
-Первая страница категории открывается обычной browser navigation. Следующие
-страницы берутся из фактического `data-next` текущего HTML и загружаются в том же
-browser context через `POST` с `X-Requested-With: XMLHttpRequest`. Ответ обязан
-иметь форму `success=true` и строковый `data.content`.
+## Пагинация и ограничения
 
-Ограничения:
+Следующая страница извлекается из фактического `data-next` и запрашивается POST
+с `X-Requested-With: XMLHttpRequest`. JSON обязан содержать `success=true` и
+строковый `data.content`. Landing/detail/pagination используют согласованный
+transport/egress; WAF cookies и токены не публикуются в диагностике.
 
-- максимум 100 страниц на категорию для full scan;
-- максимум 20 страниц на incremental scan;
-- обнаруженные page URL и vacancy ID защищены от циклов;
-- нулевой результат, резкое падение количества и высокая доля parse errors
-  переводят источник в degraded/partial;
-- CAPTCHA, login redirect, 403 и 429 не считаются пустой выдачей.
+По умолчанию full scan ограничен 100 страницами на entrypoint, incremental — 20.
+Защита от повторных URL/ID предотвращает циклы. Rate — 50 запросов в минуту с
+minimum interval 1,2 секунды. Challenge, CAPTCHA, login redirect, 403/429,
+network/parse failures не превращаются в «пустую выдачу» и не подтверждают
+закрытие вакансии. При деградации массовые close transitions блокируются.
 
-## Умеренная интенсивность
+## Расписание и конфигурация
 
-Общий limiter экземпляра пропускает не более 50 browser-запросов в минуту с
-интервалом не менее 1,2 секунды. Контекст и page общие, поэтому listing, AJAX и
-detail requests не могут обойти этот предел параллельными ветками. Изображения,
-media, fonts и websocket блокируются как ненужные для извлечения вакансий.
+Конфигурация, сохранённая в `JobSource.configuration`, управляет реальным
+расписанием. YAML и `job-agent seed` создают разные исходные настройки; seed не
+обновляет уже существующий источник и не является production migration.
 
-Расписание production-конфигурации:
+| Настройка | `config/sources/rabota-md.yaml` | Новый seed из CLI |
+| --- | --- | --- |
+| Transport | `waf_http`, fallback `none` | legacy `use_stealth_browser=true` |
+| Incremental | `0 * * * *`, категория `others` | То же |
+| Active recheck | `0 2 * * *` | `20 * * * *`, max 300, min interval 20 h |
+| Full | `0 3 * * *`, checkpoint resume | То же |
+| Enabled / downstream | disabled / paused после безопасного seed | disabled / paused |
 
-- hourly incremental: только верхнеуровневая категория `others`;
-- daily full: все верхнеуровневые категории;
-- daily active-job recheck: отдельная операция.
+Перед включением нового источника проверьте actual DB configuration и задайте
+production transport явно. Не предполагается, что YAML автоматически загружен
+или seed уже соответствует browser-free PROD. При явном `transport` убирайте
+противоречащий legacy `use_stealth_browser`.
 
-Hourly incremental предназначен прежде всего для новых external ID. Если listing
-не отдаёт update timestamp, detail уже известной вакансии повторно загружается не
-чаще одного раза за 24 часа; новый ID всегда загружается полностью. Daily full не
-использует этот shortcut и остаётся полным refresh всех категорий. На реальной
-странице 100 известных вакансий такой incremental занимает около 9 секунд вместо
-примерно 4 минут.
+Incremental всегда загружает новые ID. Известные detail refresh по умолчанию
+откладываются на 72 часа с deterministic jitter до 12 часов; budget — 50 refresh
+на run. Daily full остаётся refresh доступной выдачи. Время/глубина зависят от
+фактического сайта; старое число секунд на конкретной live странице не является SLA.
 
-Источник после seed остаётся выключенным и с paused downstream. Включение
-выполняется оператором после малого live smoke и проверки публичных условий.
-Crawling и расписания после включения работают независимо от downstream-паузы;
-matching, applications и email из paused scan автоматически не ставятся в очередь.
+Физический crawl общий; per-profile выбор источников ограничивает downstream.
+При `automatic_actions_paused` crawl может продолжаться, но matching/applications
+не запускаются из paused scan. Account/profile readiness gates действуют отдельно.
 
 ## Нормализация
 
@@ -90,13 +99,13 @@ Matching хранит источник-категории без подмены 
 `public_emails`/`public_phones`; первый валидный контакт дублируется в
 `public_email`/`public_phone` для совместимости с application pipeline.
 
-## Проверки
+## Проверки и история исследования
 
-- unit fixtures проверяют верхнеуровневые категории, AJAX pagination, checkpoint,
-  full description, email и расширенную матрицу телефонов;
-- `scripts/check_playwright_stealth.py` выполняет opt-in smoke на Sannysoft и
-  сохраняет JSON-диагностику без cookies;
-- live Rabota smoke получает ограниченное число реальных вакансий и не отправляет
-  отклики;
-- полный application/email test выполняется отдельно через policy engine и
-  idempotency key с заранее выбранными vacancy, recipient, resume и текстом.
+Локальные fixtures проверяют listing/detail normalization, пагинацию, checkpoint,
+WAF failure taxonomy, proxy proof и bounded retry. Live Rabota smoke отдельно
+opt-in, с ограниченной глубиной и без отправки откликов. Полный application/email
+E2E выполняется на fixture source и fake Gmail.
+
+[HTTP/WAF design](rabota-md-http.md) и [pure-Python spike](rabota-md-pure-python.md)
+сохранены как исторические исследования. Их прежние fallback proposals и фраза
+«реализация не начата» не описывают текущий production.

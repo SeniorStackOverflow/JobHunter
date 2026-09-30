@@ -1,5 +1,7 @@
 # Browser login and Gmail authorization
 
+Сверено с текущей реализацией 2026-09-30.
+
 The account and operator panels use persistent, signed HttpOnly cookies with a
 30-day inactivity window by default. Successful authenticated requests renew a
 session after one day (or half its configured lifetime for shorter lifetimes).
@@ -32,9 +34,10 @@ must meet the applicable verification requirements. Publishing does not promise
 that every token is permanent: revocation, Gmail password changes, unused tokens,
 token limits and account policy can still require consent again.
 
-On 2026-09-30, a read-only check matched the deployed JobHunter OAuth client to its
+An earlier read-only check on 2026-09-30 matched the deployed JobHunter OAuth client to its
 Google Cloud project and confirmed **In production**. No Cloud configuration was
-changed. If a previously issued Testing token expires, reconnect Gmail once after
+changed. This dated observation is not a new Cloud check during the documentation
+refresh. If a previously issued Testing token expires, reconnect Gmail once after
 the app is published. Do not repeatedly mint refresh tokens on ordinary login.
 
 An expired or revoked refresh token cannot be silently replaced: Google requires

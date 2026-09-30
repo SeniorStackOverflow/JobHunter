@@ -1,8 +1,10 @@
 # Эксплуатация
 
-Документ предназначен для оператора `job-agent`. Он дополняет, но не заменяет
-runbook облачной платформы. Команды ниже предполагают стандартные имена сервисов
-`api`, `worker`, `beat`, `postgres`, `redis`, `caddy`; сверяйте их с Compose-файлом.
+Актуализировано 2026-09-30. Команды выполняются из `/srv/jobhunter-prod`
+через production wrapper (на текущем host — с `sudo`). Основной web ingress —
+системный Caddy. App services: `api`, `worker`, `matching-worker`, `proxy-worker`,
+`control-worker`, `beat`, `call-agent`; data services — `postgres`, `redis`.
+[Развёртывание](deployment.md) описывает gate, image verification и откат.
 
 ## Безопасные операционные принципы
 
@@ -33,13 +35,37 @@ runbook облачной платформы. Команды ниже предп�
 
 ```bash
 ./deploy/prod-compose.sh ps
-./deploy/prod-compose.sh logs --since=24h --tail=500 api worker beat
+./deploy/prod-compose.sh logs --since=24h --tail=500 api worker matching-worker proxy-worker control-worker beat call-agent
 ./deploy/prod-compose.sh exec -T worker celery -A app.scheduler.celery_app:celery_app inspect ping
 ./deploy/prod-compose.sh exec -T worker celery -A app.scheduler.celery_app:celery_app inspect active
 ```
 
 Если путь Celery application в проекте иной, используйте фактический аргумент
 запуска worker. Не выводите полное окружение контейнера в лог диагностики.
+
+## Очереди и рабочая панель
+
+| PROD процесс | Очереди |
+| --- | --- |
+| `worker` | `crawling,celery` |
+| `matching-worker` | `matching,applications` |
+| `proxy-worker` | `proxy-maintenance` |
+| `control-worker` | `email,reports,maintenance,phone` |
+
+Celery `inspect ping` должен показать четыре worker hostname: crawler, matching,
+proxy, control. Здоровый API не подтверждает их работу. Beat запущен в одном
+экземпляре; `call-agent` является отдельным singleton process.
+
+В общей панели шапка показывает актуальные задачи и дневной лимит выбранного
+профиля, sidebar — sources/Gmail/scans. Источники проверяются из «Настроек»;
+системные предупреждения и AuditEvent — «История → Уведомления/Журнал системы»;
+телефон — «Звонки». Отдельной «Диагностики» нет.
+
+Задача исчезает после успешного выполнения. Source alert считается устранённым
+только после доказанного успешного scan; queue/partial/failed не закрывают его.
+Отметка «Прочитано» убирает warning из непрочитанных, но не подтверждает ремонт.
+Неизвестный старый warning не истекает автоматически через 24 часа.
+Подробнее — [panel-notifications.md](panel-notifications.md).
 
 ## Состояния сканирования
 
@@ -191,7 +217,8 @@ backend-сети; Caddy намеренно отвечает `404` на публ�
 показывает registry именно опрошенного API-процесса. Метрики, увеличенные Celery
 worker-ом, не агрегируются в него автоматически, потому что multiprocess collector
 или отдельный worker exporter не настроен. В Compose нет Prometheus, Alertmanager,
-экспортёра очереди, планировщика уведомлений или off-host log sink. Счётчики
+экспортёра очереди или off-host log sink. Внутренние domain alerts и отдельная
+phone Telegram task не заменяют внешний infrastructure alert pipeline. Счётчики
 сбрасываются при рестарте; оператор должен добавить внешний сбор/агрегацию и
 отдельную наблюдаемость worker/Beat/очереди. Перечень выше — требования к внешним
 alert rules, а не уже настроенные уведомления.
@@ -251,7 +278,7 @@ docker run -d --rm --name "$RESTORE_NAME" \
   --network none \
   --env-file "$RESTORE_ENV_FILE" \
   -v "$RESTORE_NAME-data:/var/lib/postgresql/data" \
-  -v jobhunter-prod_backup_data:/backups:ro \
+  -v jobhunter_backup_data:/backups:ro \
   postgres:16-alpine
 
 # Wait for readiness, then run pg_restore inside the disposable container.
@@ -267,7 +294,9 @@ docker volume rm "$RESTORE_NAME-data"
 rm -f "$RESTORE_ENV_FILE"
 ```
 
-Замените имя файла на фактическое значение команды backup. Одноразовый пароль
+Замените имя файла на фактическое значение команды backup. Имя volume на
+текущем host — `jobhunter_backup_data`; на другой установке проверьте фактический
+Compose project/volume перед запуском drill. Одноразовый пароль
 передаётся только через файл mode `0600`, не через argv. Если выполняется
 checksum-проверка, проверяйте соседний `.sha256` до запуска `pg_restore`.
 Восстановление использует `--clean`, `--if-exists`, `--exit-on-error`,
@@ -284,14 +313,16 @@ checksum-проверка, проверяйте соседний `.sha256` до 
 ## Destructive restore production database
 
 Для восстановления рабочей БД сначала включите глобальную паузу и server-side
-real-send kill switch, остановите `api`, `worker` и `beat`, сохраните текущую БД
+real-send kill switch, остановите `api`, все четыре worker, `beat` и `call-agent`, сохраните текущую БД
 отдельным backup и только затем запускайте production `restore` с явно указанной
 целевой БД. Не выполняйте destructive restore поверх работающего приложения.
 
 ## Ротация ключей и credentials
 
 - Session secret: реализация использует один активный ключ без key ring; его
-  замена инвалидирует существующие admin-сессии.
+  замена инвалидирует существующие admin/user-сессии. Для одного user
+  account suspension/version change отзывает его browser session; cookie logout
+  сам по себе не является server-side revoke скопированной admin session.
 - MCP/API bearer: конфигурация принимает список SHA-256 hash. Для перехода можно
   временно добавить hash нового значения, перезапустить API, заменить клиентский
   secret, затем удалить старый hash и снова перезапустить. В БД нет владельцев,

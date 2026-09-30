@@ -1,5 +1,10 @@
 # Phone Phase 2b DEV acceptance
 
+> Исторический design/spike/acceptance record. Даты, результаты и предложения ниже
+> относятся к моменту записи и не заменяют текущую эксплуатацию. Актуальное
+> состояние на 2026-09-30: [инструкция](../phone-agent.md).
+
+
 Acceptance run date: 2026-09-08 (Europe/Chisinau)
 
 This artifact records the DEV checks completed from the `phone-2b-impl`

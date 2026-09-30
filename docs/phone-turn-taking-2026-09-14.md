@@ -1,5 +1,10 @@
 # Phone call turn-taking hardening — 2026-09-14
 
+> Исторический design/spike/acceptance record. Даты, результаты и предложения ниже
+> относятся к моменту записи и не заменяют текущую эксплуатацию. Актуальное
+> состояние на 2026-09-30: [инструкция](phone-agent.md).
+
+
 ## Why this change exists
 
 The 2026-09-14 production calls showed a strong behavioral pattern: answered employer calls ended during the second assistant prompt or very shortly after it. PhoneGate A/B checks showed RX works on both daemon 0.2.36 and 0.2.37 before and after TTS, so a blanket RX/HAL failure is not a sufficient explanation.

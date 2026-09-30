@@ -1,5 +1,13 @@
 # Phone Call Agent — Phase 2b production-readiness extension
 
+> Исторический план/спецификация, сохранённый при актуализации 2026-09-30.
+> Ниже — исходное состояние проекта на дату документа; предлагаемые функции,
+> команды, SHA, шаблоны и acceptance не являются текущим production runbook.
+> Актуальные инструкции: [оглавление docs](../../README.md),
+> [панель](../../accounts-panel.md), [телефон](../../phone-agent.md),
+> [обучение](../../review-learning.md), [развёртывание](../../deployment.md).
+
+
 Date: 2026-09-06
 
 Status: approved design, implementation planned
