@@ -23,8 +23,8 @@ closed or explicitly reopened. PostgreSQL employer-row locks serialize the final
 policy check, and the same gates run during preparation, immediately before send,
 and before every delivery retry.
 
-The DEV [daily-minimum implementation](daily-minimum-catchup.md), pending a
-separate rollout, enforces one active slot regardless of older configurable
+The [daily-minimum implementation](daily-minimum-catchup.md), deployed to PROD
+as `4f04db0` on 2026-09-30, enforces one active slot regardless of older configurable
 limits. It conservatively guards company names against multiple same-day
 sends/reservations across employer IDs without merging identities. The audited
 `close-unanswered` API requires recent Gmail synchronization and an elapsed
