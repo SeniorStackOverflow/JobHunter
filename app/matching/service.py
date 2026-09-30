@@ -12,9 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications.daily_target import (
-    minimum_catchup_active as daily_minimum_catchup_active,
-)
-from app.applications.daily_target import (
+    daily_target_state,
     minimum_catchup_score,
 )
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
@@ -53,6 +51,7 @@ from app.matching.schemas import (
 )
 from app.models.entities import (
     Application,
+    EmployerRelationship,
     JobPreference,
     JobSnapshot,
     MatchEvaluation,
@@ -62,6 +61,7 @@ from app.models.entities import (
 )
 from app.models.enums import (
     ApplicationStatus,
+    EmployerRelationshipState,
     MatchDecision,
     PolicyDecision,
 )
@@ -69,7 +69,6 @@ from app.profiles.service import ProfileService, choose_resume_for_job
 from app.profiles.sources import source_selected
 from app.settings import Settings, get_settings
 from app.telemetry import record_external_call_attempts
-from app.time_utils import local_day_bounds
 
 _MAX_JOB_FIELD_CHARS = 50_000
 _MAX_RESUME_SUMMARY_CHARS = 50_000
@@ -399,24 +398,9 @@ def _estimate_resume_fit(
 async def _minimum_catchup_active(
     session: AsyncSession, preference: JobPreference, profile_id: UUID
 ) -> bool:
-    # A configured minimum is an operational requirement, not an advisory flag.
-    # The legacy force_minimum_daily_applications key is intentionally ignored.
-    _start_local, start_of_day, _end_of_day = local_day_bounds()
-    sent_today = await session.scalar(
-        select(func.count(Application.id)).where(
-            Application.profile_id == profile_id,
-            Application.status == ApplicationStatus.SENT,
-            Application.sent_at >= start_of_day,
-        )
-    )
-    reserved_auto_send = await session.scalar(
-        select(func.count(Application.id)).where(
-            Application.profile_id == profile_id,
-            Application.status.in_({ApplicationStatus.AUTO_APPROVED, ApplicationStatus.SENDING}),
-        )
-    )
-    progress = int(sent_today or 0) + int(reserved_auto_send or 0)
-    return daily_minimum_catchup_active(preference, progress)
+    if preference.profile_id != profile_id:
+        return False
+    return (await daily_target_state(session, preference)).remaining > 0
 
 
 async def _select_resume(session: AsyncSession, profile_id: UUID, job: SourceJob) -> Resume | None:
@@ -463,6 +447,7 @@ def _apply_same_input_safety_guard(
     source_matching_hash: str,
     profile_fingerprint_value: str,
     preference_fingerprint_value: str,
+    allow_soft_catchup: bool = False,
 ) -> MatchResult:
     if previous is None:
         return result
@@ -475,7 +460,25 @@ def _apply_same_input_safety_guard(
         return result
 
     regression: str | None = None
-    if previous.decision is MatchDecision.SKIP and result.decision is MatchDecision.AUTO_APPLY:
+    safe_soft_recheck = (
+        allow_soft_catchup
+        and bool(result.soft_mismatches)
+        and not previous.missing_requirements
+        and not previous.scam_indicators
+        and not [
+            risk
+            for risk in (previous.risks or [])
+            if risk != "experience_relevance_requires_review"
+        ]
+        and not result.missing_requirements
+        and not result.scam_indicators
+        and not result.risks
+    )
+    if (
+        previous.decision is MatchDecision.SKIP
+        and result.decision is MatchDecision.AUTO_APPLY
+        and not safe_soft_recheck
+    ):
         regression = "skip_to_auto_apply_same_inputs"
     elif (
         previous.missing_requirements
@@ -620,6 +623,8 @@ def reconcile_match_result(
         scam_indicators=scam_indicators,
         decision=decision,
         reason=reason[:4000],
+        soft_mismatches=llm_result.soft_mismatches,
+        optional_requirements_missing=llm_result.optional_requirements_missing,
     )
 
 
@@ -645,12 +650,14 @@ class MatchingService:
         resume_category: str | None = None,
         resume_summary: str | None = None,
         minimum_auto_send_score: int | None = None,
+        allow_soft_catchup: bool = False,
     ) -> tuple[MatchResult, str | None, list[dict[str, Any]]]:
         deterministic = self.prefilter.evaluate(
             job,
             preference,
             profile,
             resume_fit=resume_fit,
+            allow_soft_catchup=allow_soft_catchup,
         )
         if not deterministic.eligible_for_ai:
             return deterministic.to_match_result(), None, []
@@ -756,6 +763,7 @@ class MatchingService:
             resume_fit=resume_fit,
             resume_category=resume_category,
             minimum_auto_send_score=effective_auto_send_score,
+            allow_soft_catchup=minimum_catchup_active,
         )
         result = _apply_same_input_safety_guard(
             previous_evaluation,
@@ -763,6 +771,7 @@ class MatchingService:
             source_matching_hash=expected_matching_hash,
             profile_fingerprint_value=current_profile_fingerprint,
             preference_fingerprint_value=current_preference_fingerprint,
+            allow_soft_catchup=minimum_catchup_active,
         )
         result = _apply_missing_resume_guard(result, resume)
         if resume is not None:
@@ -808,6 +817,8 @@ class MatchingService:
             resume_fit=result.resume_fit,
             preference_fit=result.preference_fit,
             overall_fit=result.overall_fit,
+            soft_mismatches=result.soft_mismatches,
+            optional_requirements_missing=result.optional_requirements_missing,
             requirements_met=result.requirements_met,
             missing_requirements=result.missing_requirements,
             risks=result.risks,
@@ -882,6 +893,50 @@ async def process_unprocessed_jobs() -> int:
             ).all()
 
             candidates: list[tuple[UUID, bool, bool]] = []
+            target = await daily_target_state(session, preference)
+            unavailable_employers = set(
+                (
+                    await session.scalars(
+                        select(EmployerRelationship.employer_id).where(
+                            EmployerRelationship.profile_id == profile.id,
+                            EmployerRelationship.state.in_(
+                                {
+                                    EmployerRelationshipState.APPLICATION_ACTIVE,
+                                    EmployerRelationshipState.EMPLOYER_REPLIED,
+                                    EmployerRelationshipState.INTERVIEW_PENDING,
+                                    EmployerRelationshipState.INTERVIEWED,
+                                    EmployerRelationshipState.HIRED,
+                                    EmployerRelationshipState.CANDIDATE_DECLINED,
+                                }
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            first_jobs: set[UUID] = set()
+            seen_employers: set[str] = set()
+            if target.remaining > 0:
+                rows = sorted(
+                    rows,
+                    key=lambda row: (
+                        row[0].employer_id in unavailable_employers,
+                        row[0].public_email is None,
+                        -(row[1].overall_fit if row[1] is not None else 0),
+                    ),
+                )
+                for candidate_job, _, _ in rows:
+                    employer_key = str(
+                        candidate_job.employer_id
+                        or normalize_for_fingerprint(candidate_job.company or "")
+                    )
+                    if (
+                        employer_key
+                        and employer_key not in seen_employers
+                        and candidate_job.employer_id not in unavailable_employers
+                    ):
+                        first_jobs.add(candidate_job.id)
+                        seen_employers.add(employer_key)
+                rows = sorted(rows, key=lambda row: row[0].id not in first_jobs)
             for job, evaluation, snapshot_at in rows:
                 resume = choose_resume_for_job(resumes, job)
                 retry_due = bool(
@@ -943,7 +998,7 @@ async def process_unprocessed_jobs() -> int:
                         (
                             job.id,
                             deterministic.eligible_for_ai,
-                            job.id in priority_source_ids,
+                            job.id in priority_source_ids or job.id in first_jobs,
                         )
                     )
 

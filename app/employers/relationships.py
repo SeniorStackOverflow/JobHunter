@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import desc, func, or_, select
@@ -14,10 +14,12 @@ from app.models.entities import (
     Application,
     CanonicalEmployer,
     EmailDelivery,
+    EmailMailboxCursor,
     EmployerInteractionEvent,
     EmployerRelationship,
     MatchEvaluation,
     SourceJob,
+    UserProfile,
 )
 from app.models.enums import (
     ApplicationStatus,
@@ -25,6 +27,7 @@ from app.models.enums import (
     EmployerInteractionChannel,
     EmployerInteractionType,
     EmployerRelationshipState,
+    MatchDecision,
     SuppressionScope,
 )
 from app.observability.metrics import EMPLOYER_RELATIONSHIP_EVENTS_CREATED
@@ -116,6 +119,90 @@ def classify_candidate_decline(
 
 
 class EmployerRelationshipService:
+    async def close_unanswered(
+        self,
+        session: AsyncSession,
+        *,
+        profile_id: UUID,
+        employer_id: UUID,
+        actor: str,
+        reason: str,
+        waiting_days: int = 45,
+        cooldown_days: int = 90,
+    ) -> EmployerRelationship:
+        if not 1 <= waiting_days <= cooldown_days <= 730:
+            raise ValueError("invalid unanswered waiting/cooldown window")
+        profile = await session.get(UserProfile, profile_id)
+        cursor = (
+            await session.get(EmailMailboxCursor, (profile.owner_account_id, "gmail"))
+            if profile
+            else None
+        )
+        now = datetime.now(UTC)
+        if (
+            cursor is None
+            or cursor.last_checked_at is None
+            or _utc(cursor.last_checked_at) < now - timedelta(hours=1)
+        ):
+            raise ValueError("successful Gmail synchronization within the last hour is required")
+        relationship = await self._locked_relationship(
+            session, profile_id=profile_id, employer_id=employer_id
+        )
+        last_sent = relationship.last_application_at
+        if (
+            relationship.state is not EmployerRelationshipState.APPLICATION_ACTIVE
+            or last_sent is None
+        ):
+            raise ValueError("only an unanswered active application can be closed")
+        if _utc(last_sent) > now - timedelta(days=waiting_days):
+            raise ValueError("unanswered waiting window has not elapsed")
+        if relationship.last_interaction_at and _utc(relationship.last_interaction_at) > _utc(
+            last_sent
+        ):
+            raise ValueError("a later employer interaction requires manual review")
+        unknown = await session.scalar(
+            select(Application.id)
+            .where(
+                Application.profile_id == profile_id,
+                Application.employer_id == employer_id,
+                Application.status.in_(
+                    {ApplicationStatus.SENDING, ApplicationStatus.DELIVERY_UNKNOWN}
+                ),
+            )
+            .limit(1)
+        )
+        if unknown is not None or relationship.suppression_scope is not SuppressionScope.NONE:
+            raise ValueError(
+                "in-flight/unknown delivery or suppression cannot be closed as silence"
+            )
+        cooldown_until = _utc(last_sent) + timedelta(days=cooldown_days)
+        event, _ = await self.record_event(
+            session,
+            profile_id=profile_id,
+            employer_id=employer_id,
+            event_type=EmployerInteractionType.RELATIONSHIP_REOPENED,
+            channel=EmployerInteractionChannel.MANUAL,
+            idempotency_key=f"close-unanswered:{profile_id}:{employer_id}:{_utc(last_sent).isoformat()}",
+            event_metadata={
+                "unanswered_closed": True,
+                "reason": reason[:255],
+                "actor": actor,
+                "waiting_days": waiting_days,
+                "cooldown_until": cooldown_until.isoformat(),
+            },
+        )
+        await record_audit_event(
+            session,
+            actor=actor,
+            action="employer.unanswered_closed",
+            entity_type="canonical_employer",
+            entity_id=str(employer_id),
+            correlation_id=str(event.id),
+            decision="closed_with_cooldown",
+            details={"profile_id": str(profile_id), "cooldown_until": cooldown_until.isoformat()},
+        )
+        return relationship
+
     async def suppress(
         self,
         session: AsyncSession,
@@ -343,7 +430,10 @@ class EmployerRelationshipService:
         ):
             relationship.last_interaction_at = event.occurred_at
         event_type = event.event_type
-        employer_suppressed = relationship.suppression_scope is SuppressionScope.EMPLOYER
+        employer_suppressed = (
+            relationship.suppression_scope is SuppressionScope.EMPLOYER
+            and relationship.suppression_reason != "unanswered_contact_cooldown"
+        )
         if event_type is EmployerInteractionType.APPLICATION_SENT:
             relationship.last_application_at = event.occurred_at
             if not employer_suppressed:
@@ -399,6 +489,13 @@ class EmployerRelationshipService:
             relationship.suppression_reason = event_type.value
             relationship.suppressed_by_event_id = event.id
         elif event_type is EmployerInteractionType.RELATIONSHIP_REOPENED:
+            if (
+                event.event_metadata.get("unanswered_closed") is True
+                and relationship.state is not EmployerRelationshipState.APPLICATION_ACTIVE
+            ):
+                # A reply discovered by a later Gmail sync can predate this
+                # closure. Replaying the log must preserve the active contact.
+                return
             relationship.state = EmployerRelationshipState.NEVER_CONTACTED
             relationship.suppression_scope = SuppressionScope.NONE
             relationship.suppression_reason = None
@@ -406,6 +503,12 @@ class EmployerRelationshipService:
             relationship.suppressed_by_event_id = None
             relationship.suppressed_canonical_job_id = None
             relationship.suppressed_role_family = None
+            if event.event_metadata.get("unanswered_closed") is True:
+                relationship.suppression_scope = SuppressionScope.EMPLOYER
+                relationship.suppression_reason = "unanswered_contact_cooldown"
+                relationship.suppressed_until = datetime.fromisoformat(
+                    event.event_metadata["cooldown_until"]
+                )
 
     async def policy_outcome(
         self,
@@ -416,6 +519,7 @@ class EmployerRelationshipService:
         job: SourceJob,
         max_active_applications: int = 1,
         freeze_active_conversation: bool = True,
+        rank_candidates: bool = True,
     ) -> EmployerPolicyOutcome:
         employer_id = application.employer_id or job.employer_id
         if employer_id is None:
@@ -504,7 +608,12 @@ class EmployerRelationshipService:
         active_other = await session.scalar(active_other_query)
         ranked_rows = (
             await session.execute(
-                select(Application.id)
+                select(
+                    Application.id,
+                    Application.content_validated,
+                    Application.policy_result,
+                    MatchEvaluation,
+                )
                 .join(MatchEvaluation, MatchEvaluation.id == Application.match_evaluation_id)
                 .where(
                     Application.profile_id == application.profile_id,
@@ -524,10 +633,37 @@ class EmployerRelationshipService:
                     MatchEvaluation.created_at,
                     Application.id,
                 )
-                .limit(max_active_applications)
             )
         ).all()
-        ranked_ids = {row.id for row in ranked_rows}
+        qualified_rows = [
+            row
+            for row in ranked_rows
+            if (
+                row.content_validated
+                and not row.MatchEvaluation.missing_requirements
+                and not row.MatchEvaluation.scam_indicators
+                and not [
+                    risk
+                    for risk in (row.MatchEvaluation.risks or [])
+                    if risk != "experience_relevance_requires_review"
+                ]
+                and row.MatchEvaluation.decision is not MatchDecision.BLOCK
+                and (
+                    row.MatchEvaluation.decision is not MatchDecision.SKIP
+                    or row.MatchEvaluation.soft_mismatches
+                )
+                and not set((row.policy_result or {}).get("rules_failed", []))
+                - {
+                    "overall_score_threshold",
+                    "match_auto_apply",
+                    "match_not_skipped",
+                    "employer_application_slot_available",
+                    "no_active_employer_conversation",
+                    "distinct_employer_today",
+                }
+            )
+        ]
+        ranked_ids = {row.id for row in (qualified_rows or ranked_rows)[:max_active_applications]}
         best_candidate = (
             (
                 application.status is ApplicationStatus.FAILED
@@ -537,6 +673,8 @@ class EmployerRelationshipService:
             or not ranked_ids
             or application.id in ranked_ids
         )
+        if not rank_candidates:
+            best_candidate = True
         slot_available = (
             int(active_other or 0) < max_active_applications
             and best_candidate

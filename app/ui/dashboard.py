@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.applications.diagnostics import daily_minimum_audit
 from app.email.oauth import GmailOAuthService
 from app.learning import (
     LearnedReviewScore,
@@ -278,16 +279,7 @@ async def render_dashboard(
         preferences,
         settings,
     )
-    sent_today = int(
-        await session.scalar(
-            select(func.count(Application.id)).where(
-                Application.profile_id == selected_profile_id,
-                Application.sent_at >= start,
-                Application.sent_at < end,
-            )
-        )
-        or 0
-    )
+    target_audit = await daily_minimum_audit(session, selected_profile_id)
     overview = {
         "today_found": sum(item.found_jobs for item in today_scans),
         "today_new": sum(item.new_jobs for item in today_scans),
@@ -296,9 +288,10 @@ async def render_dashboard(
         "review": decisions.get(MatchDecision.PREPARE_FOR_REVIEW, 0),
         "skip": decisions.get(MatchDecision.SKIP, 0),
         "block": decisions.get(MatchDecision.BLOCK, 0),
-        "sent_today": sent_today,
+        "sent_today": target_audit["sent"],
         "daily_limit": preferences.maximum_daily_applications,
         "matching_backlog": matching_backlog,
+        "daily_target": target_audit,
     }
     gmail_oauth = await GmailOAuthService(settings).get_status(
         session, account_id=profile.owner_account_id

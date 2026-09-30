@@ -1,0 +1,46 @@
+{
+  "observed_on": "2026-09-30",
+  "scope": "Saved current policy joined to historical daily evaluation cohorts; not reconstructed historical decisions. Legacy skips lack soft classification.",
+  "days": [
+    {
+      "local_date": "2026-09-27",
+      "evidence_scope": "day_evaluations_with_current_saved_policy",
+      "sent_by_timestamp": 1,
+      "unique_evaluations": 71,
+      "replay": [
+        {
+          "threshold": 60,
+          "unique_ready_employers": 0
+        },
+        {
+          "threshold": 50,
+          "unique_ready_employers": 0
+        },
+        {
+          "threshold": 40,
+          "unique_ready_employers": 0
+        }
+      ]
+    },
+    {
+      "local_date": "2026-09-28",
+      "evidence_scope": "day_evaluations_with_current_saved_policy",
+      "sent_by_timestamp": 1,
+      "unique_evaluations": 117,
+      "replay": [
+        {
+          "threshold": 60,
+          "unique_ready_employers": 0
+        },
+        {
+          "threshold": 50,
+          "unique_ready_employers": 0
+        },
+        {
+          "threshold": 40,
+          "unique_ready_employers": 0
+        }
+      ]
+    }
+  ]
+}

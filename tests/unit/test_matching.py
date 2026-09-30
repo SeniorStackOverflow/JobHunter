@@ -879,7 +879,7 @@ async def test_analyze_persists_match_evaluation_without_network() -> None:
         assert evaluation.source_job_id == job.id
         assert evaluation.canonical_job_id == canonical.id
         assert evaluation.model == "mock-v1"
-        assert evaluation.prompt_rules_version == "matching-v7-closed-world-evidence"
+        assert evaluation.prompt_rules_version == "matching-v8-soft-catchup"
         assert evaluation.decision is MatchDecision.AUTO_APPLY
     await engine.dispose()
 
@@ -1124,7 +1124,7 @@ async def test_process_unprocessed_jobs_is_no_arg_and_idempotent(
     async with session_factory() as session:
         evaluations = list((await session.scalars(select(MatchEvaluation))).all())
         assert len(evaluations) == 2
-        assert evaluations[-1].prompt_rules_version == "matching-v7-closed-world-evidence"
+        assert evaluations[-1].prompt_rules_version == "matching-v8-soft-catchup"
         stored_job = await session.get(SourceJob, job.id)
         assert stored_job is not None
         stored_job.description = "The employer added a new requirement."

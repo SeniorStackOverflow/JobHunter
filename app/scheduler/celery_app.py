@@ -79,8 +79,8 @@ celery_app.conf.update(
         },
         "prepare-pending-applications": {
             "task": "job_agent.scheduler.prepare_pending_applications",
-            "schedule": 1800.0,
-            "options": {"queue": "applications", "expires": 1740},
+            "schedule": 300.0,
+            "options": {"queue": "applications", "expires": 270},
         },
         "reconcile-auto-approved-applications": {
             "task": "job_agent.scheduler.reconcile_auto_approved_applications",
@@ -109,7 +109,7 @@ celery_app.conf.update(
         },
         "daily-report": {
             "task": "job_agent.scheduler.generate_daily_report",
-            "schedule": crontab(minute=15, hour=21),
+            "schedule": crontab(minute=15),
             "options": {"queue": "reports"},
         },
         "train-learning-models": {

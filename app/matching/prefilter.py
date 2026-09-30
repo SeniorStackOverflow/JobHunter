@@ -309,6 +309,7 @@ class DeterministicPrefilter:
         profile: UserProfile,
         *,
         resume_fit: int,
+        allow_soft_catchup: bool = False,
     ) -> DeterministicFilterResult:
         if not 0 <= resume_fit <= 100:
             raise ValueError("resume_fit must be between 0 and 100")
@@ -392,7 +393,7 @@ class DeterministicPrefilter:
 
         minimum_resume_fit = _bounded_rule_score(rules, "minimum_resume_fit", 0)
         if resume_fit < minimum_resume_fit:
-            if outside_resume_allowed:
+            if outside_resume_allowed or allow_soft_catchup:
                 requirements_met.append("outside_resume_category_explicitly_allowed")
                 reasons.append("low_resume_fit_allowed_by_outside_resume_preference")
             else:

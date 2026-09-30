@@ -104,6 +104,7 @@ _AUTO_SEND_TRANSIENT_FAILURES = {
     "source_healthy",
     "no_active_employer_conversation",
     "employer_application_slot_available",
+    "distinct_employer_today",
 }
 
 
@@ -750,6 +751,8 @@ class EmailService:
                 application.status is ApplicationStatus.FAILED
                 and application.policy_decision is not PolicyDecision.AUTO_APPROVED
             )
+            if auto_send_authority and policy.decision is PolicyDecision.AUTO_APPROVED:
+                application.policy_result = policy.model_dump(mode="json")
             if auto_send_authority and policy.decision != PolicyDecision.AUTO_APPROVED:
                 safe_stop_reason: str | None = None
                 if _AUTO_SEND_HARD_FAILURES & failed_rules:
@@ -804,6 +807,7 @@ class EmailService:
                     "source_healthy",
                     "no_active_employer_conversation",
                     "employer_application_slot_available",
+                    "distinct_employer_today",
                 }
                 if manual_required & failed_rules:
                     if _AUTO_SEND_HARD_FAILURES & failed_rules:

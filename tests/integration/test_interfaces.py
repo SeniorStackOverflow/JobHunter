@@ -782,7 +782,9 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
         assert 'name="minimum_daily_applications" value="3"' in settings_page.text
         assert "data-daily-minimum" in settings_page.text
         assert 'readonly aria-disabled="true"' not in settings_page.text
-        assert "Минимум обязателен" in settings_page.text
+        assert "Добор до минимума" in settings_page.text
+        assert "до 50 и 40 баллов" in settings_page.text
+        assert "в разные компании" in settings_page.text
 
         legacy_preferences_form = await client.post(
             "/admin/preferences",

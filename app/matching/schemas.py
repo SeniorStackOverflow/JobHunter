@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -64,6 +64,10 @@ class MatchResult(BaseModel):
     scam_indicators: list[ShortText]
     decision: MatchDecision
     reason: ReasonText
+    soft_mismatches: list[
+        Literal["skills", "preferred_experience", "resume_relevance", "optional_requirement"]
+    ] = Field(default_factory=list)
+    optional_requirements_missing: list[ShortText] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def enforce_scam_block(self) -> MatchResult:

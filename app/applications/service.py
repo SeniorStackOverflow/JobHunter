@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications.availability import block_closed_vacancy_applications
+from app.applications.daily_target import catchup_stage, daily_target_state, lock_daily_target
 from app.applications.states import ensure_transition
 from app.contacts import ContactDiscoveryService
-from app.crawlers.parsing.normalization import detect_prompt_injection, stable_hash
-from app.employers import EmployerIdentityService
+from app.crawlers.parsing.normalization import (
+    detect_prompt_injection,
+    normalize_for_fingerprint,
+    stable_hash,
+)
+from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.bindings import evaluation_inputs_are_current
 from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
@@ -61,10 +66,14 @@ _POLICY_ONLY_REFRESH_RULES = {
     "no_candidate_withdrawal",
     "no_active_employer_conversation",
     "employer_application_slot_available",
+    "distinct_employer_today",
+    "match_not_skipped",
 }
 
 
 def _policy_only_refresh_needed(application: Application) -> bool:
+    if (application.policy_result or {}).get("owner_rejected") is True:
+        return False
     raw_failed = (application.policy_result or {}).get("rules_failed", [])
     failed = {item for item in raw_failed if isinstance(item, str)}
     return bool(failed) and failed <= _POLICY_ONLY_REFRESH_RULES
@@ -174,7 +183,12 @@ class ApplicationService:
         self.policy_engine = PolicyEngine(settings)
 
     async def prepare(
-        self, session: AsyncSession, canonical_job_id: UUID, profile_id: UUID | None = None
+        self,
+        session: AsyncSession,
+        canonical_job_id: UUID,
+        profile_id: UUID | None = None,
+        *,
+        require_employer_slot: bool = False,
     ) -> Application:
         profile = await self.profile_service.get_profile(session, profile_id)
         if profile is None:
@@ -185,10 +199,13 @@ class ApplicationService:
         profile = active_profile
         profile_id = profile.id
         existing = await session.scalar(
-            select(Application).where(
+            select(Application)
+            .where(
                 Application.canonical_job_id == canonical_job_id,
                 Application.profile_id == profile_id,
             )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         # Never rewrite content or bindings after a provider attempt. In particular,
         # SENT and DELIVERY_UNKNOWN are immutable idempotency terminal states.
@@ -199,11 +216,14 @@ class ApplicationService:
         }:
             return existing
         if existing is not None:
+            if (existing.policy_result or {}).get("owner_rejected") is True:
+                return existing
             attempted_delivery = await session.scalar(
                 select(EmailDelivery.id).where(EmailDelivery.application_id == existing.id)
             )
             if attempted_delivery is not None:
                 return existing
+        await lock_daily_target(session)
         canonical = await session.get(CanonicalJob, canonical_job_id)
         if canonical is None:
             raise LookupError(f"canonical job {canonical_job_id} does not exist")
@@ -289,6 +309,39 @@ class ApplicationService:
             contact = await self.contact_service.discover_from_source_job(session, source_job)
             if contact is None:
                 continue
+            if require_employer_slot:
+                probe = existing or Application(
+                    id=uuid4(),
+                    profile_id=profile_id,
+                    canonical_job_id=canonical_job_id,
+                    employer_id=source_job.employer_id,
+                    status=ApplicationStatus.PREPARED,
+                )
+                outcome = await EmployerRelationshipService().policy_outcome(
+                    session,
+                    application=probe,
+                    evaluation=evaluation,
+                    job=source_job,
+                    max_active_applications=1,
+                    freeze_active_conversation=True,
+                    rank_candidates=False,
+                )
+                target = await daily_target_state(session, preferences)
+                normal = evaluation.decision is MatchDecision.AUTO_APPLY and (
+                    evaluation.overall_fit >= preferences.minimum_auto_send_score
+                )
+                soft = target.remaining > 0 and catchup_stage(evaluation, preferences) is not None
+                if (
+                    not outcome.slot_available
+                    or not outcome.not_suppressed
+                    or source_job.employer_id in target.sent_employers
+                    or normalize_for_fingerprint(source_job.company)
+                    in target.sent_companies | target.reserved_companies
+                    or not (normal or soft)
+                    or evaluation.missing_requirements
+                    or evaluation.scam_indicators
+                ):
+                    continue
             selected = evaluation, source_job, resume, contact
             break
         if selected is None:
@@ -361,6 +414,21 @@ class ApplicationService:
     async def reevaluate_policy(
         self, session: AsyncSession, application: Application
     ) -> Application:
+        refreshed = await session.scalar(
+            select(Application)
+            .where(Application.id == application.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if refreshed is None:
+            raise ApplicationPreparationError("application no longer exists")
+        application = refreshed
+        if application.status in {
+            ApplicationStatus.SENT,
+            ApplicationStatus.SENDING,
+            ApplicationStatus.DELIVERY_UNKNOWN,
+        }:
+            return application
         evaluation = await session.get(MatchEvaluation, application.match_evaluation_id)
         source_job = await session.get(SourceJob, application.source_job_id)
         resume = await session.get(Resume, application.resume_id)
@@ -446,6 +514,7 @@ class ApplicationService:
         except ValueError as exc:
             raise ApplicationPreparationError("only an unsent application can be rejected") from exc
         application.status = ApplicationStatus.CANCELLED
+        application.policy_result = {**(application.policy_result or {}), "owner_rejected": True}
         if application.employer_id is not None:
             await enqueue_employer_policy_refresh(
                 session,
@@ -484,6 +553,7 @@ async def prepare_pending_applications() -> int:
                 MatchEvaluation.decision.label("decision"),
                 MatchEvaluation.created_at.label("evaluation_created_at"),
                 MatchEvaluation.overall_fit.label("overall_fit"),
+                MatchEvaluation.soft_mismatches.label("soft_mismatches"),
                 func.row_number()
                 .over(
                     partition_by=(
@@ -515,6 +585,15 @@ async def prepare_pending_applications() -> int:
                     or_(
                         Application.id.is_(None),
                         Application.status.in_(refreshable),
+                        and_(
+                            Application.status == ApplicationStatus.CANCELLED,
+                            Application.policy_decision == PolicyDecision.SKIPPED,
+                            ranked.c.decision == MatchDecision.SKIP,
+                            func.json_array_length(ranked.c.soft_mismatches) > 0,
+                            ~select(EmailDelivery.id)
+                            .where(EmailDelivery.application_id == Application.id)
+                            .exists(),
+                        ),
                         and_(
                             Application.status == ApplicationStatus.CANCELLED,
                             Application.policy_decision == PolicyDecision.SKIPPED,
@@ -563,39 +642,63 @@ async def prepare_pending_applications() -> int:
                     policy_refresh_candidates[: refresh_limit - len(policy_refresh)]
                 )
 
-        for application in policy_refresh:
-            try:
-                before_policy = application.policy_decision
-                await service.reevaluate_policy(session, application)
-                if before_policy != application.policy_decision:
-                    prepared += 1
-                    if application.employer_id is not None:
-                        await enqueue_employer_policy_refresh(
-                            session,
-                            profile_id=application.profile_id,
-                            employer_id=application.employer_id,
-                            reason="application_policy_changed",
-                        )
-            except ApplicationPreparationError:
+        full_refresh_keys = set(full_refresh)
+        policy_refresh_ids = {application.id for application in policy_refresh}
+        selected_companies: set[tuple[UUID, str]] = set()
+        # Rows are already ordered by fit, so a cheaper policy refresh must not
+        # take the target slot before a better, newly evaluated publication.
+        for profile_id, canonical_id, _evaluation_id, existing in rows:
+            needs_full_refresh = (profile_id, canonical_id) in full_refresh_keys
+            if not needs_full_refresh and (
+                existing is None or existing.id not in policy_refresh_ids
+            ):
                 continue
-
-        for profile_id, canonical_id in full_refresh:
+            if (
+                existing is not None
+                and (existing.policy_result or {}).get("owner_rejected") is True
+            ):
+                continue
             try:
-                existing = await session.scalar(
-                    select(Application).where(
-                        Application.profile_id == profile_id,
-                        Application.canonical_job_id == canonical_id,
-                    )
+                canonical = await session.get(CanonicalJob, canonical_id)
+                company_key = (
+                    normalize_for_fingerprint(canonical.normalized_company) if canonical else ""
                 )
+                if company_key and (profile_id, company_key) in selected_companies:
+                    continue
                 before_evaluation = existing.match_evaluation_id if existing is not None else None
-                application = await service.prepare(session, canonical_id, profile_id)
+                before_policy = existing.policy_decision if existing is not None else None
+                if needs_full_refresh:
+                    application = await service.prepare(
+                        session, canonical_id, profile_id, require_employer_slot=True
+                    )
+                    if (
+                        before_evaluation is None
+                        or before_evaluation != application.match_evaluation_id
+                    ):
+                        prepared += 1
+                else:
+                    assert existing is not None
+                    application = await service.reevaluate_policy(session, existing)
+                    if before_policy != application.policy_decision:
+                        prepared += 1
+                if application.status is ApplicationStatus.AUTO_APPROVED and company_key:
+                    selected_companies.add((profile_id, company_key))
                 if (
-                    before_evaluation is None
-                    or before_evaluation != application.match_evaluation_id
+                    application.employer_id is not None
+                    and before_policy != application.policy_decision
                 ):
-                    prepared += 1
+                    await enqueue_employer_policy_refresh(
+                        session,
+                        profile_id=application.profile_id,
+                        employer_id=application.employer_id,
+                        reason="application_policy_changed",
+                    )
             except ApplicationPreparationError:
                 continue
+            finally:
+                # Release reservation and application locks before another
+                # candidate; the sender locks its application before the quota.
+                await session.commit()
         await session.commit()
     return prepared
 
@@ -638,6 +741,7 @@ async def refresh_dirty_deferred_applications(
                             Application.policy_decision == PolicyDecision.DEFERRED,
                         )
                         .order_by(Application.id)
+                        .with_for_update(skip_locked=True)
                     )
                 ).all()
             )

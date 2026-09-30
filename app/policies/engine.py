@@ -4,9 +4,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications.daily_target import (
-    minimum_catchup_active,
-    minimum_catchup_score,
-    review_is_safe_catchup_candidate,
+    TARGET_POLICY_VERSION,
+    catchup_stage,
+    daily_target_state,
+    lock_daily_target,
 )
 from app.contacts import contact_is_source_verified
 from app.crawlers.parsing.normalization import (
@@ -52,7 +53,7 @@ from app.profiles.sources import source_selected
 from app.settings import Settings
 from app.time_utils import local_day_bounds
 
-POLICY_VERSION = "2026-09-22.1-employer-relationship"
+POLICY_VERSION = "2026-09-30.1-distinct-employer-catchup"
 
 
 class PolicyEngine:
@@ -71,6 +72,10 @@ class PolicyEngine:
         contact: EmployerContact,
         profile: UserProfile,
     ) -> PolicyResult:
+        await session.execute(
+            select(Application.id).where(Application.id == application.id).with_for_update()
+        )
+        await lock_daily_target(session)
         passed: list[str] = []
         failed: list[str] = []
 
@@ -144,32 +149,19 @@ class PolicyEngine:
                 ),
             )
         )
-        sent_today = await session.scalar(
-            select(func.count(Application.id)).where(
-                Application.profile_id == application.profile_id,
-                Application.status == ApplicationStatus.SENT,
-                Application.sent_at >= start_of_day,
-            )
+        target = await daily_target_state(
+            session, preferences, exclude_application_id=application.id
         )
-        reserved_auto_send = await session.scalar(
-            select(func.count(Application.id)).where(
-                Application.profile_id == application.profile_id,
-                Application.id != application.id,
-                Application.status.in_(
-                    {ApplicationStatus.AUTO_APPROVED, ApplicationStatus.SENDING}
-                ),
-            )
+        stage = catchup_stage(evaluation, preferences) if target.remaining > 0 else None
+        normal_match = (
+            evaluation.decision is MatchDecision.AUTO_APPLY
+            and evaluation.overall_fit >= preferences.minimum_auto_send_score
         )
-        catchup_progress = int(sent_today or 0) + int(reserved_auto_send or 0)
-        catchup_active = minimum_catchup_active(preferences, catchup_progress)
+        if normal_match:
+            stage = None
+        catchup_promotion = stage is not None
         effective_auto_send_score = (
-            minimum_catchup_score(preferences)
-            if catchup_active
-            else preferences.minimum_auto_send_score
-        )
-        catchup_review_promotion = catchup_active and review_is_safe_catchup_candidate(
-            evaluation,
-            threshold=effective_auto_send_score,
+            stage if stage is not None else preferences.minimum_auto_send_score
         )
         prior_unknown = await session.scalar(
             select(func.count(EmailDelivery.id)).where(
@@ -195,8 +187,8 @@ class PolicyEngine:
             application=application,
             evaluation=evaluation,
             job=job,
-            max_active_applications=self.settings.employer_max_active_applications,
-            freeze_active_conversation=self.settings.freeze_new_applications_to_active_employer,
+            max_active_applications=1,
+            freeze_active_conversation=True,
         )
 
         rule("deployment_emergency_switch_off", not self.settings.emergency_email_kill_switch)
@@ -218,6 +210,14 @@ class PolicyEngine:
             evaluation.overall_fit >= effective_auto_send_score,
         )
         rule("mandatory_requirements_met", not evaluation.missing_requirements)
+        rule(
+            "no_material_match_risk",
+            not [
+                risk
+                for risk in (evaluation.risks or [])
+                if risk != "experience_relevance_requires_review"
+            ],
+        )
         rule("deterministic_hard_requirements_met", hard_requirements_met)
         rule("hard_requirement_binding_current", hard_requirement_binding_current)
         rule(
@@ -226,11 +226,11 @@ class PolicyEngine:
         )
         rule(
             "match_not_skipped",
-            evaluation.decision != MatchDecision.SKIP,
+            evaluation.decision != MatchDecision.SKIP or catchup_promotion,
         )
         rule(
             "match_auto_apply",
-            evaluation.decision == MatchDecision.AUTO_APPLY or catchup_review_promotion,
+            evaluation.decision == MatchDecision.AUTO_APPLY or catchup_promotion,
         )
         rule("verified_email_contact", contact.contact_type == ContactType.EMAIL)
         rule("contact_verified", contact_is_source_verified(contact))
@@ -253,6 +253,11 @@ class PolicyEngine:
         rule("no_candidate_withdrawal", employer_policy.no_candidate_withdrawal)
         rule("no_active_employer_conversation", employer_policy.no_active_conversation)
         rule("employer_application_slot_available", employer_policy.slot_available)
+        company_key = normalize_for_fingerprint(job.company)
+        distinct_company = application.employer_id not in target.sent_employers and (
+            not company_key or company_key not in target.sent_companies | target.reserved_companies
+        )
+        rule("distinct_employer_today", distinct_company)
         rule("vacancy_active", job.status == JobStatus.ACTIVE)
         rule(
             "profile_binding_valid",
@@ -303,13 +308,14 @@ class PolicyEngine:
         elif {
             "no_active_employer_conversation",
             "employer_application_slot_available",
+            "distinct_employer_today",
         } & set(failed):
             decision = PolicyDecision.DEFERRED
         elif hard_requirement_missing:
             decision = PolicyDecision.SKIPPED
         elif hard_requirement_unknown or not hard_requirement_binding_current:
             decision = PolicyDecision.PENDING_REVIEW
-        elif evaluation.decision == MatchDecision.SKIP:
+        elif evaluation.decision == MatchDecision.SKIP and not catchup_promotion:
             decision = PolicyDecision.SKIPPED
         elif failed:
             decision = PolicyDecision.PENDING_REVIEW
@@ -320,6 +326,35 @@ class PolicyEngine:
             rules_passed=passed,
             rules_failed=failed,
             policy_version=POLICY_VERSION,
+            hard_safety_passed=not (
+                set(failed)
+                & (
+                    hard_block_rules
+                    | {
+                        "mandatory_requirements_met",
+                        "deterministic_hard_requirements_met",
+                        "hard_requirement_binding_current",
+                        "no_material_match_risk",
+                    }
+                )
+            ),
+            content_ready=not (
+                set(failed)
+                & {
+                    "resume_active_verified",
+                    "verified_email_contact",
+                    "contact_verified",
+                    "letter_validated",
+                    "profile_binding_valid",
+                    "all_claims_confirmed",
+                }
+            ),
+            employer_slot_available=employer_policy.slot_available and distinct_company,
+            soft_match_passed=normal_match,
+            catchup_stage=stage,
+            minimum_remaining=target.remaining,
+            target_reservation_day=target.day,
+            target_policy_version=TARGET_POLICY_VERSION,
         )
 
     async def apply(

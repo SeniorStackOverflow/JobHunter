@@ -816,6 +816,8 @@ def _dispatch_one(
     source: SourceSchedule,
     operation: str,
     now: datetime,
+    *,
+    force_minimum_search: bool = False,
 ) -> str | None:
     if not _operation_allowed_for_source(source, operation):
         return None
@@ -824,11 +826,19 @@ def _dispatch_one(
     if operation in {"incremental", "recheck"} and not source.has_successful_full_scan:
         return None
     expression = _configured_schedule(source, operation)
-    if not cron_expression_is_due(expression, now):
+    schedule_due = cron_expression_is_due(expression, now)
+    if not force_minimum_search and not schedule_due:
         return None
     if not _degraded_recovery_probe_due(source, operation, now):
         return None
     minute_slot = now.astimezone(UTC).strftime("%Y%m%d%H%M")
+    if force_minimum_search:
+        from app.time_utils import local_day_bounds
+
+        _, _, day_end = local_day_bounds(now=now)
+        interval = 15 if (day_end - now.astimezone(UTC)).total_seconds() <= 14400 else 60
+        utc_now = now.astimezone(UTC)
+        minute_slot = utc_now.strftime("%Y%m%d%H") + f"{utc_now.minute // interval:02d}"
     reservation = reserve_once(
         client,
         lock_key("beat", str(source.source_id), operation, minute_slot),
@@ -877,10 +887,46 @@ def _dispatch_one(
         raise
 
 
+async def _minimum_search_sources() -> set[UUID]:
+    from app.applications.daily_target import daily_target_state
+    from app.models.entities import JobPreference
+    from app.profiles import ProfileService
+    from app.profiles.sources import source_selected
+
+    if get_settings().emergency_email_kill_switch:
+        return set()
+    demanded: set[UUID] = set()
+    async with async_session_factory() as session:
+        sources = list(
+            (
+                await session.scalars(
+                    select(JobSource).where(
+                        JobSource.enabled.is_(True),
+                        JobSource.automatic_actions_paused.is_(False),
+                        JobSource.health_status == SourceHealth.HEALTHY,
+                    )
+                )
+            ).all()
+        )
+        for profile in await ProfileService().list_processing_profiles(session):
+            preference = await session.scalar(
+                select(JobPreference).where(JobPreference.profile_id == profile.id)
+            )
+            if preference is None or not preference.auto_send_enabled or preference.global_pause:
+                continue
+            if (await daily_target_state(session, preference)).remaining <= 0:
+                continue
+            for source in sources:
+                if await source_selected(session, profile.id, source.id):
+                    demanded.add(source.id)
+    return demanded
+
+
 @celery_app.task(name="job_agent.scheduler.dispatch_due_sources")
 def dispatch_due_sources_task() -> dict[str, Any]:
     now = datetime.now(UTC)
     sources = _run_async(_load_enabled_sources())
+    minimum_sources = _run_async(_minimum_search_sources())
     client = _redis_client()
     dispatched: list[str] = []
     invalid_schedules: list[dict[str, str]] = []
@@ -889,7 +935,14 @@ def dispatch_due_sources_task() -> dict[str, Any]:
         for source in sources:
             for operation in ("incremental", "recheck", "full"):
                 try:
-                    result = _dispatch_one(client, source, operation, now)
+                    result = _dispatch_one(
+                        client,
+                        source,
+                        operation,
+                        now,
+                        force_minimum_search=operation == "incremental"
+                        and source.source_id in minimum_sources,
+                    )
                 except ValueError as exc:
                     invalid_schedules.append(
                         {

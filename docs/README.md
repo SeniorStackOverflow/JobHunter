@@ -16,6 +16,7 @@
 | Вход Google и сохранение сессии | [Сессии](google-oauth-sessions.md) |
 | Отдельное подключение Gmail, доставка и reconnect | [Gmail OAuth](gmail-oauth.md) |
 | Условия отправки | [Политика автоотправки](auto-send-policy.md) |
+| DEV: добор минимума в разные компании, ожидает выкатки | [Добор минимума](daily-minimum-catchup.md) |
 | Контакты и история работодателя | [Память работодателей](employer-relationships.md) |
 | Явные решения, подсказки и shadow-модель | [Обучение review](review-learning.md) |
 | Удалённый привилегированный интерфейс | [MCP](mcp.md) |

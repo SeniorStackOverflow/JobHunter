@@ -38,6 +38,35 @@ class EmployerReopenInput(BaseModel):
     reason: str = Field(min_length=1, max_length=255)
 
 
+class EmployerUnansweredInput(EmployerReopenInput):
+    waiting_days: int = Field(default=45, ge=1, le=730)
+    cooldown_days: int = Field(default=90, ge=1, le=730)
+
+
+@router.post("/{employer_id}/close-unanswered", dependencies=[Depends(require_api_actor)])
+async def close_unanswered_employer(
+    employer_id: UUID,
+    payload: EmployerUnansweredInput,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, object]:
+    profile_id = await _profile_id(session, payload.profile_id)
+    try:
+        relationship = await EmployerRelationshipService().close_unanswered(
+            session,
+            profile_id=profile_id,
+            employer_id=employer_id,
+            actor=actor,
+            reason=payload.reason,
+            waiting_days=payload.waiting_days,
+            cooldown_days=payload.cooldown_days,
+        )
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await session.commit()
+    return {"state": relationship.state.value, "cooldown_until": relationship.suppressed_until}
+
+
 async def _profile_id(session: AsyncSession, value: UUID | None) -> UUID:
     profile = await ProfileService().get_profile(session, value)
     if profile is None:

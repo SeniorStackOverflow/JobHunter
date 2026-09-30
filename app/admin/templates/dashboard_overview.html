@@ -1,4 +1,5 @@
 <section class="admin-section">
+  {% set target = overview.daily_target %}
   <div class="section-heading">
     <div><h1>Главная</h1><p>Короткая сводка и только те действия, где нужен владелец.</p></div>
     {% if counts.pending_review %}<a class="btn btn-primary" href="{{ panel.view('decisions') }}">Разобрать очередь</a>{% endif %}
@@ -19,6 +20,8 @@
   </div>
 
   <div class="daily-digest"><div class="digest-icon" aria-hidden="true">◎</div><div><strong>Результат подбора за сегодня</strong><p>{% if overview.today_matches %}Для этого профиля оценено {{ overview.today_matches }} вакансий: {{ overview.auto_apply }} подходят для автоотправки, {{ overview.review }} требуют проверки, {{ overview.skip + overview.block }} отсеяны. {% if overview.matching_backlog %}Ещё {{ overview.matching_backlog }} ждут оценки.{% endif %}{% else %}Для этого профиля сегодня ещё нет новых оценок. {% if overview.matching_backlog %}В очереди {{ overview.matching_backlog }} вакансий.{% else %}Новые вакансии появятся здесь после следующего обхода и оценки.{% endif %}{% endif %}</p></div></div>
+
+  {% if target.minimum %}<div class="daily-digest" data-daily-target><div class="digest-icon" aria-hidden="true">↗</div><div><strong>Цель {{ target.minimum }} · отправлено {{ target.sent }} · готовый резерв {{ target.reserved }}</strong><p>{% if target.sent >= target.minimum %}Минимум выполнен. Дальше действует обычный отбор до дневного максимума.{% elif not preferences.auto_send_enabled or preferences.global_pause %}Автоматическая отправка приостановлена. Для добора включите её в настройках.{% elif target.remaining == 0 %}Недостающие отклики подготовлены в разные компании и ждут отправки.{% else %}Осталось добрать {{ target.remaining }}. Ищем разные компании и при нехватке допускаем более слабое совпадение.{% if not target.unique_free_employers %} Сейчас нет дополнительных готовых кандидатов для свободных компаний.{% endif %} {% if target.primary_blockers.employer %}Занятые компании: {{ target.primary_blockers.employer }}.{% endif %} {% if target.primary_blockers.hard_safety %}Не пройдены обязательные проверки: {{ target.primary_blockers.hard_safety }}.{% endif %} {% if target.primary_blockers.content %}Не готовы контакт, резюме или письмо: {{ target.primary_blockers.content }}.{% endif %} {% if target.primary_blockers.category %}Не проходят выбранные категории или названия должностей: {{ target.primary_blockers.category }}.{% endif %} {% if target.primary_blockers.soft_match %}Не проходят даже порог добора: {{ target.primary_blockers.soft_match }}.{% endif %}{% endif %}{% if target.catchup_sent_by_stage %} Доборные отправки: {% for stage, count in target.catchup_sent_by_stage.items() %}{{ count }} с порогом {{ stage }}{% if not loop.last %}; {% endif %}{% endfor %}.{% endif %}</p></div></div>{% endif %}
 
   <div class="grid grid-2 overview-columns">
     <div class="panel" id="attention">

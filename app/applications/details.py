@@ -151,6 +151,13 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
         ),
         "match_evaluation_issue": match_evaluation_issue,
         "failed_policy_rules": [str(item) for item in failed_rules],
+        "employer_only_deferred": bool(failed_rules)
+        and set(failed_rules)
+        <= {
+            "no_active_employer_conversation",
+            "employer_application_slot_available",
+            "distinct_employer_today",
+        },
         "job": _fields(
             job,
             "id",

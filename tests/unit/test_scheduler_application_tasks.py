@@ -28,7 +28,7 @@ def test_application_tasks_are_registered_and_routed() -> None:
     )
 
     assert schedule["prepare-pending-applications"]["options"]["queue"] == "applications"
-    assert schedule["prepare-pending-applications"]["schedule"] == 1800.0
+    assert schedule["prepare-pending-applications"]["schedule"] == 300.0
     assert schedule["reconcile-auto-approved-applications"]["schedule"] == 60.0
     assert schedule["reconcile-auto-approved-applications"]["options"]["queue"] == "applications"
     assert schedule["refresh-dirty-deferred-applications"]["schedule"] == 60.0

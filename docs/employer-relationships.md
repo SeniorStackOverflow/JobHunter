@@ -23,6 +23,14 @@ closed or explicitly reopened. PostgreSQL employer-row locks serialize the final
 policy check, and the same gates run during preparation, immediately before send,
 and before every delivery retry.
 
+The DEV [daily-minimum implementation](daily-minimum-catchup.md), pending a
+separate rollout, enforces one active slot regardless of older configurable
+limits. It conservatively guards company names against multiple same-day
+sends/reservations across employer IDs without merging identities. The audited
+`close-unanswered` API requires recent Gmail synchronization and an elapsed
+waiting window (default 45 days), then imposes a cooldown (default 90 days from
+the last send). Replies discovered later restore the active contact state.
+
 An employer reply or verified interview proposal/confirmation freezes new
 applications. An explicit decline is job-scoped unless stronger evidence exists.
 Employer-scoped automatic suppression requires an explicit company-level decline

@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from app.matching.schemas import MatchRequest, MatchResult
 from app.models.enums import MatchDecision
 
-MATCHING_RULES_VERSION = "matching-v7-closed-world-evidence"
+MATCHING_RULES_VERSION = "matching-v8-soft-catchup"
 
 # The matching prompt is intentionally kept as reviewable prose. Reflowing it to
 # satisfy source line length would silently change the model input.
@@ -80,6 +80,14 @@ DECISION RUBRIC:
   clearly irrelevant and a hard experience requirement exists, return skip; use review only when relevance is genuinely ambiguous.
 
 SCORING:
+- Record soft matching gaps in soft_mismatches using only skills, preferred_experience, resume_relevance,
+  or optional_requirement. A low score alone may produce skip with these gaps, so the owner can use a bounded
+  daily-minimum catch-up policy. Never label a mandatory qualification, work permit, licence, required experience,
+  explicit user search boundary, unresolved material risk, or unconfirmed logistics as a soft mismatch.
+- Missing optional advantages belong in soft_mismatches, not missing_requirements or risks. List each kind once.
+- List the actual missing optional advantages individually in optional_requirements_missing; do not collapse several
+  requirements into a single item. Bounded catch-up may tolerate at most one missing optional requirement. Mandatory
+  conditions must stay in missing_requirements and must never move into this optional list.
 - resume_fit measures evidence-backed fit of experience/skills/education to the role.
 - preference_fit measures fit to trusted user preferences.
 - overall_fit should reflect both, but the application will recompute the final weighted score.

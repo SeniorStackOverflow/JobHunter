@@ -111,7 +111,9 @@ async def make_graph(session, storage: Path):
         verified=True,
         is_default=True,
     )
-    session.add_all([source, profile, preference, resume])
+    session.add_all([source, profile])
+    await session.flush()
+    session.add_all([preference, resume])
     await session.flush()
     canonical = CanonicalJob(
         normalized_company="example",

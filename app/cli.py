@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import getpass
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import yaml
 from sqlalchemy import select
@@ -24,6 +26,16 @@ from app.settings import get_settings
 async def employer_identity_preview(company: str | None) -> dict[str, Any]:
     async with async_session_factory() as session:
         return await EmployerBackfillService().preview_identity(session, company_filter=company)
+
+
+async def minimum_audit(profile_id: UUID, day: date | None) -> dict[str, Any]:
+    from app.applications.diagnostics import daily_minimum_audit
+
+    async with async_session_factory() as session:
+        with session.no_autoflush:
+            result = await daily_minimum_audit(session, profile_id, day=day)
+        await session.rollback()
+        return result
 
 
 async def employer_relationship_audit(company: str | None) -> dict[str, Any]:
@@ -222,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
         "email-delivery-audit", help="read recent Gmail DSNs without mutating state"
     )
     delivery_audit.add_argument("--recipient")
+    minimum = subparsers.add_parser(
+        "daily-minimum-audit", help="read-only distinct-employer replay"
+    )
+    minimum.add_argument("--profile-id", type=UUID, required=True)
+    minimum.add_argument("--day", type=date.fromisoformat)
     return parser
 
 
@@ -239,6 +256,12 @@ def main() -> None:
         print(hash_api_key(value))
     elif args.command == "seed":
         asyncio.run(seed_defaults(args.include_fixture))
+    elif args.command == "daily-minimum-audit":
+        print(
+            json.dumps(
+                asyncio.run(minimum_audit(args.profile_id, args.day)), indent=2, ensure_ascii=False
+            )
+        )
     elif args.command == "validate-source-config":
         print(json.dumps(validate_source_config(args.path), indent=2, ensure_ascii=False))
     elif args.command == "phone-agent":

@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import pytest
+
 from app.models.enums import SourceHealth
 from app.scheduler.tasks import (
     RecheckPolicy,
@@ -123,3 +125,65 @@ def test_recovery_cooldown_does_not_affect_healthy_or_other_sources() -> None:
 
     assert _degraded_recovery_probe_due(healthy, "incremental", now) is True
     assert _degraded_recovery_probe_due(other, "incremental", now) is True
+
+
+@pytest.mark.parametrize("hour, expected", [(10, 1), (18, 4)])
+def test_minimum_search_is_hourly_then_quarter_hourly_without_duplicate_dispatch(
+    monkeypatch, hour, expected
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from app.scheduler import tasks
+
+    source = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="generic_html",
+        configuration={"incremental_scan": {"schedule": "0 0 * * *"}},
+        health_status=SourceHealth.HEALTHY,
+        has_successful_full_scan=True,
+    )
+    reserved = set()
+
+    def reserve(_client, key, **_kwargs):
+        if key in reserved:
+            return None
+        reserved.add(key)
+        return Mock()
+
+    async def no_orphans(*_args, **_kwargs):
+        return []
+
+    async def new_scan(*_args, **_kwargs):
+        return SimpleNamespace(id=uuid4()), True
+
+    enqueue = Mock()
+    monkeypatch.setattr(tasks, "reserve_once", reserve)
+    monkeypatch.setattr(tasks, "_reconcile_orphaned_scans", no_orphans)
+    monkeypatch.setattr(tasks, "_get_or_create_queued_scan", new_scan)
+    monkeypatch.setattr(tasks.run_scan_task, "apply_async", enqueue)
+    # Europe/Chisinau midnight is 21:00 UTC in September: 18:00 is in the final four hours.
+    for minute in range(60):
+        now = datetime(2026, 9, 30, hour, minute, tzinfo=UTC)
+        assert tasks._dispatch_one(Mock(), source, "incremental", now) is None
+        tasks._dispatch_one(Mock(), source, "incremental", now, force_minimum_search=True)
+        tasks._dispatch_one(Mock(), source, "incremental", now, force_minimum_search=True)
+    assert enqueue.call_count == expected
+
+
+def test_minimum_search_still_rejects_invalid_source_schedule():
+    from unittest.mock import Mock
+
+    from app.scheduler import tasks
+
+    source = SourceSchedule(
+        source_id=uuid4(),
+        adapter_type="generic_html",
+        configuration={"incremental_scan": {"schedule": "invalid"}},
+        health_status=SourceHealth.HEALTHY,
+        has_successful_full_scan=True,
+    )
+    with pytest.raises(ValueError, match="five fields"):
+        tasks._dispatch_one(
+            Mock(), source, "incremental", datetime.now(UTC), force_minimum_search=True
+        )

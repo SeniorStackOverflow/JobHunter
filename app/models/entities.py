@@ -535,6 +535,10 @@ class MatchEvaluation(UUIDPrimaryKeyMixin, Base):
     resume_fit: Mapped[int] = mapped_column(Integer, nullable=False)
     preference_fit: Mapped[int] = mapped_column(Integer, nullable=False)
     overall_fit: Mapped[int] = mapped_column(Integer, nullable=False)
+    soft_mismatches: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    optional_requirements_missing: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
     requirements_met: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     missing_requirements: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     risks: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
