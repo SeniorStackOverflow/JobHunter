@@ -26,8 +26,8 @@ Main может быть checkout-нута в отдельном worktree: пр�
 
 На момент актуализации семь сервисов приложения (`api`, `worker`,
 `matching-worker`, `proxy-worker`, `control-worker`, `beat`, `call-agent`) здоровы
-и используют образ `jobhunter-prod:8167300ae75d` (rollout 2026-10-01). Alembic head —
-`b7f1e4c9a2d3`.
+и используют образ `jobhunter-prod:7f99ff89e95f` (rollout 2026-10-01). Alembic head —
+`c5d7a9e1f3b2`.
 Runtime PostgreSQL role — `jobhunter_app`; миграции используют
 `jobhunter_migrator` через защищённый `/etc/jobhunter/migrator.env`.
 
