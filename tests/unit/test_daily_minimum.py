@@ -387,7 +387,12 @@ async def test_preparation_selects_best_company_before_writing_other_letters(
         first, best, other = [await session.get(Application, identifier) for identifier in ids]
         assert best.status is ApplicationStatus.AUTO_APPROVED
         assert other.status is ApplicationStatus.AUTO_APPROVED
-        assert first.status is ApplicationStatus.PREPARED
+        # The weaker vacancy of the already reserved company is never approved.
+        # It is recorded as deferred rather than left untouched: an application
+        # without a policy outcome would be re-prepared on every scheduler cycle.
+        assert first.status is ApplicationStatus.DEFERRED
+        assert first.policy_result["safe_stop_reason"] == "same_employer_application_deferred"
+        assert "distinct_employer_today" in first.policy_result["rules_failed"]
         assert (
             await daily_target_state(session, await session.get(type(graph[2]), graph[2].id))
         ).reserved == 2

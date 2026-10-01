@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
-from uuid import UUID, uuid4
+from uuid import UUID
 
+import structlog
 from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications.availability import block_closed_vacancy_applications
-from app.applications.daily_target import catchup_stage, daily_target_state, lock_daily_target
+from app.applications.daily_target import lock_daily_target
 from app.applications.states import ensure_transition
 from app.contacts import ContactDiscoveryService
 from app.crawlers.parsing.normalization import (
@@ -15,7 +16,7 @@ from app.crawlers.parsing.normalization import (
     normalize_for_fingerprint,
     stable_hash,
 )
-from app.employers import EmployerIdentityService, EmployerRelationshipService
+from app.employers import EmployerIdentityService
 from app.matching.bindings import evaluation_inputs_are_current
 from app.matching.freshness import evaluation_is_current
 from app.models.entities import (
@@ -41,6 +42,8 @@ from app.policy_refresh_queue import enqueue_employer_policy_refresh
 from app.profiles import ProfileService, ResumeService
 from app.settings import Settings, get_settings
 from app.time_utils import local_day_bounds
+
+logger = structlog.get_logger(__name__)
 
 
 class ApplicationPreparationError(ValueError):
@@ -187,8 +190,6 @@ class ApplicationService:
         session: AsyncSession,
         canonical_job_id: UUID,
         profile_id: UUID | None = None,
-        *,
-        require_employer_slot: bool = False,
     ) -> Application:
         profile = await self.profile_service.get_profile(session, profile_id)
         if profile is None:
@@ -309,39 +310,6 @@ class ApplicationService:
             contact = await self.contact_service.discover_from_source_job(session, source_job)
             if contact is None:
                 continue
-            if require_employer_slot:
-                probe = existing or Application(
-                    id=uuid4(),
-                    profile_id=profile_id,
-                    canonical_job_id=canonical_job_id,
-                    employer_id=source_job.employer_id,
-                    status=ApplicationStatus.PREPARED,
-                )
-                outcome = await EmployerRelationshipService().policy_outcome(
-                    session,
-                    application=probe,
-                    evaluation=evaluation,
-                    job=source_job,
-                    max_active_applications=1,
-                    freeze_active_conversation=True,
-                    rank_candidates=False,
-                )
-                target = await daily_target_state(session, preferences)
-                normal = evaluation.decision is MatchDecision.AUTO_APPLY and (
-                    evaluation.overall_fit >= preferences.minimum_auto_send_score
-                )
-                soft = target.remaining > 0 and catchup_stage(evaluation, preferences) is not None
-                if (
-                    not outcome.slot_available
-                    or not outcome.not_suppressed
-                    or source_job.employer_id in target.sent_employers
-                    or normalize_for_fingerprint(source_job.company)
-                    in target.sent_companies | target.reserved_companies
-                    or not (normal or soft)
-                    or evaluation.missing_requirements
-                    or evaluation.scam_indicators
-                ):
-                    continue
             selected = evaluation, source_job, resume, contact
             break
         if selected is None:
@@ -531,6 +499,8 @@ async def prepare_pending_applications() -> int:
     from app.database.session import async_session_factory
 
     prepared = 0
+    failed = 0
+    started = time.monotonic()
     settings = get_settings()
     service = ApplicationService(settings)
     refreshable = {
@@ -545,6 +515,17 @@ async def prepare_pending_applications() -> int:
             session,
             actor="application_scheduler",
         )
+        # prepare() refuses a profile that may not be processed (draft/inactive
+        # profile, suspended account, no verified resume). Its evaluations must
+        # not be selected at all: otherwise every evaluated pair of such a
+        # profile costs a failed prepare() round trip on every cycle.
+        processing_profile_ids = [
+            profile.id
+            for profile in await service.profile_service.list_processing_profiles(session)
+        ]
+        if not processing_profile_ids:
+            await session.commit()
+            return 0
         ranked = (
             select(
                 MatchEvaluation.profile_id.label("profile_id"),
@@ -563,7 +544,7 @@ async def prepare_pending_applications() -> int:
                     order_by=(MatchEvaluation.created_at.desc(), MatchEvaluation.id.desc()),
                 )
                 .label("rank"),
-            )
+            ).where(MatchEvaluation.profile_id.in_(processing_profile_ids))
         ).subquery()
         rows = (
             await session.execute(
@@ -668,9 +649,12 @@ async def prepare_pending_applications() -> int:
                 before_evaluation = existing.match_evaluation_id if existing is not None else None
                 before_policy = existing.policy_decision if existing is not None else None
                 if needs_full_refresh:
-                    application = await service.prepare(
-                        session, canonical_id, profile_id, require_employer_slot=True
-                    )
+                    # Every pending pair gets a durable policy outcome
+                    # (auto-approved, review, deferred, cancelled or blocked).
+                    # The policy engine, not candidate selection, enforces the
+                    # employer slot and the distinct-company rule; a pair left
+                    # without a record would be re-attempted on every cycle.
+                    application = await service.prepare(session, canonical_id, profile_id)
                     if (
                         before_evaluation is None
                         or before_evaluation != application.match_evaluation_id
@@ -694,12 +678,25 @@ async def prepare_pending_applications() -> int:
                         reason="application_policy_changed",
                     )
             except ApplicationPreparationError:
+                failed += 1
                 continue
             finally:
                 # Release reservation and application locks before another
                 # candidate; the sender locks its application before the quota.
                 await session.commit()
         await session.commit()
+    # One line per cycle makes a regression of this task's workload visible
+    # without re-deriving it from the database.
+    logger.info(
+        "applications_prepare_cycle",
+        profiles=len(processing_profile_ids),
+        pending_rows=len(rows),
+        full_refresh=len(full_refresh),
+        policy_refresh=len(policy_refresh),
+        prepared=prepared,
+        failed=failed,
+        duration_seconds=round(time.monotonic() - started, 2),
+    )
     return prepared
 
 
