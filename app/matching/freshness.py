@@ -165,7 +165,14 @@ def build_matching_preselection_query(
         )
         .outerjoin(
             MatchEvaluation,
-            MatchEvaluation.id == latest_evaluation_id,
+            and_(
+                MatchEvaluation.id == latest_evaluation_id,
+                # Implied by the id match; stated so the planner can reach the
+                # row through the (profile, source job) index instead of
+                # hashing every evaluation in the table.
+                MatchEvaluation.profile_id == profile.id,
+                MatchEvaluation.source_job_id == SourceJob.id,
+            ),
         )
         .where(
             SourceJob.status == JobStatus.ACTIVE,

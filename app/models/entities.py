@@ -1083,8 +1083,10 @@ class AuditEvent(UUIDPrimaryKeyMixin, Base):
     decision: Mapped[str | None] = mapped_column(String(128))
     sanitized_details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Indexed: the panel, API and reports read the newest events, and the table
+    # grows by an event per background action.
     timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )
 
 

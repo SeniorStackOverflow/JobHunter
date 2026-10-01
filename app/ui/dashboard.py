@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.applications.daily_target import daily_target_state
 from app.applications.diagnostics import daily_minimum_audit
 from app.email.oauth import GmailOAuthService
 from app.learning import (
@@ -273,13 +274,35 @@ async def render_dashboard(
             )
             or 0
         )
-    matching_backlog = await count_profile_matching_backlog(
-        session,
-        profile,
-        preferences,
-        settings,
-    )
-    target_audit = await daily_minimum_audit(session, selected_profile_id)
+    # The matching backlog and the daily-minimum audit replay the profile's whole
+    # evaluation history and are shown only on the overview. Every other view
+    # needs just today's confirmed sends for the header quota.
+    overview_view = view == "overview" and template_name != "application_detail.html"
+    matching_backlog: int | None = None
+    target_audit: dict[str, Any] | None = None
+    if overview_view:
+        matching_backlog = await count_profile_matching_backlog(
+            session,
+            profile,
+            preferences,
+            settings,
+        )
+        target = await daily_target_state(session, preferences)
+        # The overview prints the replayed blocker counts only in its deficit
+        # branch (dashboard_overview.html); otherwise the live target suffices.
+        deficit_shown = (
+            target.minimum > 0
+            and target.sent < target.minimum
+            and preferences.auto_send_enabled
+            and not preferences.global_pause
+            and target.remaining > 0
+        )
+        target_audit = await daily_minimum_audit(
+            session, selected_profile_id, include_replay=deficit_shown
+        )
+        sent_today = int(target_audit["sent"])
+    else:
+        sent_today = (await daily_target_state(session, preferences)).sent
     overview = {
         "today_found": sum(item.found_jobs for item in today_scans),
         "today_new": sum(item.new_jobs for item in today_scans),
@@ -288,7 +311,7 @@ async def render_dashboard(
         "review": decisions.get(MatchDecision.PREPARE_FOR_REVIEW, 0),
         "skip": decisions.get(MatchDecision.SKIP, 0),
         "block": decisions.get(MatchDecision.BLOCK, 0),
-        "sent_today": target_audit["sent"],
+        "sent_today": sent_today,
         "daily_limit": preferences.maximum_daily_applications,
         "matching_backlog": matching_backlog,
         "daily_target": target_audit,
