@@ -1,6 +1,6 @@
 # Окружения DEV и PROD
 
-Сверено 2026-09-30. Этот документ описывает проверенные границы окружений;
+Сверено 2026-10-01. Этот документ описывает проверенные границы окружений;
 операционные команды обновления находятся в [deployment.md](deployment.md).
 
 ## Репозитории и версии
@@ -26,7 +26,8 @@ Main может быть checkout-нута в отдельном worktree: пр�
 
 На момент актуализации семь сервисов приложения (`api`, `worker`,
 `matching-worker`, `proxy-worker`, `control-worker`, `beat`, `call-agent`) здоровы
-и используют образ `jobhunter-prod:f4df0e24a324`. Alembic head — `c72f9a31d5be`.
+и используют образ `jobhunter-prod:8167300ae75d` (rollout 2026-10-01). Alembic head —
+`b7f1e4c9a2d3`.
 Runtime PostgreSQL role — `jobhunter_app`; миграции используют
 `jobhunter_migrator` через защищённый `/etc/jobhunter/migrator.env`.
 
