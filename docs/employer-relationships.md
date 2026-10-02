@@ -31,6 +31,18 @@ sends/reservations across employer IDs without merging identities. The audited
 waiting window (default 45 days), then imposes a cooldown (default 90 days from
 the last send). Replies discovered later restore the active contact state.
 
+An unanswered application does not hold the employer forever. After
+`EMPLOYER_UNANSWERED_RELEASE_DAYS` (default 14) since the last application with no
+employer reply, the employer may receive an application for another vacancy: the
+old send no longer counts as an active conversation or as the occupied slot. This
+is evaluated from timestamps at policy time; no event is written and the sent
+application stays `sent`. The best-ranked deferred application of that employer
+gets the slot, and its send restarts the window. A reply, an interview, a
+suppression or the `close-unanswered` cooldown still block as before; the same
+vacancy is never applied to twice. `0` restores the permanent freeze. In PROD
+(2026-10-02) 15 of 413 contacted employers had replied, 14 of them within four
+days, which is why two weeks is a conservative window.
+
 An employer reply or verified interview proposal/confirmation freezes new
 applications. An explicit decline is job-scoped unless stronger evidence exists.
 Employer-scoped automatic suppression requires an explicit company-level decline

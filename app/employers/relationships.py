@@ -520,6 +520,7 @@ class EmployerRelationshipService:
         max_active_applications: int = 1,
         freeze_active_conversation: bool = True,
         rank_candidates: bool = True,
+        unanswered_release_days: int = 0,
     ) -> EmployerPolicyOutcome:
         employer_id = application.employer_id or job.employer_id
         if employer_id is None:
@@ -534,6 +535,19 @@ class EmployerRelationshipService:
         not_suppressed = True
         withdrawal_clear = True
         active_conversation = False
+        # An application the employer never answered stops holding the employer
+        # after the window; any reply moves the relationship out of
+        # APPLICATION_ACTIVE and keeps the freeze.
+        unanswered_before = (
+            now - timedelta(days=unanswered_release_days)
+            if unanswered_release_days > 0
+            and relationship is not None
+            and relationship.state is EmployerRelationshipState.APPLICATION_ACTIVE
+            and relationship.last_application_at is not None
+            and _utc(relationship.last_application_at)
+            <= now - timedelta(days=unanswered_release_days)
+            else None
+        )
         if relationship is not None:
             suppression_active = relationship.suppression_scope is not SuppressionScope.NONE and (
                 relationship.suppressed_until is None or _utc(relationship.suppressed_until) > now
@@ -571,6 +585,8 @@ class EmployerRelationshipService:
                     and latest_event.application_id == application.id
                 ):
                     active_conversation = False
+            if unanswered_before is not None:
+                active_conversation = False
 
         active_other_query = select(func.count(Application.id)).where(
             Application.profile_id == application.profile_id,
@@ -603,6 +619,14 @@ class EmployerRelationshipService:
                     Application.status == ApplicationStatus.SENDING,
                     Application.sent_at.is_(None),
                     Application.sent_at >= relationship.last_interaction_at,
+                )
+            )
+        if unanswered_before is not None:
+            active_other_query = active_other_query.where(
+                or_(
+                    Application.status != ApplicationStatus.SENT,
+                    Application.sent_at.is_(None),
+                    Application.sent_at > unanswered_before,
                 )
             )
         active_other = await session.scalar(active_other_query)

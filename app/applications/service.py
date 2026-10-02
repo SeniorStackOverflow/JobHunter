@@ -79,7 +79,12 @@ def _policy_only_refresh_needed(application: Application) -> bool:
         return False
     raw_failed = (application.policy_result or {}).get("rules_failed", [])
     failed = {item for item in raw_failed if isinstance(item, str)}
-    return bool(failed) and failed <= _POLICY_ONLY_REFRESH_RULES
+    if not failed:
+        # Deferred with no failed rule on record: the status was changed without
+        # the policy result (an employer safety pass did that). Nothing would
+        # ever release such a row, so the policy must state the real reason.
+        return application.status is ApplicationStatus.DEFERRED
+    return failed <= _POLICY_ONLY_REFRESH_RULES
 
 
 def _awaits_no_email_rejection(application: Application) -> bool:

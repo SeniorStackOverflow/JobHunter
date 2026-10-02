@@ -148,6 +148,10 @@ async def daily_minimum_audit(
             failed = set(rules_failed) if isinstance(rules_failed, list) else set()
             for rule in failed:
                 secondary[rule] = secondary.get(rule, 0) + 1
+            # The day's capacity is not a property of the vacancy: it must not
+            # hide the real blocker, and alone it means the send is ready.
+            waits_for_capacity = failed == {"daily_limit"}
+            failed.discard("daily_limit")
             if (
                 application_id is None
                 or not has_policy_result
@@ -171,10 +175,17 @@ async def daily_minimum_audit(
                 primary["employer"] += 1
                 if failed <= _EMPLOYER_RULES:
                     employer_only += 1
+            elif waits_for_capacity and status is ApplicationStatus.DEFERRED:
+                primary["ready"] += 1
+            elif status is ApplicationStatus.DEFERRED:
+                # The status is the fact; a stored result that names no employer
+                # rule is stale and must not turn the row into a ready send.
+                primary["employer"] += 1
             elif (
                 employer_id is None
                 or status
                 in {
+                    ApplicationStatus.BLOCKED,
                     ApplicationStatus.DELIVERY_UNKNOWN,
                     ApplicationStatus.FAILED,
                 }

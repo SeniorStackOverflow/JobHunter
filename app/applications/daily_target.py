@@ -134,7 +134,9 @@ async def daily_target_state(
     from app.models.entities import EmployerContact, JobSource, Resume, SourceJob, UserProfile
     from app.models.enums import ContactDeliveryState, JobStatus, SourceHealth
     from app.profiles.sources import source_selected
+    from app.settings import get_settings
 
+    unanswered_release_days = get_settings().employer_unanswered_release_days
     local_start, start, end = local_day_bounds(now=now)
     day = local_start.date().isoformat()
     applications = list(
@@ -297,6 +299,7 @@ async def daily_target_state(
             job=job,
             max_active_applications=1,
             freeze_active_conversation=True,
+            unanswered_release_days=unanswered_release_days,
         )
         if not outcome.slot_available or not outcome.not_suppressed:
             continue

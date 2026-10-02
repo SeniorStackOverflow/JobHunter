@@ -379,6 +379,17 @@ def _application_rejection_note(application: Any) -> str | None:
     return None
 
 
+def _application_deferred_note(application: Any) -> str | None:
+    """Explain a deferral that is not about the employer."""
+
+    if _application_safe_stop_reason(application) == "daily_limit_reached":
+        return (
+            "Дневной лимит отправок исчерпан — отклик будет одобрен автоматически, "
+            "когда появится место."
+        )
+    return None
+
+
 def _approval_failure_notice(application: Application | None, error: Exception) -> str:
     message = str(error)
     if application is not None and not _application_content_validated(application):
@@ -412,3 +423,4 @@ templates.env.globals["audit_action_label"] = _audit_action_label
 templates.env.globals["alert_code_label"] = _alert_code_label
 templates.env.globals["application_approval_issue"] = _application_approval_issue
 templates.env.globals["application_rejection_note"] = _application_rejection_note
+templates.env.globals["application_deferred_note"] = _application_deferred_note

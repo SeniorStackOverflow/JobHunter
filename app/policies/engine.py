@@ -53,8 +53,9 @@ from app.policies.schemas import PolicyResult
 from app.profiles.sources import source_selected
 from app.settings import Settings
 
-POLICY_VERSION = "2026-10-02.1-no-public-email-skip"
+POLICY_VERSION = "2026-10-02.2-employer-release-daily-capacity"
 NO_PUBLIC_EMAIL_STOP_REASON = "no_public_email"
+DAILY_LIMIT_STOP_REASON = "daily_limit_reached"
 
 
 class PolicyEngine:
@@ -175,6 +176,7 @@ class PolicyEngine:
             job=job,
             max_active_applications=1,
             freeze_active_conversation=True,
+            unanswered_release_days=self.settings.employer_unanswered_release_days,
         )
 
         rule("deployment_emergency_switch_off", not self.settings.emergency_email_kill_switch)
@@ -264,9 +266,21 @@ class PolicyEngine:
             application.status not in {ApplicationStatus.SENT, ApplicationStatus.SENDING},
         )
         rule("no_delivery_unknown", not prior_unknown)
+        # A new approval also competes with applications already approved for
+        # today, so the policy never approves more than can still be sent.
+        # An application that already holds an approval is checked against
+        # confirmed submissions only: the sender re-evaluates it right before
+        # sending, and the other reservations must not block that.
+        holds_approval = application.status in {
+            ApplicationStatus.AUTO_APPROVED,
+            ApplicationStatus.APPROVED,
+            ApplicationStatus.SENDING,
+            ApplicationStatus.FAILED,
+        }
+        reserved_today = 0 if holds_approval else target.reserved
         rule(
             "daily_limit",
-            int(attempts_today or 0) < preferences.maximum_daily_applications,
+            int(attempts_today or 0) + reserved_today < preferences.maximum_daily_applications,
         )
 
         hard_block_rules = {
@@ -308,6 +322,9 @@ class PolicyEngine:
             decision = PolicyDecision.PENDING_REVIEW
         elif evaluation.decision == MatchDecision.SKIP and not catchup_promotion:
             decision = PolicyDecision.SKIPPED
+        elif failed == ["daily_limit"]:
+            # Nothing for the owner to decide: it waits for capacity.
+            decision = PolicyDecision.DEFERRED
         elif failed:
             decision = PolicyDecision.PENDING_REVIEW
         else:
@@ -366,11 +383,12 @@ class PolicyEngine:
         failed = set(result.rules_failed)
         policy_result = result.model_dump(mode="json")
         if result.decision is PolicyDecision.DEFERRED:
-            reason = (
-                "active_employer_conversation"
-                if "no_active_employer_conversation" in failed
-                else "same_employer_application_deferred"
-            )
+            if failed == {"daily_limit"}:
+                reason = DAILY_LIMIT_STOP_REASON
+            elif "no_active_employer_conversation" in failed:
+                reason = "active_employer_conversation"
+            else:
+                reason = "same_employer_application_deferred"
             policy_result.update(
                 {
                     "safe_stop_reason": reason,
@@ -393,7 +411,7 @@ class PolicyEngine:
             PolicyDecision.SKIPPED: ApplicationStatus.CANCELLED,
         }
         application.status = status_map[result.decision]
-        if result.decision is PolicyDecision.DEFERRED:
+        if result.decision is PolicyDecision.DEFERRED and failed != {"daily_limit"}:
             APPLICATIONS_DEFERRED_SAME_EMPLOYER.inc()
         if {"employer_not_suppressed", "no_candidate_withdrawal"} & failed:
             APPLICATIONS_BLOCKED_EMPLOYER_SUPPRESSION.inc()

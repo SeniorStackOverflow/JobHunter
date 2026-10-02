@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     mail_routing_cache_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     employer_max_active_applications: int = Field(default=1, ge=1, le=10)
     freeze_new_applications_to_active_employer: bool = True
+    # Days without an employer reply after which the employer may receive an
+    # application for another vacancy. 0 keeps an unanswered employer frozen.
+    employer_unanswered_release_days: int = Field(default=14, ge=0, le=365)
 
     llm_provider: Literal["mock", "openai", "gemini", "llmrouter"] = "mock"
     openai_api_key: SecretStr | None = None
