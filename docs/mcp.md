@@ -97,6 +97,8 @@ policy/idempotency проверки.
 - `set_default_profile`
 - `get_job_preferences`
 - `update_job_preferences`
+- `get_source_categories`
+- `set_source_categories`
 - `pause_auto_send`
 - `resume_auto_send`
 

@@ -58,6 +58,7 @@ from app.models.enums import (
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeDeletion, ResumeInUseError
+from app.profiles.source_categories import category_lists_from_states, set_source_categories
 from app.profiles.sources import set_source_selected
 from app.security.auth import CsrfProtector, SessionSigner, verify_password
 from app.security.files import (
@@ -467,9 +468,6 @@ async def make_default_profile(
 @router.post("/admin/preferences")
 async def save_preferences(
     request: Request,
-    allowed_categories: str = Form(""),
-    auto_send_categories: str = Form(""),
-    forbidden_categories: str = Form(""),
     allowed_cities: str = Form(""),
     minimum_daily_applications: int = Form(0, ge=0, le=100),
     maximum_daily_applications: int = Form(3, ge=0, le=100),
@@ -490,10 +488,8 @@ async def save_preferences(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="minimum daily applications cannot exceed the maximum",
         )
+    # Categories are chosen per source (see the source category routes).
     payload = JobPreferenceUpdateInput(
-        allowed_categories=_items(allowed_categories),
-        auto_send_categories=_items(auto_send_categories),
-        forbidden_categories=_items(forbidden_categories),
         allowed_cities=_items(allowed_cities),
         maximum_daily_applications=maximum_daily_applications,
         minimum_auto_send_score=minimum_auto_send_score,
@@ -912,6 +908,54 @@ async def admin_select_profile_source(
     await session.commit()
     return RedirectResponse(
         f"/admin?view=settings&profile_id={profile_id}&notice=source_selection_saved",
+        status_code=303,
+    )
+
+
+@router.post("/admin/profile-sources/{source_id}/categories")
+async def admin_save_profile_source_categories(
+    source_id: UUID,
+    request: Request,
+    profile_id: UUID = Form(...),
+    csrf_token: str = Form(...),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    form = await request.form()
+    try:
+        search, auto_send, excluded = category_lists_from_states(
+            {key: value for key, value in form.items() if isinstance(value, str)}
+        )
+        await set_source_categories(
+            session,
+            profile_id=profile_id,
+            source_id=source_id,
+            search=search,
+            auto_send=auto_send,
+            excluded=excluded,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="profile or source not found") from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    await _audit_admin(
+        session,
+        "profile_source.categories_saved",
+        "user_profile",
+        str(profile_id),
+        details={
+            "source_id": str(source_id),
+            "search": search,
+            "auto_send": auto_send,
+            "excluded": excluded,
+        },
+    )
+    await session.commit()
+    return RedirectResponse(
+        f"/admin?view=settings&profile_id={profile_id}&notice=source_categories_saved#sources",
         status_code=303,
     )
 

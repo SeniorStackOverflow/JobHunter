@@ -56,6 +56,11 @@ class Panel:
             return f"/admin/profile-sources/{source_id}/selection"
         return f"/app/profiles/{self.profile_id}/sources/{source_id}"
 
+    def source_categories(self, source_id: UUID | str) -> str:
+        if self.is_admin:
+            return f"/admin/profile-sources/{source_id}/categories"
+        return f"/app/profiles/{self.profile_id}/sources/{source_id}/categories"
+
     def auto_send(self, paused: bool) -> str:
         if self.is_admin:
             return f"/admin/pause/{str(paused).lower()}"

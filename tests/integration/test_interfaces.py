@@ -393,6 +393,12 @@ async def test_rest_preference_updates_preserve_hidden_fields_and_protect_auto_s
         updated = await client.put(
             "/api/v1/preferences",
             headers=headers,
+            json={"allowed_cities": ["Chisinau"]},
+        )
+        # Categories are chosen per source; the profile-wide lists are not patchable.
+        categories = await client.put(
+            "/api/v1/preferences",
+            headers=headers,
             json={"allowed_categories": ["operations"]},
         )
         resumed = await client.post("/api/v1/preferences/resume", headers=headers)
@@ -400,12 +406,14 @@ async def test_rest_preference_updates_preserve_hidden_fields_and_protect_auto_s
 
     assert protected.status_code == 422
     assert updated.status_code == 200
+    assert categories.status_code == 422
     assert resumed.json() == {"auto_send_enabled": True, "global_pause": False}
     assert paused.json() == {"auto_send_enabled": True, "global_pause": True}
     async with sqlite_session_factory() as session:
         preferences = await session.scalar(select(JobPreference))
         assert preferences is not None
-        assert preferences.allowed_categories == ["operations"]
+        assert preferences.allowed_cities == ["Chisinau"]
+        assert preferences.allowed_categories == ["technology"]
         assert preferences.minimum_salary == Decimal("1250.00")
         assert preferences.salary_currency == "EUR"
         assert preferences.allowed_schedules == ["day"]
@@ -849,8 +857,7 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
         preferences_saved = await client.post(
             "/admin/preferences",
             data={
-                "allowed_categories": "operations",
-                "auto_send_categories": "operations",
+                "allowed_cities": "Chisinau",
                 "minimum_daily_applications": "2",
                 "maximum_daily_applications": "4",
                 "minimum_auto_send_score": "88",
@@ -886,7 +893,8 @@ async def test_admin_forms_merge_unexposed_fields_and_require_explicit_resume(
             assert profile.driving_licences == ["B"]
             assert profile.confirmed_facts == [{"id": "fact-1", "confirmed": True}]
             assert profile.availability == {"notice_days": 14}
-            assert preferences.allowed_categories == ["operations"]
+            assert preferences.allowed_cities == ["Chisinau"]
+            assert preferences.allowed_categories == []
             assert preferences.minimum_salary == Decimal("1500.00")
             assert preferences.salary_currency == "EUR"
             assert preferences.allowed_schedules == ["day"]
@@ -2450,6 +2458,8 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
             "update_user_profile",
             "get_job_preferences",
             "update_job_preferences",
+            "get_source_categories",
+            "set_source_categories",
             "list_resumes",
             "upload_resume_metadata",
             "activate_resume",
@@ -2625,11 +2635,26 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
                 "tools/call",
                 {
                     "name": "update_job_preferences",
-                    "arguments": {"preferences": {"allowed_categories": ["operations"]}},
+                    "arguments": {"preferences": {"allowed_cities": ["Chisinau"]}},
                 },
             ),
         )
         assert ordinary_preference_update.json()["result"].get("isError") is not True
+
+        # Categories belong to a source and cannot be patched profile-wide.
+        category_preference_update = await client.post(
+            "/mcp",
+            headers=headers,
+            json=_mcp_request(
+                10,
+                "tools/call",
+                {
+                    "name": "update_job_preferences",
+                    "arguments": {"preferences": {"allowed_categories": ["operations"]}},
+                },
+            ),
+        )
+        assert category_preference_update.json()["result"]["isError"] is True
 
         resumed = await client.post(
             "/mcp",
@@ -2701,7 +2726,7 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
         assert preferences is not None
         assert stored.status == ApplicationStatus.PENDING_REVIEW
         assert reconciled_application.status == ApplicationStatus.DELIVERY_UNKNOWN
-        assert preferences.allowed_categories == ["operations"]
+        assert preferences.allowed_cities == ["Chisinau"]
         assert preferences.allowed_schedules == ["day"]
         assert preferences.auto_send_enabled is True
         assert preferences.global_pause is False

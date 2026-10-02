@@ -20,6 +20,36 @@
     });
   });
 
+  document.querySelectorAll('[data-category-picker]').forEach((picker) => {
+    const rows = Array.from(picker.querySelectorAll('[data-category-row]'));
+    const filter = picker.querySelector('[data-category-filter]');
+    const empty = picker.querySelector('[data-category-empty]');
+    const summary = picker.querySelector('[data-category-summary]');
+    const counts = picker.querySelector('[data-category-counts]');
+    const update = () => {
+      const totals = { search: 0, auto: 0, excluded: 0 };
+      rows.forEach((row) => {
+        const state = row.querySelector('input:checked')?.value || 'off';
+        row.dataset.state = state;
+        if (state in totals) totals[state] += 1;
+      });
+      const text = `Ищу: ${totals.search + totals.auto} · автоотправка: ${totals.auto} · исключено: ${totals.excluded}`;
+      if (summary) summary.textContent = text;
+      if (counts && rows.length) counts.textContent = text;
+    };
+    picker.addEventListener('change', update);
+    filter?.addEventListener('input', () => {
+      const query = filter.value.trim().toLowerCase();
+      let visible = 0;
+      rows.forEach((row) => {
+        const match = !query || (row.dataset.categoryName || '').includes(query);
+        row.hidden = !match;
+        if (match) visible += 1;
+      });
+      if (empty) empty.hidden = visible !== 0;
+    });
+    update();
+  });
   const sidebar = document.querySelector('.sidebar');
   const menuButtons = document.querySelectorAll('[data-menu-toggle]');
   const setSidebar = (open) => {

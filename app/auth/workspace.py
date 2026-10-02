@@ -45,6 +45,7 @@ from app.models.enums import (
 from app.profiles import ProfileService, ResumeService
 from app.profiles.schemas import JobPreferenceUpdateInput, UserProfileInput
 from app.profiles.service import ResumeDeletion, ResumeInUseError
+from app.profiles.source_categories import category_lists_from_states, set_source_categories
 from app.profiles.sources import set_source_selected
 from app.security.files import UnsafeResumeError, read_verified_resume
 
@@ -228,9 +229,6 @@ async def set_user_default_profile(
 async def update_user_preferences(
     profile_id: UUID,
     request: Request,
-    allowed_categories: str = Form(""),
-    auto_send_categories: str = Form(""),
-    forbidden_categories: str = Form(""),
     allowed_cities: str = Form(""),
     minimum_daily_applications: int = Form(0, ge=0, le=100),
     daily_application_rules_present: bool = Form(False),
@@ -249,10 +247,8 @@ async def update_user_preferences(
         raise HTTPException(
             status_code=422, detail="minimum daily applications cannot exceed maximum"
         )
+    # Categories are chosen per source (see the source category route).
     payload = JobPreferenceUpdateInput(
-        allowed_categories=_items(allowed_categories),
-        auto_send_categories=_items(auto_send_categories),
-        forbidden_categories=_items(forbidden_categories),
         allowed_cities=_items(allowed_cities),
         maximum_daily_applications=maximum_daily_applications,
         minimum_auto_send_score=minimum_auto_send_score,
@@ -313,6 +309,56 @@ async def select_user_source(
     await session.commit()
     return RedirectResponse(
         _url("settings", profile.id, notice="source_selection_saved"), status_code=303
+    )
+
+
+@router.post("/app/profiles/{profile_id}/sources/{source_id}/categories")
+async def save_user_source_categories(
+    profile_id: UUID,
+    source_id: UUID,
+    request: Request,
+    csrf_token: str = Form(...),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_user_feature()
+    require_user_csrf(request, csrf_token)
+    account, profile = await _actor_profile(request, session, profile_id)
+    form = await request.form()
+    try:
+        search, auto_send, excluded = category_lists_from_states(
+            {key: value for key, value in form.items() if isinstance(value, str)}
+        )
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source_id,
+            search=search,
+            auto_send=auto_send,
+            excluded=excluded,
+            owner_account_id=account.id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="source not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        actor=f"account:{account.id}",
+        action="profile_source.categories_saved",
+        entity_type="user_profile",
+        entity_id=str(profile.id),
+        correlation_id=str(profile.id),
+        details={
+            "source_id": str(source_id),
+            "search": search,
+            "auto_send": auto_send,
+            "excluded": excluded,
+        },
+    )
+    await session.commit()
+    return RedirectResponse(
+        _url("settings", profile.id, notice="source_categories_saved") + "#sources",
+        status_code=303,
     )
 
 

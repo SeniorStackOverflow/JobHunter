@@ -366,3 +366,74 @@ def test_rabota_adapter_narrows_incremental_scans_to_the_given_categories() -> N
     adapter.set_incremental_categories(["workers", "warehouses"])
 
     assert adapter.config.incremental_category_slugs == ["workers", "warehouses"]
+
+
+async def test_picker_lists_every_known_category_with_its_state(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.profiles.source_categories import source_category_picker
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        await set_source_categories(
+            session,
+            profile_id=graph[1].id,
+            source_id=graph[0].id,
+            search=["workers", "warehouses"],
+            auto_send=["warehouses"],
+            excluded=["calls"],
+        )
+
+        picker = await source_category_picker(session, graph[2], graph[0].id)
+
+        # Chosen categories come first, then the rest by name.
+        assert [(item.external_id, item.name, item.state) for item in picker.choices] == [
+            ("warehouses", "Складское хозяйство", "auto"),
+            ("workers", "Разнорабочие, грузчики", "search"),
+            ("calls", "Работа на телефоне", "excluded"),
+            ("technology", "IT, Программирование", "off"),
+        ]
+        assert (picker.searched, picker.auto_sent, picker.excluded) == (2, 1, 1)
+        assert picker.configured is True
+        assert picker.unknown == []
+
+
+async def test_picker_shows_the_profile_wide_lists_until_the_source_is_configured(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.profiles.source_categories import source_category_picker
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        graph[2].allowed_categories = ["technology", "legacy-free-text"]
+
+        picker = await source_category_picker(session, graph[2], graph[0].id)
+
+        states = {item.external_id: item.state for item in picker.choices}
+        assert states["technology"] == "auto"
+        assert picker.configured is False
+        # A value typed by hand that the source does not publish is reported, not hidden.
+        assert picker.unknown == ["legacy-free-text"]
+
+
+def test_form_states_become_the_three_lists() -> None:
+    from app.profiles.source_categories import category_lists_from_states
+
+    lists = category_lists_from_states(
+        {
+            "category:workers": "search",
+            "category:warehouses": "auto",
+            "category:calls": "excluded",
+            "category:it": "off",
+            "csrf_token": "x",
+        }
+    )
+
+    assert lists == (["workers"], ["warehouses"], ["calls"])
+
+
+def test_an_unknown_form_state_is_rejected() -> None:
+    from app.profiles.source_categories import category_lists_from_states
+
+    with pytest.raises(ValueError, match="unknown category state"):
+        category_lists_from_states({"category:workers": "maybe"})

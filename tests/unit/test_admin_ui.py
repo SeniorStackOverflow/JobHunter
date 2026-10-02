@@ -85,6 +85,7 @@ def test_admin_javascript_initializes_every_custom_control() -> None:
         "data-password-toggle",
         "data-notice-dismiss",
         "data-confirm-dialog",
+        "data-category-picker",
     ):
         assert hook in script
 

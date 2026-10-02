@@ -60,6 +60,12 @@ from app.profiles.schemas import (
     ResumeMetadataInput,
     UserProfileInput,
 )
+from app.profiles.source_categories import (
+    category_policy,
+    known_source_categories,
+)
+from app.profiles.source_categories import set_source_categories as save_source_categories
+from app.profiles.sources import source_selected
 from app.reports import get_run_summary as build_run_summary
 from app.settings import get_settings
 
@@ -517,6 +523,86 @@ async def update_job_preferences(
         await _audit_write(session, "preferences.updated", "job_preference", str(item.id))
         await session.commit()
         return {"id": str(item.id), "updated_at": item.updated_at.isoformat()}
+
+
+@mcp.tool()
+async def get_source_categories(profile_id: str | None = None) -> list[dict[str, Any]]:
+    """List every source with the categories it publishes and the profile's choice.
+
+    Category ids belong to the source. ``configured`` false means the source
+    still follows the profile-wide lists returned by get_job_preferences.
+    """
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        preference = await ProfileService().get_preferences(
+            session, UUID(profile_id) if profile_id else None
+        )
+        sources = (await session.scalars(select(JobSource).order_by(JobSource.name))).all()
+        result: list[dict[str, Any]] = []
+        for source in sources:
+            policy = await category_policy(session, preference, source.id)
+            result.append(
+                {
+                    "source_id": str(source.id),
+                    "source_name": source.name,
+                    "adapter_type": source.adapter_type,
+                    "selected": await source_selected(session, preference.profile_id, source.id),
+                    "configured": policy.configured,
+                    "search": list(policy.search),
+                    "auto_send": list(policy.auto_send),
+                    "excluded": list(policy.excluded),
+                    "known_categories": [
+                        {"id": option.external_id, "name": option.name}
+                        for option in await known_source_categories(session, source.id)
+                    ],
+                }
+            )
+        return result
+
+
+@mcp.tool()
+async def set_source_categories(
+    source_id: str,
+    search: list[str],
+    auto_send: list[str],
+    excluded: list[str],
+    profile_id: str | None = None,
+) -> dict[str, Any]:
+    """Replace a profile's category choice for one source.
+
+    Ids must be categories that source publishes (see get_source_categories).
+    Auto-send implies search; an excluded category is neither searched nor sent.
+    """
+    from app.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        preference = await ProfileService().get_preferences(
+            session, UUID(profile_id) if profile_id else None
+        )
+        row = await save_source_categories(
+            session,
+            profile_id=preference.profile_id,
+            source_id=UUID(source_id),
+            search=search,
+            auto_send=auto_send,
+            excluded=excluded,
+        )
+        result = {
+            "source_id": str(row.source_id),
+            "search": list(row.search_categories),
+            "auto_send": list(row.auto_send_categories),
+            "excluded": list(row.excluded_categories),
+        }
+        await _audit_write(
+            session,
+            "profile_source.categories_saved",
+            "user_profile",
+            str(preference.profile_id),
+            details=result,
+        )
+        await session.commit()
+        return result
 
 
 @mcp.tool()

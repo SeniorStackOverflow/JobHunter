@@ -51,13 +51,14 @@ class JobPreferenceUpdateInput(BaseModel):
     partial update without resetting fields that their UI does not expose.  The
     protected ``auto_send_enabled`` and ``global_pause`` fields are deliberately not
     part of this schema; callers must use the explicit pause/resume actions.
+
+    Categories are not part of it either: they are chosen per source
+    (``app.profiles.source_categories``), and the profile-wide lists are only a
+    mirror of those choices.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    allowed_categories: list[str] = Field(default_factory=list)
-    auto_send_categories: list[str] = Field(default_factory=list)
-    forbidden_categories: list[str] = Field(default_factory=list)
     allowed_cities: list[str] = Field(default_factory=list)
     remote_allowed: bool = True
     minimum_salary: Decimal | None = Field(default=None, ge=0)

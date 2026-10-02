@@ -8,7 +8,7 @@ for that source. The profile-wide lists on ``JobPreference`` remain as a mirror
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -93,6 +93,91 @@ async def known_source_categories(
         (SourceCategoryOption(external_id, name) for external_id, (_rank, name) in names.items()),
         key=lambda item: (item.name.casefold(), item.external_id),
     )
+
+
+CATEGORY_STATES = ("off", "search", "auto", "excluded")
+_STATE_ORDER = {"auto": 0, "search": 1, "excluded": 2, "off": 3}
+_FORM_PREFIX = "category:"
+
+
+@dataclass(frozen=True)
+class SourceCategoryChoice:
+    external_id: str
+    name: str
+    state: str
+
+
+@dataclass(frozen=True)
+class SourceCategoryPicker:
+    choices: list[SourceCategoryChoice]
+    searched: int
+    auto_sent: int
+    excluded: int
+    # Stored values the source does not publish (typed by hand before the picker).
+    unknown: list[str]
+    configured: bool
+
+
+async def source_category_picker(
+    session: AsyncSession, preference: JobPreference, source_id: UUID
+) -> SourceCategoryPicker:
+    """Every category the source publishes with the profile's choice for it."""
+
+    policy = await category_policy(session, preference, source_id)
+    options = await known_source_categories(session, source_id)
+    known = {option.external_id for option in options}
+
+    def state(external_id: str) -> str:
+        if external_id in policy.excluded:
+            return "excluded"
+        if external_id in policy.auto_send:
+            return "auto"
+        if external_id in policy.search:
+            return "search"
+        return "off"
+
+    choices = sorted(
+        (
+            SourceCategoryChoice(option.external_id, option.name, state(option.external_id))
+            for option in options
+        ),
+        key=lambda item: (_STATE_ORDER[item.state], item.name.casefold(), item.external_id),
+    )
+    return SourceCategoryPicker(
+        choices=choices,
+        searched=sum(item.state in {"search", "auto"} for item in choices),
+        auto_sent=sum(item.state == "auto" for item in choices),
+        excluded=sum(item.state == "excluded" for item in choices),
+        unknown=_ordered(
+            value
+            for value in (*policy.search, *policy.auto_send, *policy.excluded)
+            if value not in known
+        ),
+        configured=policy.configured,
+    )
+
+
+def category_lists_from_states(
+    form: Mapping[str, object],
+) -> tuple[list[str], list[str], list[str]]:
+    """Turn the picker form (``category:<id>`` → state) into search/auto/excluded."""
+
+    search: list[str] = []
+    auto_send: list[str] = []
+    excluded: list[str] = []
+    for key, value in form.items():
+        if not key.startswith(_FORM_PREFIX):
+            continue
+        external_id = key.removeprefix(_FORM_PREFIX)
+        if value not in CATEGORY_STATES:
+            raise ValueError(f"unknown category state: {value!r}")
+        if value == "search":
+            search.append(external_id)
+        elif value == "auto":
+            auto_send.append(external_id)
+        elif value == "excluded":
+            excluded.append(external_id)
+    return _ordered(search), _ordered(auto_send), _ordered(excluded)
 
 
 async def _mirror_profile_lists(session: AsyncSession, profile_id: UUID) -> None:
@@ -196,10 +281,15 @@ async def crawl_category_slugs(session: AsyncSession, source_id: UUID) -> list[s
 
 
 __all__ = [
+    "CATEGORY_STATES",
+    "SourceCategoryChoice",
     "SourceCategoryOption",
+    "SourceCategoryPicker",
     "SourceCategoryPolicy",
+    "category_lists_from_states",
     "category_policy",
     "crawl_category_slugs",
     "known_source_categories",
     "set_source_categories",
+    "source_category_picker",
 ]

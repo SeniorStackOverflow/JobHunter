@@ -16,16 +16,14 @@
         {% set daily_rules = preferences.additional_rules or {} %}
         {% set force_minimum_daily = daily_rules.get('force_minimum_daily_applications') is sameas true %}
         <div class="form-grid">
-          <label class="field full">Категории для поиска<input type="text" name="allowed_categories" value="{{ preferences.allowed_categories|join(', ') }}"><span class="field-help">Через запятую</span></label>
+          <p class="field-help full">Категории для поиска, автоматической отправки и исключения выбираются отдельно для каждого источника — в разделе <a href="#sources">«Источники»</a> ниже.</p>
           <div class="preference-columns full">
             <div class="preference-column">
-              <label class="field">Категории для автоматической отправки<input type="text" name="auto_send_categories" value="{{ preferences.auto_send_categories|join(', ') }}"></label>
               <label class="field">Разрешённые города<input type="text" name="allowed_cities" value="{{ preferences.allowed_cities|join(', ') }}"></label>
               <label class="field">Минимальная оценка для автоотправки<input type="number" min="0" max="100" name="minimum_auto_send_score" value="{{ preferences.minimum_auto_send_score }}"></label>
               <div class="switch-row"><div class="switch-copy"><strong>Без опыта</strong><span>Рассматривать начальные позиции</span></div><label class="switch"><input type="checkbox" name="willing_without_experience" {% if preferences.willing_without_experience %}checked{% endif %}><span class="switch-ui"></span></label></div>
             </div>
             <div class="preference-column">
-              <label class="field">Исключить категории<input type="text" name="forbidden_categories" value="{{ preferences.forbidden_categories|join(', ') }}"></label>
               <fieldset class="daily-limit-field" data-daily-limit-range>
                 <legend>Отклики в день</legend>
                 <div class="daily-limit-inputs">
@@ -140,6 +138,33 @@
             {% if panel.is_admin and item.enabled %}<form method="post" action="/admin/sources/{{ item.id }}/scan/incremental"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}"><button class="btn btn-sm">{{ 'Проверить снова' if item.health_status.value != 'healthy' else 'Обновить сейчас' }}</button></form>{% endif %}
           </div>
         </div>
+        {% set picker = source_category_pickers.get(item.id) %}
+        <section class="category-picker" id="categories-{{ item.id }}" data-category-picker aria-label="Категории {{ item.name }}">
+          <div class="category-head"><strong>Категории {{ item.name }}</strong><small data-category-counts>{% if picker and picker.choices %}Ищу: {{ picker.searched }} · автоотправка: {{ picker.auto_sent }} · исключено: {{ picker.excluded }}{% else %}Источник не публикует категории{% endif %}</small></div>
+          {% if picker and picker.choices %}
+          <form method="post" action="{{ panel.source_categories(item.id) }}" class="category-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+            <div class="category-toolbar">
+              <label class="field category-search">Найти категорию<input type="search" data-category-filter placeholder="Например, склад" autocomplete="off"></label>
+              <p class="field-help"><strong>Искать</strong> — вакансии оцениваются и попадают в «Требуют решения». <strong>Автоотправка</strong> — подходящие отклики уходят сами. <strong>Исключить</strong> — вакансия пропускается, даже если она есть и в выбранной категории.</p>
+            </div>
+            {% if not picker.searched %}<div class="notice">Категории не выбраны: фильтр по категориям не применяется, а обход идёт по списку источника по умолчанию.</div>{% endif %}
+            {% if picker.unknown %}<div class="notice warning">В настройках остались значения, которых нет у источника: {{ picker.unknown|join(', ') }}. После сохранения они будут убраны.</div>{% endif %}
+            <div class="category-list">
+              {% for choice in picker.choices %}
+              <div class="category-row" role="group" aria-label="{{ choice.name }}" data-category-row data-category-name="{{ choice.name|lower }} {{ choice.external_id }}" data-state="{{ choice.state }}">
+                <span class="category-name">{{ choice.name }}</span>
+                <div class="segmented">
+                  {% for value, label in [('off', 'Не искать'), ('search', 'Искать'), ('auto', 'Автоотправка'), ('excluded', 'Исключить')] %}<label class="segment segment-{{ value }}"><input type="radio" name="category:{{ choice.external_id }}" value="{{ value }}"{% if choice.state == value %} checked{% endif %}><span>{{ label }}</span></label>{% endfor %}
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            <p class="empty-state compact" data-category-empty hidden>Ничего не найдено.</p>
+            <div class="form-actions"><span class="category-summary" data-category-summary aria-live="polite"></span><button class="btn btn-primary">Сохранить категории</button></div>
+          </form>
+          {% else %}<div class="empty-state compact">Источник не публикует категории: отбор для него идёт без фильтра по категориям.</div>{% endif %}
+        </section>
         {% else %}<div class="empty-state compact">Источники ещё не настроены.</div>{% endfor %}
       </div>
     </div></details>

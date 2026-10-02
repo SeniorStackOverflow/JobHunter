@@ -48,6 +48,7 @@ from app.models.enums import (
 )
 from app.notifications import resolved_alert_ids
 from app.profiles import ProfileService
+from app.profiles.source_categories import SourceCategoryPicker, source_category_picker
 from app.security.auth import CsrfProtector
 from app.settings import Settings
 from app.ui.panel import Panel
@@ -338,6 +339,7 @@ async def render_dashboard(
     scans: list[ScanRun] = []
     resumes: list[Resume] = []
     resume_usage: dict[UUID, int] = {}
+    source_category_pickers: dict[UUID, SourceCategoryPicker] = {}
     audits: list[AuditEvent] = []
     alert_states: dict[UUID, str] = {}
     historical_alerts: list[Alert] = []
@@ -708,6 +710,9 @@ async def render_dashboard(
                 for reference_id, reference_count in usage_rows.all():
                     if reference_id is not None:
                         resume_usage[reference_id] += int(reference_count)
+        source_category_pickers = {
+            item.id: await source_category_picker(session, preferences, item.id) for item in sources
+        }
     elif view == "calls":
         from app.admin.phone_routes import build_calls_context
 
@@ -806,6 +811,7 @@ async def render_dashboard(
             "preferences": preferences,
             "sources": sources,
             "disabled_source_ids": disabled_source_ids,
+            "source_category_pickers": source_category_pickers,
             "source_names": source_names,
             "resumes": resumes,
             "resume_usage": resume_usage,
