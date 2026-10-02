@@ -2,8 +2,10 @@
 
 Each adapter publishes its own categories, so the choice is stored per
 (profile, source) and validated against the catalogue the crawler discovered
-for that source. The profile-wide lists on ``JobPreference`` remain as a mirror
-(the union over all configured sources) for code that hashes or exposes them.
+for that source. The profile-wide lists on ``JobPreference`` stay as the default
+for a source that has no choice of its own; they are part of the evaluation
+fingerprint and are never rewritten here, so a per-source change re-evaluates
+only the vacancies it affects.
 """
 
 from __future__ import annotations
@@ -12,14 +14,16 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import (
     JobPreference,
     JobSource,
+    MatchEvaluation,
     ProfileSourcePreference,
     SourceCategory,
+    SourceJob,
     UserProfile,
 )
 
@@ -180,31 +184,52 @@ def category_lists_from_states(
     return _ordered(search), _ordered(auto_send), _ordered(excluded)
 
 
-async def _mirror_profile_lists(session: AsyncSession, profile_id: UUID) -> None:
-    preference = await session.scalar(
-        select(JobPreference).where(JobPreference.profile_id == profile_id)
-    )
-    if preference is None:
-        return
-    rows = (
-        await session.scalars(
-            select(ProfileSourcePreference).where(
-                ProfileSourcePreference.profile_id == profile_id,
-                ProfileSourcePreference.categories_configured.is_(True),
-            )
+async def _mark_changed_vacancies_stale(
+    session: AsyncSession,
+    *,
+    profile_id: UUID,
+    source_id: UUID,
+    before: SourceCategoryPolicy,
+    after: SourceCategoryPolicy,
+) -> int:
+    """Mark the profile's evaluations of vacancies whose category verdict changed.
+
+    Only those vacancies need the prefilter and the model again. An unset
+    preference fingerprint is the matcher's existing "not current" state.
+    Auto-send is not model input, so it never makes an evaluation stale.
+    """
+    from app.matching.prefilter import category_verdict
+
+    if (before.search, before.excluded) == (after.search, after.excluded):
+        return 0
+    jobs = (
+        await session.execute(
+            select(
+                SourceJob.id, SourceJob.category, SourceJob.subcategory, SourceJob.categories_seen
+            ).where(SourceJob.source_id == source_id)
         )
     ).all()
-    if not rows:
-        return
-    preference.allowed_categories = _ordered(
-        value for row in rows for value in row.search_categories or []
-    )
-    preference.auto_send_categories = _ordered(
-        value for row in rows for value in row.auto_send_categories or []
-    )
-    preference.forbidden_categories = _ordered(
-        value for row in rows for value in row.excluded_categories or []
-    )
+    changed: list[UUID] = []
+    for job_id, category, subcategory, categories_seen in jobs:
+        categories = [item for item in (category, subcategory, *(categories_seen or [])) if item]
+        if category_verdict(categories, before.search, before.excluded) != category_verdict(
+            categories, after.search, after.excluded
+        ):
+            changed.append(job_id)
+    marked = 0
+    for start in range(0, len(changed), 500):
+        result = await session.execute(
+            update(MatchEvaluation)
+            .where(
+                MatchEvaluation.profile_id == profile_id,
+                MatchEvaluation.source_job_id.in_(changed[start : start + 500]),
+                MatchEvaluation.preference_fingerprint.is_not(None),
+            )
+            .values(preference_fingerprint=None)
+            .execution_options(synchronize_session="fetch")
+        )
+        marked += int(getattr(result, "rowcount", 0) or 0)
+    return marked
 
 
 async def set_source_categories(
@@ -240,6 +265,12 @@ async def set_source_categories(
         if external_id not in known:
             raise ValueError(f"unknown source category: {external_id}")
 
+    preference = await session.scalar(
+        select(JobPreference).where(JobPreference.profile_id == profile_id)
+    )
+    before = (
+        await category_policy(session, preference, source_id) if preference is not None else None
+    )
     row = await session.get(ProfileSourcePreference, (profile_id, source_id))
     if row is None:
         row = ProfileSourcePreference(profile_id=profile_id, source_id=source_id, enabled=True)
@@ -249,8 +280,20 @@ async def set_source_categories(
     row.auto_send_categories = auto_ids
     row.excluded_categories = excluded_ids
     await session.flush()
-    await _mirror_profile_lists(session, profile_id)
-    await session.flush()
+    if before is not None:
+        await _mark_changed_vacancies_stale(
+            session,
+            profile_id=profile_id,
+            source_id=source_id,
+            before=before,
+            after=SourceCategoryPolicy(
+                search=tuple(search_ids),
+                auto_send=tuple(auto_ids),
+                excluded=tuple(excluded_ids),
+                configured=True,
+            ),
+        )
+        await session.flush()
     return row
 
 

@@ -11,9 +11,11 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
+from app.matching.bindings import preference_fingerprint
 from app.models.entities import (
     JobPreference,
     JobSource,
+    MatchEvaluation,
     ProfileSourcePreference,
     SourceCategory,
     UserProfile,
@@ -26,6 +28,7 @@ from app.profiles.source_categories import (
     known_source_categories,
     set_source_categories,
 )
+from tests.unit.test_daily_minimum import additional_candidate
 from tests.unit.test_policy_and_email import make_graph
 
 
@@ -158,14 +161,15 @@ async def test_automatic_sending_implies_search_and_exclusion_wins(
         assert policy.excluded == ("calls",)
 
 
-async def test_profile_wide_lists_mirror_the_union_of_all_sources(
+async def test_profile_wide_lists_stay_the_default_for_unconfigured_sources(
     sqlite_session_factory, tmp_path: Path
 ) -> None:
-    """Code that still reads the profile-wide lists (evaluation freshness, the
-    public API) must see every change made per source."""
+    """They are part of the evaluation fingerprint: rewriting them on every
+    per-source change would re-send every vacancy of the profile to the model."""
     async with sqlite_session_factory() as session:
         graph = await _graph_with_catalog(session, tmp_path)
-        source, profile = graph[0], graph[1]
+        source, profile, preference = graph[0], graph[1], graph[2]
+        before = preference_fingerprint(preference)
 
         await set_source_categories(
             session,
@@ -176,13 +180,126 @@ async def test_profile_wide_lists_mirror_the_union_of_all_sources(
             excluded=["calls"],
         )
 
-        preference = await session.scalar(
-            select(JobPreference).where(JobPreference.profile_id == profile.id)
+        assert preference.allowed_categories == ["technology"]
+        assert preference.auto_send_categories == ["technology"]
+        assert preference_fingerprint(preference) == before
+
+
+async def _second_vacancy(session, graph, *, category: str):
+    job, evaluation = (await additional_candidate(session, graph, company="Second", score=90))[1:3]
+    job.category = category
+    job.categories_seen = [category]
+    evaluation.preference_fingerprint = preference_fingerprint(graph[2])
+    await session.flush()
+    return evaluation
+
+
+async def test_adding_a_category_reevaluates_only_vacancies_of_that_category(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile, preference, technology = graph[0], graph[1], graph[2], graph[6]
+        workers = await _second_vacancy(session, graph, category="workers")
+        current = preference_fingerprint(preference)
+        assert technology.preference_fingerprint == current
+
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["technology", "workers"],
+            auto_send=["technology"],
+            excluded=[],
         )
-        assert preference is not None
-        assert preference.allowed_categories == ["warehouses", "workers"]
-        assert preference.auto_send_categories == ["warehouses"]
-        assert preference.forbidden_categories == ["calls"]
+
+        # Unset fingerprint = stale: the matcher picks the vacancy up again.
+        assert workers.preference_fingerprint is None
+        assert technology.preference_fingerprint == current
+
+
+async def test_removing_or_excluding_a_category_reevaluates_its_vacancies(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile, technology = graph[0], graph[1], graph[6]
+        workers = await _second_vacancy(session, graph, category="workers")
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["technology", "workers"],
+            auto_send=[],
+            excluded=[],
+        )
+        workers.preference_fingerprint = technology.preference_fingerprint
+        await session.flush()
+
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["workers"],
+            auto_send=[],
+            excluded=["technology"],
+        )
+
+        assert technology.preference_fingerprint is None
+        assert workers.preference_fingerprint is not None
+
+
+async def test_changing_only_automatic_sending_reevaluates_nothing(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    """Auto-send is a delivery rule the policy rechecks; it is not model input."""
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile, technology = graph[0], graph[1], graph[6]
+        before = technology.preference_fingerprint
+
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["technology"],
+            auto_send=[],
+            excluded=[],
+        )
+
+        assert technology.preference_fingerprint == before
+
+
+async def test_another_profiles_evaluations_are_not_touched(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile, technology = graph[0], graph[1], graph[6]
+        other = UserProfile(name="Other")
+        session.add(other)
+        await session.flush()
+        session.add(JobPreference(profile_id=other.id, allowed_categories=["technology"]))
+        values = {
+            column.key: getattr(technology, column.key)
+            for column in MatchEvaluation.__table__.columns
+            if column.key != "id"
+        }
+        foreign = MatchEvaluation(**{**values, "profile_id": other.id})
+        session.add(foreign)
+        await session.flush()
+
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["workers"],
+            auto_send=[],
+            excluded=[],
+        )
+
+        assert technology.preference_fingerprint is None
+        assert foreign.preference_fingerprint is not None
 
 
 async def test_another_accounts_profile_cannot_be_changed(

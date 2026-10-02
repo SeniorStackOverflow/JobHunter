@@ -53,8 +53,8 @@ class JobPreferenceUpdateInput(BaseModel):
     part of this schema; callers must use the explicit pause/resume actions.
 
     Categories are not part of it either: they are chosen per source
-    (``app.profiles.source_categories``), and the profile-wide lists are only a
-    mirror of those choices.
+    (``app.profiles.source_categories``). The profile-wide lists remain only as
+    the default for a source without its own choice.
     """
 
     model_config = ConfigDict(extra="forbid")

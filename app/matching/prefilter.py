@@ -225,6 +225,24 @@ def _category_policy_matches(candidates: Iterable[str], policies: Iterable[str])
     return _policy_matches(expanded, policies)
 
 
+def category_verdict(
+    categories: Iterable[str], allowed: Iterable[str], forbidden: Iterable[str]
+) -> str:
+    """How a category choice treats a vacancy's categories.
+
+    ``forbidden`` beats everything; an empty ``allowed`` list does not restrict.
+    The per-source settings compare this before and after a change to find the
+    vacancies whose evaluation is no longer current.
+    """
+    categories = list(categories)
+    allowed = list(allowed)
+    if _category_policy_matches(categories, forbidden):
+        return "forbidden"
+    if not allowed:
+        return "unrestricted"
+    return "allowed" if _category_policy_matches(categories, allowed) else "not_allowed"
+
+
 def _location_policy_matches(candidates: Iterable[str], policies: Iterable[str]) -> bool:
     canonical_candidates = [
         canonical for value in candidates if (canonical := canonicalize_location(value))
@@ -384,17 +402,16 @@ class DeterministicPrefilter:
             if category_policy is not None
             else preference.forbidden_categories or []
         )
-        category_allowed = bool(allowed_categories) and _category_policy_matches(
-            categories, allowed_categories
-        )
+        verdict = category_verdict(categories, allowed_categories, forbidden_categories)
+        category_allowed = verdict == "allowed"
         outside_resume_allowed = bool(
             preference.consider_outside_primary_resume and category_allowed
         )
 
-        if _category_policy_matches(categories, forbidden_categories):
+        if verdict == "forbidden":
             skip_reasons.append("category_forbidden")
             preference_fit = 0
-        elif allowed_categories and not category_allowed:
+        elif verdict == "not_allowed":
             skip_reasons.append("category_not_allowed")
             preference_fit = min(preference_fit, 20)
         elif category_allowed:
