@@ -1,0 +1,368 @@
+"""Category choices belong to a (profile, source) pair.
+
+Every adapter has its own category vocabulary, so one global list of free-text
+slugs cannot describe several sources. The owner picks from the categories the
+source itself publishes."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from sqlalchemy import select
+
+from app.models.entities import (
+    JobPreference,
+    JobSource,
+    ProfileSourcePreference,
+    SourceCategory,
+    UserProfile,
+)
+from app.models.enums import ProfileStatus, SourceHealth
+from app.profiles.source_categories import (
+    SourceCategoryPolicy,
+    category_policy,
+    crawl_category_slugs,
+    known_source_categories,
+    set_source_categories,
+)
+from tests.unit.test_policy_and_email import make_graph
+
+
+async def _catalog(session, source: JobSource, *items: tuple[str, str, str]) -> None:
+    for external_id, name, locale in items:
+        session.add(
+            SourceCategory(
+                source_id=source.id,
+                external_id=external_id,
+                name=name,
+                url=f"{source.base_url}/{locale}/category/{external_id}",
+                locale=locale,
+            )
+        )
+    await session.flush()
+
+
+async def _graph_with_catalog(session, storage: Path):
+    graph = await make_graph(session, storage)
+    await _catalog(
+        session,
+        graph[0],
+        ("technology", "IT, Программирование", "ru"),
+        ("technology", "IT, Programare", "ro"),
+        ("warehouses", "Складское хозяйство", "ru"),
+        ("workers", "Разнорабочие, грузчики", "ru"),
+        ("calls", "Работа на телефоне", "ru"),
+    )
+    return graph
+
+
+async def test_unconfigured_source_uses_the_profile_wide_lists(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, preference = graph[0], graph[2]
+        preference.forbidden_categories = ["calls"]
+
+        policy = await category_policy(session, preference, source.id)
+
+        assert policy == SourceCategoryPolicy(
+            search=("technology",),
+            auto_send=("technology",),
+            excluded=("calls",),
+            configured=False,
+        )
+
+
+async def test_saved_choice_is_scoped_to_its_source(sqlite_session_factory, tmp_path: Path) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile, preference = graph[0], graph[1], graph[2]
+        other = JobSource(
+            name="Other board",
+            base_url="https://other.example.com",
+            adapter_type="fixture_source",
+            configuration={},
+            health_status=SourceHealth.HEALTHY,
+        )
+        session.add(other)
+        await session.flush()
+        await _catalog(session, other, ("depozit", "Depozit", "ro"))
+
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["warehouses", "workers"],
+            auto_send=["warehouses"],
+            excluded=["calls"],
+        )
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=other.id,
+            search=["depozit"],
+            auto_send=[],
+            excluded=[],
+        )
+
+        first = await category_policy(session, preference, source.id)
+        second = await category_policy(session, preference, other.id)
+        assert first == SourceCategoryPolicy(
+            search=("warehouses", "workers"),
+            auto_send=("warehouses",),
+            excluded=("calls",),
+            configured=True,
+        )
+        assert second == SourceCategoryPolicy(
+            search=("depozit",), auto_send=(), excluded=(), configured=True
+        )
+
+
+async def test_a_category_the_source_does_not_publish_is_rejected(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+
+        with pytest.raises(ValueError, match="unknown source category: sklad"):
+            await set_source_categories(
+                session,
+                profile_id=graph[1].id,
+                source_id=graph[0].id,
+                search=["sklad"],
+                auto_send=[],
+                excluded=[],
+            )
+
+
+async def test_automatic_sending_implies_search_and_exclusion_wins(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+
+        await set_source_categories(
+            session,
+            profile_id=graph[1].id,
+            source_id=graph[0].id,
+            search=["calls"],
+            auto_send=["warehouses", "calls"],
+            excluded=["calls"],
+        )
+
+        policy = await category_policy(session, graph[2], graph[0].id)
+        assert policy.search == ("warehouses",)
+        assert policy.auto_send == ("warehouses",)
+        assert policy.excluded == ("calls",)
+
+
+async def test_profile_wide_lists_mirror_the_union_of_all_sources(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    """Code that still reads the profile-wide lists (evaluation freshness, the
+    public API) must see every change made per source."""
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile = graph[0], graph[1]
+
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["workers", "warehouses"],
+            auto_send=["warehouses"],
+            excluded=["calls"],
+        )
+
+        preference = await session.scalar(
+            select(JobPreference).where(JobPreference.profile_id == profile.id)
+        )
+        assert preference is not None
+        assert preference.allowed_categories == ["warehouses", "workers"]
+        assert preference.auto_send_categories == ["warehouses"]
+        assert preference.forbidden_categories == ["calls"]
+
+
+async def test_another_accounts_profile_cannot_be_changed(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from uuid import uuid4
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+
+        with pytest.raises(LookupError):
+            await set_source_categories(
+                session,
+                profile_id=graph[1].id,
+                source_id=graph[0].id,
+                search=["workers"],
+                auto_send=[],
+                excluded=[],
+                owner_account_id=uuid4(),
+            )
+        assert (await session.scalars(select(ProfileSourcePreference))).all() == []
+
+
+async def test_known_categories_are_named_in_the_preferred_language(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        hidden = await session.scalar(
+            select(SourceCategory).where(SourceCategory.external_id == "workers")
+        )
+        assert hidden is not None
+        hidden.active = False
+        await session.flush()
+
+        options = await known_source_categories(session, graph[0].id)
+
+        assert [(item.external_id, item.name) for item in options] == [
+            ("technology", "IT, Программирование"),
+            ("calls", "Работа на телефоне"),
+            ("warehouses", "Складское хозяйство"),
+        ]
+
+
+async def test_crawl_scope_is_the_union_of_processing_profiles(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile = graph[0], graph[1]
+        draft = UserProfile(name="Draft", status=ProfileStatus.DRAFT)
+        session.add(draft)
+        await session.flush()
+        session.add(JobPreference(profile_id=draft.id))
+        await session.flush()
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["warehouses", "workers"],
+            auto_send=[],
+            excluded=[],
+        )
+        await set_source_categories(
+            session,
+            profile_id=draft.id,
+            source_id=source.id,
+            search=["calls"],
+            auto_send=[],
+            excluded=[],
+        )
+
+        # A profile that is not processed must not widen what is crawled.
+        assert await crawl_category_slugs(session, source.id) == ["warehouses", "workers"]
+
+
+async def test_crawl_scope_is_empty_until_someone_chooses_categories(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+
+        assert await crawl_category_slugs(session, graph[0].id) == []
+
+
+async def test_a_source_excluded_by_the_profile_does_not_widen_the_crawl(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.profiles.sources import set_source_selected
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        source, profile = graph[0], graph[1]
+        await set_source_categories(
+            session,
+            profile_id=profile.id,
+            source_id=source.id,
+            search=["workers"],
+            auto_send=[],
+            excluded=[],
+        )
+        await set_source_selected(
+            session, profile_id=profile.id, source_id=source.id, enabled=False
+        )
+
+        assert await crawl_category_slugs(session, source.id) == []
+        # Excluding a source keeps the category choice for when it is enabled again.
+        assert (await category_policy(session, graph[2], source.id)).search == ("workers",)
+
+
+class _ScopedAdapter:
+    def __init__(self) -> None:
+        self.scope: list[str] | None = None
+
+    def set_incremental_categories(self, slugs: list[str]) -> None:
+        self.scope = list(slugs)
+
+
+async def test_scan_uses_the_categories_profiles_chose_for_the_source(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.crawlers.pipeline import apply_profile_category_scope
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        await set_source_categories(
+            session,
+            profile_id=graph[1].id,
+            source_id=graph[0].id,
+            search=["workers", "warehouses"],
+            auto_send=[],
+            excluded=[],
+        )
+        adapter = _ScopedAdapter()
+
+        await apply_profile_category_scope(session, graph[0], adapter)
+
+        assert adapter.scope == ["warehouses", "workers"]
+
+
+async def test_scan_keeps_the_source_default_until_categories_are_chosen(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.crawlers.pipeline import apply_profile_category_scope
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        adapter = _ScopedAdapter()
+
+        await apply_profile_category_scope(session, graph[0], adapter)
+
+        assert adapter.scope is None
+
+
+async def test_an_adapter_without_categories_is_left_alone(
+    sqlite_session_factory, tmp_path: Path
+) -> None:
+    from app.crawlers.pipeline import apply_profile_category_scope
+
+    async with sqlite_session_factory() as session:
+        graph = await _graph_with_catalog(session, tmp_path)
+        await set_source_categories(
+            session,
+            profile_id=graph[1].id,
+            source_id=graph[0].id,
+            search=["workers"],
+            auto_send=[],
+            excluded=[],
+        )
+
+        await apply_profile_category_scope(session, graph[0], object())
+
+
+def test_rabota_adapter_narrows_incremental_scans_to_the_given_categories() -> None:
+    from app.crawlers.adapters.rabota_md import RabotaMdAdapter
+    from app.crawlers.adapters.rabota_md.adapter import RabotaMdConfig
+    from tests.unit.test_rabota_adapter import FixtureFetcher
+
+    adapter = RabotaMdAdapter(RabotaMdConfig(), http_fetcher=FixtureFetcher())
+
+    adapter.set_incremental_categories(["workers", "warehouses"])
+
+    assert adapter.config.incremental_category_slugs == ["workers", "warehouses"]

@@ -322,3 +322,112 @@ def test_send_attempt_ledger_backfill_preserves_hard_maximum_history(
         assert "email_send_attempts" not in {
             row[0] for row in connection.execute("SELECT name FROM sqlite_master")
         }
+
+
+def test_category_lists_are_copied_to_every_source_of_the_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from app.models.entities import JobPreference, JobSource
+
+    database_path = tmp_path / "categories.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
+    get_settings.cache_clear()
+    try:
+        command.upgrade(Config("alembic.ini"), "c5d7a9e1f3b2")
+    finally:
+        get_settings.cache_clear()
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with Session(engine) as session:
+            sources = [
+                JobSource(name=name, base_url=f"https://{name}.example", adapter_type="rss")
+                for name in ("first", "second")
+            ]
+            chooser = UserProfile(name="Chooser")
+            excluded_second = UserProfile(name="Excluded second")
+            blank = UserProfile(name="Blank")
+            session.add_all([*sources, chooser, excluded_second, blank])
+            session.flush()
+            session.add_all(
+                [
+                    JobPreference(
+                        profile_id=chooser.id,
+                        allowed_categories=["others", "warehouses"],
+                        auto_send_categories=["warehouses"],
+                        forbidden_categories=["calls"],
+                    ),
+                    JobPreference(profile_id=excluded_second.id, allowed_categories=["it"]),
+                    JobPreference(profile_id=blank.id),
+                ]
+            )
+            session.commit()
+            ids = {
+                "first": sources[0].id.hex,
+                "second": sources[1].id.hex,
+                "chooser": chooser.id.hex,
+                "excluded_second": excluded_second.id.hex,
+                "blank": blank.id.hex,
+            }
+    finally:
+        engine.dispose()
+    with closing(sqlite3.connect(database_path)) as connection:
+        # This profile had already excluded the second source.
+        connection.execute(
+            "INSERT INTO profile_source_preferences "
+            "(profile_id, source_id, enabled, created_at, updated_at) "
+            "VALUES (?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            (ids["excluded_second"], ids["second"]),
+        )
+        connection.commit()
+    get_settings.cache_clear()
+    try:
+        command.upgrade(Config("alembic.ini"), "d8e2f4a6b1c3")
+    finally:
+        get_settings.cache_clear()
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        rows = {
+            (profile_id, source_id): (
+                enabled,
+                configured,
+                json.loads(search),
+                json.loads(auto_send),
+                json.loads(excluded),
+            )
+            for profile_id, source_id, enabled, configured, search, auto_send, excluded in (
+                connection.execute(
+                    "SELECT profile_id, source_id, enabled, categories_configured, "
+                    "search_categories, auto_send_categories, excluded_categories "
+                    "FROM profile_source_preferences"
+                )
+            )
+        }
+        preference = connection.execute(
+            "SELECT allowed_categories FROM job_preferences WHERE profile_id = ?",
+            (ids["chooser"],),
+        ).fetchone()
+    copied = (1, 1, ["others", "warehouses"], ["warehouses"], ["calls"])
+    assert rows == {
+        (ids["chooser"], ids["first"]): copied,
+        (ids["chooser"], ids["second"]): copied,
+        (ids["excluded_second"], ids["first"]): (1, 1, ["it"], [], []),
+        # The earlier exclusion of the source is kept.
+        (ids["excluded_second"], ids["second"]): (0, 1, ["it"], [], []),
+    }
+    # The profile-wide lists stay untouched: nothing is re-evaluated by the upgrade.
+    assert preference is not None and json.loads(preference[0]) == ["others", "warehouses"]
+
+    get_settings.cache_clear()
+    try:
+        command.downgrade(Config("alembic.ini"), "c5d7a9e1f3b2")
+    finally:
+        get_settings.cache_clear()
+    with closing(sqlite3.connect(database_path)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(profile_source_preferences)")
+        }
+    assert "search_categories" not in columns
+    assert "enabled" in columns

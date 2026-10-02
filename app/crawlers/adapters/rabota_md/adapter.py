@@ -458,6 +458,11 @@ class RabotaMdAdapter:
         self._region_cache = []
         return []
 
+    def set_incremental_categories(self, slugs: list[str]) -> None:
+        """Narrow incremental scans to the categories profiles chose for this source."""
+
+        self.config = self.config.model_copy(update={"incremental_category_slugs": list(slugs)})
+
     async def discover_categories(self) -> list[SourceCategoryData]:
         await self._ensure_access()
         if self._category_cache is not None:

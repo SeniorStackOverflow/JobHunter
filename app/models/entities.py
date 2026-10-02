@@ -281,6 +281,13 @@ class ProfileSourcePreference(TimestampMixin, Base):
         ForeignKey("job_sources.id", ondelete="CASCADE"), primary_key=True
     )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Category choices use the source's own category ids (SourceCategory.external_id):
+    # every adapter has a different vocabulary. Until ``categories_configured`` is
+    # set, the profile-wide lists of JobPreference apply to the source.
+    categories_configured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    search_categories: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    auto_send_categories: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    excluded_categories: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
 
 
 class CanonicalEmployer(UUIDPrimaryKeyMixin, TimestampMixin, Base):

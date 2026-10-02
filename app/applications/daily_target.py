@@ -133,6 +133,7 @@ async def daily_target_state(
     from app.matching.freshness import evaluation_is_current
     from app.models.entities import EmployerContact, JobSource, Resume, SourceJob, UserProfile
     from app.models.enums import ContactDeliveryState, JobStatus, SourceHealth
+    from app.profiles.source_categories import category_policy
     from app.profiles.sources import source_selected
     from app.settings import get_settings
 
@@ -286,7 +287,10 @@ async def daily_target_state(
                 ContactDeliveryState.SUPPRESSED,
             }
             or (job.category or "").casefold()
-            not in {value.casefold() for value in preference.auto_send_categories}
+            not in {
+                value.casefold()
+                for value in (await category_policy(session, preference, job.source_id)).auto_send
+            }
             or not evaluation_inputs_are_current(evaluation, profile, preference, resume)
             or not await evaluation_is_current(session, evaluation, job)
             or not await source_selected(session, profile.id, source.id)

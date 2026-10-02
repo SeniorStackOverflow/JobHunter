@@ -50,6 +50,7 @@ from app.observability.metrics import (
     APPLICATIONS_DEFERRED_SAME_EMPLOYER,
 )
 from app.policies.schemas import PolicyResult
+from app.profiles.source_categories import category_policy
 from app.profiles.sources import source_selected
 from app.settings import Settings
 
@@ -98,7 +99,8 @@ class PolicyEngine:
         if identity is not None and contact.employer_id is None:
             contact.employer_id = identity.employer.id
         category = (job.category or "").casefold()
-        auto_categories = {item.casefold() for item in preferences.auto_send_categories}
+        source_categories = await category_policy(session, preferences, job.source_id)
+        auto_categories = {item.casefold() for item in source_categories.auto_send}
         additional_rules = preferences.additional_rules or {}
         raw_forbidden_title_terms = additional_rules.get("forbidden_title_terms", [])
         forbidden_title_terms = (

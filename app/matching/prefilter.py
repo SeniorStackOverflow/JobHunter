@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
 from app.matching.hard_requirements import HardRequirementEngine
@@ -14,6 +14,9 @@ from app.matching.schemas import (
 )
 from app.models.entities import JobPreference, SourceJob, UserProfile
 from app.models.enums import JobStatus, MatchDecision
+
+if TYPE_CHECKING:
+    from app.profiles.source_categories import SourceCategoryPolicy
 
 _MAX_UNTRUSTED_TEXT = 100_000
 
@@ -310,6 +313,7 @@ class DeterministicPrefilter:
         *,
         resume_fit: int,
         allow_soft_catchup: bool = False,
+        category_policy: SourceCategoryPolicy | None = None,
     ) -> DeterministicFilterResult:
         if not 0 <= resume_fit <= 100:
             raise ValueError("resume_fit must be between 0 and 100")
@@ -368,7 +372,18 @@ class DeterministicPrefilter:
         categories = [
             item for item in (job.category, job.subcategory, *(job.categories_seen or [])) if item
         ]
-        allowed_categories = preference.allowed_categories or []
+        # The vacancy's own source decides which categories count; without a
+        # source choice the profile-wide lists apply.
+        allowed_categories = (
+            list(category_policy.search)
+            if category_policy is not None
+            else preference.allowed_categories or []
+        )
+        forbidden_categories = (
+            list(category_policy.excluded)
+            if category_policy is not None
+            else preference.forbidden_categories or []
+        )
         category_allowed = bool(allowed_categories) and _category_policy_matches(
             categories, allowed_categories
         )
@@ -376,7 +391,7 @@ class DeterministicPrefilter:
             preference.consider_outside_primary_resume and category_allowed
         )
 
-        if _category_policy_matches(categories, preference.forbidden_categories or []):
+        if _category_policy_matches(categories, forbidden_categories):
             skip_reasons.append("category_forbidden")
             preference_fit = 0
         elif allowed_categories and not category_allowed:

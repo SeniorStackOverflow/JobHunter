@@ -224,6 +224,23 @@ def _completed_scan_status(run: ScanRun) -> RunStatus:
     return RunStatus.SUCCEEDED
 
 
+async def apply_profile_category_scope(
+    session: AsyncSession, source: JobSource, adapter: object
+) -> list[str]:
+    """Scan the categories that processed profiles search on this source.
+
+    The source configuration keeps its own default list; it applies while no
+    profile has chosen categories, and for adapters without categories.
+    """
+    from app.profiles.source_categories import crawl_category_slugs
+
+    scope = await crawl_category_slugs(session, source.id)
+    setter = getattr(adapter, "set_incremental_categories", None)
+    if scope and callable(setter):
+        setter(scope)
+    return scope
+
+
 class ScanService:
     def __init__(
         self,
@@ -497,6 +514,7 @@ class ScanService:
             run.started_at = run.started_at or datetime.now(UTC)
 
             adapter = self.registry.create(source)
+            await apply_profile_category_scope(session, source, adapter)
             try:
                 validation = await adapter.validate_source()
             except BaseException:

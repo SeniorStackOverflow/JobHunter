@@ -67,6 +67,7 @@ from app.models.enums import (
     PolicyDecision,
 )
 from app.profiles.service import ProfileService, choose_resume_for_job
+from app.profiles.source_categories import SourceCategoryPolicy, category_policy
 from app.profiles.sources import source_selected
 from app.settings import Settings, get_settings
 from app.telemetry import record_external_call_attempts
@@ -282,6 +283,7 @@ def build_match_request(
     prefilter: DeterministicFilterResult,
     resume_category: str | None = None,
     resume_summary: str | None = None,
+    category_policy: SourceCategoryPolicy | None = None,
 ) -> MatchRequest:
     return MatchRequest(
         job_title=job.title,
@@ -309,8 +311,16 @@ def build_match_request(
         resume_category=resume_category,
         resume_summary=_truncate(resume_summary, _MAX_RESUME_SUMMARY_CHARS),
         preference_context={
-            "allowed_categories": preference.allowed_categories or [],
-            "forbidden_categories": preference.forbidden_categories or [],
+            "allowed_categories": (
+                list(category_policy.search)
+                if category_policy is not None
+                else preference.allowed_categories or []
+            ),
+            "forbidden_categories": (
+                list(category_policy.excluded)
+                if category_policy is not None
+                else preference.forbidden_categories or []
+            ),
             "allowed_cities": preference.allowed_cities or [],
             "remote_allowed": preference.remote_allowed,
             "minimum_salary": (
@@ -652,6 +662,7 @@ class MatchingService:
         resume_summary: str | None = None,
         minimum_auto_send_score: int | None = None,
         allow_soft_catchup: bool = False,
+        source_categories: SourceCategoryPolicy | None = None,
     ) -> tuple[MatchResult, LLMCallTrace | None]:
         """Return the reconciled result and the LLM call trace (None if no LLM call)."""
         deterministic = self.prefilter.evaluate(
@@ -660,6 +671,7 @@ class MatchingService:
             profile,
             resume_fit=resume_fit,
             allow_soft_catchup=allow_soft_catchup,
+            category_policy=source_categories,
         )
         if not deterministic.eligible_for_ai:
             return deterministic.to_match_result(), None
@@ -670,6 +682,7 @@ class MatchingService:
             prefilter=deterministic,
             resume_category=resume_category,
             resume_summary=resume_summary,
+            category_policy=source_categories,
         )
         trace: LLMCallTrace
         if isinstance(self.provider, LLMRouterProvider):
@@ -774,6 +787,7 @@ class MatchingService:
             resume_category=resume_category,
             minimum_auto_send_score=effective_auto_send_score,
             allow_soft_catchup=minimum_catchup_active,
+            source_categories=await category_policy(session, preference, job.source_id),
         )
         result = _apply_same_input_safety_guard(
             previous_evaluation,
@@ -983,7 +997,11 @@ async def process_unprocessed_jobs() -> int:
                 )
                 resume_fit = _estimate_resume_fit(job, profile, resume.category if resume else None)
                 deterministic = service.prefilter.evaluate(
-                    job, preference, profile, resume_fit=resume_fit
+                    job,
+                    preference,
+                    profile,
+                    resume_fit=resume_fit,
+                    category_policy=await category_policy(session, preference, job.source_id),
                 )
                 hard_requirement_refresh_due = bool(deterministic.hard_requirements) and (
                     evaluation is None
