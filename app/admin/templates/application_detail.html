@@ -4,6 +4,7 @@
 <a class="btn" href="{{ panel.view(view) }}">← К откликам</a>
   {% set vacancy_active = application.job and application.job.status == 'active' %}
   {% if application.policy_result.get('catchup_stage') %}<div class="notice detail-spacer">Отклик выбран для добора дневного минимума с порогом {{ application.policy_result.catchup_stage }} баллов. Проверки отправки и ограничение на разные компании сохраняются.</div>{% endif %}
+  {% set rejection_note = application_rejection_note(application) %}{% if application.status == 'cancelled' and rejection_note %}<div class="notice detail-spacer">{{ rejection_note }}</div>{% endif %}
   {% if application.status == 'deferred' %}<div class="notice detail-spacer">{% if application.policy_result.get('hard_safety_passed') and application.policy_result.get('content_ready') and application.employer_only_deferred %}Отклик ожидает свободного работодателя. Перед отправкой все условия будут проверены снова.{% else %}Компания сейчас недоступна для нового отклика. У заявки могут быть и другие препятствия; освобождение компании само по себе не разрешает отправку.{% endif %}</div>{% endif %}
 
   <div class="section-heading">

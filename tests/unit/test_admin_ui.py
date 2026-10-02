@@ -268,3 +268,38 @@ def test_phone_health_template_exists_and_uses_correct_variables() -> None:
     markup = template_path.read_text(encoding="utf-8")
     assert "phone_health.components" in markup
     assert "status_tone" in markup
+
+
+def test_admin_explains_automatic_no_email_rejection() -> None:
+    from app.ui.presentation import _application_rejection_note
+
+    application = {
+        "status": "cancelled",
+        "policy_result": {
+            "decision": "skipped",
+            "safe_stop_reason": "no_public_email",
+            "rules_failed": ["letter_validated", "verified_email_contact"],
+        },
+    }
+
+    assert _application_rejection_note(application) == (
+        "Отклонено автоматически: у вакансии нет публичного email — JobHunter "  # noqa: RUF001
+        "не отправляет отклики через внутреннюю форму сайта."
+    )
+
+
+def test_admin_adds_no_rejection_note_to_an_owner_rejected_application() -> None:
+    from app.ui.presentation import _application_rejection_note
+
+    application = {
+        "status": "cancelled",
+        "policy_result": {"owner_rejected": True, "rules_failed": ["verified_email_contact"]},
+    }
+
+    assert _application_rejection_note(application) is None
+
+
+def test_application_detail_template_shows_the_rejection_note() -> None:
+    template = Path("app/admin/templates/application_detail.html").read_text(encoding="utf-8")
+
+    assert "application_rejection_note(application)" in template

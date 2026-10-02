@@ -368,6 +368,17 @@ def _application_approval_issue(
     return "Письмо или получатель не прошли проверку безопасности."
 
 
+def _application_rejection_note(application: Any) -> str | None:
+    """Explain a rejection the policy made on its own, without the owner."""
+
+    if _application_safe_stop_reason(application) == "no_public_email":
+        return (
+            "Отклонено автоматически: у вакансии нет публичного email — JobHunter "
+            "не отправляет отклики через внутреннюю форму сайта."
+        )
+    return None
+
+
 def _approval_failure_notice(application: Application | None, error: Exception) -> str:
     message = str(error)
     if application is not None and not _application_content_validated(application):
@@ -400,3 +411,4 @@ templates.env.globals["format_dt"] = _format_dt
 templates.env.globals["audit_action_label"] = _audit_action_label
 templates.env.globals["alert_code_label"] = _alert_code_label
 templates.env.globals["application_approval_issue"] = _application_approval_issue
+templates.env.globals["application_rejection_note"] = _application_rejection_note

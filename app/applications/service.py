@@ -82,6 +82,22 @@ def _policy_only_refresh_needed(application: Application) -> bool:
     return bool(failed) and failed <= _POLICY_ONLY_REFRESH_RULES
 
 
+def _awaits_no_email_rejection(application: Application) -> bool:
+    """A no-email application the policy has not rejected yet.
+
+    Such rows were queued for review or deferred before the policy rejected
+    vacancies without a public email. One evaluation turns each into a
+    cancelled application that is not selected again, so the backlog is
+    evaluated in full instead of waiting for the rotating refresh batch.
+    """
+    if (application.policy_result or {}).get("owner_rejected") is True:
+        return False
+    if application.policy_decision in {PolicyDecision.SKIPPED, PolicyDecision.BLOCKED}:
+        return False
+    raw_failed = (application.policy_result or {}).get("rules_failed", [])
+    return isinstance(raw_failed, list) and "verified_email_contact" in raw_failed
+
+
 def _confirmed_fact(profile: UserProfile, job: SourceJob) -> tuple[str | None, str | None]:
     haystack = f"{job.title} {job.description or ''}".casefold()
     for fact in profile.confirmed_facts:
@@ -601,6 +617,7 @@ async def prepare_pending_applications() -> int:
 
         full_refresh: list[tuple[UUID, UUID]] = []
         policy_refresh_candidates: list[Application] = []
+        no_email_backlog: list[Application] = []
         for profile_id, canonical_id, latest_evaluation_id, application in rows:
             if (
                 application is None
@@ -608,6 +625,8 @@ async def prepare_pending_applications() -> int:
                 or application.match_evaluation_id != latest_evaluation_id
             ):
                 full_refresh.append((profile_id, canonical_id))
+            elif _awaits_no_email_rejection(application):
+                no_email_backlog.append(application)
             elif _policy_only_refresh_needed(application):
                 policy_refresh_candidates.append(application)
 
@@ -622,6 +641,8 @@ async def prepare_pending_applications() -> int:
                 policy_refresh.extend(
                     policy_refresh_candidates[: refresh_limit - len(policy_refresh)]
                 )
+
+        policy_refresh = [*policy_refresh, *no_email_backlog]
 
         full_refresh_keys = set(full_refresh)
         policy_refresh_ids = {application.id for application in policy_refresh}
@@ -693,6 +714,7 @@ async def prepare_pending_applications() -> int:
         pending_rows=len(rows),
         full_refresh=len(full_refresh),
         policy_refresh=len(policy_refresh),
+        no_email_backlog=len(no_email_backlog),
         prepared=prepared,
         failed=failed,
         duration_seconds=round(time.monotonic() - started, 2),

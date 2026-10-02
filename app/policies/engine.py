@@ -53,7 +53,8 @@ from app.policies.schemas import PolicyResult
 from app.profiles.sources import source_selected
 from app.settings import Settings
 
-POLICY_VERSION = "2026-09-30.1-distinct-employer-catchup"
+POLICY_VERSION = "2026-10-02.1-no-public-email-skip"
+NO_PUBLIC_EMAIL_STOP_REASON = "no_public_email"
 
 
 class PolicyEngine:
@@ -290,6 +291,11 @@ class PolicyEngine:
         }
         if hard_block_rules & set(failed):
             decision = PolicyDecision.BLOCKED
+        elif "verified_email_contact" in failed:
+            # JobHunter never submits through a job board's internal form, so
+            # there is nothing the owner could approve and no employer slot
+            # worth waiting for.
+            decision = PolicyDecision.SKIPPED
         elif {
             "no_active_employer_conversation",
             "employer_application_slot_available",
@@ -368,6 +374,13 @@ class PolicyEngine:
             policy_result.update(
                 {
                     "safe_stop_reason": reason,
+                    "requires_rematch": False,
+                }
+            )
+        elif result.decision is PolicyDecision.SKIPPED and "verified_email_contact" in failed:
+            policy_result.update(
+                {
+                    "safe_stop_reason": NO_PUBLIC_EMAIL_STOP_REASON,
                     "requires_rematch": False,
                 }
             )
