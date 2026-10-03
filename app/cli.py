@@ -145,6 +145,7 @@ async def seed_defaults(include_fixture: bool) -> None:
 
 
 def validate_source_config(path: Path) -> dict[str, Any]:
+    from app.crawlers.adapters.delucru_md import DelucruMdConfig
     from app.crawlers.adapters.rabota_md import RabotaMdConfig
     from app.crawlers.adapters.structured import StructuredSourceConfig
     from app.crawlers.schemas import GenericSourceConfig
@@ -153,7 +154,7 @@ def validate_source_config(path: Path) -> dict[str, Any]:
         raw = yaml.safe_load(handle)
     source = raw["source"]
     adapter_type = str(source.get("adapter", "")).casefold()
-    parsed: GenericSourceConfig | RabotaMdConfig | StructuredSourceConfig
+    parsed: GenericSourceConfig | RabotaMdConfig | DelucruMdConfig | StructuredSourceConfig
     if adapter_type in {"generic_html", "company_careers", "fixture_source"}:
         parsed = GenericSourceConfig.model_validate(source)
     elif adapter_type == "rabota_md":
@@ -179,6 +180,25 @@ def validate_source_config(path: Path) -> dict[str, Any]:
             "incremental_detail_refresh_budget": incremental.get("detail_refresh_budget", 50),
         }
         parsed = RabotaMdConfig.model_validate(values)
+    elif adapter_type == "delucru_md":
+        from app.crawlers.adapters.delucru_md import DelucruMdConfig
+
+        incremental = source.get("incremental_scan", {})
+        values = {
+            "base_url": source.get("base_url", "https://www.delucru.md"),
+            "live_mode": source.get("live_mode", True),
+            "policy_review_acknowledged": source.get("policy_review_acknowledged", False),
+            "policy_review_reference": source.get("policy_review_reference"),
+            "locale_priority": source.get("locale_priority", ["ro", "ru"]),
+            "requests_per_minute": source.get("requests_per_minute", 25),
+            "minimum_interval_seconds": source.get("minimum_interval_seconds", 2.0),
+            "incremental_max_pages_per_entrypoint": incremental.get("max_pages_per_entrypoint", 10),
+            "known_unchanged_stop_threshold": incremental.get("known_unchanged_stop_threshold", 50),
+            "incremental_category_slugs": incremental.get(
+                "category_slugs", ["it-internet", "lucru-de-acasa-part-time"]
+            ),
+        }
+        parsed = DelucruMdConfig.model_validate(values)
     elif adapter_type in {"generic_api", "rss", "sitemap"}:
         parsed = StructuredSourceConfig.model_validate(source)
     else:

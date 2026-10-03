@@ -49,6 +49,7 @@ class JobSourceAdapterRegistry:
 def build_default_registry(
     client_factory: Callable[[JobSource], HttpFetcher | None] | None = None,
 ) -> JobSourceAdapterRegistry:
+    from app.crawlers.adapters.delucru_md import DelucruMdAdapter
     from app.crawlers.adapters.fixture_source import FixtureSourceAdapter
     from app.crawlers.adapters.generic_html import GenericHtmlSourceAdapter
     from app.crawlers.adapters.rabota_md import RabotaMdAdapter
@@ -60,6 +61,7 @@ def build_default_registry(
 
     registry = JobSourceAdapterRegistry(client_factory=client_factory)
     registry.register("rabota_md", RabotaMdAdapter)
+    registry.register("delucru_md", DelucruMdAdapter)
     registry.register("generic_html", GenericHtmlSourceAdapter)
     registry.register("company_careers", GenericHtmlSourceAdapter)
     registry.register("fixture_source", FixtureSourceAdapter)

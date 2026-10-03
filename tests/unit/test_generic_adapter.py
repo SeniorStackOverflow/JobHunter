@@ -214,6 +214,7 @@ def test_default_registry_lists_and_constructs_generic_adapter(
 
     assert registry.list_available() == [
         "company_careers",
+        "delucru_md",
         "fixture_source",
         "generic_api",
         "generic_html",
