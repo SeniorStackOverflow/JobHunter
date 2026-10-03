@@ -119,6 +119,7 @@ jobs:
           docker compose config --quiet
       - name: Validate production Compose
         env:
+          JOBHUNTER_IMAGE_TAG: ${{ github.sha }}
           DATABASE_URL: postgresql+asyncpg://job_agent:compose-check@postgres:5432/job_agent
           REDIS_URL: redis://:compose-check@redis:6379/0
           PUBLIC_BASE_URL: https://job-agent.example.invalid
@@ -127,4 +128,5 @@ jobs:
           POSTGRES_PASSWORD: compose-check
           REDIS_PASSWORD: compose-check
           CADDY_ADDRESS: job-agent.example.invalid
-        run: docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
+        # Deployment-owned service env files (such as migrator.env) are absent in CI.
+        run: docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet --no-env-resolution

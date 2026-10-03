@@ -25,7 +25,7 @@ source adapter → discovery/crawl → normalization → SourceJob
   → deterministic policy → Gmail sender(application_id)
 ```
 
-- `app/crawlers/` — registry, Rabota.md, Generic HTML, fixture, API/RSS/sitemap
+- `app/crawlers/` — registry, Rabota.md, Delucru.md, Generic HTML, fixture, API/RSS/sitemap
   adapters, checkpoints, recheck и degradation circuit breaker;
 - `app/models/`, `app/database/`, `migrations/` — SQLAlchemy 2, PostgreSQL и
   Alembic;
@@ -47,15 +47,21 @@ source adapter → discovery/crawl → normalization → SourceJob
 `EmailDelivery`, `OAuthCredential`, `AuditEvent`, `Alert` и `DailyReport`.
 Начальная миграция находится в `migrations/versions/`.
 
-## Телефонный агент (Phase 1)
+## Телефонный агент и автоответ
 
-`call-agent` — отдельный процесс `job-agent phone-agent`, который только читает
-PhoneGate REST API (`/api/events`, `/api/device/status`), сопоставляет входящие
-звонки с откликами и сохраняет `CommunicationSession` / `CommunicationTurn`. Он
-никогда не отвечает, не говорит и не звонит. По умолчанию выключен
-(`PHONE_AGENT_ENABLED=false`); включается только после настройки `PHONEGATE_URL`
-и `PHONEGATE_AUTH_TOKEN`. Здоровье канала — в разделе `Диагностика` и
-`GET /api/v1/phone/status`. Деградация телефона не влияет на `/ready`.
+`call-agent` — отдельный процесс `job-agent phone-agent`, который получает события
+PhoneGate REST API, сопоставляет входящие звонки с откликами и сохраняет
+`CommunicationSession` / `CommunicationTurn`. По умолчанию процесс выключен
+(`PHONE_AGENT_ENABLED=false`); для включения нужны `PHONEGATE_URL` и
+`PHONEGATE_AUTH_TOKEN`.
+
+Автоответ включается отдельно через `PHONE_AUTO_ANSWER_ENABLED=true` (по умолчанию
+`false`). Агент проверяет состояние звонка, блок-лист и остановку оператором,
+затем через PhoneGate отвечает, произносит раскрытие роли, слушает собеседника и
+ведёт детерминированный сценарий с ограничением длительности. Оператор управляет
+автоответом и текущим звонком в панели `Звонки` (`/admin?view=calls`); там же видно
+здоровье канала. API статуса — `GET /api/v1/phone/status`. Деградация телефона не
+влияет на `/ready`. Подробности — [телефонный агент](docs/phone-agent.md).
 
 ## Телефонная проверка после звонка (Phase 2b)
 

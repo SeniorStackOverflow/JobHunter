@@ -1,6 +1,6 @@
 # Архитектура JobHunter
 
-Актуализировано 2026-09-30. Навигация по документации — [README](README.md).
+Актуализировано 2026-10-03. Навигация по документации — [README](README.md).
 
 ## Границы системы
 
@@ -49,10 +49,15 @@ Celery Beat инициирует работу независимо от любо
 ## Источники
 
 `JobSource.adapter_type` выбирается через `JobSourceAdapterRegistry`. Реестр поддерживает
-`rabota_md`, `generic_html`, `generic_api`, `rss`, `sitemap`, `company_careers` и
+`rabota_md`, `delucru_md`, `generic_html`, `generic_api`, `rss`, `sitemap`, `company_careers` и
 `fixture_source`. `generic_api`, `rss` и `sitemap` реализованы structured adapters;
 `company_careers` использует generic HTML. Валидация конкретного config и доступ
 источника должны пройти отдельно: зарегистрированный type не означает ready source.
+
+`delucru_md` — отдельный адаптер публичных вакансий Delucru.md с локалями RO/RU,
+обнаружением категорий и регионов, full/incremental scan, recheck и извлечением
+опубликованных контактов. Live-доступ требует явного review правил источника;
+offline-тесты используют внедрённый fixture transport.
 
 Full scan объединяет общую выдачу, категории, подкатегории, регионы и только разрешённые
 публичные feed/sitemap-точки. Reference дедуплицируется по внешнему ID до загрузки detail
