@@ -1,0 +1,27 @@
+source:
+  id: delucru_md
+  name: Delucru.md
+  adapter: delucru_md
+  base_url: https://www.delucru.md
+  enabled: false
+  policy_review_acknowledged: true
+  policy_review_reference: "operator-approved-2026-10-03"
+  locale_priority: [ro, ru]
+  requests_per_minute: 25
+  minimum_interval_seconds: 2.0
+  incremental_scan:
+    schedule: "0 * * * *"
+    category_slugs: [it-software, it-internet, lucru-de-acasa-part-time, sales-consulting]
+    known_unchanged_stop_threshold: 50
+    known_detail_refresh_hours: 72
+    refresh_jitter_hours: 12
+    detail_refresh_budget: 50
+    max_pages_per_entrypoint: 10
+  active_job_recheck:
+    schedule: "20 * * * *"
+    close_after_confirmed_absence_count: 3
+    max_jobs_per_run: 300
+    min_recheck_interval_hours: 20
+  full_scan:
+    schedule: "0 3 * * *"
+    resume_from_checkpoint: true

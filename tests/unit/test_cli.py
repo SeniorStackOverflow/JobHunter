@@ -18,11 +18,15 @@ def test_validate_source_config_dispatches_generic_and_rabota() -> None:
 
     generic = validate_source_config(root / "config/sources/generic-example.yaml")
     rabota = validate_source_config(root / "config/sources/rabota-md.yaml")
+    delucru = validate_source_config(root / "config/sources/delucru-md.yaml")
 
     assert generic["adapter"] == "generic_html"
     assert rabota["base_url"] == "https://www.rabota.md"
     assert rabota["policy_review_acknowledged"] is True
     assert rabota["policy_review_reference"] == "operator-approved-2026-08-11"
+    assert delucru["base_url"] == "https://www.delucru.md"
+    assert delucru["policy_review_acknowledged"] is True
+    assert delucru["policy_review_reference"] == "operator-approved-2026-10-03"
 
 
 @pytest.mark.asyncio
@@ -65,7 +69,8 @@ async def test_seed_defaults_creates_safe_profile_and_is_idempotent(
         config = DelucruMdConfig.model_validate(delucru.configuration)
         assert config.base_url == delucru.base_url
         assert config.live_mode is True
-        assert config.policy_review_acknowledged is False
+        assert config.policy_review_acknowledged is True
+        assert config.policy_review_reference == "operator-approved-2026-10-03"
         assert await session.scalar(select(func.count(JobSource.id))) == 2
 
 
