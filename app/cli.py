@@ -124,6 +124,29 @@ async def seed_defaults(include_fixture: bool) -> None:
                     automatic_actions_paused=True,
                 )
             )
+        delucru = await session.scalar(
+            select(JobSource).where(JobSource.adapter_type == "delucru_md")
+        )
+        if delucru is None:
+            session.add(
+                JobSource(
+                    name="Delucru.md",
+                    base_url="https://www.delucru.md",
+                    adapter_type="delucru_md",
+                    configuration={
+                        "live_mode": True,
+                        "policy_review_acknowledged": False,
+                        "locale_priority": ["ro", "ru"],
+                        "requests_per_minute": 25,
+                        "minimum_interval_seconds": 2.0,
+                    },
+                    enabled=False,
+                    rate_limit=25,
+                    concurrency=1,
+                    health_status=SourceHealth.PAUSED,
+                    automatic_actions_paused=True,
+                )
+            )
         if include_fixture:
             fixture = await session.scalar(
                 select(JobSource).where(JobSource.adapter_type == "fixture_source")

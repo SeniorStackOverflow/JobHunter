@@ -14,6 +14,16 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 Use Python 3.12 semantics. Before handing off changes run `ruff check .`, `ruff format --check .`,
 `mypy app fixture_site`, and `pytest`. Never enable real email delivery or live crawling in tests.
 
+## Adding job sources
+
+Adding an adapter is not a completed source integration. Also provide idempotent registration
+of its `JobSource` record in the target database and verify that the source appears in the
+administrator and user settings panels. Include registration in the rollout plan and report
+the resulting source names and operational states. New sources start disabled with automatic
+actions paused unless the operator explicitly authorizes enabling them. Preserve existing
+source configuration, profile choices, and operational states when registering missing sources.
+Never mark an integration complete based only on adapter registry membership or image deployment.
+
 ## Production deployment gate
 
 Develop and validate JobHunter changes in the local WSL checkout by default. Do not edit files,

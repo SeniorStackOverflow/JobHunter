@@ -4,10 +4,15 @@ categories that source publishes, instead of typing slugs into text fields."""
 from __future__ import annotations
 
 # Russian labels are assertions against the rendered interface.
+import asyncio
 import re
+import socket
 from uuid import UUID
 
+import httpx
 import pytest
+import uvicorn
+from pydantic import SecretStr
 from sqlalchemy import select
 
 from app.models.entities import (
@@ -32,6 +37,126 @@ _CATALOG = (
     ("workers", "Разнорабочие, грузчики"),
     ("calls", "Работа на телефоне, колл-центры"),
 )
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_registered_default_sources_are_visible_in_both_panels_three_clean_contexts(
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from playwright.async_api import async_playwright, expect
+
+    from app import cli
+    from app.admin import routes as admin_routes
+    from app.api import routes as api_routes
+    from app.auth import access as auth_access
+    from app.security.auth import hash_password
+
+    monkeypatch.setattr(cli, "async_session_factory", user_auth_context.session_factory)
+    await cli.seed_defaults(include_fixture=False)
+    async with user_auth_context.session_factory() as session:
+        # Reproduce the deployed database: Rabota exists, Delucru is missing.
+        delucru = await session.scalar(
+            select(JobSource).where(JobSource.adapter_type == "delucru_md")
+        )
+        assert delucru is not None
+        await session.delete(delucru)
+        owner = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+        session.add(owner)
+        await session.flush()
+        profile = UserProfile(name="Source registration user", owner_account_id=owner.id)
+        session.add(profile)
+        await session.flush()
+        session.add(JobPreference(profile_id=profile.id))
+        owner_id, profile_id = owner.id, profile.id
+        await session.commit()
+    await cli.seed_defaults(include_fixture=False)
+    await cli.seed_defaults(include_fixture=False)
+    async with user_auth_context.session_factory() as session:
+        delucru = await session.scalar(
+            select(JobSource).where(JobSource.adapter_type == "delucru_md")
+        )
+        assert delucru is not None and delucru.enabled is False
+        assert delucru.automatic_actions_paused is True
+        delucru_id = delucru.id
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    base_url = f"http://localhost:{port}"
+    password = "local-source-registration-test"
+    settings = user_auth_context.settings.model_copy(
+        update={
+            "public_base_url": base_url,
+            "admin_password_hash": SecretStr(hash_password(password)),
+        }
+    )
+    for module in (admin_routes, api_routes, auth_access):
+        monkeypatch.setattr(module, "get_settings", lambda: settings)
+    server = uvicorn.Server(
+        uvicorn.Config(user_auth_context.app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    try:
+        async with httpx.AsyncClient() as client:
+            for _ in range(100):
+                try:
+                    if (await client.get(base_url + "/login")).status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("source registration browser server did not start")
+        async with async_playwright() as runtime:
+            browser = await runtime.chromium.launch(headless=True)
+            try:
+                for _ in range(3):
+                    for role in ("admin", "user"):
+                        context = await browser.new_context()
+                        try:
+                            page = await context.new_page()
+                            if role == "admin":
+                                await page.goto(base_url + "/login")
+                                await page.locator(".login-admin-fallback summary").click()
+                                await page.locator('input[name="password"]').fill(password)
+                                await page.locator(
+                                    '.login-password-form button[type="submit"]'
+                                ).click()
+                                await expect(page).to_have_url(base_url + "/admin")
+                                route = "/admin?view=settings"
+                            else:
+                                token = AccountSessionSigner(
+                                    settings.secret_key.get_secret_value()
+                                ).issue(owner_id, 0)
+                                await context.add_cookies(
+                                    [
+                                        {
+                                            "name": settings.user_session_cookie_name,
+                                            "value": token,
+                                            "url": base_url,
+                                        }
+                                    ]
+                                )
+                                route = f"/app?view=settings&profile_id={profile_id}"
+                            response = await page.goto(base_url + route)
+                            assert response is not None and response.status == 200
+                            sources = page.locator("#sources")
+                            await expect(sources.locator(".compact-row")).to_have_count(2)
+                            await expect(sources).to_contain_text("Rabota.md")
+                            row = sources.locator(f"#source-{delucru_id}")
+                            await expect(row).to_contain_text("Delucru.md")
+                            await expect(row).to_contain_text(
+                                "Администратор временно остановил обход"
+                            )
+                        finally:
+                            await context.close()
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=10)
 
 
 async def _seed(context: UserAuthContext, *, owner: Account | None = None) -> tuple[UUID, UUID]:

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import cli
 from app.cli import validate_source_config
+from app.crawlers.adapters.delucru_md import DelucruMdConfig
 from app.models.entities import JobPreference, JobSource, UserProfile
 from app.models.enums import SourceHealth
 
@@ -53,4 +54,56 @@ async def test_seed_defaults_creates_safe_profile_and_is_idempotent(
         assert source.automatic_actions_paused is True
         assert await session.scalar(select(func.count(UserProfile.id))) == 1
         assert await session.scalar(select(func.count(JobPreference.id))) == 1
-        assert await session.scalar(select(func.count(JobSource.id))) == 1
+        delucru = await session.scalar(
+            select(JobSource).where(JobSource.adapter_type == "delucru_md")
+        )
+        assert delucru is not None
+        assert delucru.name == "Delucru.md"
+        assert delucru.enabled is False
+        assert delucru.health_status == SourceHealth.PAUSED
+        assert delucru.automatic_actions_paused is True
+        config = DelucruMdConfig.model_validate(delucru.configuration)
+        assert config.base_url == delucru.base_url
+        assert config.live_mode is True
+        assert config.policy_review_acknowledged is False
+        assert await session.scalar(select(func.count(JobSource.id))) == 2
+
+
+@pytest.mark.asyncio
+async def test_seed_registers_missing_source_without_changing_existing_sources_or_preferences(
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "async_session_factory", sqlite_session_factory)
+    await cli.seed_defaults(include_fixture=False)
+    async with sqlite_session_factory() as session:
+        sources = list((await session.scalars(select(JobSource))).all())
+        existing = {item.adapter_type: item for item in sources}
+        rabota = existing["rabota_md"]
+        await session.delete(existing["delucru_md"])
+        rabota.enabled = True
+        rabota.automatic_actions_paused = False
+        rabota.health_status = SourceHealth.HEALTHY
+        rabota.configuration = {"transport": "waf_http", "operator_setting": "preserve"}
+        preferences = await session.scalar(select(JobPreference))
+        assert preferences is not None
+        preferences.global_pause = False
+        profile_id = preferences.profile_id
+        rabota_id = rabota.id
+        await session.commit()
+
+    await cli.seed_defaults(include_fixture=False)
+    await cli.seed_defaults(include_fixture=False)
+
+    async with sqlite_session_factory() as session:
+        rabota = await session.get(JobSource, rabota_id)
+        assert rabota is not None
+        assert rabota.enabled is True
+        assert rabota.automatic_actions_paused is False
+        assert rabota.health_status == SourceHealth.HEALTHY
+        assert rabota.configuration == {"transport": "waf_http", "operator_setting": "preserve"}
+        preferences = await session.scalar(select(JobPreference))
+        assert preferences is not None
+        assert preferences.profile_id == profile_id
+        assert preferences.global_pause is False
+        assert await session.scalar(select(func.count(JobSource.id))) == 2
