@@ -212,7 +212,7 @@ def test_default_registry_lists_and_constructs_generic_adapter(
 
     created = registry.create(source)
 
-    assert registry.list_available() == [
+    assert {
         "company_careers",
         "delucru_md",
         "fixture_source",
@@ -221,7 +221,7 @@ def test_default_registry_lists_and_constructs_generic_adapter(
         "rabota_md",
         "rss",
         "sitemap",
-    ]
+    }.issubset(registry.list_available())
     assert isinstance(created, GenericHtmlSourceAdapter)
     assert created.source is source
     assert created.client is fetcher

@@ -155,6 +155,15 @@
   let confirmedForm = null;
 
   const setSubmitting = (form, submitter) => {
+    // Disabled buttons are omitted from form data. Keep the clicked action.
+    if (submitter?.name) {
+      const value = document.createElement('input');
+      value.type = 'hidden';
+      value.name = submitter.name;
+      value.value = submitter.value;
+      value.dataset.submitterValue = 'true';
+      form.append(value);
+    }
     form.classList.add('is-submitting');
     form.setAttribute('aria-busy', 'true');
     form.querySelectorAll('button').forEach((button) => {
@@ -218,6 +227,7 @@
   });
   window.addEventListener('pageshow', () => {
     document.querySelectorAll('form.is-submitting').forEach((form) => {
+      form.querySelectorAll('[data-submitter-value]').forEach((input) => input.remove());
       form.classList.remove('is-submitting');
       form.removeAttribute('aria-busy');
       form.querySelectorAll('button').forEach((button) => {

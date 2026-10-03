@@ -255,6 +255,7 @@ class JobPreference(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 class JobSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "job_sources"
 
+    catalog_key: Mapped[str | None] = mapped_column(String(100), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     base_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     adapter_type: Mapped[str] = mapped_column(String(64), nullable=False)

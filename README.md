@@ -313,7 +313,6 @@ provider call.
 ## Проверки
 
 ```bash
-uv sync --extra dev
 ./scripts/verify.sh
 ./scripts/demo-e2e.sh
 uv run alembic upgrade head
@@ -321,6 +320,10 @@ uv run alembic check
 docker compose config --quiet
 docker compose build
 ```
+
+`verify.sh` устанавливает зависимости из lock-файла и Chromium, затем выполняет
+ruff, mypy и весь pytest, включая браузерные проверки панели. CI запускает эти
+проверки при push и pull request, а также проверяет миграции на PostgreSQL.
 
 Обычные тесты не зависят от Rabota.md и не отправляют письма. PostgreSQL/Redis/
 Celery service-backed проверки запускаются отдельно (CI делает это

@@ -66,3 +66,12 @@ def test_rabota_fixture_mode_cannot_be_enabled_as_persisted_source() -> None:
 
     with pytest.raises(SourceControlError, match="fixture_source"):
         enable_source_record(source)
+
+
+def test_removed_adapter_cannot_be_enabled_after_code_change() -> None:
+    source = _source("removed_board")
+    source.enabled = False
+    with pytest.raises(SourceControlError) as failure:
+        enable_source_record(source)
+    assert failure.value.reason == "source_adapter_unavailable"
+    assert source.enabled is False

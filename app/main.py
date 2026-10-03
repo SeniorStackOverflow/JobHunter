@@ -68,9 +68,17 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.resume_storage_path.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Hoisted above the try so an import regression fails loudly at startup
     # instead of silently disabling reconcile forever.
+    from app.crawlers.catalog import reconcile_source_catalog
+    from app.crawlers.registry import build_default_registry
     from app.database.session import async_session_factory
     from app.profiles import ResumeService
     from app.profiles.service import RESUME_TRANSACTION_RECONCILE_INTERVAL_SECONDS
+
+    async with async_session_factory() as session:
+        registered = await reconcile_source_catalog(session, build_default_registry())
+        await session.commit()
+    if registered:
+        logger.info("source_catalog_registered", source_keys=registered)
 
     try:
         async with async_session_factory() as session:

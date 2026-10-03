@@ -11,11 +11,13 @@ from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.crawlers.catalog import reconcile_source_catalog
+from app.crawlers.registry import build_default_registry
 from app.database.base import Base
 from app.deduplication import DeduplicationService
 from app.email.providers import FakeGmailProvider
 from app.email.service import EmailSendBlocked, EmailService
-from app.models.entities import Application, CanonicalJob
+from app.models.entities import Application, CanonicalJob, JobSource
 from app.models.enums import ApplicationStatus
 from tests.integration.test_duplicate_delivery import legacy_duplicate_graph
 from tests.unit.test_deduplication import job, source
@@ -41,6 +43,42 @@ async def dedup_postgres():
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_postgres_source_catalog_startups_register_each_site_once(dedup_postgres):
+    async with dedup_postgres() as session:
+        legacy = JobSource(
+            name="Operator's Rabota",
+            base_url="https://www.rabota.md",
+            adapter_type="rabota_md",
+            configuration={"operator_setting": "keep"},
+            enabled=True,
+            automatic_actions_paused=False,
+        )
+        session.add(legacy)
+        await session.commit()
+        original_id = legacy.id
+    barrier = asyncio.Barrier(6)
+    registry = build_default_registry()
+
+    async def startup():
+        async with dedup_postgres() as session:
+            await barrier.wait()
+            created = await reconcile_source_catalog(session, registry)
+            await session.commit()
+            return created
+
+    results = await asyncio.wait_for(asyncio.gather(*(startup() for _ in range(6))), timeout=30)
+    assert sum(result.count("delucru_md") for result in results) == 1
+    async with dedup_postgres() as session:
+        assert await session.scalar(select(func.count(JobSource.id))) == len(
+            registry.source_definitions()
+        )
+        legacy = await session.get(JobSource, original_id)
+        assert legacy is not None and legacy.catalog_key == "rabota_md"
+        assert legacy.enabled and not legacy.automatic_actions_paused
+        assert legacy.configuration == {"operator_setting": "keep"}
 
 
 @pytest.mark.asyncio

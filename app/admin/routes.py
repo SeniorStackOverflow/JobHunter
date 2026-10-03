@@ -27,6 +27,8 @@ from app.crawlers.source_control import (
     SourceControlError,
     disable_source_record,
     enable_source_record,
+    source_configuration,
+    source_policy_state,
 )
 from app.database import get_session
 from app.email.oauth import (
@@ -960,18 +962,85 @@ async def admin_save_profile_source_categories(
     )
 
 
-@router.post("/admin/sources/{source_id}/toggle")
-async def toggle_source(
+def _source_settings_redirect(
+    source_id: UUID, notice: str, profile_id: UUID | None = None
+) -> RedirectResponse:
+    target = f"/admin?view=settings&notice={notice}"
+    if profile_id is not None:
+        target += f"&profile_id={profile_id}"
+    anchor = "source-policy" if notice.startswith("source_policy") else "source"
+    return RedirectResponse(f"{target}#{anchor}-{source_id}", status_code=303)
+
+
+@router.post("/admin/sources/{source_id}/policy-review")
+async def save_source_policy_review(
     source_id: UUID,
     request: Request,
     csrf_token: str = Form(...),
+    acknowledged: bool = Form(False),
+    review_reference: str = Form(""),
+    enable: bool = Form(False),
+    profile_id: UUID | None = Form(None),
     _: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
     source = await session.get(JobSource, source_id)
     if source is None:
-        raise HTTPException(status_code=404)
+        return _source_settings_redirect(source_id, "source_not_found", profile_id)
+    reference = review_reference.strip()
+    if not acknowledged or not reference or len(reference) > 500:
+        return _source_settings_redirect(source_id, "source_policy_invalid", profile_id)
+    if not source_policy_state(source).required:
+        return _source_settings_redirect(source_id, "source_policy_not_required", profile_id)
+    configuration = dict(source.configuration or {})
+    reviewed = {
+        **source_configuration(source),
+        "policy_review_acknowledged": True,
+        "policy_review_reference": reference,
+    }
+    if isinstance(configuration.get("source"), dict):
+        configuration["source"] = reviewed
+    else:
+        configuration = reviewed
+    source.configuration = configuration
+    if enable:
+        try:
+            enable_source_record(source)
+        except SourceControlError as exc:
+            await session.rollback()
+            return _source_settings_redirect(source_id, exc.reason, profile_id)
+    await _audit_admin(
+        session,
+        "source.policy_reviewed",
+        "job_source",
+        str(source_id),
+        decision="acknowledged",
+        details={"policy_review_reference": reference},
+    )
+    if enable:
+        await _audit_admin(
+            session, "source.enabled", "job_source", str(source_id), decision="enabled"
+        )
+    await session.commit()
+    return _source_settings_redirect(
+        source_id, "source_enabled" if enable else "source_policy_saved", profile_id
+    )
+
+
+@router.post("/admin/sources/{source_id}/toggle")
+async def toggle_source(
+    source_id: UUID,
+    request: Request,
+    csrf_token: str = Form(...),
+    profile_id: UUID | None = Form(None),
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    require_csrf(request, csrf_token)
+    source = await session.get(JobSource, source_id)
+    if source is None:
+        return _source_settings_redirect(source_id, "source_not_found", profile_id)
     enabling = not source.enabled
     try:
         if enabling:
@@ -979,7 +1048,7 @@ async def toggle_source(
         else:
             disable_source_record(source)
     except SourceControlError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _source_settings_redirect(source_id, exc.reason, profile_id)
     await _audit_admin(
         session,
         "source.enabled" if enabling else "source.disabled",
@@ -989,7 +1058,7 @@ async def toggle_source(
     )
     await session.commit()
     notice = "source_enabled" if enabling else "source_disabled"
-    return RedirectResponse(f"/admin?view=settings&notice={notice}", status_code=303)
+    return _source_settings_redirect(source_id, notice, profile_id)
 
 
 @router.post("/admin/sources/{source_id}/scan/{scan_type}")
@@ -1005,9 +1074,12 @@ async def admin_start_scan(
     from app.database.session import async_session_factory
     from app.scheduler.tasks import run_scan_task
 
-    run = await ScanService(async_session_factory, build_default_registry()).create_scan(
-        source_id, scan_type, actor="admin"
-    )
+    try:
+        run = await ScanService(async_session_factory, build_default_registry()).create_scan(
+            source_id, scan_type, actor="admin"
+        )
+    except (LookupError, ValueError):
+        return _source_settings_redirect(source_id, "source_scan_unavailable", profile_id)
     try:
         run_scan_task.delay(str(run.id))
     except Exception as exc:
@@ -1017,7 +1089,7 @@ async def admin_start_scan(
                 stored.status = RunStatus.FAILED
                 stored.diagnostics = {"queue_error": type(exc).__name__}
                 await session.commit()
-        raise HTTPException(status_code=503, detail="task queue unavailable") from exc
+        return _source_settings_redirect(source_id, "source_queue_unavailable", profile_id)
     target = "/admin?view=settings&notice=scan_started"
     if profile_id is not None:
         target += f"&profile_id={profile_id}"

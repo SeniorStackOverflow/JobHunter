@@ -12,6 +12,8 @@ from uuid import UUID
 import yaml
 from sqlalchemy import select
 
+from app.crawlers.catalog import reconcile_source_catalog
+from app.crawlers.registry import build_default_registry
 from app.database.session import async_session_factory
 from app.email.delivery import EmailDeliveryReconciliationService
 from app.employers import EmployerBackfillService, EmployerSafetyAuditService
@@ -81,118 +83,7 @@ async def seed_defaults(include_fixture: bool) -> None:
                 make_default=True,
             )
         await profile_service.get_preferences(session, profile.id)
-        rabota = await session.scalar(
-            select(JobSource).where(JobSource.adapter_type == "rabota_md")
-        )
-        if rabota is None:
-            session.add(
-                JobSource(
-                    name="Rabota.md",
-                    base_url="https://www.rabota.md",
-                    adapter_type="rabota_md",
-                    configuration={
-                        "locale_priority": ["ru"],
-                        "use_stealth_browser": True,
-                        "requests_per_minute": 50,
-                        "minimum_interval_seconds": 1.2,
-                        "policy_review_acknowledged": True,
-                        "policy_review_reference": "operator-approved-2026-08-11",
-                        "incremental_scan": {
-                            "schedule": "0 * * * *",
-                            "category_slugs": ["others"],
-                            "known_unchanged_stop_threshold": 100,
-                            "known_detail_refresh_hours": 72,
-                            "refresh_jitter_hours": 12,
-                            "detail_refresh_budget": 50,
-                            "max_pages_per_entrypoint": 20,
-                        },
-                        "active_job_recheck": {
-                            "schedule": "20 * * * *",
-                            "close_after_confirmed_absence_count": 3,
-                            "max_jobs_per_run": 300,
-                            "min_recheck_interval_hours": 20,
-                        },
-                        "full_scan": {
-                            "schedule": "0 3 * * *",
-                            "resume_from_checkpoint": True,
-                        },
-                    },
-                    enabled=False,
-                    rate_limit=50,
-                    concurrency=1,
-                    health_status=SourceHealth.PAUSED,
-                    automatic_actions_paused=True,
-                )
-            )
-        delucru = await session.scalar(
-            select(JobSource).where(JobSource.adapter_type == "delucru_md")
-        )
-        delucru_defaults = {
-            "live_mode": True,
-            "policy_review_acknowledged": True,
-            "policy_review_reference": "operator-approved-2026-10-03",
-            "locale_priority": ["ro", "ru"],
-            "requests_per_minute": 25,
-            "minimum_interval_seconds": 2.0,
-            "incremental_scan": {
-                "schedule": "0 * * * *",
-                "category_slugs": [
-                    "it-software",
-                    "it-internet",
-                    "lucru-de-acasa-part-time",
-                    "sales-consulting",
-                ],
-                "known_unchanged_stop_threshold": 50,
-                "known_detail_refresh_hours": 72,
-                "refresh_jitter_hours": 12,
-                "detail_refresh_budget": 50,
-                "max_pages_per_entrypoint": 10,
-            },
-            "active_job_recheck": {
-                "schedule": "20 * * * *",
-                "close_after_confirmed_absence_count": 3,
-                "max_jobs_per_run": 300,
-                "min_recheck_interval_hours": 20,
-            },
-            "full_scan": {
-                "schedule": "0 3 * * *",
-                "resume_from_checkpoint": True,
-            },
-        }
-        if delucru is None:
-            session.add(
-                JobSource(
-                    name="Delucru.md",
-                    base_url="https://www.delucru.md",
-                    adapter_type="delucru_md",
-                    configuration=delucru_defaults,
-                    enabled=False,
-                    rate_limit=25,
-                    concurrency=1,
-                    health_status=SourceHealth.PAUSED,
-                    automatic_actions_paused=True,
-                )
-            )
-        else:
-            cfg = dict(delucru.configuration or {})
-            updated = False
-            if not cfg.get("policy_review_acknowledged"):
-                cfg["policy_review_acknowledged"] = True
-                updated = True
-            if not cfg.get("policy_review_reference"):
-                cfg["policy_review_reference"] = "operator-approved-2026-10-03"
-                updated = True
-            if "incremental_scan" not in cfg:
-                cfg["incremental_scan"] = delucru_defaults["incremental_scan"]
-                updated = True
-            if "active_job_recheck" not in cfg:
-                cfg["active_job_recheck"] = delucru_defaults["active_job_recheck"]
-                updated = True
-            if "full_scan" not in cfg:
-                cfg["full_scan"] = delucru_defaults["full_scan"]
-                updated = True
-            if updated:
-                delucru.configuration = cfg
+        await reconcile_source_catalog(session, build_default_registry())
         if include_fixture:
             fixture = await session.scalar(
                 select(JobSource).where(JobSource.adapter_type == "fixture_source")

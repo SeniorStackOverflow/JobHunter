@@ -197,6 +197,40 @@ _FEEDBACK_NOTICES = {
         "Оно сохранено в истории уведомлений. Просмотр не означает устранение проблемы.",
     ),
     "source_enabled": ("Источник включён", "Новые обходы снова разрешены."),
+    "source_policy_required": (
+        "Сначала подтвердите проверку условий сайта",
+        "Установите флажок в настройках источника и укажите ссылку или запись о проверке.",
+    ),
+    "source_policy_invalid": (
+        "Подтверждение не сохранено",
+        "Установите флажок и укажите ссылку или запись о проверке длиной до 500 символов.",
+    ),
+    "source_policy_saved": (
+        "Проверка условий подтверждена",
+        "Теперь источник можно запустить из панели.",
+    ),
+    "source_policy_not_required": (
+        "Подтверждение не требуется",
+        "Для этого источника оно не нужно.",
+    ),
+    "source_fixture_only": (
+        "Обход недоступен в тестовом режиме",
+        "Этот источник настроен для локальных тестов. Проверьте конфигурацию перед запуском.",
+    ),
+    "source_control_failed": ("Состояние источника не изменено", "Проверьте настройки источника."),
+    "source_adapter_unavailable": (
+        "Обход недоступен",
+        "Адаптер этого источника отсутствует в текущей версии приложения.",
+    ),
+    "source_not_found": ("Источник не найден", "Обновите страницу настроек."),
+    "source_scan_unavailable": (
+        "Обход не запущен",
+        "Источник или выбранный обход недоступен. Проверьте настройки источника.",
+    ),
+    "source_queue_unavailable": (
+        "Обход не удалось поставить в очередь",
+        "Сервис фоновых задач временно недоступен. Повторите попытку позже.",
+    ),
     "source_selection_saved": (
         "Источники профиля обновлены",
         "Выбор действует только для этого профиля; общие обходы не изменились.",
@@ -257,6 +291,14 @@ _FEEDBACK_NOTICES = {
 }
 
 _FEEDBACK_NOTICE_TONES = {
+    "source_policy_required": "warning",
+    "source_policy_invalid": "warning",
+    "source_fixture_only": "warning",
+    "source_scan_unavailable": "warning",
+    "source_queue_unavailable": "danger",
+    "source_control_failed": "danger",
+    "source_adapter_unavailable": "warning",
+    "source_not_found": "warning",
     "application_approval_no_email": "warning",
     "application_approval_invalid_content": "danger",
     "application_approval_inactive_vacancy": "warning",

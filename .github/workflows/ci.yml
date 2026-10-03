@@ -28,6 +28,8 @@ jobs:
       LLM_PROVIDER: mock
       RESUME_STORAGE_PATH: /tmp/job-agent-resumes
       RUN_SERVICE_INTEGRATION_TESTS: "1"
+      RUN_PLAYWRIGHT_TESTS: "1"
+      JOBHUNTER_DEDUP_TEST_DATABASE_URL: postgresql+asyncpg://job_agent:test-password@127.0.0.1:5432/jobhunter_dedup_test
     services:
       postgres:
         image: postgres:16-alpine
@@ -60,7 +62,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install locked dependencies
-        run: uv sync --extra dev --frozen
+        run: uv sync --extra dev --extra playwright --frozen
+      - name: Install Chromium for browser checks
+        run: uv run --no-sync playwright install --with-deps chromium
       - name: Ruff format
         run: uv run ruff format --check .
       - name: Ruff lint
@@ -71,8 +75,26 @@ jobs:
         run: uv run alembic upgrade head
       - name: Check model and migration drift
         run: uv run alembic check
+      - name: Create isolated database for concurrent registration and delivery checks
+        run: |
+          uv run --no-sync python - <<'PY'
+          import asyncio
+          import asyncpg
+
+          async def main():
+              connection = await asyncpg.connect(
+                  user="job_agent", password="test-password", database="job_agent_test",
+                  host="127.0.0.1", port=5432,
+              )
+              try:
+                  await connection.execute("CREATE DATABASE jobhunter_dedup_test")
+              finally:
+                  await connection.close()
+
+          asyncio.run(main())
+          PY
       - name: Test
-        run: uv run pytest
+        run: uv run --no-sync pytest
 
   dependency-and-code-security:
     runs-on: ubuntu-latest

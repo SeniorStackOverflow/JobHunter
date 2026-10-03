@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app import cli
 from app.cli import validate_source_config
 from app.crawlers.adapters.delucru_md import DelucruMdConfig
+from app.crawlers.registry import build_default_registry
 from app.models.entities import JobPreference, JobSource, UserProfile
 from app.models.enums import SourceHealth
 
@@ -71,7 +72,9 @@ async def test_seed_defaults_creates_safe_profile_and_is_idempotent(
         assert config.live_mode is True
         assert config.policy_review_acknowledged is True
         assert config.policy_review_reference == "operator-approved-2026-10-03"
-        assert await session.scalar(select(func.count(JobSource.id))) == 2
+        assert await session.scalar(select(func.count(JobSource.id))) == len(
+            build_default_registry().source_definitions()
+        )
 
 
 @pytest.mark.asyncio
@@ -111,4 +114,6 @@ async def test_seed_registers_missing_source_without_changing_existing_sources_o
         assert preferences is not None
         assert preferences.profile_id == profile_id
         assert preferences.global_pause is False
-        assert await session.scalar(select(func.count(JobSource.id))) == 2
+        assert await session.scalar(select(func.count(JobSource.id))) == len(
+            build_default_registry().source_definitions()
+        )

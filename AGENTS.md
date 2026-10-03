@@ -24,6 +24,14 @@ actions paused unless the operator explicitly authorizes enabling them. Preserve
 source configuration, profile choices, and operational states when registering missing sources.
 Never mark an integration complete based only on adapter registry membership or image deployment.
 
+For built-in sites, attach a `SourceDefinition` to the adapter registration in the default
+registry. The API startup and `seed` reconcile this catalog automatically. Keep its stable
+`catalog_key` unchanged across code refactors; defaults must not overwrite existing operator
+configuration or acknowledge/re-enable an existing source without an explicit operator action.
+Use `scripts/verify.sh` for reproducible browser-enabled checks. Include a catalog/startup-to-panel
+regression scenario when changing source registration, rather than asserting only a fixed list
+of source names. Apply schema migrations before starting an API with changed models.
+
 ## Production deployment gate
 
 Develop and validate JobHunter changes in the local WSL checkout by default. Do not edit files,

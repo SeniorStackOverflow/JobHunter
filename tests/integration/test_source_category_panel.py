@@ -15,6 +15,7 @@ import uvicorn
 from pydantic import SecretStr
 from sqlalchemy import select
 
+from app.crawlers.registry import build_default_registry
 from app.models.entities import (
     Account,
     JobPreference,
@@ -143,7 +144,9 @@ async def test_registered_default_sources_are_visible_in_both_panels_three_clean
                             response = await page.goto(base_url + route)
                             assert response is not None and response.status == 200
                             sources = page.locator("#sources")
-                            await expect(sources.locator(".compact-row")).to_have_count(2)
+                            await expect(sources.locator(".compact-row")).to_have_count(
+                                len(build_default_registry().source_definitions())
+                            )
                             await expect(sources).to_contain_text("Rabota.md")
                             row = sources.locator(f"#source-{delucru_id}")
                             await expect(row).to_contain_text("Delucru.md")

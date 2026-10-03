@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications.daily_target import daily_target_state
 from app.applications.diagnostics import daily_minimum_audit
+from app.crawlers.source_control import source_policy_state
 from app.email.oauth import GmailOAuthService
 from app.learning import (
     LearnedReviewScore,
@@ -810,6 +811,9 @@ async def render_dashboard(
             "pagination": pagination,
             "preferences": preferences,
             "sources": sources,
+            "source_policy_states": {item.id: source_policy_state(item) for item in sources}
+            if is_admin
+            else {},
             "disabled_source_ids": disabled_source_ids,
             "source_category_pickers": source_category_pickers,
             "source_names": source_names,

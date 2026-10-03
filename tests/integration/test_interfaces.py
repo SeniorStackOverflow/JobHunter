@@ -2109,8 +2109,14 @@ async def test_admin_scan_queue_failure_marks_run_failed(
             f"/admin/sources/{source_id}/scan/full",
             data={"csrf_token": csrf_token},
         )
+        assert response.status_code == 303
+        assert response.headers["location"] == (
+            f"/admin?view=settings&notice=source_queue_unavailable#source-{source_id}"
+        )
+        notice = await client.get(response.headers["location"])
+        assert notice.status_code == 200
+        assert "Обход не удалось поставить в очередь" in notice.text
 
-    assert response.status_code == 503
     async with sqlite_session_factory() as session:
         run = await session.scalar(select(ScanRun).where(ScanRun.source_id == source_id))
         assert run is not None

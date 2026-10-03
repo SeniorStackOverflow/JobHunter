@@ -38,6 +38,14 @@ def test_fresh_sqlite_database_migrations_round_trip(
     engine = create_engine(f"sqlite:///{database_path}")
     try:
         database = inspect(engine)
+        source_columns = {column["name"]: column for column in database.get_columns("job_sources")}
+        assert source_columns["catalog_key"]["nullable"] is True
+        catalog_index = next(
+            item
+            for item in database.get_indexes("job_sources")
+            if item["name"] == "ix_job_sources_catalog_key"
+        )
+        assert catalog_index["unique"] is True or catalog_index["unique"] == 1
         assert {"public_emails", "public_phones", "matching_content_hash"} <= {
             column["name"] for column in database.get_columns("source_jobs")
         }
@@ -281,6 +289,7 @@ def test_send_attempt_ledger_backfill_preserves_hard_maximum_history(
     # so the insert works at this older revision. The ledger migration reads
     # only email_deliveries/applications.
     with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("ALTER TABLE job_sources ADD COLUMN catalog_key VARCHAR(100)")
         for column, kind in (
             ("llm_logical_request_id", "VARCHAR(128)"),
             ("llm_outcome", "VARCHAR(32)"),
@@ -338,6 +347,11 @@ def test_category_lists_are_copied_to_every_source_of_the_profile(
         command.upgrade(Config("alembic.ini"), "c5d7a9e1f3b2")
     finally:
         get_settings.cache_clear()
+
+    # Current ORM fixture, unrelated to the historical category migration.
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("ALTER TABLE job_sources ADD COLUMN catalog_key VARCHAR(100)")
+        connection.commit()
 
     engine = create_engine(f"sqlite:///{database_path}")
     try:
