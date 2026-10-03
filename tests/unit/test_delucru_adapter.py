@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,9 @@ from app.crawlers.adapters.delucru_md import (
     DelucruMdAdapter,
     DelucruMdConfig,
 )
+from app.crawlers.adapters.delucru_md.errors import DelucruMdDegradedError
 from app.crawlers.registry.registry import build_default_registry
-from app.crawlers.schemas import RawJobReference, ScanCheckpoint
+from app.crawlers.schemas import RawJobData, RawJobReference, ScanCheckpoint
 from app.crawlers.source_control import SourceControlError, enable_source_record
 from app.models.entities import JobSource
 from app.models.enums import JobStatus
@@ -227,6 +229,7 @@ async def test_incremental_scan_stops_at_threshold() -> None:
         adapter_state={
             "known_external_ids": ["88409", "55318"],
             "known_updated_hints": {"88409": "03.10.2026"},
+            "known_last_checked_at": {"88409": datetime.now(UTC).isoformat()},
         }
     )
     stream = adapter.iterate_incremental_scan(checkpoint=state)
@@ -369,7 +372,7 @@ async def test_recheck_job() -> None:
         {"canonical_url": f"{BASE}/job/404", "external_job_id": "404", "content_hash": "some"}
     )
     assert recheck_404.exists is False
-    assert recheck_404.explicitly_closed is True
+    assert recheck_404.explicitly_closed is False
 
     # 5. Rate limit 403
     recheck_403 = await adapter.recheck_job(
@@ -404,3 +407,213 @@ def test_source_control_enable() -> None:
     enable_source_record(source)
     assert source.enabled is True
     assert source.automatic_actions_paused is True
+
+
+def raw_job(html: str, external_id: str = "88409") -> RawJobData:
+    return RawJobData(
+        reference=RawJobReference(external_id=external_id, url=f"{BASE}/job/{external_id}"),
+        html=html,
+        final_url=f"{BASE}/job/{external_id}",
+        fetched_at=datetime.now(UTC),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fixture_name", "before", "after"),
+    [
+        (
+            "job_88409_it.html",
+            "Python 3.12, SQL, machine learning basics.",
+            "Mandatory forklift certificate and five years experience.",
+        ),
+        (
+            "job_88409_it.html",
+            "Develop predictive models and data pipelines.",
+            "Operate a forklift.",
+        ),
+        ("job_43867_retail.html", "Chișinău, Ialoveni, Strășeni", "Chișinău, Bălți"),
+        ("job_55318_horeca.html", "Botanica, Centru", "Botanica, Buiucani"),
+    ],
+)
+async def test_material_content_changes_invalidate_hash(
+    fixture_name: str, before: str, after: str
+) -> None:
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    html = fixture(fixture_name)
+    assert before in html
+    original = await adapter.normalize_job(raw_job(html))
+    edited = await adapter.normalize_job(raw_job(html.replace(before, after)))
+    assert original.content_hash != edited.content_hash
+
+
+@pytest.mark.asyncio
+async def test_contacts_order_does_not_invalidate_content_hash() -> None:
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    html = fixture("job_88409_it.html")
+    first = '<a href="mailto:aaa@fxbits.io">aaa@fxbits.io</a>'
+    second = '<a href="mailto:zzz@fxbits.io">zzz@fxbits.io</a>'
+    a = await adapter.normalize_job(
+        raw_job(html.replace('<div id="contacts">', f'<div id="contacts">{first}{second}'))
+    )
+    b = await adapter.normalize_job(
+        raw_job(html.replace('<div id="contacts">', f'<div id="contacts">{second}{first}'))
+    )
+    assert a.content_hash == b.content_hash
+
+
+@pytest.mark.asyncio
+async def test_unknown_fields_stay_unknown_and_footer_is_not_job_status() -> None:
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    html = fixture("job_88409_it.html")
+    for field in (
+        "Oraș: <span>Chișinău</span>",
+        "Locație: <span>Remote</span>",
+        "Program de lucru: <span>Full-time</span>",
+    ):
+        html = html.replace(field, "")
+    html = html.replace("<footer>", "<footer>Вакансия закрыта")
+    normalized = await adapter.normalize_job(raw_job(html))
+    assert normalized.status is JobStatus.ACTIVE
+    assert normalized.city is None and normalized.cities == []
+    assert normalized.schedule is None and normalized.employment_type is None
+    assert normalized.workplace_type is None
+    assert normalized.published_at is None
+    assert normalized.requirements == "Python 3.12, SQL, machine learning basics."
+    assert "Cerințe" not in (normalized.responsibilities or "")
+
+
+@pytest.mark.asyncio
+async def test_invalid_public_content_is_not_an_active_job() -> None:
+    adapter = DelucruMdAdapter(
+        adapter_config(),
+        client=FixtureFetcher({f"{BASE}/jobs": "<html><title>Please wait</title></html>"}),
+    )
+    assert not (await adapter.validate_source()).valid
+    with pytest.raises(DelucruMdDegradedError):
+        await adapter.normalize_job(
+            raw_job("<html><title>Please wait</title><body>Loading</body></html>")
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 429])
+@pytest.mark.parametrize("method", ["discover_categories", "discover_regions"])
+async def test_discovery_does_not_hide_access_failures(status: int, method: str) -> None:
+    url = f"{BASE}/jobs/by-category" if method == "discover_categories" else f"{BASE}/jobs/by-city"
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher({url: (status, "Blocked")}))
+    with pytest.raises(DelucruMdDegradedError):
+        await getattr(adapter, method)()
+
+
+@pytest.mark.asyncio
+async def test_profile_category_scope_and_duplicate_reference_metadata() -> None:
+    fetcher = FixtureFetcher(default_routes())
+    adapter = DelucruMdAdapter(adapter_config(), client=fetcher)
+    adapter.set_incremental_categories(["food-industry-horeca"])
+    incremental = await collect(adapter.iterate_incremental_scan(None))
+    assert incremental and all(ref.category == "food-industry-horeca" for ref in incremental)
+    assert f"{BASE}/jobs/it-internet" not in fetcher.requested
+    full = await collect(adapter.iterate_full_scan(None))
+    duplicates = [ref for ref in full if ref.external_id == "88409"]
+    assert len(duplicates) > 1
+    assert duplicates[0].metadata["duplicate_reference"] is False
+    assert duplicates[-1].metadata["duplicate_reference"] is True
+    assert {"it-internet", "food-industry-horeca", "sales-consulting"} <= set(
+        duplicates[-1].metadata["categories_seen"]
+    )
+    assert duplicates[0].metadata["categories_seen"] == ["it-internet"]
+
+
+@pytest.mark.asyncio
+async def test_old_details_refresh_despite_unchanged_listing_date_and_respect_budget() -> None:
+    adapter = DelucruMdAdapter(
+        adapter_config(
+            locale_priority=["ro"],
+            incremental_category_slugs=["it-internet"],
+            incremental_detail_refresh_budget=1,
+            incremental_refresh_jitter_hours=0,
+        ),
+        client=FixtureFetcher(default_routes()),
+    )
+    checkpoint = ScanCheckpoint(
+        adapter_state={
+            "known_external_ids": ["88409", "55318"],
+            "known_updated_hints": {"88409": "03.10.2026", "55318": "02.10.2026"},
+            "known_last_checked_at": {
+                job_id: (datetime.now(UTC) - timedelta(days=100)).isoformat()
+                for job_id in ("88409", "55318")
+            },
+        }
+    )
+    refs = await collect(adapter.iterate_incremental_scan(checkpoint))
+    first, second = refs[:2]
+    assert first.metadata["detail_refresh_due"] and not first.metadata["known_unchanged"]
+    assert second.metadata["detail_refresh_due"] and second.metadata["detail_refresh_deferred"]
+    assert second.metadata["known_unchanged"]
+    assert "known_last_checked_at" not in first.metadata["scan_checkpoint"]["adapter_state"]
+
+
+@pytest.mark.asyncio
+async def test_capped_scan_preserves_next_page_and_resumes_without_skipping_jobs() -> None:
+    routes = default_routes()
+    routes[f"{BASE}/jobs/it-internet"] = fixture("home_ro.html").replace(
+        "jobs?page=2", "jobs/it-internet?page=2"
+    )
+    routes[f"{BASE}/jobs/it-internet?page=2"] = '<html><a href="/job/99999">Extra job</a></html>'
+    config = adapter_config(locale_priority=["ro"], max_pages_per_entrypoint=1)
+    adapter = DelucruMdAdapter(config, client=FixtureFetcher(routes))
+    first = await collect(adapter.iterate_full_scan(None))
+    checkpoint = adapter.last_checkpoint.model_copy(deep=True)
+    assert checkpoint.page_url == f"{BASE}/jobs/it-internet?page=2"
+    assert checkpoint.adapter_state["scan_incomplete"]
+    assert f"{BASE}/jobs/it-internet" not in checkpoint.completed_entrypoints
+    resumed = DelucruMdAdapter(config, client=FixtureFetcher(routes))
+    second = await collect(resumed.iterate_full_scan(checkpoint))
+    assert "99999" not in {ref.external_id for ref in first}
+    assert "99999" in {ref.external_id for ref in second}
+
+
+@pytest.mark.asyncio
+async def test_internal_actions_are_metadata_only_and_never_fetched() -> None:
+    fetcher = FixtureFetcher(default_routes())
+    adapter = DelucruMdAdapter(adapter_config(), client=fetcher)
+    job = await adapter.normalize_job(raw_job(fixture("job_88409_it.html")))
+    assert job.application_url == f"{BASE}/jobs/click/88409"
+    with pytest.raises(DelucruMdAccessDenied):
+        await adapter.fetch_job_details(
+            RawJobReference(external_id="88409", url=job.application_url)
+        )
+    assert fetcher.requested == []
+
+
+@pytest.mark.parametrize("page_url", [f"{BASE}/jobs?page=2", f"{BASE}/jobs?page=2&filter=active"])
+def test_numeric_pagination_keeps_valid_query(page_url: str) -> None:
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    html = '<div class="page-item active">2</div><a href="/job/88409">Job</a>'
+    next_url = adapter._next_page_url(html, page_url, {page_url})
+    expected = f"{BASE}/jobs?" + ("filter=active&" if "filter=" in page_url else "") + "page=3"
+    assert next_url == expected
+
+
+def test_pagination_loop_is_degraded_instead_of_successfully_completed() -> None:
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    url = f"{BASE}/jobs"
+    with pytest.raises(DelucruMdDegradedError, match="pagination loop"):
+        adapter._next_page_url('<a rel="next" href="/jobs">Next</a>', url, {url})
+
+
+@pytest.mark.asyncio
+async def test_selected_category_is_scanned_in_both_locales_when_directory_link_is_missing() -> (
+    None
+):
+    routes = default_routes()
+    routes[f"{BASE}/ru/jobs/by-category"] = fixture("empty_listing.html")
+    url = f"{BASE}/ru/jobs/food-industry-horeca"
+    routes[url] = '<a href="/ru/job/99999">Category-only job</a>'
+    fetcher = FixtureFetcher(routes)
+    adapter = DelucruMdAdapter(adapter_config(), client=fetcher)
+    adapter.set_incremental_categories(["food-industry-horeca"])
+    references = await collect(adapter.iterate_incremental_scan(None))
+    assert "99999" in {reference.external_id for reference in references}
+    assert url in fetcher.requested

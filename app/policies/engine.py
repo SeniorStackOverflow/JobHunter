@@ -15,6 +15,7 @@ from app.crawlers.parsing.normalization import (
     detect_scam_indicators,
     normalize_for_fingerprint,
 )
+from app.deduplication import DeduplicationService
 from app.delivery_ledger import transmissions_on_day
 from app.employers import EmployerIdentityService, EmployerRelationshipService
 from app.matching.hard_requirements import (
@@ -28,6 +29,7 @@ from app.models.entities import (
     Application,
     EmailDelivery,
     EmployerContact,
+    EmployerIdentityCandidate,
     JobPreference,
     JobSource,
     MatchEvaluation,
@@ -54,7 +56,7 @@ from app.profiles.source_categories import category_policy
 from app.profiles.sources import source_selected
 from app.settings import Settings
 
-POLICY_VERSION = "2026-10-02.2-employer-release-daily-capacity"
+POLICY_VERSION = "2026-10-03.1-cross-source-duplicates"
 NO_PUBLIC_EMAIL_STOP_REASON = "no_public_email"
 DAILY_LIMIT_STOP_REASON = "daily_limit_reached"
 
@@ -79,6 +81,7 @@ class PolicyEngine:
             select(Application.id).where(Application.id == application.id).with_for_update()
         )
         await lock_daily_target(session)
+        await DeduplicationService.lock_profile(session, application.profile_id)
         passed: list[str] = []
         failed: list[str] = []
 
@@ -239,6 +242,27 @@ class PolicyEngine:
             and application.employer_id == job.employer_id == contact.employer_id,
         )
         rule("employer_identity_resolved", employer_policy.employer_resolved)
+        ambiguous_employer = await session.scalar(
+            select(EmployerIdentityCandidate.id).where(
+                EmployerIdentityCandidate.source_job_id == job.id,
+                EmployerIdentityCandidate.status == "needs_review",
+            )
+        )
+        rule(
+            "employer_identity_unambiguous",
+            ambiguous_employer is None and not (identity and identity.ambiguous),
+        )
+        deduplication = (job.raw_metadata or {}).get("deduplication", {})
+        rule(
+            "vacancy_identity_unambiguous",
+            not isinstance(deduplication, dict) or deduplication.get("status") != "needs_review",
+        )
+        rule(
+            "no_duplicate_application",
+            not await DeduplicationService().conflicts_with_delivery(
+                session, job, profile.id, application.id
+            ),
+        )
         rule("employer_not_suppressed", employer_policy.not_suppressed)
         rule("no_candidate_withdrawal", employer_policy.no_candidate_withdrawal)
         rule("no_active_employer_conversation", employer_policy.no_active_conversation)
@@ -300,6 +324,7 @@ class PolicyEngine:
             "no_scam_indicators",
             "not_previously_sent",
             "no_delivery_unknown",
+            "no_duplicate_application",
             "contact_delivery_usable",
             "contact_same_employer",
             "employer_not_suppressed",

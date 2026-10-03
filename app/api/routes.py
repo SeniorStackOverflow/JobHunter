@@ -3,11 +3,12 @@ from __future__ import annotations
 # FastAPI's declarative dependency/form parameters intentionally call Depends/File.
 # ruff: noqa: B008
 import contextlib
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -24,6 +25,7 @@ from app.crawlers.lifecycle import managed_adapter
 from app.crawlers.registry import build_default_registry
 from app.crawlers.source_control import disable_source_record, enable_source_record
 from app.database import get_session
+from app.deduplication import DeduplicationService
 from app.email.oauth import GmailOAuthService
 from app.email.service import EmailSendBlocked, EmailService
 from app.models.entities import (
@@ -625,6 +627,97 @@ async def list_jobs(
         )
         for job in jobs
     ]
+
+
+class DuplicateReviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    decision: Literal["distinct", "duplicate"]
+    target_canonical_job_id: UUID | None = None
+    reason: str = Field(min_length=1, max_length=500)
+
+
+@router.get("/jobs/{job_id}/deduplication", dependencies=[Depends(require_api_actor)])
+async def get_job_deduplication(
+    job_id: UUID, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    job = await session.get(SourceJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="source job not found")
+    candidates = await DeduplicationService().candidate_jobs(session, job)
+    return {
+        "source_job_id": job.id,
+        "canonical_job_id": job.canonical_job_id,
+        "decision": (job.raw_metadata or {}).get("deduplication", {}),
+        "history": (job.raw_metadata or {}).get("deduplication_history", []),
+        "candidates": [
+            public_model(
+                candidate,
+                "id",
+                "canonical_job_id",
+                "title",
+                "company",
+                "location",
+                "schedule",
+                "cities",
+                "description",
+                "requirements",
+                "responsibilities",
+                "required_experience",
+                "employment_type",
+                "workplace_type",
+                "salary_min",
+                "salary_max",
+                "currency",
+                "canonical_url",
+            )
+            for candidate in candidates
+        ],
+    }
+
+
+@router.post("/jobs/{job_id}/deduplication/review")
+async def review_job_deduplication(
+    job_id: UUID,
+    payload: DuplicateReviewInput,
+    actor: str = Depends(require_api_actor),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    job = await session.scalar(select(SourceJob).where(SourceJob.id == job_id).with_for_update())
+    if job is None:
+        raise HTTPException(status_code=404, detail="source job not found")
+    old_id = job.canonical_job_id
+    try:
+        service = DeduplicationService()
+        if payload.decision == "distinct":
+            canonical = await service.split(session, job)
+        elif payload.target_canonical_job_id is None:
+            raise ValueError("target_canonical_job_id is required for a duplicate")
+        else:
+            canonical = await service.confirm_duplicate(
+                session, job, payload.target_canonical_job_id
+            )
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        actor=actor,
+        action="job.deduplication_reviewed",
+        entity_type="source_job",
+        entity_id=str(job.id),
+        correlation_id=str(job.id),
+        decision=payload.decision,
+        details={
+            "reason": payload.reason,
+            "previous_canonical_job_id": str(old_id),
+            "canonical_job_id": str(canonical.id),
+        },
+    )
+    await session.commit()
+    return {
+        "source_job_id": job.id,
+        "canonical_job_id": canonical.id,
+        "decision": job.raw_metadata["deduplication"],
+    }
 
 
 @router.get("/matches", dependencies=[Depends(require_api_actor)])

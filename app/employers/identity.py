@@ -9,6 +9,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawlers.parsing.normalization import normalize_for_fingerprint
+from app.employers.normalization import company_domain, company_key
 from app.models.entities import (
     CanonicalEmployer,
     CanonicalJob,
@@ -21,16 +22,6 @@ from app.models.enums import EmployerIdentifierType
 from app.observability.metrics import EMPLOYER_IDENTITY_AMBIGUOUS, EMPLOYER_IDENTITY_MERGES
 from app.phone.numbers import normalize_e164
 
-_FREE_EMAIL_DOMAINS = {
-    "gmail.com",
-    "googlemail.com",
-    "hotmail.com",
-    "icloud.com",
-    "mail.ru",
-    "outlook.com",
-    "yahoo.com",
-    "yandex.ru",
-}
 _RABOTA_EMPLOYER_PATH = re.compile(r"/(?:ru|ro)?/?companies/([^/?#]+)", re.I)
 _LEGAL_NAME_TOKENS = {"company", "grup", "group", "sa", "srl", "societate"}
 
@@ -57,7 +48,12 @@ def _normalized_url(value: str) -> str | None:
     try:
         parts = urlsplit(value)
         hostname = (parts.hostname or "").casefold().rstrip(".")
-        if parts.scheme not in {"http", "https"} or not hostname:
+        if (
+            parts.scheme not in {"http", "https"}
+            or not hostname
+            or parts.username
+            or parts.password
+        ):
             return None
         port = parts.port
     except ValueError:
@@ -77,10 +73,12 @@ def _domain_from_email(value: str | None) -> str | None:
     if normalized is None:
         return None
     domain = normalized.rsplit("@", maxsplit=1)[1].rstrip(".")
-    return domain if domain and domain not in _FREE_EMAIL_DOMAINS else None
+    return company_domain(f"https://{domain}")
 
 
 def _domain_matches_company(domain: str, company: str | None) -> bool:
+    if company_domain(f"https://{domain}") is None:
+        return False
     label = domain.split(".", maxsplit=1)[0]
     company_tokens = [
         token
@@ -91,6 +89,7 @@ def _domain_matches_company(domain: str, company: str | None) -> bool:
     compact_domain = re.sub(r"[^a-z0-9]", "", label.casefold())
     return bool(
         len(compact_domain) >= 4
+        and len(compact_company) >= 3
         and (
             compact_domain in compact_company
             or compact_company in compact_domain
@@ -119,6 +118,20 @@ class EmployerIdentityService:
         source = await session.get(JobSource, job.source_id)
         namespace = str(job.source_id)
         signals: list[IdentitySignal] = []
+        metadata = job.raw_metadata or {}
+        if source is not None and source.adapter_type == "delucru_md":
+            company_id = str(metadata.get("company_id") or "")
+            if company_id.isdecimal():
+                signals.append(
+                    IdentitySignal(
+                        EmployerIdentifierType.SOURCE_EMPLOYER_ID,
+                        namespace,
+                        company_id,
+                        company_id,
+                        1.0,
+                        "delucru_company_id",
+                    )
+                )
         employer_url = _normalized_url(job.employer_url or "") if job.employer_url else None
         contact_namespace = "global"
         if employer_url:
@@ -129,7 +142,12 @@ class EmployerIdentityService:
             signals.append(
                 IdentitySignal(
                     EmployerIdentifierType.EMPLOYER_PROFILE_URL,
-                    namespace,
+                    (
+                        "global"
+                        if (profile_domain := company_domain(employer_url))
+                        and (source is None or profile_domain != company_domain(source.base_url))
+                        else namespace
+                    ),
                     employer_url,
                     job.employer_url or employer_url,
                     1.0,
@@ -200,6 +218,46 @@ class EmployerIdentityService:
                         "source_job.public_phone",
                     )
                 )
+        # A shared recruiter contact alone never joins named client profiles.
+        # Bind cross-board contacts to the exact normalized brand as well.
+        brand = company_key(job.company)
+        if employer_url and len(brand.replace(" ", "")) >= 4:
+            brand_namespace = f"company:{hashlib.sha256(brand.encode()).hexdigest()}"
+            for signal in list(signals):
+                if signal.identifier_type in {
+                    EmployerIdentifierType.EMAIL,
+                    EmployerIdentifierType.PHONE,
+                }:
+                    signals.append(
+                        IdentitySignal(
+                            signal.identifier_type,
+                            brand_namespace,
+                            signal.normalized_value,
+                            signal.raw_value,
+                            0.9,
+                            "company_and_public_contact",
+                        )
+                    )
+        website = metadata.get("company_website")
+        domain = company_domain(website) if isinstance(website, str) else None
+        source_domain = company_domain(source.base_url) if source is not None else None
+        if (
+            source is not None
+            and source.adapter_type != "company_careers"
+            and domain == source_domain
+        ):
+            domain = None
+        if domain:
+            signals.append(
+                IdentitySignal(
+                    EmployerIdentifierType.DOMAIN,
+                    "global" if _domain_matches_company(domain, job.company) else contact_namespace,
+                    domain,
+                    str(website),
+                    0.95,
+                    "public_company_website",
+                )
+            )
         return list(
             {
                 (signal.identifier_type, signal.namespace, signal.normalized_value): signal
@@ -216,11 +274,9 @@ class EmployerIdentityService:
     async def resolve_for_source_job(
         self, session: AsyncSession, job: SourceJob
     ) -> EmployerIdentityResult:
-        if job.employer_id is not None:
-            employer = await session.get(CanonicalEmployer, job.employer_id)
-            if employer is not None:
-                return EmployerIdentityResult(employer, True, False, ())
-
+        assigned = (
+            await session.get(CanonicalEmployer, job.employer_id) if job.employer_id else None
+        )
         signals = await self._signals(session, job)
         if signals and session.bind is not None and session.bind.dialect.name == "postgresql":
             lock_keys = sorted(
@@ -233,6 +289,7 @@ class EmployerIdentityService:
                     {"identity_key": f"jobhunter:employer:{lock_key}"},
                 )
         matches: dict[object, CanonicalEmployer] = {}
+        matched_signals: list[IdentitySignal] = []
         for signal in signals:
             identifier = await session.scalar(
                 select(EmployerIdentifier).where(
@@ -245,10 +302,35 @@ class EmployerIdentityService:
                 employer = await session.get(CanonicalEmployer, identifier.employer_id)
                 if employer is not None:
                     matches[employer.id] = employer
+                    matched_signals.append(signal)
 
         normalized_name = normalize_for_fingerprint(job.company)
-        ambiguous = len(matches) > 1
-        if len(matches) == 1:
+        if assigned is not None:
+            matches[assigned.id] = assigned
+        unverified_brand_change = (
+            assigned is None
+            and len(matches) == 1
+            and company_key(job.company)
+            != company_key(next(iter(matches.values())).normalized_name)
+            and not any(
+                signal.identifier_type
+                in {
+                    EmployerIdentifierType.EMPLOYER_PROFILE_URL,
+                    EmployerIdentifierType.RABOTA_EMPLOYER_ID,
+                    EmployerIdentifierType.SOURCE_EMPLOYER_ID,
+                }
+                or (
+                    signal.identifier_type == EmployerIdentifierType.DOMAIN
+                    and _domain_matches_company(signal.normalized_value, job.company)
+                )
+                for signal in matched_signals
+            )
+        )
+        ambiguous = len(matches) > 1 or unverified_brand_change
+        if assigned is not None:
+            employer = assigned
+            matched_existing = True
+        elif len(matches) == 1 and not ambiguous:
             employer = next(iter(matches.values()))
             matched_existing = True
         else:

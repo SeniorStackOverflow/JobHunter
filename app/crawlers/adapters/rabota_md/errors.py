@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.crawlers.errors import SourceDegradedError
+
 
 class RabotaMdError(RuntimeError):
     """Base error raised by the Rabota.md adapter."""
@@ -13,7 +15,7 @@ class RabotaMdTemporaryError(RabotaMdError):
     """A retryable source or network error."""
 
 
-class RabotaMdDegradedError(RabotaMdError):
+class RabotaMdDegradedError(RabotaMdError, SourceDegradedError):
     """The source appears blocked or structurally degraded."""
 
 

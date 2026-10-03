@@ -502,7 +502,7 @@ async def test_stale_auto_approved_application_is_rematched_prepared_and_sent(
         refreshed = await session.get(Application, application_id)
         assert refreshed is not None
         assert refreshed.match_evaluation_id != original_evaluation_id
-        assert refreshed.status == ApplicationStatus.AUTO_APPROVED
+        assert refreshed.status == ApplicationStatus.AUTO_APPROVED, refreshed.policy_result
         assert "safe_stop_reason" not in refreshed.policy_result
 
     assert await email_service.send_auto_approved_applications() == 1

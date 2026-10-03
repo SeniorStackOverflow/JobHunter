@@ -30,6 +30,7 @@ from app.models.entities import (
 from app.models.enums import (
     ApplicationStatus,
     DeliveryStatus,
+    EmployerIdentifierType,
     EmployerInteractionChannel,
     EmployerInteractionType,
     JobStatus,
@@ -125,6 +126,93 @@ async def test_exact_domain_merges_different_spellings(
 
 
 @pytest.mark.asyncio
+async def test_delucru_company_id_is_stable_across_locale_and_profile_slug(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session, adapter="delucru_md")
+        first = await _job(
+            session,
+            source,
+            key="a",
+            company="Alpha",
+            employer_url="https://www.delucru.md/company/alpha-42",
+        )
+        second = await _job(
+            session,
+            source,
+            key="b",
+            company="Alpha SRL",
+            employer_url="https://www.delucru.md/ru/company/new-name-42",
+        )
+        first.raw_metadata = second.raw_metadata = {"company_id": "42"}
+        identity = EmployerIdentityService()
+        assert (await identity.resolve_for_source_job(session, first)).employer.id == (
+            await identity.resolve_for_source_job(session, second)
+        ).employer.id
+
+
+@pytest.mark.asyncio
+async def test_company_website_and_new_contacts_enrich_existing_identity(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        first = await _job(
+            session,
+            source,
+            key="a",
+            company="Alpha",
+            employer_url="https://www.delucru.md/company/alpha-42",
+        )
+        second = await _job(
+            session,
+            source,
+            key="b",
+            company="Alpha SRL",
+            employer_url="https://www.rabota.md/companies/alpha",
+        )
+        identity = EmployerIdentityService()
+        employer = (await identity.resolve_for_source_job(session, first)).employer
+        first.raw_metadata = {"company_website": "https://www.alpha.md/careers"}
+        first.public_email = "jobs@alpha.md"
+        enriched = await identity.resolve_for_source_job(session, first)
+        second.raw_metadata = {"company_website": "https://alpha.md"}
+        assert enriched.employer.id == employer.id
+        assert (await identity.resolve_for_source_job(session, second)).employer.id == employer.id
+
+
+@pytest.mark.asyncio
+async def test_exact_external_company_profile_resolves_across_sources(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        first_source, second_source = await _source(session), await _source(session)
+        second_source.base_url = "https://another-board.example"
+        first = await _job(
+            session,
+            first_source,
+            key="external-a",
+            company="Alpha",
+            email="first@gmail.com",
+            employer_url="https://alpha.example/careers",
+        )
+        second = await _job(
+            session,
+            second_source,
+            key="external-b",
+            company="Alpha SRL",
+            email="second@gmail.com",
+            employer_url="https://alpha.example/careers",
+        )
+        service = EmployerIdentityService()
+        first_result = await service.resolve_for_source_job(session, first)
+        second_result = await service.resolve_for_source_job(session, second)
+        assert first_result.employer.id == second_result.employer.id
+        assert not second_result.ambiguous
+
+
+@pytest.mark.asyncio
 async def test_source_employer_id_merges_rabota_jobs(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -180,6 +268,60 @@ async def test_different_source_profiles_sharing_recruiter_contact_do_not_merge(
         second_result = await service.resolve_for_source_job(session, second)
 
         assert first_result.employer.id != second_result.employer.id
+
+
+@pytest.mark.asyncio
+async def test_shared_recruiter_without_profiles_requires_identity_review(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        first = await _job(
+            session,
+            source,
+            key="agency-a",
+            company="Client One",
+            email="recruiter@gmail.com",
+            phone="+37360004589",
+        )
+        second = await _job(
+            session,
+            source,
+            key="agency-b",
+            company="Client Two",
+            email="recruiter@gmail.com",
+            phone="+37360004589",
+        )
+        service = EmployerIdentityService()
+        first_result = await service.resolve_for_source_job(session, first)
+        second_result = await service.resolve_for_source_job(session, second)
+        assert first_result.employer.id != second_result.employer.id
+        assert second_result.ambiguous
+
+
+@pytest.mark.asyncio
+async def test_source_website_and_shared_email_provider_are_not_company_domains(
+    sqlite_session_factory,
+) -> None:
+    async with sqlite_session_factory() as session:
+        source = await _source(session)
+        item = await _job(
+            session,
+            source,
+            key="board-site",
+            company="Gmail",
+            email="recruiter@gmail.com",
+            employer_url="https://jobs.example/company/gmail",
+        )
+        item.raw_metadata = {"company_website": source.base_url}
+        signals = await EmployerIdentityService().signals_for_source_job(session, item)
+        assert not any(
+            signal.identifier_type == EmployerIdentifierType.DOMAIN for signal in signals
+        )
+        assert not any(
+            signal.identifier_type == EmployerIdentifierType.EMAIL and signal.namespace == "global"
+            for signal in signals
+        )
 
 
 @pytest.mark.asyncio

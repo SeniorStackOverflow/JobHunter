@@ -107,6 +107,7 @@ class ContactDeliveryState(StrEnum):
 
 
 class EmployerIdentifierType(StrEnum):
+    SOURCE_EMPLOYER_ID = "source_employer_id"
     RABOTA_EMPLOYER_ID = "rabota_employer_id"
     EMPLOYER_PROFILE_URL = "employer_profile_url"
     DOMAIN = "domain"

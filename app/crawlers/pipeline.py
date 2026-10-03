@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from statistics import median
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
@@ -14,8 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.applications.availability import block_closed_vacancy_applications
 from app.audit import record_audit_event
-from app.crawlers.adapters.rabota_md.errors import RabotaMdDegradedError, RabotaMdError
+from app.crawlers.adapters.rabota_md.errors import RabotaMdError
 from app.crawlers.browser import BrowserNavigationError
+from app.crawlers.errors import SourceDegradedError
 from app.crawlers.registry import JobSourceAdapterRegistry
 from app.crawlers.schemas import (
     JobRecheckResult,
@@ -105,8 +107,8 @@ SOURCE_JOB_FIELDS = (
 def _degradation_reason(exc: Exception) -> str | None:
     if isinstance(exc, UnsafeURLError):
         return "adapter attempted an unsafe or non-allowlisted URL"
-    if isinstance(exc, RabotaMdDegradedError):
-        return "adapter access degraded: RabotaMdDegradedError"
+    if isinstance(exc, SourceDegradedError):
+        return f"adapter access degraded: {type(exc).__name__}"
     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {403, 429}:
         return f"source returned HTTP {exc.response.status_code}"
     message = str(exc).casefold()
@@ -219,7 +221,10 @@ def _missing_pending_reference(exc: Exception) -> bool:
 
 
 def _completed_scan_status(run: ScanRun) -> RunStatus:
-    if run.parsing_errors > 0 or scan_has_pending_reference_failures(run):
+    checkpoint = run.checkpoint or {}
+    state = checkpoint.get("adapter_state", {})
+    incomplete = isinstance(state, dict) and state.get("scan_incomplete") is True
+    if run.parsing_errors > 0 or scan_has_pending_reference_failures(run) or incomplete:
         return RunStatus.PARTIAL
     return RunStatus.SUCCEEDED
 
@@ -559,7 +564,7 @@ class ScanService:
                 )
                 run.heartbeat_at = datetime.now(UTC)
                 await session.commit()
-            except RabotaMdDegradedError as exc:
+            except SourceDegradedError as exc:
                 # Exhausted egress is a transport failure, not a parse warning. Stop the
                 # scan here instead of reusing the already-exhausted ProxyPoolFetcher.
                 run.network_errors += 1
@@ -1063,7 +1068,11 @@ class ScanService:
             set(normalized.categories_seen)
             | ({reference.category} if reference.category else set())
         )
-        raw_metadata = dict(normalized.raw_metadata)
+        raw_metadata = {
+            **normalized.raw_metadata,
+            "source_domain": urlsplit(source.base_url).hostname,
+            "source_adapter_type": source.adapter_type,
+        }
         previous_raw_metadata = (
             dict(existing.raw_metadata)
             if existing is not None and isinstance(existing.raw_metadata, dict)
@@ -1118,8 +1127,8 @@ class ScanService:
             job.matching_content_hash = compute_source_matching_hash(job)
             session.add(job)
             await session.flush()
-            result = await self.deduplication.assign(session, job)
             await self.employer_identity.resolve_for_source_job(session, job)
+            result = await self.deduplication.assign(session, job)
             await self._refresh_canonical_status(session, {result.canonical_job.id})
             return "new"
 
@@ -1145,6 +1154,7 @@ class ScanService:
         if not changed:
             existing.matching_content_hash = compute_source_matching_hash(existing)
             await self.employer_identity.resolve_for_source_job(session, existing)
+            await self.deduplication.assign(session, existing)
             if existing.canonical_job_id is not None:
                 await self._refresh_canonical_status(session, {existing.canonical_job_id})
             await session.flush()
@@ -1173,6 +1183,7 @@ class ScanService:
         existing.matching_content_hash = compute_source_matching_hash(existing)
         if _hash_version_migration_only(previous_hash_version, next_hash_version, changed_fields):
             await self.employer_identity.resolve_for_source_job(session, existing)
+            await self.deduplication.assign(session, existing)
             if existing.canonical_job_id is not None:
                 await self._refresh_canonical_status(session, {existing.canonical_job_id})
             await session.flush()
@@ -1203,9 +1214,10 @@ class ScanService:
                 requires_rematch=changes_require_rematch(changed_fields),
             )
         )
+        await self.employer_identity.resolve_for_source_job(session, existing)
+        await self.deduplication.assign(session, existing)
         if existing.canonical_job_id is not None:
             await self._refresh_canonical_status(session, {existing.canonical_job_id})
-        await self.employer_identity.resolve_for_source_job(session, existing)
         await session.flush()
         return "updated"
 

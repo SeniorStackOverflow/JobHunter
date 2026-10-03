@@ -49,6 +49,7 @@ def normalize_for_fingerprint(value: str | None) -> str:
     if not value:
         return ""
     ascii_like = unicodedata.normalize("NFKD", value).casefold()
+    ascii_like = "".join(char for char in ascii_like if not unicodedata.combining(char))
     return " ".join(re.findall(r"[\w]+", ascii_like, flags=re.UNICODE))
 
 

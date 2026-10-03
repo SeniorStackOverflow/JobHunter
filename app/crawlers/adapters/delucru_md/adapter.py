@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar, Literal
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -81,7 +81,7 @@ _INTERNAL_ACTION_PARTS = (
     "/login",
     "/register",
 )
-_CONTENT_HASH_VERSION = 1
+_CONTENT_HASH_VERSION = 2
 
 _CHISINAU_DISTRICTS: dict[str, str] = {
     "botanica": "Botanica",
@@ -375,11 +375,14 @@ class DelucruMdAdapter:
                 )
                 raw_config.setdefault(
                     "incremental_category_slugs",
-                    incremental.get(
-                        "category_slugs",
-                        ["it-internet", "lucru-de-acasa-part-time", "sales-consulting"],
-                    ),
+                    incremental.get("category_slugs", _default_incremental_categories()),
                 )
+                for field, nested_field, default in (
+                    ("incremental_known_detail_refresh_hours", "known_detail_refresh_hours", 72),
+                    ("incremental_refresh_jitter_hours", "refresh_jitter_hours", 12),
+                    ("incremental_detail_refresh_budget", "detail_refresh_budget", 50),
+                ):
+                    raw_config.setdefault(field, incremental.get(nested_field, default))
             parsed_config = DelucruMdConfig.model_validate(raw_config)
         elif isinstance(config, DelucruMdConfig):
             parsed_config = config
@@ -425,6 +428,14 @@ class DelucruMdAdapter:
         self._references_by_id: dict[str, RawJobReference] = {}
         self.last_checkpoint = ScanCheckpoint()
 
+    def set_incremental_categories(self, slugs: list[str]) -> None:
+        cleaned = list(dict.fromkeys(slug.strip().casefold() for slug in slugs))
+        if any(not re.fullmatch(r"[a-z0-9_-]+", slug) for slug in cleaned):
+            raise ValueError(
+                "category slugs must contain only letters, digits, underscores or hyphens"
+            )
+        self.config = self.config.model_copy(update={"incremental_category_slugs": cleaned})
+
     async def __aenter__(self) -> DelucruMdAdapter:
         return self
 
@@ -454,7 +465,11 @@ class DelucruMdAdapter:
             )
         try:
             locales = await self.discover_locales()
-        except DelucruMdError as exc:
+            for locale in locales:
+                response = await self._get_public_page(locale.start_urls[0])
+                self._require_success(response, locale.start_urls[0])
+                self._validate_listing(response.text)
+        except (DelucruMdError, httpx.HTTPError) as exc:
             return SourceValidationResult(
                 valid=False,
                 errors=[str(exc)],
@@ -512,37 +527,37 @@ class DelucruMdAdapter:
         for locale in await self.discover_locales():
             prefix = "" if locale.code == "ro" else f"/{locale.code}"
             cat_url = f"{self.config.base_url}{prefix}/jobs/by-category"
-            with contextlib.suppress(Exception):
-                response = await self._get_public_page(cat_url)
-                if response.status_code == 200:
-                    tree = HTMLParser(response.text)
-                    for a in tree.css("a[href*='/jobs/']"):
-                        href = a.attributes.get("href") or ""
-                        cand = self._candidate_public_url(cat_url, href)
-                        if not cand or "/by-" in cand:
-                            continue
-                        m = _CATEGORY_PATH_RE.match(urlsplit(cand).path)
-                        if m:
-                            slug = m.group("category").lower()
-                            if slug not in {"jobs", "by-category", "by-city", "by-district"}:
-                                name = self._clean_text(a.text(separator=" ", strip=True))
-                                # Strip trailing job count e.g. "(180)" or " 293 joburi"
-                                name = re.sub(
-                                    r"\s*(?:\(\d+\)|\d+\s*(?:joburi|вакансий|вакансии|locuri|oferte))\s*$",
-                                    "",
-                                    name,
-                                    flags=re.IGNORECASE,
-                                ).strip()
-                                if not name:
-                                    name = slug
-                                categories.append(
-                                    SourceCategoryData(
-                                        external_id=slug,
-                                        name=name,
-                                        url=cand,
-                                        locale=locale.code,
-                                    )
+            response = await self._get_public_page(cat_url)
+            self._require_success(response, cat_url)
+            if response.status_code == 200:
+                tree = HTMLParser(response.text)
+                for a in tree.css("a[href*='/jobs/']"):
+                    href = a.attributes.get("href") or ""
+                    cand = self._candidate_public_url(cat_url, href)
+                    if not cand or "/by-" in cand:
+                        continue
+                    m = _CATEGORY_PATH_RE.match(urlsplit(cand).path)
+                    if m:
+                        slug = m.group("category").lower()
+                        if slug not in {"jobs", "by-category", "by-city", "by-district"}:
+                            name = self._clean_text(a.text(separator=" ", strip=True))
+                            # Strip trailing job count e.g. "(180)" or " 293 joburi"
+                            name = re.sub(
+                                r"\s*(?:\(\d+\)|\d+\s*(?:joburi|вакансий|вакансии|locuri|oferte))\s*$",
+                                "",
+                                name,
+                                flags=re.IGNORECASE,
+                            ).strip()
+                            if not name:
+                                name = slug
+                            categories.append(
+                                SourceCategoryData(
+                                    external_id=slug,
+                                    name=name,
+                                    url=cand,
+                                    locale=locale.code,
                                 )
+                            )
 
         if not categories:
             # Fallback to known 46 categories
@@ -573,33 +588,33 @@ class DelucruMdAdapter:
             prefix = "" if locale.code == "ro" else f"/{locale.code}"
             for subpage in ("/jobs/by-city", "/jobs/by-district"):
                 reg_url = f"{self.config.base_url}{prefix}{subpage}"
-                with contextlib.suppress(Exception):
-                    response = await self._get_public_page(reg_url)
-                    if response.status_code == 200:
-                        tree = HTMLParser(response.text)
-                        for a in tree.css("a[href*='/jobs/']"):
-                            href = a.attributes.get("href") or ""
-                            cand = self._candidate_public_url(reg_url, href)
-                            if not cand or "/by-" in cand:
-                                continue
-                            m = _CATEGORY_PATH_RE.match(urlsplit(cand).path)
-                            if m:
-                                slug = m.group("category").lower()
-                                name = self._clean_text(a.text(separator=" ", strip=True))
-                                name = re.sub(
-                                    r"\s*(?:\(\d+\)|\d+\s*(?:joburi|вакансий|вакансии|locuri|oferte))\s*$",
-                                    "",
-                                    name,
-                                    flags=re.IGNORECASE,
-                                ).strip()
-                                regions.append(
-                                    SourceRegion(
-                                        external_id=slug,
-                                        name=name or slug,
-                                        url=cand,
-                                        locale=locale.code,
-                                    )
+                response = await self._get_public_page(reg_url)
+                self._require_success(response, reg_url)
+                if response.status_code == 200:
+                    tree = HTMLParser(response.text)
+                    for a in tree.css("a[href*='/jobs/']"):
+                        href = a.attributes.get("href") or ""
+                        cand = self._candidate_public_url(reg_url, href)
+                        if not cand or "/by-" in cand:
+                            continue
+                        m = _CATEGORY_PATH_RE.match(urlsplit(cand).path)
+                        if m:
+                            slug = m.group("category").lower()
+                            name = self._clean_text(a.text(separator=" ", strip=True))
+                            name = re.sub(
+                                r"\s*(?:\(\d+\)|\d+\s*(?:joburi|вакансий|вакансии|locuri|oferte))\s*$",
+                                "",
+                                name,
+                                flags=re.IGNORECASE,
+                            ).strip()
+                            regions.append(
+                                SourceRegion(
+                                    external_id=slug,
+                                    name=name or slug,
+                                    url=cand,
+                                    locale=locale.code,
                                 )
+                            )
 
         if not regions:
             for dist_slug, dist_name in _CHISINAU_DISTRICTS.items():
@@ -612,7 +627,7 @@ class DelucruMdAdapter:
                             locale="ro",
                         )
                     )
-        deduped_reg: dict[str, SourceRegion] = {r.external_id: r for r in regions}
+        deduped_reg = {(r.external_id, r.locale): r for r in regions}
         self._region_cache = list(deduped_reg.values())
         return list(self._region_cache)
 
@@ -644,12 +659,22 @@ class DelucruMdAdapter:
         job_id = self._job_id(raw_job.final_url) or raw_job.reference.external_id
 
         # 1. Job closed status detection
-        body_text_lower = tree.body.text(strip=True).lower() if tree.body else ""
+        title_node = tree.css_first("h2.job-item-title") or tree.css_first(".page-description h1")
+        status_nodes = tree.css(".page-description .alert, .job-status, .job-expired")
+        body_text_lower = " ".join(node.text(strip=True).lower() for node in status_nodes)
+        if title_node is None:
+            body_text_lower = tree.body.text(strip=True).lower() if tree.body else ""
         is_closed = any(m in body_text_lower for m in _CLOSED_MARKERS) or raw_job.status_code in {
             404,
             410,
         }
         status = JobStatus.CLOSED if is_closed else JobStatus.ACTIVE
+        if not is_closed and (
+            title_node is None
+            or tree.css_first(".page-description") is None
+            or tree.css_first("#job-description") is None
+        ):
+            raise DelucruMdDegradedError("public response does not contain a recognizable job card")
 
         # 2. Canonical & Localized URLs
         canonical_url = f"{self.config.base_url}/job/{job_id}"
@@ -660,7 +685,6 @@ class DelucruMdAdapter:
         page_locale = "ru" if "/ru/" in raw_job.final_url else "ro"
 
         # 3. Title
-        title_node = tree.css_first("h2.job-item-title") or tree.css_first("h1")
         title = self._clean_text(title_node.text(strip=True)) if title_node else ""
         if not title:
             title_tag = tree.css_first("title")
@@ -726,7 +750,7 @@ class DelucruMdAdapter:
         workplace_type = self._parse_workplace_type(workplace_raw, tree)
 
         # 9. Schedule & Employment Type
-        sched_raw = metadata.get("program de lucru") or metadata.get("вид занятости") or "Full-time"
+        sched_raw = metadata.get("program de lucru") or metadata.get("вид занятости")
         schedule, employment_type = self._parse_schedule(sched_raw)
 
         # 10. Experience
@@ -741,7 +765,13 @@ class DelucruMdAdapter:
         # 11. Description, Responsibilities, Requirements
         desc_node = tree.css_first("#job-description")
         description = (
-            self._clean_text(desc_node.text(separator="\n", strip=True)) if desc_node else ""
+            "\n".join(
+                line
+                for text in desc_node.text(separator="\n", strip=True).splitlines()
+                if (line := self._clean_text(text))
+            )
+            if desc_node
+            else ""
         )
         responsibilities, requirements = self._split_sections(description)
 
@@ -756,7 +786,9 @@ class DelucruMdAdapter:
         click_link = tree.css_first(f"a[href*='/jobs/click/{job_id}']")
         if click_link:
             click_href = click_link.attributes.get("href") or ""
-            cand_click = self._candidate_public_url(raw_job.final_url, click_href)
+            cand_click = self._candidate_public_url(
+                raw_job.final_url, click_href, allow_application_action=True
+            )
             if cand_click:
                 app_url = cand_click
 
@@ -769,12 +801,23 @@ class DelucruMdAdapter:
             "salary_max": str(sal_max) if sal_max is not None else None,
             "currency": cur,
             "city": city,
+            "cities": sorted(cities),
+            "districts": sorted(districts),
+            "description": description,
+            "requirements": requirements,
+            "responsibilities": responsibilities,
+            "employer_url": employer_url,
+            "company_website": web,
             "schedule": schedule,
             "employment_type": employment_type,
             "required_experience": req_exp,
             "no_experience": no_exp,
             "workplace_type": workplace_type,
-            "contacts": [*emails, *phones, app_url],
+            "contacts": {
+                "emails": sorted(emails),
+                "phones": sorted(phones),
+                "application_url": app_url,
+            },
             "status": status.value,
         }
         content_hash = self._hash_json(hash_payload)
@@ -787,6 +830,12 @@ class DelucruMdAdapter:
         )
 
         categories_seen = self._string_list(raw_job.reference.metadata.get("categories_seen"))
+        known_categories = {slug for slug, _, _ in _KNOWN_CATEGORIES}
+        known_categories.update(item.external_id for item in self._category_cache or [])
+        for link in tree.css(".page-description a[href*='/jobs/'], .breadcrumb a[href*='/jobs/']"):
+            match = _CATEGORY_PATH_RE.match(urlsplit(link.attributes.get("href") or "").path)
+            if match and match.group("category") in known_categories:
+                categories_seen.append(match.group("category"))
         if raw_job.reference.category and raw_job.reference.category not in categories_seen:
             categories_seen.append(raw_job.reference.category)
 
@@ -797,8 +846,8 @@ class DelucruMdAdapter:
             title=title,
             company=company_name,
             employer_url=employer_url,
-            category=raw_job.reference.category,
-            categories_seen=categories_seen,
+            category=raw_job.reference.category or next(iter(sorted(set(categories_seen))), None),
+            categories_seen=sorted(set(categories_seen)),
             description=description,
             responsibilities=responsibilities,
             requirements=requirements,
@@ -855,7 +904,7 @@ class DelucruMdAdapter:
             return JobRecheckResult(exists=None, temporary_error=str(exc), adapter_degraded=True)
 
         if response.status_code in {404, 410}:
-            return JobRecheckResult(exists=False, explicitly_closed=True)
+            return JobRecheckResult(exists=False, explicitly_closed=response.status_code == 410)
         if response.status_code in {403, 429} or response.status_code >= 500:
             return JobRecheckResult(
                 exists=None,
@@ -898,8 +947,49 @@ class DelucruMdAdapter:
         known_ids = set(self._string_list(state.adapter_state.get("known_external_ids")))
         known_hints_raw = state.adapter_state.get("known_updated_hints", {})
         known_hints = known_hints_raw if isinstance(known_hints_raw, dict) else {}
+        checks_raw = state.adapter_state.get("known_last_checked_at", {})
+        checks = checks_raw if isinstance(checks_raw, dict) else {}
+        refresh_ids = set(self._string_list(state.adapter_state.get("detail_refresh_selected_ids")))
+        scan_time = datetime.now(UTC)
+        state.adapter_state["scan_incomplete"] = False
 
-        entrypoints = await self._scan_entrypoints(incremental=incremental)
+        def reference_state(ref: RawJobReference) -> tuple[bool, bool, bool]:
+            if not incremental or ref.external_id not in known_ids:
+                return False, False, False
+            if ref.updated_hint and known_hints.get(ref.external_id) != ref.updated_hint:
+                return False, False, False
+            checked_at = None
+            checked = checks.get(ref.external_id)
+            if isinstance(checked, str):
+                with contextlib.suppress(ValueError):
+                    checked_at = datetime.fromisoformat(checked.replace("Z", "+00:00"))
+                    if checked_at.tzinfo is None:
+                        checked_at = checked_at.replace(tzinfo=UTC)
+            jitter = self.config.incremental_refresh_jitter_hours * 3600
+            digest = hashlib.sha256(ref.external_id.encode()).digest()
+            offset = int.from_bytes(digest[:8], "big") % (2 * jitter + 1) - jitter
+            max_age = timedelta(
+                seconds=max(
+                    3600, self.config.incremental_known_detail_refresh_hours * 3600 + offset
+                )
+            )
+            if checked_at is not None and timedelta(0) <= scan_time - checked_at <= max_age:
+                return True, False, False
+            if (
+                ref.external_id in refresh_ids
+                or len(refresh_ids) < self.config.incremental_detail_refresh_budget
+            ):
+                refresh_ids.add(ref.external_id)
+                state.adapter_state["detail_refresh_selected_ids"] = sorted(refresh_ids)
+                return False, True, False
+            return True, True, True
+
+        saved_entries = state.adapter_state.get("scan_entrypoints")
+        if isinstance(saved_entries, list):
+            entrypoints = saved_entries
+        else:
+            entrypoints = await self._scan_entrypoints(incremental=incremental)
+            state.adapter_state["scan_entrypoints"] = entrypoints
         max_pages = (
             self.config.incremental_max_pages_per_entrypoint
             if incremental
@@ -929,35 +1019,60 @@ class DelucruMdAdapter:
 
                 response = await self._get_public_page(current_url)
                 if response.status_code == 404:
+                    current_url = None
                     break
                 self._require_success(response, current_url)
+                self._validate_listing(response.text)
                 pages += 1
 
                 references = self._references_from_listing(
                     response.text,
                     str(response.url),
                     category=entry.get("category"),
+                    region=entry.get("region"),
                 )
 
                 for ref in references:
-                    is_known_unchanged = (
-                        ref.external_id in known_ids
-                        and bool(ref.updated_hint)
-                        and known_hints.get(ref.external_id) == ref.updated_hint
-                    )
-
-                    if is_known_unchanged:
-                        unchanged_run += 1
-                    else:
-                        unchanged_run = 0
-
-                    if ref.external_id not in seen_ids:
+                    unchanged, due, deferred = reference_state(ref)
+                    unchanged_run = unchanged_run + 1 if unchanged and not due else 0
+                    existing = self._references_by_id.get(ref.external_id)
+                    if existing is not None:
+                        ref.category = existing.category or ref.category
+                        ref.metadata["categories_seen"] = sorted(
+                            set(
+                                self._string_list(existing.metadata.get("categories_seen"))
+                                + self._string_list(ref.metadata.get("categories_seen"))
+                            )
+                        )
+                        ref.metadata["localized_urls"] = {
+                            **existing.metadata.get("localized_urls", {}),
+                            **ref.metadata.get("localized_urls", {}),
+                        }
+                    self._references_by_id[ref.external_id] = ref
+                    duplicate = ref.external_id in seen_ids
+                    if not duplicate:
                         seen_ids.add(ref.external_id)
                         state.yielded_external_ids.append(ref.external_id)
-                        yielded = ref.model_copy(deep=True)
-                        yielded.metadata["known_unchanged"] = is_known_unchanged
-                        yielded.metadata["scan_checkpoint"] = state.model_dump(mode="json")
-                        yield yielded
+                    yielded = ref.model_copy(deep=True)
+                    yielded.metadata.update(
+                        {
+                            "known_unchanged": unchanged,
+                            "detail_refresh_due": due,
+                            "detail_refresh_deferred": deferred,
+                            "duplicate_reference": duplicate,
+                            "scan_checkpoint": state.model_dump(
+                                mode="json",
+                                exclude={
+                                    "adapter_state": {
+                                        "known_external_ids",
+                                        "known_updated_hints",
+                                        "known_last_checked_at",
+                                    }
+                                },
+                            ),
+                        }
+                    )
+                    yield yielded
 
                     if incremental and unchanged_run >= self.config.known_unchanged_stop_threshold:
                         current_url = None
@@ -969,6 +1084,10 @@ class DelucruMdAdapter:
                     continue
                 break
 
+            if current_url is not None and pages >= max_pages:
+                state.page_url = current_url
+                state.adapter_state["scan_incomplete"] = True
+                return
             if entry_url not in state.completed_entrypoints:
                 state.completed_entrypoints.append(entry_url)
             state.entrypoint_index = index + 1
@@ -977,20 +1096,33 @@ class DelucruMdAdapter:
     async def _scan_entrypoints(self, *, incremental: bool) -> list[dict[str, str | None]]:
         entrypoints: list[dict[str, str | None]] = []
         locales = await self.discover_locales()
-
+        hot = {slug.casefold() for slug in self.config.incremental_category_slugs}
+        for cat in await self.discover_categories():
+            if not incremental or cat.external_id.casefold() in hot:
+                entrypoints.append({"url": cat.url, "category": cat.external_id, "region": None})
         if incremental:
-            # Hot categories
-            hot = {slug.lower() for slug in self.config.incremental_category_slugs}
-            categories = await self.discover_categories()
-            for cat in categories:
-                if cat.external_id.lower() in hot:
-                    entrypoints.append({"url": cat.url, "category": cat.external_id})
-        else:
+            # A missing locale link in the directory must not drop a selected category.
+            listed_urls = {entry["url"] for entry in entrypoints}
+            for locale in locales:
+                prefix = "" if locale.code == "ro" else f"/{locale.code}"
+                for slug in sorted(hot):
+                    url = f"{self.config.base_url}{prefix}/jobs/{slug}"
+                    if url not in listed_urls:
+                        entrypoints.append({"url": url, "category": slug, "region": None})
+        if not incremental:
             # General listings for each locale
             for loc in locales:
                 prefix = "" if loc.code == "ro" else f"/{loc.code}"
                 entrypoints.append(
-                    {"url": f"{self.config.base_url}{prefix}/jobs", "category": None}
+                    {
+                        "url": f"{self.config.base_url}{prefix}/jobs",
+                        "category": None,
+                        "region": None,
+                    }
+                )
+            for region in await self.discover_regions():
+                entrypoints.append(
+                    {"url": region.url, "category": None, "region": region.external_id}
                 )
 
         deduped: list[dict[str, str | None]] = []
@@ -1000,10 +1132,12 @@ class DelucruMdAdapter:
             if u and u not in seen:
                 seen.add(u)
                 deduped.append(e)
+        if len(deduped) > self.config.max_discovered_entrypoints:
+            raise DelucruMdParseError("discovered entrypoints exceed the configured scan budget")
         return deduped
 
     def _references_from_listing(
-        self, html: str, page_url: str, *, category: str | None
+        self, html: str, page_url: str, *, category: str | None, region: str | None = None
     ) -> list[RawJobReference]:
         tree = HTMLParser(html)
         refs: dict[str, RawJobReference] = {}
@@ -1027,9 +1161,13 @@ class DelucruMdAdapter:
                 url=cand,
                 locale=locale,
                 category=category,
+                region=region,
                 discovery_url=page_url,
                 updated_hint=updated_hint,
-                metadata={"categories_seen": [category] if category else []},
+                metadata={
+                    "categories_seen": [category] if category else [],
+                    "localized_urls": {locale: cand},
+                },
             )
         return list(refs.values())
 
@@ -1040,7 +1178,9 @@ class DelucruMdAdapter:
         if next_node:
             href = next_node.attributes.get("href")
             cand = self._candidate_public_url(page_url, href or "")
-            if cand and cand not in visited:
+            if cand:
+                if cand in visited:
+                    raise DelucruMdDegradedError("pagination loop in listing")
                 return cand
 
         # 2. Page links containing > or next
@@ -1049,16 +1189,18 @@ class DelucruMdAdapter:
             if text in {"următoarea", "urmatoarea", "следующая", ">", "»"}:
                 href = a.attributes.get("href")
                 cand = self._candidate_public_url(page_url, href or "")
-                if cand and cand not in visited:
+                if cand:
+                    if cand in visited:
+                        raise DelucruMdDegradedError("pagination loop in listing")
                     return cand
 
         # 3. Numeric page increment fallback
         m_page = re.search(r"[?&]page=(\d+)", page_url)
         curr_page = int(m_page.group(1)) if m_page else 1
         next_page = curr_page + 1
-        sep = "&" if "?" in page_url else "?"
-        base_without_page = re.sub(r"[?&]page=\d+", "", page_url)
-        cand = f"{base_without_page}{sep}page={next_page}"
+        parts = urlsplit(page_url)
+        query = [(key, value) for key, value in parse_qsl(parts.query) if key != "page"]
+        cand = urlunsplit(parts._replace(query=urlencode([*query, ("page", str(next_page))])))
         # Only suggest if there are job links on the current page
         if cand not in visited and tree.css_first("a[href*='/job/']"):
             active_p = tree.css_first(".page-item.active")
@@ -1076,7 +1218,25 @@ class DelucruMdAdapter:
         candidate = self._require_public_url(url)
         response = await self._http.get(candidate)
         self._require_public_url(str(response.url))
+        if response.status_code == 200:
+            tree = HTMLParser(response.text)
+            title = tree.css_first("title")
+            text = title.text(strip=True).casefold() if title is not None else ""
+            if any(
+                marker in text
+                for marker in ("please wait", "just a moment", "captcha", "access denied")
+            ):
+                raise DelucruMdDegradedError(
+                    "source returned an access challenge instead of public content"
+                )
         return response
+
+    def _validate_listing(self, html: str) -> None:
+        tree = HTMLParser(html)
+        if tree.css_first("a[href*='/job/'], .empty-results") is None:
+            raise DelucruMdDegradedError(
+                "public response does not contain a recognizable jobs listing"
+            )
 
     @staticmethod
     def _require_success(response: httpx.Response, url: str) -> None:
@@ -1093,28 +1253,38 @@ class DelucruMdAdapter:
                 f"Delucru.md unexpected client error (HTTP {response.status_code}) for {url}"
             )
 
-    def _require_public_url(self, url: str) -> str:
+    def _require_public_url(self, url: str, *, allow_application_action: bool = False) -> str:
         parsed = urlsplit(url)
         hostname = (parsed.hostname or "").rstrip(".").lower()
         if (
             parsed.scheme != "https"
             or parsed.username is not None
             or parsed.password is not None
-            or not (hostname == "delucru.md" or hostname.endswith(".delucru.md"))
+            or hostname not in {"delucru.md", "www.delucru.md"}
             or parsed.port not in {None, 443}
         ):
             raise DelucruMdAccessDenied("URL is outside the HTTPS Delucru.md source allowlist")
         path = parsed.path or "/"
         lowered = unquote(path).casefold()
-        if any(part in lowered for part in _INTERNAL_ACTION_PARTS):
-            pass
+        if any(part in lowered for part in _INTERNAL_ACTION_PARTS) and (
+            not allow_application_action
+            or not re.fullmatch(r"/(?:ru/|ro/)?jobs/(?:form|click)/\d+/?", lowered)
+        ):
+            raise DelucruMdAccessDenied(
+                "internal application and authentication actions are not crawlable"
+            )
         return urlunsplit(("https", parsed.netloc, path, parsed.query, ""))
 
-    def _candidate_public_url(self, current_url: str, href: str) -> str | None:
+    def _candidate_public_url(
+        self, current_url: str, href: str, *, allow_application_action: bool = False
+    ) -> str | None:
         if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
             return None
         try:
-            return self._require_public_url(urljoin(current_url, href.strip()))
+            return self._require_public_url(
+                urljoin(current_url, href.strip()),
+                allow_application_action=allow_application_action,
+            )
         except (ValueError, DelucruMdAccessDenied):
             return None
 
@@ -1195,7 +1365,7 @@ class DelucruMdAdapter:
     @staticmethod
     def _parse_location(value: str | None) -> tuple[str | None, list[str], list[str]]:
         if not value:
-            return "Chișinău", ["Chișinău"], []
+            return None, [], []
         cities: list[str] = []
         districts: list[str] = []
         tokens = [t.strip() for t in value.split(",") if t.strip()]
@@ -1214,7 +1384,7 @@ class DelucruMdAdapter:
                 if tok not in cities:
                     cities.append(tok)
 
-        city = cities[0] if cities else "Chișinău"
+        city = cities[0] if cities else None
         return city, cities, districts
 
     @staticmethod
@@ -1232,14 +1402,18 @@ class DelucruMdAdapter:
             b_text = badge.text(strip=True).lower()
             if "remote" in b_text or "distanță" in b_text:
                 return "remote"
-        return "onsite"
+        return None
 
     @staticmethod
-    def _parse_schedule(value: str) -> tuple[str, str | None]:
+    def _parse_schedule(value: str | None) -> tuple[str | None, str | None]:
+        if not value:
+            return None, None
         sched = DelucruMdAdapter._clean_text(value)
         low = sched.lower()
-        emp_type = "full-time"
-        if "part-time" in low:
+        emp_type = None
+        if "full-time" in low or "полная" in low:
+            emp_type = "full-time"
+        elif "part-time" in low or "частичная" in low:
             emp_type = "part-time"
         elif "proiect" in low or "sezonier" in low or "временная" in low:
             emp_type = "temporary"
@@ -1261,7 +1435,8 @@ class DelucruMdAdapter:
         resp_pattern = (
             r"(?:responsabilitățile candidatului|responsabilități|key responsibilities|"
             r"ce vei face|workflow description|обязанности)[\s:]+(.*?)"
-            r"(?=(?:cerințe|ce ne dorim|we look for|oferim|beneficii|oferta|condiții|условия|$))"
+            r"(?=(?:cerințe|ce ne dorim|requirements|we look for|требования|"
+            r"oferim|beneficii|oferta|condiții|условия|$))"
         )
         resp_m = re.search(resp_pattern, description, re.IGNORECASE | re.DOTALL)
         if resp_m:
@@ -1281,7 +1456,9 @@ class DelucruMdAdapter:
     def _extract_contacts(
         self, tree: HTMLParser, page_url: str
     ) -> tuple[list[str], list[str], str | None, list[str]]:
-        scope = tree.css_first("div.page-description") or tree
+        scope = tree.css_first("div.page-description")
+        if scope is None:
+            return [], [], None, []
         emails: list[str] = []
         phones: list[str] = []
         website: str | None = None
@@ -1386,11 +1563,13 @@ class DelucruMdAdapter:
             if date_el:
                 dt_str = date_el.text(strip=True).lower()
                 if "azi" in dt_str or "сегодня" in dt_str:
-                    updated_at = fetched_at.replace(hour=0, minute=0, second=0, microsecond=0)
+                    local_time = fetched_at.astimezone(ZoneInfo("Europe/Chisinau"))
+                    updated_at = local_time.replace(hour=0, minute=0, second=0, microsecond=0)
                 elif "ieri" in dt_str or "вчера" in dt_str:
-                    updated_at = (fetched_at - timedelta(days=1)).replace(
+                    local_time = fetched_at.astimezone(ZoneInfo("Europe/Chisinau"))
+                    updated_at = (local_time - timedelta(days=1)).replace(
                         hour=0, minute=0, second=0, microsecond=0
                     )
 
-        published_at = updated_at or fetched_at
+        published_at = updated_at
         return published_at, updated_at
