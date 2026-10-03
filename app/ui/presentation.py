@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.templating import Jinja2Templates
 
+from app.email.failures import mentions_tls_failure
 from app.models.entities import Application
 from app.security.ssrf import public_url_shape_is_safe
 
@@ -76,6 +77,17 @@ _STATUS_LABELS = {
     "sending": "Отправляется",
     "sent": "Отправлен",
     "delivery_unknown": "Доставка неизвестна",
+    "submitted": "Передано Gmail",
+    "provider_accepted": "Принято Gmail",
+    "delivered": "Доставлено",
+    "bounced_transient": "Временный отказ",
+    "bounced_permanent": "Не доставлено",
+    "recipient_rejected": "Получатель отклонил",
+    "mailbox_full": "Ящик переполнен",
+    "domain_rejected": "Домен не принимает письма",
+    "policy_rejected": "Отклонено правилами получателя",
+    "spam_rejected": "Отклонено как спам",
+    "delivery_failed": "Не доставлено",
     "temporary_failure": "Временная ошибка",
     "permanent_failure": "Ошибка доставки",
     "blocked": "Заблокирован",
@@ -106,6 +118,7 @@ _AUDIT_ACTION_LABELS = {
     "auto_send.paused": "Автоотправка поставлена на паузу",
     "auto_send.resumed": "Автоотправка возобновлена",
     "email.delivery": "Обновлено состояние доставки",
+    "email.delivery_delayed": "Доставка письма задерживается",
     "oauth.gmail.connected": "Google-аккаунт подключён",
     "oauth.gmail.disconnected": "Google-аккаунт отключён",
     "preferences.updated": "Настройки поиска обновлены",
@@ -263,7 +276,16 @@ def _status_label(value: Any) -> str:
 
 def _status_tone(value: Any) -> str:
     raw = _enum_value(value)
-    if raw in {"healthy", "succeeded", "active", "auto_apply", "approved", "auto_approved", "sent"}:
+    if raw in {
+        "healthy",
+        "succeeded",
+        "active",
+        "auto_apply",
+        "approved",
+        "auto_approved",
+        "sent",
+        "delivered",
+    }:
         return "success"
     if raw in {
         "queued",
@@ -276,6 +298,7 @@ def _status_tone(value: Any) -> str:
         "unknown",
         "prepare_for_review",
         "temporary_failure",
+        "bounced_transient",
     }:
         return "warning"
     if raw in {
@@ -286,6 +309,13 @@ def _status_tone(value: Any) -> str:
         "delivery_unknown",
         "degraded",
         "unavailable",
+        "bounced_permanent",
+        "recipient_rejected",
+        "mailbox_full",
+        "domain_rejected",
+        "policy_rejected",
+        "spam_rejected",
+        "delivery_failed",
     }:
         return "danger"
     if raw in {"disabled", "cancelled", "closed", "skip", "skipped"}:
@@ -309,6 +339,8 @@ def _audit_action_label(value: str) -> str:
 def _alert_code_label(value: str) -> str:
     if value.startswith("email_permanent_delivery_failure:"):
         return "Не удалось доставить отклик"
+    if value.startswith("email_delivery_delayed:"):
+        return "Доставка отклика задерживается"
     return _ALERT_CODE_LABELS.get(value, "Системное уведомление")
 
 
@@ -395,6 +427,86 @@ def _application_deferred_note(application: Any) -> str | None:
     return None
 
 
+def _delivery_tls_problem(delivery: dict[str, Any]) -> bool:
+    if delivery.get("failure_class") == "tls_failure":
+        return True
+    return mentions_tls_failure(delivery.get("failure_reason"))
+
+
+def _vacancy_phones(application: dict[str, Any]) -> list[str]:
+    job = application.get("job") or {}
+    phones = [job.get("public_phone"), *(job.get("public_phones") or [])]
+    return [phone for phone in dict.fromkeys(phones) if phone]
+
+
+def _application_delivery_note(application: Any) -> tuple[str, str] | None:
+    """Explain a delivery the provider could not complete, as (tone, text)."""
+
+    if not isinstance(application, dict):
+        return None
+    delivery = application.get("delivery")
+    if not isinstance(delivery, dict):
+        return None
+    status = str(delivery.get("status") or "")
+    failure_class = delivery.get("failure_class")
+    recipient = delivery.get("final_recipient") or delivery.get("recipient") or ""
+    domain = recipient.rsplit("@", 1)[-1] if "@" in recipient else "получателя"
+    phones = _vacancy_phones(application)
+    contact = application.get("contact") or {}
+    # The probe after a pause failed too: the address is no longer retried.
+    repeated = str(contact.get("last_failure_reason") or "").endswith("_repeated")
+    other_channel = (
+        f" Свяжитесь с работодателем другим способом — телефон из вакансии: {', '.join(phones)}."
+        if phones
+        else " Свяжитесь с работодателем другим способом: по телефону или через другой адрес."
+    )
+    if failure_class == "delivery_delayed" and status in {"provider_accepted", "sent", "submitted"}:
+        cause = (
+            f"почтовый сервер домена {domain} не может установить защищённое соединение"
+            if _delivery_tls_problem(delivery)
+            else "почтовый сервер получателя временно не принимает письмо"
+        )
+        return (
+            "warning",
+            f"Доставка задерживается: {cause}. Gmail повторяет попытки сам до трёх суток "
+            "после отправки; JobHunter письмо повторно не отправит. Если сервер не "
+            "исправят, Gmail пришлёт окончательный отказ.",
+        )
+    if failure_class == "tls_failure" and status not in {"delivered", "provider_accepted"}:
+        outcome = (
+            "Сервер не исправили и после паузы — на этот домен JobHunter больше не пишет."
+            if repeated
+            else "Домен поставлен на паузу; после неё следующий отклик проверит сервер "
+            "снова, и если он снова не примет письмо, домен будет заблокирован."
+        )
+        return (
+            "danger",
+            f"Письмо не доставлено: почтовый сервер домена {domain} трое суток не "
+            f"устанавливал защищённое соединение. {outcome}" + other_channel,
+        )
+    if failure_class in {"delivery_expired", "mailbox_full"} and status not in {
+        "delivered",
+        "provider_accepted",
+    }:
+        outcome = (
+            "Адрес не заработал и после паузы — JobHunter больше на него не пишет."
+            if repeated
+            else "Адрес поставлен на паузу; после неё следующий отклик проверит его снова, "
+            "и если письмо снова не дойдёт, адрес будет заблокирован."
+        )
+        cause = (
+            "ящик получателя переполнен"
+            if failure_class == "mailbox_full"
+            else "Gmail трое суток пытался доставить его и прекратил попытки"
+        )
+        return (
+            "danger",
+            f"Письмо не доставлено: {cause}. Повторно JobHunter его не отправит. {outcome}"
+            + other_channel,
+        )
+    return None
+
+
 def _approval_failure_notice(application: Application | None, error: Exception) -> str:
     message = str(error)
     if application is not None and not _application_content_validated(application):
@@ -429,3 +541,4 @@ templates.env.globals["alert_code_label"] = _alert_code_label
 templates.env.globals["application_approval_issue"] = _application_approval_issue
 templates.env.globals["application_rejection_note"] = _application_rejection_note
 templates.env.globals["application_deferred_note"] = _application_deferred_note
+templates.env.globals["application_delivery_note"] = _application_delivery_note

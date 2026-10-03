@@ -188,6 +188,8 @@ async def get_application_detail(session: AsyncSession, application_id: UUID) ->
             "employment_type",
             "required_experience",
             "workplace_type",
+            "public_phone",
+            "public_phones",
             "last_seen_at",
             "last_checked_at",
             "confirmed_absence_count",

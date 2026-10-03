@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # Days without an employer reply after which the employer may receive an
     # application for another vacancy. 0 keeps an unanswered employer frozen.
     employer_unanswered_release_days: int = Field(default=14, ge=0, le=365)
+    # Days an address stays paused after a failure that is usually fixed in
+    # time: the provider gave up after days of temporary errors, the mailbox was
+    # full, or the domain's mail server failed TLS (the whole domain pauses).
+    # Afterwards the next application probes it again; if that fails too, the
+    # address (or domain) is blocked for good. 0 makes the first pause permanent.
+    email_failure_pause_days: int = Field(default=14, ge=0, le=365)
 
     llm_provider: Literal["mock", "openai", "gemini", "llmrouter"] = "mock"
     openai_api_key: SecretStr | None = None

@@ -830,6 +830,24 @@ async def _generate(
         or 0
     )
     permanent_count = sum(permanent_breakdown.values())
+    # Messages the provider is still retrying after warning about a delay; the
+    # final outcome arrives only when its retry window (about three days) ends.
+    delayed_rows = (
+        await session.execute(
+            select(EmailDelivery.recipient, EmailDelivery.smtp_status)
+            .where(
+                EmailDelivery.failure_class == "delivery_delayed",
+                EmailDelivery.status.in_(
+                    [
+                        DeliveryStatus.SUBMITTED,
+                        DeliveryStatus.PROVIDER_ACCEPTED,
+                        DeliveryStatus.SENT,
+                    ]
+                ),
+            )
+            .order_by(EmailDelivery.updated_at)
+        )
+    ).all()
     permanent_statuses = {
         DeliveryStatus.BOUNCED_PERMANENT,
         DeliveryStatus.RECIPIENT_REJECTED,
@@ -1047,6 +1065,11 @@ async def _generate(
             ),
             "by_status": delivery_status_counts,
             "permanent_failure_breakdown": permanent_breakdown,
+            "delayed_in_flight": len(delayed_rows),
+            "delayed_recipients": [
+                {"recipient": recipient, "smtp_status": smtp_status}
+                for recipient, smtp_status in delayed_rows
+            ],
             "alerts": delivery_alerts,
         },
         # Legacy counters are retained for compatibility. The explicit fields below

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -134,15 +134,33 @@ async def _delivery_history_source(
     )
     if invalid is not None:
         return invalid
-    if employer_id is None:
-        return None
-    rejected: EmployerContact | None = await session.scalar(
+    if employer_id is not None:
+        rejected: EmployerContact | None = await session.scalar(
+            select(EmployerContact)
+            .where(
+                EmployerContact.contact_type == ContactType.EMAIL,
+                EmployerContact.value == email,
+                EmployerContact.employer_id == employer_id,
+                EmployerContact.delivery_state == ContactDeliveryState.REJECTED,
+            )
+            .order_by(
+                EmployerContact.last_delivery_failure_at.desc(),
+                EmployerContact.created_at.desc(),
+            )
+            .limit(1)
+        )
+        if rejected is not None:
+            return rejected
+    # A server that cannot do TLS fails every mailbox of its domain, including
+    # addresses first seen after the failure.
+    domain = email.rsplit("@", maxsplit=1)[-1]
+    paused_domain: EmployerContact | None = await session.scalar(
         select(EmployerContact)
         .where(
             EmployerContact.contact_type == ContactType.EMAIL,
-            EmployerContact.value == email,
-            EmployerContact.employer_id == employer_id,
+            EmployerContact.value.like(f"%@{domain}"),
             EmployerContact.delivery_state == ContactDeliveryState.REJECTED,
+            EmployerContact.last_failure_reason.in_(["tls_failure", "tls_failure_repeated"]),
         )
         .order_by(
             EmployerContact.last_delivery_failure_at.desc(),
@@ -150,7 +168,7 @@ async def _delivery_history_source(
         )
         .limit(1)
     )
-    return rejected
+    return paused_domain
 
 
 def _inherit_delivery_history(target: EmployerContact, source: EmployerContact) -> None:
@@ -250,6 +268,76 @@ async def propagate_email_domain_failure(
             contact.last_smtp_status = smtp_status
         changed += 1
     return changed
+
+
+# Failures that outlasted the provider's retries but are usually fixed later.
+PAUSED_FAILURE_REASONS = frozenset({"tls_failure", "delivery_expired", "mailbox_full"})
+# Marks an address whose pause has ended; the next failure is the second one.
+_PAUSE_ENDED_PREFIX = "pause_ended:"
+
+
+async def failure_reason_after_pause(
+    session: AsyncSession, *, contact: EmployerContact | None, failure_class: str
+) -> str:
+    """Name a failure, escalating it when an earlier pause did not help.
+
+    The first failure of a usually temporary kind pauses the address. When the
+    address fails again after that pause, the other side is not fixing it: the
+    failure is recorded as ``<class>_repeated``, which is never released. For a
+    TLS failure any address of the domain that already had its pause counts.
+    """
+
+    if failure_class not in PAUSED_FAILURE_REASONS or contact is None:
+        return failure_class
+    repeated = f"{failure_class}_repeated"
+    if (contact.last_failure_reason or "").startswith(_PAUSE_ENDED_PREFIX):
+        return repeated
+    if failure_class != "tls_failure":
+        return failure_class
+    domain = contact.value.rsplit("@", maxsplit=1)[-1].casefold()
+    earlier = await session.scalar(
+        select(EmployerContact.id)
+        .where(
+            EmployerContact.contact_type == ContactType.EMAIL,
+            EmployerContact.value.like(f"%@{domain}"),
+            EmployerContact.last_failure_reason.in_(
+                [f"{_PAUSE_ENDED_PREFIX}tls_failure", "tls_failure_repeated"]
+            ),
+        )
+        .limit(1)
+    )
+    return repeated if earlier is not None else failure_class
+
+
+async def release_paused_email_contacts(
+    session: AsyncSession, *, now: datetime, pause_days: int
+) -> int:
+    """End the pause of addresses whose failure is old enough to retry.
+
+    A broken TLS setup, an unreachable server or a full mailbox is often fixed
+    later, so the address is paused, not condemned: it becomes usable again and
+    the next application probes it. If that probe fails too, the failure is
+    final (see ``failure_reason_after_pause``).
+    """
+
+    if pause_days <= 0:
+        return 0
+    contacts = list(
+        (
+            await session.scalars(
+                select(EmployerContact).where(
+                    EmployerContact.contact_type == ContactType.EMAIL,
+                    EmployerContact.delivery_state == ContactDeliveryState.REJECTED,
+                    EmployerContact.last_failure_reason.in_(PAUSED_FAILURE_REASONS),
+                    EmployerContact.last_delivery_failure_at <= now - timedelta(days=pause_days),
+                )
+            )
+        ).all()
+    )
+    for contact in contacts:
+        contact.delivery_state = ContactDeliveryState.TRANSIENT_FAILURE
+        contact.last_failure_reason = f"{_PAUSE_ENDED_PREFIX}{contact.last_failure_reason}"
+    return len(contacts)
 
 
 class ContactDiscoveryService:

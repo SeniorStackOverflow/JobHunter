@@ -21,11 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.audit import record_audit_event
 from app.contacts import (
+    failure_reason_after_pause,
     propagate_email_delivery_failure,
     propagate_email_domain_failure,
+    release_paused_email_contacts,
     select_best_email_contact,
     validate_public_email,
 )
+from app.email.failures import mentions_tls_failure
 from app.email.oauth import GmailOAuthService
 from app.email.providers import (
     GMAIL_READONLY_SCOPE,
@@ -146,8 +149,11 @@ def classify_smtp_failure(
     smtp_status = " ".join(value for value in (basic_code, enhanced_code) if value) or None
     leading = enhanced_code[0] if enhanced_code else (basic_code[0] if basic_code else "")
     normalized_action = (action or "").strip().casefold()
-    permanent = leading == "5"
-    retryable = leading == "4"
+    # "failed" with a 4.x.x status: the provider retried for days and gave up.
+    # Sending again only restarts the same doomed retry window.
+    expired = normalized_action == "failed" and leading == "4"
+    permanent = leading == "5" or expired
+    retryable = leading == "4" and not expired
 
     if normalized_action in {"delayed", "relayed", "expanded"}:
         return BounceClassification(
@@ -178,9 +184,16 @@ def classify_smtp_failure(
         )
         permanent = False
         retryable = False
+    elif mentions_tls_failure(folded):
+        failure_class = "tls_failure"
+        delivery_status = (
+            DeliveryStatus.BOUNCED_TRANSIENT if retryable else DeliveryStatus.DOMAIN_REJECTED
+        )
     elif any(marker in folded for marker in ("mailbox full", "quota exceeded", "5.2.2", "4.2.2")):
         failure_class = "mailbox_full"
-        delivery_status = DeliveryStatus.MAILBOX_FULL
+        delivery_status = (
+            DeliveryStatus.BOUNCED_PERMANENT if permanent else DeliveryStatus.MAILBOX_FULL
+        )
     elif any(
         marker in folded
         for marker in (
@@ -273,6 +286,9 @@ def classify_smtp_failure(
         delivery_status = (
             DeliveryStatus.BOUNCED_TRANSIENT if retryable else DeliveryStatus.POLICY_REJECTED
         )
+    elif expired:
+        failure_class = "delivery_expired"
+        delivery_status = DeliveryStatus.BOUNCED_PERMANENT
     elif any(marker in folded for marker in ("rate limit", "too many", "4.7.")):
         failure_class = "rate_limited"
         delivery_status = DeliveryStatus.BOUNCED_TRANSIENT
@@ -534,6 +550,39 @@ class GmailMailboxProvider:
             raise GmailReauthorizationRequired("Gmail reauthorization is required") from exc
 
 
+# Failures of the recipient domain as a whole, not of one mailbox.
+DOMAIN_FAILURE_CLASSES = frozenset({"domain_not_found", "routing_failure", "tls_failure"})
+# Delivery states that a later notice may still turn into a final outcome.
+_AWAITING_OUTCOME = frozenset(
+    {DeliveryStatus.SUBMITTED, DeliveryStatus.PROVIDER_ACCEPTED, DeliveryStatus.SENT}
+)
+
+
+def _email_domain(address: str) -> str:
+    return address.rsplit("@", 1)[-1].strip().rstrip(".").casefold()
+
+
+def delay_alert_code(delivery_id: UUID) -> str:
+    return f"email_delivery_delayed:{delivery_id}"
+
+
+async def _resolve_delay_alert(
+    session: AsyncSession, delivery: EmailDelivery, outcome: str, occurred_at: datetime
+) -> None:
+    """The final outcome answers the delay warning; it no longer needs attention."""
+
+    if delivery.failure_class != "delivery_delayed":
+        return
+    alert = await session.scalar(select(Alert).where(Alert.code == delay_alert_code(delivery.id)))
+    if alert is None or alert.acknowledged:
+        return
+    alert.acknowledged = True
+    alert.safe_diagnostics = {
+        **(alert.safe_diagnostics or {}),
+        "resolution": {"reason": f"delivery_{outcome}", "at": occurred_at.isoformat()},
+    }
+
+
 class EmailDeliveryReconciliationService:
     def __init__(
         self,
@@ -747,6 +796,11 @@ class EmailDeliveryReconciliationService:
         if classification.status is DeliveryStatus.PROVIDER_ACCEPTED:
             # A delayed/relayed notice or bare 2xx acknowledgment is not proof
             # of final delivery and must not schedule a duplicate send.
+            if (
+                classification.failure_class == "delivery_delayed"
+                and delivery.status in _AWAITING_OUTCOME
+            ):
+                await self._record_delay(session, delivery, classification, notice)
             await session.flush()
             return True, True
 
@@ -769,6 +823,7 @@ class EmailDeliveryReconciliationService:
             return True, True
 
         if classification.status is DeliveryStatus.DELIVERED:
+            await _resolve_delay_alert(session, delivery, "delivered", notice.occurred_at)
             delivery.status = DeliveryStatus.DELIVERED
             delivery.final_recipient = notice.final_recipient or delivery.recipient
             delivery.smtp_status = classification.smtp_status
@@ -805,6 +860,9 @@ class EmailDeliveryReconciliationService:
             await session.flush()
             return True, True
 
+        await _resolve_delay_alert(
+            session, delivery, classification.status.value, notice.occurred_at
+        )
         delivery.status = classification.status
         delivery.smtp_status = classification.smtp_status
         delivery.failure_class = classification.failure_class
@@ -892,10 +950,15 @@ class EmailDeliveryReconciliationService:
                         if source_job is not None
                         else set()
                     )
+                    failed_domain = _email_domain(delivery.final_recipient or delivery.recipient)
                     alternate_contacts = [
                         candidate
                         for candidate in alternate_contacts
                         if candidate.value in current_public_emails
+                        and not (
+                            classification.failure_class in DOMAIN_FAILURE_CLASSES
+                            and _email_domain(candidate.value) == failed_domain
+                        )
                     ]
                     alternate = select_best_email_contact(alternate_contacts)
                     alternate_recipient = alternate.value if alternate is not None else None
@@ -969,9 +1032,17 @@ class EmailDeliveryReconciliationService:
                         )
                     )
         if contact is not None:
+            # A final failure right after a pause ended is not fixed by waiting.
+            failure_reason = (
+                await failure_reason_after_pause(
+                    session, contact=contact, failure_class=classification.failure_class
+                )
+                if classification.permanent
+                else classification.failure_class
+            )
             contact.last_delivery_failure_at = notice.occurred_at
             contact.last_smtp_status = classification.smtp_status
-            contact.last_failure_reason = classification.failure_class
+            contact.last_failure_reason = failure_reason
             contact.failure_count += 1
             if classification.permanent and classification.failure_class in {
                 "recipient_not_found",
@@ -990,16 +1061,16 @@ class EmailDeliveryReconciliationService:
                     smtp_status=classification.smtp_status,
                     failure_reason=classification.failure_class,
                 )
-            elif classification.permanent and classification.failure_class in {
-                "domain_not_found",
-                "routing_failure",
-            }:
-                # A dead domain rejects every mailbox: do not try its other contacts.
+            elif (
+                classification.permanent and classification.failure_class in DOMAIN_FAILURE_CLASSES
+            ):
+                # A dead domain, or one whose server cannot do TLS, rejects every
+                # mailbox: do not try its other contacts.
                 await propagate_email_domain_failure(
                     session,
-                    domain=(delivery.final_recipient or delivery.recipient).rsplit("@", 1)[-1],
+                    domain=_email_domain(delivery.final_recipient or delivery.recipient),
                     occurred_at=notice.occurred_at,
-                    failure_reason=classification.failure_class,
+                    failure_reason=failure_reason,
                     smtp_status=classification.smtp_status,
                 )
         await record_audit_event(
@@ -1024,6 +1095,52 @@ class EmailDeliveryReconciliationService:
         ).inc()
         await session.flush()
         return True, True
+
+    async def _record_delay(
+        self,
+        session: AsyncSession,
+        delivery: EmailDelivery,
+        classification: BounceClassification,
+        notice: ParsedDeliveryNotice,
+    ) -> None:
+        """Keep the delivery accepted but make the provider's warning visible.
+
+        The provider keeps retrying on its own; JobHunter must not send again.
+        The final notice replaces these fields and answers the alert.
+        """
+
+        delivery.smtp_status = classification.smtp_status
+        delivery.failure_class = classification.failure_class
+        delivery.failure_reason = classification.reason
+        alert_code = delay_alert_code(delivery.id)
+        if await session.scalar(select(Alert.id).where(Alert.code == alert_code)) is not None:
+            return
+        session.add(
+            Alert(
+                severity="warning",
+                code=alert_code,
+                message="Email delivery delayed",
+                safe_diagnostics={
+                    "application_id": str(delivery.application_id),
+                    "delivery_id": str(delivery.id),
+                    "recipient": delivery.final_recipient or delivery.recipient,
+                    "smtp_status": classification.smtp_status,
+                    "reason": classification.reason,
+                    "remote_mta": notice.remote_mta,
+                },
+                acknowledged=False,
+            )
+        )
+        await record_audit_event(
+            session,
+            actor="email_reconciler",
+            action="email.delivery_delayed",
+            entity_type="email_delivery",
+            entity_id=str(delivery.id),
+            correlation_id=str(delivery.application_id),
+            decision=delivery.status.value,
+            details={"smtp_status": classification.smtp_status},
+        )
 
     async def reconcile(
         self,
@@ -1118,6 +1235,13 @@ class EmailDeliveryReconciliationService:
     async def reconcile_all(self) -> dict[str, int | str]:
         if not self.settings.gmail_delivery_reconciliation_enabled:
             return {"status": "disabled", "fetched": 0, "processed": 0, "correlated": 0}
+        async with self.session_factory() as session:
+            await release_paused_email_contacts(
+                session,
+                now=datetime.now(UTC),
+                pause_days=self.settings.email_failure_pause_days,
+            )
+            await session.commit()
         if self._mailbox is not None:
             return await self.reconcile(account_id=BOOTSTRAP_ADMIN_ACCOUNT_ID)
         async with self.session_factory() as session:

@@ -506,19 +506,20 @@ async def test_structured_dsn_does_not_correlate_from_human_readable_prose(
 
 
 @pytest.mark.parametrize(
-    ("action", "expected_status", "retryable"),
+    ("action", "expected_status"),
     [
-        ("failed", DeliveryStatus.BOUNCED_TRANSIENT, True),
-        ("delayed", DeliveryStatus.PROVIDER_ACCEPTED, False),
+        # "failed" with a 4.x.x status: the provider retried and gave up.
+        ("failed", DeliveryStatus.BOUNCED_PERMANENT),
+        ("delayed", DeliveryStatus.PROVIDER_ACCEPTED),
     ],
 )
 def test_structured_status_overrides_unrelated_diagnostic_number(
-    action: str, expected_status: DeliveryStatus, retryable: bool
+    action: str, expected_status: DeliveryStatus
 ) -> None:
     result = classify_smtp_failure("smtp; 201 4.4.1 remote timeout", status="4.4.1", action=action)
     assert result.status is expected_status
     assert result.smtp_status == "4.4.1"
-    assert result.retryable is retryable
+    assert result.retryable is False
 
 
 def test_bare_positive_smtp_code_does_not_confirm_delivery() -> None:
@@ -884,9 +885,10 @@ async def test_late_positive_notice_cannot_revive_permanently_rejected_recipient
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("action", "expected_status", "expected_contact_state", "retry_scheduled"),
+    ("action", "expected_status", "expected_contact_state", "final"),
     [
-        ("failed", DeliveryStatus.BOUNCED_TRANSIENT, ContactDeliveryState.TRANSIENT_FAILURE, True),
+        # The provider gave up after its own retries: final, never resent.
+        ("failed", DeliveryStatus.BOUNCED_PERMANENT, ContactDeliveryState.REJECTED, True),
         ("delayed", DeliveryStatus.PROVIDER_ACCEPTED, ContactDeliveryState.UNKNOWN, False),
     ],
 )
@@ -895,7 +897,7 @@ async def test_structured_dsn_reconciliation_preserves_action_semantics(
     action: str,
     expected_status: DeliveryStatus,
     expected_contact_state: ContactDeliveryState,
-    retry_scheduled: bool,
+    final: bool,
 ) -> None:
     async with sqlite_session_factory() as session:
         application, delivery, contact, _employer = await _delivery_graph(session)
@@ -918,7 +920,7 @@ async def test_structured_dsn_reconciliation_preserves_action_semantics(
     )
     audit = await service.audit_mailbox()
     assert audit["matches"][0]["proposed_delivery_status"] == expected_status.value
-    assert audit["matches"][0]["retryable"] is retry_scheduled
+    assert audit["matches"][0]["retryable"] is False
     assert audit["matches"][0]["action"] == action
 
     first = await service.reconcile()
@@ -932,15 +934,15 @@ async def test_structured_dsn_reconciliation_preserves_action_semantics(
         events = (await session.scalars(select(EmailDeliveryEvent))).all()
         assert refreshed_delivery is not None
         assert refreshed_delivery.status is expected_status
-        assert (refreshed_delivery.next_retry_at is not None) is retry_scheduled
+        assert refreshed_delivery.next_retry_at is None
         assert refreshed_contact is not None
         assert refreshed_contact.delivery_state is expected_contact_state
         assert refreshed_application is not None
         assert refreshed_application.status is (
-            ApplicationStatus.FAILED if retry_scheduled else ApplicationStatus.SENT
+            ApplicationStatus.FAILED if final else ApplicationStatus.SENT
         )
         assert len(events) == 1
-        assert events[0].event_type == ("bounce" if retry_scheduled else "delivery_notice")
+        assert events[0].event_type == ("bounce" if final else "delivery_notice")
         assert events[0].smtp_status == "4.4.1"
         assert events[0].safe_metadata["structured"] is True
 
