@@ -214,6 +214,7 @@ _KNOWN_CATEGORIES: list[tuple[str, str, str]] = [
     ("oil-gas", "Petrol / Gaze", "Нефть / Газ"),
     ("wood-processing-pvc", "Prelucrarea lemnului / PVC", "Обработка дерева / ПВХ"),
     ("production", "Producție / Producere", "Производство"),
+    ("it-software", "Tech / IT / Programare", "Технологии / IT / Программирование"),
     ("it-internet", "IT / Internet", "IT / Интернет"),
     ("lucru-de-acasa-part-time", "Lucru de acasă / Part-time", "Работа на дому / Частичная"),
     ("sales-consulting", "Vânzări / Consultanță", "Продажи / Консультации"),
@@ -238,7 +239,7 @@ def _default_locales() -> list[Literal["ro", "ru"]]:
 
 
 def _default_incremental_categories() -> list[str]:
-    return ["it-internet", "lucru-de-acasa-part-time", "sales-consulting"]
+    return ["it-software", "it-internet", "lucru-de-acasa-part-time", "sales-consulting"]
 
 
 class DelucruMdConfig(BaseModel):
@@ -264,6 +265,19 @@ class DelucruMdConfig(BaseModel):
     max_discovered_entrypoints: int = Field(default=10_000, ge=1, le=100_000)
     incremental_category_slugs: list[str] = Field(default_factory=_default_incremental_categories)
     user_agent: str = "job-agent/0.1"
+    proxy_url: str | None = None
+
+    @field_validator("proxy_url")
+    @classmethod
+    def validate_proxy_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https", "socks5"} or not parsed.netloc:
+            raise ValueError(
+                "proxy_url must be an http(s) or socks5 URL with a valid host and port"
+            )
+        return value
 
     @field_validator("base_url")
     @classmethod
@@ -384,6 +398,14 @@ class DelucruMdAdapter:
         if injected_fetcher is not None:
             self._http = injected_fetcher
         else:
+            proxy_transport = (
+                httpx.AsyncHTTPTransport(
+                    proxy=self.config.proxy_url,
+                    limits=httpx.Limits(max_keepalive_connections=0),
+                )
+                if self.config.proxy_url
+                else None
+            )
             self._http = SecureHttpClient(
                 allowed_domains=["delucru.md", "www.delucru.md"],
                 user_agent=self.config.user_agent,
@@ -392,6 +414,8 @@ class DelucruMdAdapter:
                 timeout_seconds=self.config.timeout_seconds,
                 max_redirects=self.config.max_redirects,
                 resolver=resolver,
+                transport=proxy_transport,
+                pin_resolved_addresses=False if self.config.proxy_url else None,
             )
 
         self._access_result: AccessPolicyResult | None = None
@@ -502,8 +526,13 @@ class DelucruMdAdapter:
                             slug = m.group("category").lower()
                             if slug not in {"jobs", "by-category", "by-city", "by-district"}:
                                 name = self._clean_text(a.text(separator=" ", strip=True))
-                                # Strip trailing job count e.g. "IT, Internet (180)"
-                                name = re.sub(r"\s*\(\d+\)$", "", name).strip()
+                                # Strip trailing job count e.g. "(180)" or " 293 joburi"
+                                name = re.sub(
+                                    r"\s*(?:\(\d+\)|\d+\s*(?:joburi|вакансий|вакансии|locuri|oferte))\s*$",
+                                    "",
+                                    name,
+                                    flags=re.IGNORECASE,
+                                ).strip()
                                 if not name:
                                     name = slug
                                 categories.append(
@@ -557,7 +586,12 @@ class DelucruMdAdapter:
                             if m:
                                 slug = m.group("category").lower()
                                 name = self._clean_text(a.text(separator=" ", strip=True))
-                                name = re.sub(r"\s*\(\d+\)$", "", name).strip()
+                                name = re.sub(
+                                    r"\s*(?:\(\d+\)|\d+\s*(?:joburi|вакансий|вакансии|locuri|oferte))\s*$",
+                                    "",
+                                    name,
+                                    flags=re.IGNORECASE,
+                                ).strip()
                                 regions.append(
                                     SourceRegion(
                                         external_id=slug,
@@ -1253,15 +1287,27 @@ class DelucruMdAdapter:
         website: str | None = None
         socials: list[str] = []
 
-        # Emails: mailto links and unmasked spans
+        # Emails: mailto links
         for a in scope.css("a[href^='mailto:']"):
             href = a.attributes.get("href") or ""
             val = unquote(href.replace("mailto:", "").split("?", 1)[0]).strip().lower()
             if val and val not in _DELUCRU_SERVICE_EMAILS and _PUBLIC_EMAIL_RE.fullmatch(val):
                 emails.append(val)
 
+        # Exact unmasked values from copy buttons
+        for el in scope.css("[data-copy-value]"):
+            val = (el.attributes.get("data-copy-value") or "").strip()
+            if _PUBLIC_EMAIL_RE.fullmatch(val) and val.lower() not in _DELUCRU_SERVICE_EMAILS:
+                emails.append(val.lower())
+            else:
+                clean_phone = re.sub(r"[^\d+]", "", val)
+                norm_phone = normalize_e164(clean_phone, region="MD")
+                if norm_phone and norm_phone not in _DELUCRU_SERVICE_PHONES:
+                    phones.append(norm_phone)
+
         for span in scope.css("[data-contact-type='email'], .job-contact-mask-value"):
-            t = span.text(strip=True).lower()
+            t = span.text(separator=" ", strip=True).lower()
+            t = re.sub(r"\b(?:copiat|скопировано)\b", "", t).strip()
             m = _PUBLIC_EMAIL_RE.search(t)
             if m:
                 val = m.group(0).lower()
@@ -1278,7 +1324,8 @@ class DelucruMdAdapter:
                 phones.append(norm)
 
         for span in scope.css("[data-contact-type='phone'], .job-contact-mask-value"):
-            t = span.text(strip=True)
+            t = span.text(separator=" ", strip=True)
+            t = re.sub(r"\b(?:copiat|скопировано)\b", "", t, flags=re.IGNORECASE).strip()
             m_phone = re.search(r"(?:\+?\d[\d\s().-]{6,14}\d)", t)
             if m_phone:
                 clean_val = re.sub(r"[^\d+]", "", m_phone.group(0))
