@@ -660,3 +660,32 @@ def test_unrecognized_alert_does_not_count_as_empty_results(message):
     adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
     with pytest.raises(DelucruMdDegradedError, match="recognizable jobs listing"):
         adapter._validate_listing(f'<div class="alert alert-info">{message}</div>')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locale", ["ro", "ru"])
+@pytest.mark.parametrize("negotiable", [False, True])
+async def test_current_detail_cards_outside_description(locale, negotiable):
+    html = fixture(f"job_current_detail_{locale}.html")
+    html = html.replace(
+        '<div id="job-description">',
+        '<div class="col">Salariu: 999999 USD</div><div id="job-description">',
+    )
+    if negotiable:
+        html = html.replace("12 000 - 15 000 MDL", "Negociabil" if locale == "ro" else "Договорная")
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    raw = raw_job(html)
+    raw.final_url = f"{BASE}{'/ru' if locale == 'ru' else ''}/job/88409"
+    job = await adapter.normalize_job(raw)
+    assert job.salary_min == (None if negotiable else Decimal("12000"))
+    assert job.salary_max == (None if negotiable else Decimal("15000"))
+    assert job.currency == (None if negotiable else "MDL")
+    assert job.salary_text == (
+        ("Negociabil" if locale == "ro" else "Договорная") if negotiable else "12 000 - 15 000 MDL"
+    )
+    assert job.schedule == "Full-time" and job.employment_type == "full-time"
+    assert job.no_experience is True
+    assert job.required_experience == ("Fără Experiență" if locale == "ro" else "Без опыта")
+    assert set(job.cities) == {"Chișinău", "Ialoveni"}
+    assert job.workplace_type == "onsite"
+    assert job.raw_metadata["detail_normalization_version"] == 1

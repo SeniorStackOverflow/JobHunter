@@ -51,6 +51,7 @@ _TRANSIENT_CHECKPOINT_ADAPTER_KEYS = frozenset(
         "known_external_ids",
         "known_updated_hints",
         "known_last_checked_at",
+        "detail_normalization_refresh_ids",
     }
 )
 
@@ -652,6 +653,19 @@ class ScanService:
                 run.checkpoint = _persistable_checkpoint(checkpoint)
                 run.heartbeat_at = datetime.now(UTC)
                 await session.commit()
+            normalization_refresh_ids: set[str] = set()
+            normalization_version = getattr(adapter, "detail_normalization_version", None)
+            if (
+                isinstance(normalization_version, int)
+                and not isinstance(normalization_version, bool)
+                and normalization_version > 0
+            ):
+                normalization_refresh_ids = await self._normalization_refresh_ids(
+                    session, source.id, normalization_version
+                )
+                checkpoint.adapter_state["detail_normalization_refresh_ids"] = sorted(
+                    normalization_refresh_ids
+                )
             iterator = (
                 adapter.iterate_full_scan(checkpoint)
                 if run.scan_type == ScanType.FULL
@@ -673,9 +687,11 @@ class ScanService:
                     yield discovered
 
             references = references_with_pending_retries()
-            # IDs already committed by a resumed scan are metadata-only duplicates. This avoids
-            # refetching their detail pages while still allowing later category/locale merges.
-            processed_ids: set[str] = set(checkpoint.yielded_external_ids)
+            # Committed IDs normally need metadata merges only on resume. Older detail
+            # extraction versions still require one refresh when encountered again.
+            processed_ids: set[str] = (
+                set(checkpoint.yielded_external_ids) - normalization_refresh_ids
+            )
             observed_pages: set[str] = set()
             forced_degradation_reason: str | None = None
             detail_fetches = 0
@@ -863,6 +879,31 @@ class ScanService:
             await session.commit()
             await adapter.aclose()
             return run
+
+    @staticmethod
+    async def _normalization_refresh_ids(
+        session: AsyncSession, source_id: UUID, required_version: int
+    ) -> set[str]:
+        """Repair older detail extraction when those jobs are encountered again."""
+        rows = (
+            await session.execute(
+                select(SourceJob.external_job_id, SourceJob.raw_metadata).where(
+                    SourceJob.source_id == source_id
+                )
+            )
+        ).all()
+        refresh: set[str] = set()
+        for external_id, metadata in rows:
+            version = (
+                metadata.get("detail_normalization_version") if isinstance(metadata, dict) else None
+            )
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < required_version
+            ):
+                refresh.add(external_id)
+        return refresh
 
     async def _seed_incremental_known_state(
         self,

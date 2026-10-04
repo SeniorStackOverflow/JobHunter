@@ -331,6 +331,7 @@ class DelucruMdAdapter:
     """
 
     adapter_type = "delucru_md"
+    detail_normalization_version: ClassVar[int] = 1
     capabilities: ClassVar[list[str]] = [
         "dynamic_locales",
         "dynamic_categories",
@@ -724,7 +725,10 @@ class DelucruMdAdapter:
 
         # 5. Metadata cards
         metadata: dict[str, str] = {}
-        for col in tree.css(".page-description .col-6, .page-description .col"):
+        metadata_cards = tree.css(".employer-details-page .lead > .row > .col")
+        if not metadata_cards:
+            metadata_cards = tree.css(".page-description .col-6, .page-description .col")
+        for col in metadata_cards:
             t = self._clean_text(col.text(separator=" ", strip=True))
             if ":" in t:
                 k, v = t.split(":", 1)
@@ -879,6 +883,7 @@ class DelucruMdAdapter:
                 "company_website": web,
                 "social_links": socials,
                 "content_hash_version": _CONTENT_HASH_VERSION,
+                "detail_normalization_version": self.detail_normalization_version,
                 "listing_updated_hint": raw_job.reference.updated_hint,
                 "discovery_url": raw_job.reference.discovery_url,
             },
@@ -950,10 +955,15 @@ class DelucruMdAdapter:
         checks_raw = state.adapter_state.get("known_last_checked_at", {})
         checks = checks_raw if isinstance(checks_raw, dict) else {}
         refresh_ids = set(self._string_list(state.adapter_state.get("detail_refresh_selected_ids")))
+        normalization_refresh_ids = set(
+            self._string_list(state.adapter_state.get("detail_normalization_refresh_ids"))
+        )
         scan_time = datetime.now(UTC)
         state.adapter_state["scan_incomplete"] = False
 
         def reference_state(ref: RawJobReference) -> tuple[bool, bool, bool]:
+            if ref.external_id in normalization_refresh_ids:
+                return False, True, False
             if not incremental or ref.external_id not in known_ids:
                 return False, False, False
             if ref.updated_hint and known_hints.get(ref.external_id) != ref.updated_hint:
@@ -1067,6 +1077,7 @@ class DelucruMdAdapter:
                                         "known_external_ids",
                                         "known_updated_hints",
                                         "known_last_checked_at",
+                                        "detail_normalization_refresh_ids",
                                     }
                                 },
                             ),

@@ -18,12 +18,12 @@ from app import cli
 from app.crawlers.catalog import SourceDefinition
 from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
-from app.models.entities import Account, AuditEvent, JobSource, ScanRun, UserProfile
+from app.models.entities import Account, AuditEvent, JobSource, ScanRun, SourceJob, UserProfile
 from app.models.enums import AccountRole, AccountStatus, RunStatus, ScanType, SourceHealth
 from app.security.auth import AccountSessionSigner, SessionSigner, hash_password
 from tests.integration.test_user_invite_auth import UserAuthContext
 from tests.integration.test_user_invite_auth import user_auth_context as user_auth_context
-from tests.unit.test_delucru_adapter import FixtureFetcher, finite_category_routes
+from tests.unit.test_delucru_adapter import FixtureFetcher, finite_category_routes, fixture
 
 pytestmark = pytest.mark.integration
 
@@ -303,9 +303,20 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
         await session.delete(missing)
         await session.commit()
     fetchers = []
+    detail_layout = {"current": False}
 
     def local_fetcher(_):
-        fetcher = FixtureFetcher(finite_category_routes())
+        routes = finite_category_routes()
+        detail = fixture("job_current_detail_ro.html")
+        if not detail_layout["current"]:
+            detail = detail.replace('class="employer-details-page"', 'class="old-layout"')
+        else:
+            detail = detail.replace(
+                '<div id="job-description">',
+                '<div class="col">Salariu: 999999 USD</div><div id="job-description">',
+            )
+        routes["https://www.delucru.md/job/junior-data-scientist-88409"] = detail
+        fetcher = FixtureFetcher(routes)
         fetchers.append(fetcher)
         return fetcher
 
@@ -403,6 +414,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
 
             try:
                 for index in range(3):
+                    detail_layout["current"] = False
                     async with context.session_factory() as session:
                         await session.execute(delete(ScanRun).where(ScanRun.source_id == source_id))
                         source = await session.get(JobSource, source_id)
@@ -557,6 +569,18 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                         # fabricated page 3, then continue through the actual UI route.
                         async with context.session_factory() as session:
                             saved = await session.get(ScanRun, completed.id)
+                            old_job = await session.scalar(
+                                select(SourceJob).where(
+                                    SourceJob.source_id == source_id,
+                                    SourceJob.external_job_id == "88409",
+                                )
+                            )
+                            assert old_job.salary_text is None and old_job.no_experience is None
+                            old_job.raw_metadata = {
+                                key: value
+                                for key, value in old_job.raw_metadata.items()
+                                if key != "detail_normalization_version"
+                            }
                             saved.status = RunStatus.PARTIAL
                             checkpoint = dict(saved.checkpoint)
                             checkpoint.update(
@@ -584,6 +608,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             source.last_scan_status = RunStatus.PARTIAL
                             source.automatic_actions_paused = True
                             await session.commit()
+                        detail_layout["current"] = True
                         await page.reload()
                         await page.locator(
                             f"#source-controls-{source_id} [data-source-scan] button"
@@ -605,7 +630,20 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             continued.id
                         )
                         assert recovered.status == RunStatus.SUCCEEDED
-                        assert recovered.new_jobs == 0 and recovered.found_jobs == 0
+                        assert recovered.new_jobs == 0 and recovered.found_jobs == 1
+                        assert recovered.updated_jobs == 1
+                        async with context.session_factory() as session:
+                            restored = await session.scalar(
+                                select(SourceJob).where(
+                                    SourceJob.source_id == source_id,
+                                    SourceJob.external_job_id == "88409",
+                                )
+                            )
+                            assert str(restored.salary_min) == "12000.00"
+                            assert restored.no_experience is True
+                            assert restored.location == "Chișinău"
+                            assert restored.employment_type == "full-time"
+                            assert restored.raw_metadata["detail_normalization_version"] == 1
                         for button in await page.locator(
                             f'[data-source-scan="{source_id}"] button'
                         ).all():
