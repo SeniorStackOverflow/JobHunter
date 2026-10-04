@@ -370,9 +370,9 @@ class SourceCategory(UUIDPrimaryKeyMixin, Base):
 class CanonicalJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "canonical_jobs"
 
-    normalized_company: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    normalized_title: Mapped[str] = mapped_column(String(255), nullable=False)
-    normalized_location: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    normalized_company: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    normalized_title: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_location: Mapped[str] = mapped_column(Text, default="", nullable=False)
     employer_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("canonical_employers.id", ondelete="SET NULL"), index=True
     )

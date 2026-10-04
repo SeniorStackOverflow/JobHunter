@@ -723,7 +723,11 @@ class ScanService:
                         detail_fetches += 1
                         raw = await adapter.fetch_job_details(reference)
                         normalized = await adapter.normalize_job(raw)
-                        outcome = await self._upsert_job(session, source, normalized, reference)
+                        # A database write failure must roll back this publication only.
+                        # Keep the outer scan transaction usable so its failed reference
+                        # and committed cursor can be recorded for the next attempt.
+                        async with session.begin_nested():
+                            outcome = await self._upsert_job(session, source, normalized, reference)
                         if outcome == "new":
                             run.new_jobs += 1
                         elif outcome == "updated":

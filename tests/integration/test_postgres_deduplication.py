@@ -149,3 +149,122 @@ async def test_concurrent_postgres_legacy_senders_cannot_double_deliver(
         apps = list((await session.scalars(select(Application))).all())
         loser = next(app for app in apps if app.status is ApplicationStatus.BLOCKED)
         assert "no_duplicate_application" in loser.policy_result["rules_failed"]
+
+
+async def test_postgres_preserves_long_canonical_fields_without_truncating(dedup_postgres):
+    from app.deduplication.comparison import cities, role_key
+    from app.deduplication.service import canonical_fingerprint
+    from app.employers.normalization import company_key
+
+    async with dedup_postgres() as session:
+        src = source("long-fields")
+        session.add(src)
+        await session.flush()
+        item = job(src.id, "many-cities", "Specialist " + "transport " * 35)
+        item.company = "Operator " + "logistics " * 35
+        item.cities = [f"Destination {index:03d}" for index in range(80)]
+        session.add(item)
+        await session.flush()
+        assigned = await DeduplicationService().assign(session, item)
+        await session.commit()
+        canonical = await session.get(CanonicalJob, assigned.canonical_job.id)
+        assert canonical is not None
+        assert canonical.normalized_location == " ".join(sorted(cities(item)))
+        assert len(canonical.normalized_location) > 255
+        assert canonical.normalized_company == company_key(item.company)
+        assert len(canonical.normalized_company) > 255
+        assert canonical.normalized_title == role_key(item.title)
+        assert len(canonical.normalized_title) > 255
+        assert canonical.canonical_fingerprint == canonical_fingerprint(item)
+        split = await DeduplicationService().split(session, item)
+        await session.commit()
+        assert split.normalized_location == canonical.normalized_location
+
+
+async def test_postgres_scan_records_failed_insert_and_resumes_committed_cursor(dedup_postgres):
+    from app.crawlers.pipeline import ScanService
+    from app.models.entities import ScanRun, SourceJob
+    from app.models.enums import RunStatus, ScanType
+    from tests.integration.test_delucru_pipeline import source_record
+    from tests.unit.test_delucru_adapter import FixtureFetcher, finite_category_routes
+
+    source_id = await source_record(dedup_postgres)
+    fetcher = FixtureFetcher(finite_category_routes())
+    scanner = ScanService(dedup_postgres, build_default_registry(client_factory=lambda _: fetcher))
+    async with dedup_postgres() as session:
+        await session.execute(
+            text(
+                "ALTER TABLE source_jobs ADD CONSTRAINT offline_failed_insert "
+                "CHECK (external_job_id <> '43867')"
+            )
+        )
+        await session.commit()
+    first, _ = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    partial = await scanner.run_scan(first.id)
+    assert partial.status == RunStatus.PARTIAL
+    assert partial.parsing_errors == 1
+    assert partial.diagnostics["errors"][-1] == {"external_id": "43867", "type": "IntegrityError"}
+    async with dedup_postgres() as session:
+        committed_ids = set(await session.scalars(select(SourceJob.external_job_id)))
+        assert committed_ids == {"88409", "55318"}
+        stored = await session.get(ScanRun, first.id)
+        assert "43867" in stored.checkpoint["adapter_state"]["failed_references"]
+        assert "43867" not in stored.checkpoint["yielded_external_ids"]
+        await session.execute(text("ALTER TABLE source_jobs DROP CONSTRAINT offline_failed_insert"))
+        await session.commit()
+    resumed, created = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    assert created and resumed.diagnostics["resume_parent_scan_id"] == str(first.id)
+    completed = await scanner.run_scan(resumed.id)
+    assert completed.status == RunStatus.SUCCEEDED
+    async with dedup_postgres() as session:
+        assert await session.scalar(select(func.count(SourceJob.id))) == 3
+    assert fetcher.requested.count("https://www.delucru.md/job/junior-data-scientist-88409") == 1
+
+
+async def test_postgres_canonical_text_migration_keeps_rows_and_rejects_lossy_downgrade(
+    dedup_postgres,
+):
+    import importlib.util
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import inspect
+
+    path = Path("migrations/versions/c8d2e6f4a901_canonical_normalized_text.py")
+    spec = importlib.util.spec_from_file_location("canonical_text_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    async with dedup_postgres() as session:
+        canonical = CanonicalJob(
+            normalized_company="offline operator",
+            normalized_title="offline courier",
+            normalized_location="chisinau",
+            canonical_fingerprint="migration-fixture",
+        )
+        session.add(canonical)
+        await session.commit()
+        row_id = canonical.id
+        connection = await session.connection()
+
+        def apply(sync_connection, function):
+            with Operations.context(MigrationContext.configure(sync_connection)):
+                function()
+
+        # Start from the existing VARCHAR schema, then exercise the actual migration.
+        await connection.run_sync(apply, migration.downgrade)
+        await connection.run_sync(apply, migration.upgrade)
+        types = await connection.run_sync(
+            lambda c: {
+                column["name"]: str(column["type"])
+                for column in inspect(c).get_columns("canonical_jobs")
+            }
+        )
+        assert all(types[name] == "TEXT" for name in migration.FIELDS)
+        await session.refresh(canonical)
+        assert canonical.id == row_id and canonical.normalized_location == "chisinau"
+        canonical.normalized_location = "destination " * 80
+        await session.flush()
+        with pytest.raises(RuntimeError, match="without losing stored vacancy data"):
+            await connection.run_sync(apply, migration.downgrade)
+        await session.commit()
+        assert (await session.get(CanonicalJob, row_id)).normalized_location == "destination " * 80

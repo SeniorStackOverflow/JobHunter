@@ -18,7 +18,15 @@ from app import cli
 from app.crawlers.catalog import SourceDefinition
 from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
-from app.models.entities import Account, AuditEvent, JobSource, ScanRun, SourceJob, UserProfile
+from app.models.entities import (
+    Account,
+    AuditEvent,
+    CanonicalJob,
+    JobSource,
+    ScanRun,
+    SourceJob,
+    UserProfile,
+)
 from app.models.enums import AccountRole, AccountStatus, RunStatus, ScanType, SourceHealth
 from app.security.auth import AccountSessionSigner, SessionSigner, hash_password
 from tests.integration.test_user_invite_auth import UserAuthContext
@@ -304,6 +312,8 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
         await session.commit()
     fetchers = []
     detail_layout = {"current": False}
+    new_city_id = "99001"
+    many_cities = ["Chișinău", "Ialoveni", *(f"Destination {i:03d}" for i in range(80))]
 
     def local_fetcher(_):
         routes = finite_category_routes()
@@ -311,9 +321,16 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
         if not detail_layout["current"]:
             detail = detail.replace('class="employer-details-page"', 'class="old-layout"')
         else:
+            detail = detail.replace("Chișinău, Ialoveni", ", ".join(many_cities))
             detail = detail.replace(
                 '<div id="job-description">',
                 '<div class="col">Salariu: 999999 USD</div><div id="job-description">',
+            )
+            routes["https://www.delucru.md/jobs"] += (
+                f'<a href="/job/{new_city_id}">Multi-city storage regression</a>'
+            )
+            routes[f"https://www.delucru.md/job/{new_city_id}"] = detail.replace(
+                "Fixture vacancy", "Multi-city storage regression"
             )
         routes["https://www.delucru.md/job/junior-data-scientist-88409"] = detail
         fetcher = FixtureFetcher(routes)
@@ -414,6 +431,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
 
             try:
                 for index in range(3):
+                    new_city_id = str(99001 + index)
                     detail_layout["current"] = False
                     async with context.session_factory() as session:
                         await session.execute(delete(ScanRun).where(ScanRun.source_id == source_id))
@@ -630,7 +648,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             continued.id
                         )
                         assert recovered.status == RunStatus.SUCCEEDED
-                        assert recovered.new_jobs == 0 and recovered.found_jobs == 1
+                        assert recovered.new_jobs == 1 and recovered.found_jobs == 2
                         assert recovered.updated_jobs == 1
                         async with context.session_factory() as session:
                             restored = await session.scalar(
@@ -642,8 +660,18 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             assert str(restored.salary_min) == "12000.00"
                             assert restored.no_experience is True
                             assert restored.location == "Chișinău"
+                            assert restored.cities == many_cities
                             assert restored.employment_type == "full-time"
                             assert restored.raw_metadata["detail_normalization_version"] == 1
+                            multi_city = await session.scalar(
+                                select(SourceJob).where(
+                                    SourceJob.source_id == source_id,
+                                    SourceJob.external_job_id == new_city_id,
+                                )
+                            )
+                            canonical = await session.get(CanonicalJob, multi_city.canonical_job_id)
+                            assert len(canonical.normalized_location) > 255
+                            assert "destination 079" in canonical.normalized_location
                         for button in await page.locator(
                             f'[data-source-scan="{source_id}"] button'
                         ).all():
