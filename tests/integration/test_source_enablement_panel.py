@@ -166,7 +166,7 @@ async def test_enable_queues_initial_full_and_reenable_uses_incremental(
     retry = await context.client.post(
         f"/admin/sources/{source_id}/scan/full", data={"csrf_token": csrf}
     )
-    assert retry.status_code == 303 and "scan_started" in retry.headers["location"]
+    assert retry.status_code == 303 and "source_scan_active" in retry.headers["location"]
     assert len(offline_scan_queue) == 1
     async with context.session_factory() as session:
         run = await session.get(ScanRun, run.id)
@@ -258,6 +258,23 @@ async def test_policy_form_requires_admin_and_csrf(user_auth_context, monkeypatc
     async with context.session_factory() as session:
         source = await session.get(JobSource, source_id)
         assert source.configuration == original and source.enabled is False
+
+
+async def test_scan_status_requires_admin_and_handles_missing_source(
+    user_auth_context, monkeypatch
+):
+    from uuid import uuid4
+
+    context = user_auth_context
+    source_id, _ = await _pending_source(context, monkeypatch)
+    url = f"/admin/sources/{source_id}/scan-status"
+    assert (await context.client.get(url)).status_code == 401
+    _admin(context)
+    state = await context.client.get(url)
+    assert state.status_code == 200
+    assert state.json()["active"] is False
+    assert state.json()["enabled"] is False
+    assert (await context.client.get(f"/admin/sources/{uuid4()}/scan-status")).status_code == 404
 
 
 @pytest.mark.e2e
@@ -457,13 +474,47 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             assert queued is not None
                             assert queued.scan_type == ScanType.FULL
                             assert offline_scan_queue[-1] == str(queued.id)
+                        scan_buttons = page.locator(f'[data-source-scan="{source_id}"] button')
+                        await expect(scan_buttons).to_have_count(2)
+                        for button in await scan_buttons.all():
+                            await expect(button).to_be_disabled()
+                            await expect(button).to_contain_text("Полный обход: В очереди")
+                        # A second tab/stale form cannot publish the queued scan again,
+                        # including a request for a different scan type.
+                        published = len(offline_scan_queue)
+                        for scan_type in ("full", "incremental"):
+                            csrf = await page.locator(
+                                'input[name="csrf_token"]'
+                            ).first.input_value()
+                            retry = await browser_context.request.post(
+                                origin + f"/admin/sources/{source_id}/scan/{scan_type}",
+                                form={"csrf_token": csrf},
+                                max_redirects=0,
+                            )
+                            assert "source_scan_active" in retry.headers["location"]
+                        assert len(offline_scan_queue) == published
+                        async with context.session_factory() as session:
+                            active = await session.get(ScanRun, queued.id)
+                            active.status = RunStatus.RUNNING
+                            await session.commit()
+                        for button in await scan_buttons.all():
+                            await expect(button).to_contain_text(
+                                "Полный обход: Выполняется", timeout=12000
+                            )
+                        # Return it to the queue for the real offline pipeline to claim.
+                        async with context.session_factory() as session:
+                            active = await session.get(ScanRun, queued.id)
+                            active.status = RunStatus.QUEUED
+                            await session.commit()
                         # Run the actual adapter/pipeline entirely against saved local HTML.
                         completed = await ScanService(context.session_factory, registry).run_scan(
                             queued.id
                         )
                         assert completed.status == RunStatus.SUCCEEDED
                         assert completed.found_jobs > 0
-                        await page.reload()
+                        # Polling unlocks both controls and updates health without reloading.
+                        for button in await scan_buttons.all():
+                            await expect(button).to_be_enabled(timeout=12000)
                         await expect(page.locator(f"#source-{source_id}")).to_contain_text(
                             "Работает"
                         )

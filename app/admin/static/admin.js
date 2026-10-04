@@ -50,6 +50,43 @@
     });
     update();
   });
+  // Poll only sources with an active scan, once per source even with two controls.
+  const scanSources = new Set(Array.from(
+    document.querySelectorAll('[data-source-scan][data-scan-active="true"]'),
+    (form) => form.dataset.sourceScan,
+  ));
+  const pollScan = async (sourceId) => {
+    if (document.hidden) {
+      window.setTimeout(() => pollScan(sourceId), 5000);
+      return;
+    }
+    try {
+      const response = await fetch(`/admin/sources/${sourceId}/scan-status`, {
+        credentials: 'same-origin', cache: 'no-store',
+      });
+      if ([401, 403, 404].includes(response.status) || response.redirected) return;
+      if (!response.ok) throw new Error('Scan status unavailable');
+      const state = await response.json();
+      document.querySelectorAll(`[data-source-scan="${sourceId}"]`).forEach((form) => {
+        form.dataset.scanActive = String(state.active);
+        form.action = `/admin/sources/${sourceId}/scan/${state.scan_type}`;
+        const button = form.querySelector('button');
+        button.disabled = state.active || !state.enabled;
+        button.textContent = state.button_label;
+        button.setAttribute('aria-busy', String(state.active));
+      });
+      document.querySelectorAll(`[data-source-health="${sourceId}"]`).forEach((badge) => {
+        badge.textContent = state.health_label;
+        badge.className = `badge ${state.health_tone}`;
+      });
+      if (!state.active) return;
+    } catch {
+      // Keep the last confirmed state during a transient connection failure.
+    }
+    window.setTimeout(() => pollScan(sourceId), 5000);
+  };
+  scanSources.forEach((sourceId) => window.setTimeout(() => pollScan(sourceId), 5000));
+
   const sidebar = document.querySelector('.sidebar');
   const menuButtons = document.querySelectorAll('[data-menu-toggle]');
   const setSidebar = (open) => {

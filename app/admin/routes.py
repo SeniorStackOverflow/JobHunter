@@ -991,13 +991,13 @@ async def _enqueue_source_scan(source_id: UUID, scan_type: ScanType | None = Non
             )
         scan_type = ScanType.INCREMENTAL if completed_full else ScanType.FULL
     try:
-        run = await ScanService(async_session_factory, build_default_registry()).create_scan(
-            source_id, scan_type, actor="admin"
-        )
+        run, created = await ScanService(
+            async_session_factory, build_default_registry()
+        ).request_manual_scan(source_id, scan_type, actor="admin")
     except (LookupError, ValueError):
         return "source_scan_unavailable"
-    if run.status == RunStatus.RUNNING:
-        return "scan_started"
+    if not created:
+        return "source_scan_active"
     try:
         run_scan_task.delay(str(run.id))
     except Exception as exc:
@@ -1112,6 +1112,56 @@ async def toggle_source(
         if scan_notice != "scan_started":
             notice = scan_notice
     return _source_settings_redirect(source_id, notice, profile_id)
+
+
+@router.get("/admin/sources/{source_id}/scan-status")
+async def admin_source_scan_status(
+    source_id: UUID,
+    _: str = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    source = await session.get(JobSource, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    active = await session.scalar(
+        select(ScanRun)
+        .where(
+            ScanRun.source_id == source_id,
+            ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
+        )
+        .order_by((ScanRun.status == RunStatus.RUNNING).desc())
+        .limit(1)
+    )
+    full = await session.scalar(
+        select(ScanRun.id)
+        .where(
+            ScanRun.source_id == source_id,
+            ScanRun.scan_type == ScanType.FULL,
+            ScanRun.status == RunStatus.SUCCEEDED,
+        )
+        .limit(1)
+    )
+    if active is not None:
+        button_label = "Полный обход" if active.scan_type == ScanType.FULL else "Обход"
+        button_label += ": " + _status_label(active.status)
+        health_label = "Обход: " + _status_label(active.status)
+    else:
+        button_label = "Обновить сейчас" if full else "Запустить полный обход"
+        health_label = _status_label(source.health_status)
+        if source.health_status.value == "unknown":
+            health_label = (
+                "Проверка не удалась"
+                if source.last_scan_status == RunStatus.FAILED
+                else "Ожидает проверки"
+            )
+    return {
+        "active": active is not None,
+        "enabled": source.enabled,
+        "scan_type": "incremental" if full else "full",
+        "button_label": button_label,
+        "health_label": health_label,
+        "health_tone": _status_tone(source.health_status),
+    }
 
 
 @router.post("/admin/sources/{source_id}/scan/{scan_type}")

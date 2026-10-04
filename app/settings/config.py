@@ -149,6 +149,7 @@ class Settings(BaseSettings):
     max_resume_bytes: int = 5 * 1024 * 1024
     crawler_user_agent: str = "job-agent/0.1 (+operator contact configured by deployment)"
     rabota_browser_fallback_mode: Literal["source", "none", "stealth_browser"] = "source"
+    crawler_proxy_primary_url: SecretStr | None = None
     rabota_proxy_pool_enabled: bool = False
     rabota_proxy_primary_url: SecretStr | None = None
     rabota_proxy_free_fallback_enabled: bool = True
@@ -243,6 +244,7 @@ class Settings(BaseSettings):
         "phonegate_auth_token",
         "phone_summary_llm_api_key",
         "rabota_proxy_primary_url",
+        "crawler_proxy_primary_url",
         "telegram_bot_token",
         mode="before",
     )
@@ -253,7 +255,7 @@ class Settings(BaseSettings):
         raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
         return None if not raw.strip() else value
 
-    @field_validator("rabota_proxy_primary_url")
+    @field_validator("rabota_proxy_primary_url", "crawler_proxy_primary_url")
     @classmethod
     def validate_rabota_proxy_primary_url(cls, value: SecretStr | None) -> SecretStr | None:
         if value is None:
@@ -263,7 +265,7 @@ class Settings(BaseSettings):
             parts = urlsplit(raw)
             port = parts.port
         except ValueError as exc:
-            raise ValueError("RABOTA_PROXY_PRIMARY_URL must be a valid proxy URL") from exc
+            raise ValueError("primary proxy URL must be a valid proxy URL") from exc
         if (
             parts.scheme not in {"http", "https", "socks5", "socks5h"}
             or not parts.hostname
@@ -273,7 +275,7 @@ class Settings(BaseSettings):
             or parts.path not in {"", "/"}
         ):
             raise ValueError(
-                "RABOTA_PROXY_PRIMARY_URL must be an http(s)/socks5 URL with an explicit port"
+                "primary proxy URL must be an http(s)/socks5 URL with an explicit port"
             )
         return value
 

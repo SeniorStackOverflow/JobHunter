@@ -16,6 +16,7 @@ from app.security.ssrf import (
     validate_outbound_url,
     validate_redirect,
 )
+from app.settings import get_settings
 
 DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
@@ -57,9 +58,25 @@ class SecureHttpClient:
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         pin_resolved_addresses: bool | None = None,
         rate_limiter: AsyncRateLimiter | None = None,
+        use_primary_proxy: bool = True,
     ) -> None:
         if max_response_bytes < 1:
             raise ValueError("max_response_bytes must be positive")
+        # A shared operator proxy applies to current and future HTTP adapters. Injected
+        # transports keep their own routing (fixtures and Rabota's WAF-aware pool).
+        if transport is None and use_primary_proxy:
+            settings = get_settings()
+            primary = settings.crawler_proxy_primary_url
+            if primary is None and settings.rabota_proxy_pool_enabled:
+                primary = settings.rabota_proxy_primary_url
+            if primary is not None:
+                transport = httpx.AsyncHTTPTransport(
+                    proxy=primary.get_secret_value(),
+                    trust_env=False,
+                    limits=httpx.Limits(max_keepalive_connections=0),
+                )
+                if pin_resolved_addresses is None:
+                    pin_resolved_addresses = False
         self.allowed_domains = tuple(allowed_domains)
         self._resolver = resolver
         self._max_redirects = max_redirects

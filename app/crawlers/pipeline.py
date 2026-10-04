@@ -376,6 +376,31 @@ class ScanService:
         resume_scan_id: UUID | None = None,
         actor: str = "scheduler",
     ) -> ScanRun:
+        run, _ = await self._create_scan(
+            source_id,
+            scan_type,
+            resume_from_checkpoint=resume_from_checkpoint,
+            resume_scan_id=resume_scan_id,
+            actor=actor,
+        )
+        return run
+
+    async def request_manual_scan(
+        self, source_id: UUID, scan_type: ScanType, *, actor: str = "admin"
+    ) -> tuple[ScanRun, bool]:
+        """Reserve one manual scan per source; only its creator publishes the task."""
+        return await self._create_scan(source_id, scan_type, actor=actor, reuse_any_active=True)
+
+    async def _create_scan(
+        self,
+        source_id: UUID,
+        scan_type: ScanType,
+        *,
+        resume_from_checkpoint: bool = False,
+        resume_scan_id: UUID | None = None,
+        actor: str = "scheduler",
+        reuse_any_active: bool = False,
+    ) -> tuple[ScanRun, bool]:
         async with self.session_factory() as session:
             source = await session.scalar(
                 select(JobSource).where(JobSource.id == source_id).with_for_update()
@@ -386,14 +411,16 @@ class ScanService:
                 select(ScanRun)
                 .where(
                     ScanRun.source_id == source_id,
-                    ScanRun.scan_type == scan_type,
+                    ScanRun.source_id == source_id
+                    if reuse_any_active
+                    else ScanRun.scan_type == scan_type,
                     ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
                 )
                 .order_by(desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast())
                 .limit(1)
             )
             if active is not None:
-                return active
+                return active, False
 
             previous: ScanRun | None = None
             if resume_scan_id is not None:
@@ -470,7 +497,7 @@ class ScanService:
                 },
             )
             await session.commit()
-            return run
+            return run, True
 
     async def _fail_run(
         self, session: AsyncSession, run: ScanRun, source: JobSource, reason: str

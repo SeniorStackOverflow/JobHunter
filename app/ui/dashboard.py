@@ -343,6 +343,7 @@ async def render_dashboard(
     resume_usage: dict[UUID, int] = {}
     source_category_pickers: dict[UUID, SourceCategoryPicker] = {}
     source_scan_statuses: dict[UUID, RunStatus] = {}
+    source_scan_types: dict[UUID, ScanType] = {}
     sources_with_full_scan: set[UUID] = set()
     audits: list[AuditEvent] = []
     alert_states: dict[UUID, str] = {}
@@ -718,13 +719,14 @@ async def render_dashboard(
             item.id: await source_category_picker(session, preferences, item.id) for item in sources
         }
         active_scans = await session.execute(
-            select(ScanRun.source_id, ScanRun.status).where(
+            select(ScanRun.source_id, ScanRun.status, ScanRun.scan_type).where(
                 ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])
             )
         )
-        for source_id, scan_status in active_scans:
+        for source_id, scan_status, scan_type in active_scans:
             if source_scan_statuses.get(source_id) != RunStatus.RUNNING:
                 source_scan_statuses[source_id] = scan_status
+                source_scan_types[source_id] = scan_type
         sources_with_full_scan = set(
             (
                 await session.scalars(
@@ -835,6 +837,7 @@ async def render_dashboard(
             "preferences": preferences,
             "sources": sources,
             "source_scan_statuses": source_scan_statuses,
+            "source_scan_types": source_scan_types,
             "sources_with_full_scan": sources_with_full_scan,
             "source_policy_states": {item.id: source_policy_state(item) for item in sources}
             if is_admin
