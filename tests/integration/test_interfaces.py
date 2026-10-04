@@ -4550,7 +4550,7 @@ async def test_panel_actions_and_confirmed_source_recovery_three_clean_contexts(
                             page.locator(".notification-item").filter(has_text="Проверьте резюме")
                         ).to_have_count(0)
                         await page.locator(
-                            f"#source-{seeded['source_id']} [action$='/scan/incremental'] button"
+                            f"#source-{seeded['source_id']} [action$='/scan/full'] button"
                         ).click()
                         assert (
                             str(profile_id) in page.url

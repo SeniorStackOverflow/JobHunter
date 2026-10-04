@@ -45,6 +45,7 @@ from app.models.enums import (
     MatchDecision,
     PhoneVerificationStatus,
     RunStatus,
+    ScanType,
     SourceHealth,
 )
 from app.notifications import resolved_alert_ids
@@ -341,6 +342,8 @@ async def render_dashboard(
     resumes: list[Resume] = []
     resume_usage: dict[UUID, int] = {}
     source_category_pickers: dict[UUID, SourceCategoryPicker] = {}
+    source_scan_statuses: dict[UUID, RunStatus] = {}
+    sources_with_full_scan: set[UUID] = set()
     audits: list[AuditEvent] = []
     alert_states: dict[UUID, str] = {}
     historical_alerts: list[Alert] = []
@@ -714,6 +717,26 @@ async def render_dashboard(
         source_category_pickers = {
             item.id: await source_category_picker(session, preferences, item.id) for item in sources
         }
+        active_scans = await session.execute(
+            select(ScanRun.source_id, ScanRun.status).where(
+                ScanRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])
+            )
+        )
+        for source_id, scan_status in active_scans:
+            if source_scan_statuses.get(source_id) != RunStatus.RUNNING:
+                source_scan_statuses[source_id] = scan_status
+        sources_with_full_scan = set(
+            (
+                await session.scalars(
+                    select(ScanRun.source_id)
+                    .where(
+                        ScanRun.scan_type == ScanType.FULL,
+                        ScanRun.status == RunStatus.SUCCEEDED,
+                    )
+                    .distinct()
+                )
+            ).all()
+        )
     elif view == "calls":
         from app.admin.phone_routes import build_calls_context
 
@@ -811,6 +834,8 @@ async def render_dashboard(
             "pagination": pagination,
             "preferences": preferences,
             "sources": sources,
+            "source_scan_statuses": source_scan_statuses,
+            "sources_with_full_scan": sources_with_full_scan,
             "source_policy_states": {item.id: source_policy_state(item) for item in sources}
             if is_admin
             else {},

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import UTC, datetime
 
 # FastAPI's declarative dependency/form parameters intentionally call Depends/File.
 # ruff: noqa: B008
@@ -11,6 +12,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.applications import (
@@ -972,6 +974,50 @@ def _source_settings_redirect(
     return RedirectResponse(f"{target}#{anchor}-{source_id}", status_code=303)
 
 
+async def _enqueue_source_scan(source_id: UUID, scan_type: ScanType | None = None) -> str:
+    from app.database.session import async_session_factory
+    from app.scheduler.tasks import run_scan_task
+
+    if scan_type is None:
+        async with async_session_factory() as session:
+            completed_full = await session.scalar(
+                select(ScanRun.id)
+                .where(
+                    ScanRun.source_id == source_id,
+                    ScanRun.scan_type == ScanType.FULL,
+                    ScanRun.status == RunStatus.SUCCEEDED,
+                )
+                .limit(1)
+            )
+        scan_type = ScanType.INCREMENTAL if completed_full else ScanType.FULL
+    try:
+        run = await ScanService(async_session_factory, build_default_registry()).create_scan(
+            source_id, scan_type, actor="admin"
+        )
+    except (LookupError, ValueError):
+        return "source_scan_unavailable"
+    if run.status == RunStatus.RUNNING:
+        return "scan_started"
+    try:
+        run_scan_task.delay(str(run.id))
+    except Exception as exc:
+        async with async_session_factory() as session:
+            stored = await session.scalar(
+                select(ScanRun).where(ScanRun.id == run.id).with_for_update()
+            )
+            # A concurrent publisher may already have started this same scan.
+            if stored is not None and stored.status == RunStatus.QUEUED:
+                stored.status = RunStatus.FAILED
+                stored.finished_at = datetime.now(UTC)
+                stored.diagnostics = {"queue_error": type(exc).__name__}
+                source = await session.get(JobSource, source_id)
+                if source is not None:
+                    source.last_scan_status = RunStatus.FAILED
+                await session.commit()
+        return "source_queue_unavailable"
+    return "scan_started"
+
+
 @router.post("/admin/sources/{source_id}/policy-review")
 async def save_source_policy_review(
     source_id: UUID,
@@ -1023,9 +1069,12 @@ async def save_source_policy_review(
             session, "source.enabled", "job_source", str(source_id), decision="enabled"
         )
     await session.commit()
-    return _source_settings_redirect(
-        source_id, "source_enabled" if enable else "source_policy_saved", profile_id
-    )
+    if enable:
+        notice = await _enqueue_source_scan(source_id)
+        return _source_settings_redirect(
+            source_id, "source_enabled" if notice == "scan_started" else notice, profile_id
+        )
+    return _source_settings_redirect(source_id, "source_policy_saved", profile_id)
 
 
 @router.post("/admin/sources/{source_id}/toggle")
@@ -1058,6 +1107,10 @@ async def toggle_source(
     )
     await session.commit()
     notice = "source_enabled" if enabling else "source_disabled"
+    if enabling:
+        scan_notice = await _enqueue_source_scan(source_id)
+        if scan_notice != "scan_started":
+            notice = scan_notice
     return _source_settings_redirect(source_id, notice, profile_id)
 
 
@@ -1071,29 +1124,8 @@ async def admin_start_scan(
     _: str = Depends(require_admin),
 ) -> RedirectResponse:
     require_csrf(request, csrf_token)
-    from app.database.session import async_session_factory
-    from app.scheduler.tasks import run_scan_task
-
-    try:
-        run = await ScanService(async_session_factory, build_default_registry()).create_scan(
-            source_id, scan_type, actor="admin"
-        )
-    except (LookupError, ValueError):
-        return _source_settings_redirect(source_id, "source_scan_unavailable", profile_id)
-    try:
-        run_scan_task.delay(str(run.id))
-    except Exception as exc:
-        async with async_session_factory() as session:
-            stored = await session.get(ScanRun, run.id)
-            if stored is not None:
-                stored.status = RunStatus.FAILED
-                stored.diagnostics = {"queue_error": type(exc).__name__}
-                await session.commit()
-        return _source_settings_redirect(source_id, "source_queue_unavailable", profile_id)
-    target = "/admin?view=settings&notice=scan_started"
-    if profile_id is not None:
-        target += f"&profile_id={profile_id}"
-    return RedirectResponse(f"{target}#source-{source_id}", status_code=303)
+    notice = await _enqueue_source_scan(source_id, scan_type)
+    return _source_settings_redirect(source_id, notice, profile_id)
 
 
 @router.get("/admin/applications/{application_id}", response_class=HTMLResponse)

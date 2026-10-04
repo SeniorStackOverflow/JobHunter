@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Russian UI copy is intentional.
+# ruff: noqa: RUF001
 import asyncio
 import re
 import socket
@@ -10,18 +12,33 @@ import httpx
 import pytest
 import uvicorn
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app import cli
 from app.crawlers.catalog import SourceDefinition
+from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
-from app.models.entities import AuditEvent, JobSource
-from app.models.enums import SourceHealth
-from app.security.auth import SessionSigner, hash_password
+from app.models.entities import Account, AuditEvent, JobSource, ScanRun, UserProfile
+from app.models.enums import AccountRole, AccountStatus, RunStatus, ScanType, SourceHealth
+from app.security.auth import AccountSessionSigner, SessionSigner, hash_password
 from tests.integration.test_user_invite_auth import UserAuthContext
 from tests.integration.test_user_invite_auth import user_auth_context as user_auth_context
+from tests.unit.test_delucru_adapter import FixtureFetcher, default_routes
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def offline_scan_queue(user_auth_context, monkeypatch):
+    from app.database import session as database_session
+    from app.scheduler.tasks import run_scan_task
+
+    queued = []
+    monkeypatch.setattr(
+        database_session, "async_session_factory", user_auth_context.session_factory
+    )
+    monkeypatch.setattr(run_scan_task, "delay", queued.append)
+    return queued
 
 
 async def _pending_source(context, monkeypatch, *, nested=False):
@@ -112,6 +129,114 @@ async def test_policy_form_validates_preserves_settings_and_records_admin(
         source = await session.get(JobSource, source_id)
         assert source.enabled is True and source.automatic_actions_paused is True
         assert source.health_status == SourceHealth.UNKNOWN
+        scan = await session.scalar(select(ScanRun).where(ScanRun.source_id == source_id))
+        assert scan.scan_type == ScanType.FULL and scan.status == RunStatus.QUEUED
+
+
+@pytest.mark.parametrize("entry", ["toggle", "policy-review"])
+async def test_enable_queues_initial_full_and_reenable_uses_incremental(
+    user_auth_context, monkeypatch, offline_scan_queue, entry
+):
+    context = user_auth_context
+    source_id, _ = await _pending_source(context, monkeypatch)
+    csrf = _admin(context)
+    async with context.session_factory() as session:
+        source = await session.get(JobSource, source_id)
+        source.configuration = {
+            **source.configuration,
+            "policy_review_acknowledged": True,
+            "policy_review_reference": "local-review",
+        }
+        await session.commit()
+    fields = {
+        "csrf_token": csrf,
+        "acknowledged": "true",
+        "review_reference": "local-review",
+        "enable": "true",
+    }
+    response = await context.client.post(f"/admin/sources/{source_id}/{entry}", data=fields)
+    assert response.status_code == 303 and "source_enabled" in response.headers["location"]
+    async with context.session_factory() as session:
+        run = await session.scalar(select(ScanRun).where(ScanRun.source_id == source_id))
+        assert run.scan_type == ScanType.FULL and run.status == RunStatus.QUEUED
+        assert offline_scan_queue == [str(run.id)]
+        run.status = RunStatus.RUNNING
+        await session.commit()
+    # Clicking a manual retry while the first scan is running must reuse it.
+    retry = await context.client.post(
+        f"/admin/sources/{source_id}/scan/full", data={"csrf_token": csrf}
+    )
+    assert retry.status_code == 303 and "scan_started" in retry.headers["location"]
+    assert len(offline_scan_queue) == 1
+    async with context.session_factory() as session:
+        run = await session.get(ScanRun, run.id)
+        run.status = RunStatus.SUCCEEDED
+        await session.commit()
+    await context.client.post(f"/admin/sources/{source_id}/toggle", data={"csrf_token": csrf})
+    response = await context.client.post(
+        f"/admin/sources/{source_id}/toggle", data={"csrf_token": csrf}
+    )
+    assert "source_enabled" in response.headers["location"]
+    async with context.session_factory() as session:
+        runs = list(
+            (await session.scalars(select(ScanRun).where(ScanRun.source_id == source_id))).all()
+        )
+        assert len(runs) == 2
+        incremental = next(run for run in runs if run.scan_type == ScanType.INCREMENTAL)
+        assert incremental.status == RunStatus.QUEUED
+        assert offline_scan_queue[-1] == str(incremental.id)
+        source = await session.get(JobSource, source_id)
+        assert source.enabled and source.automatic_actions_paused
+
+
+@pytest.mark.parametrize("entry", ["toggle", "policy-review"])
+async def test_enable_queue_failure_is_visible_and_initial_full_can_be_retried(
+    user_auth_context, monkeypatch, offline_scan_queue, entry
+):
+    from app.scheduler.tasks import run_scan_task
+
+    context = user_auth_context
+    source_id, _ = await _pending_source(context, monkeypatch)
+    csrf = _admin(context)
+    async with context.session_factory() as session:
+        source = await session.get(JobSource, source_id)
+        source.configuration = {
+            **source.configuration,
+            "policy_review_acknowledged": True,
+            "policy_review_reference": "local-review",
+        }
+        await session.commit()
+
+    def unavailable(_):
+        raise RuntimeError("offline broker failure")
+
+    monkeypatch.setattr(run_scan_task, "delay", unavailable)
+    response = await context.client.post(
+        f"/admin/sources/{source_id}/{entry}",
+        data={
+            "csrf_token": csrf,
+            "acknowledged": "true",
+            "review_reference": "local-review",
+            "enable": "true",
+        },
+    )
+    assert (
+        response.status_code == 303 and "source_queue_unavailable" in response.headers["location"]
+    )
+    page = await context.client.get(response.headers["location"])
+    assert "Проверка не удалась" in page.text
+    assert f"/admin/sources/{source_id}/scan/full" in page.text
+    async with context.session_factory() as session:
+        run = await session.scalar(select(ScanRun).where(ScanRun.source_id == source_id))
+        assert run.status == RunStatus.FAILED and run.finished_at is not None
+        source = await session.get(JobSource, source_id)
+        assert source.enabled and source.automatic_actions_paused
+    monkeypatch.setattr(run_scan_task, "delay", offline_scan_queue.append)
+    response = await context.client.post(
+        f"/admin/sources/{source_id}/scan/full", data={"csrf_token": csrf}
+    )
+    assert "scan_started" in response.headers["location"]
+    assert len(offline_scan_queue) == 1
 
 
 async def test_policy_form_requires_admin_and_csrf(user_auth_context, monkeypatch):
@@ -137,7 +262,10 @@ async def test_policy_form_requires_admin_and_csrf(user_auth_context, monkeypatc
 
 @pytest.mark.e2e
 async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
-    user_auth_context: UserAuthContext, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    user_auth_context: UserAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    offline_scan_queue,
 ):
     from mcp.server.fastmcp import FastMCP
     from playwright.async_api import async_playwright, expect
@@ -157,7 +285,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
         )
         await session.delete(missing)
         await session.commit()
-    registry = build_default_registry()
+    registry = build_default_registry(client_factory=lambda _: FixtureFetcher(default_routes()))
     original = registry.source_definitions()["delucru_md"]
     registry.register(
         "delucru_md",
@@ -215,15 +343,51 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
             source_id = delucru.id
             future = next(source for source in sources if source.catalog_key == "future-site")
             assert future.enabled is False and future.automatic_actions_paused is True
+            account = Account(role=AccountRole.USER, status=AccountStatus.ACTIVE)
+            session.add(account)
+            await session.flush()
+            session.add(UserProfile(name="Source panel user", owner_account_id=account.id))
+            await session.commit()
+            user_token = AccountSessionSigner(context.settings.secret_key.get_secret_value()).issue(
+                account.id, account.session_version
+            )
         async with async_playwright() as runtime:
             browser = await runtime.chromium.launch(headless=True)
+
+            async def check_user_panel(label, width):
+                user_browser = await browser.new_context(viewport={"width": width, "height": 900})
+                try:
+                    await user_browser.add_cookies(
+                        [
+                            {
+                                "name": context.settings.user_session_cookie_name,
+                                "value": user_token,
+                                "url": origin,
+                            }
+                        ]
+                    )
+                    user_page = await user_browser.new_page()
+                    response = await user_page.goto(origin + "/app?view=settings")
+                    assert response.status == 200
+                    await expect(user_page.locator(f"#source-{source_id}")).to_contain_text(label)
+                    await expect(user_page.locator("#source-management")).to_have_count(0)
+                    assert await user_page.evaluate(
+                        "document.documentElement.scrollWidth <= innerWidth + 2"
+                    )
+                finally:
+                    await user_browser.close()
+
             try:
                 for index in range(3):
                     async with context.session_factory() as session:
+                        await session.execute(delete(ScanRun).where(ScanRun.source_id == source_id))
                         source = await session.get(JobSource, source_id)
                         source.enabled = False
+                        source.health_status = SourceHealth.PAUSED
+                        source.last_scan_status = None
                         source.configuration = {
                             "live_mode": True,
+                            "locale_priority": ["ro"],
                             "policy_review_acknowledged": False,
                             "operator_setting": "keep",
                         }
@@ -279,6 +443,34 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                         await expect(page.locator(f"#source-controls-{source_id}")).to_contain_text(
                             "Обход включён"
                         )
+                        await expect(page.locator(f"#source-{source_id}")).to_contain_text(
+                            "Обход: В очереди"
+                        )
+                        await check_user_panel("Обход: В очереди", 390 if index == 1 else 1440)
+                        async with context.session_factory() as session:
+                            queued = await session.scalar(
+                                select(ScanRun).where(
+                                    ScanRun.source_id == source_id,
+                                    ScanRun.status == RunStatus.QUEUED,
+                                )
+                            )
+                            assert queued is not None
+                            assert queued.scan_type == ScanType.FULL
+                            assert offline_scan_queue[-1] == str(queued.id)
+                        # Run the actual adapter/pipeline entirely against saved local HTML.
+                        completed = await ScanService(context.session_factory, registry).run_scan(
+                            queued.id
+                        )
+                        assert completed.status == RunStatus.SUCCEEDED
+                        assert completed.found_jobs > 0
+                        await page.reload()
+                        await expect(page.locator(f"#source-{source_id}")).to_contain_text(
+                            "Работает"
+                        )
+                        await check_user_panel("Работает", 390 if index == 1 else 1440)
+                        await expect(
+                            page.locator(f"#source-{source_id} [action$='/scan/incremental']")
+                        ).to_have_count(1)
                         assert not errors
                         dimensions = await page.evaluate(
                             "({width: innerWidth, scroll: document.documentElement.scrollWidth})"
@@ -295,6 +487,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                                 == f"local-operator-check-{index}"
                             )
                             assert source.configuration["operator_setting"] == "keep"
+                            assert source.health_status == SourceHealth.HEALTHY
                     finally:
                         await browser_context.close()
             finally:
