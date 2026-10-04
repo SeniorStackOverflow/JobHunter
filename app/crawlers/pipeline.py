@@ -389,7 +389,13 @@ class ScanService:
         self, source_id: UUID, scan_type: ScanType, *, actor: str = "admin"
     ) -> tuple[ScanRun, bool]:
         """Reserve one manual scan per source; only its creator publishes the task."""
-        return await self._create_scan(source_id, scan_type, actor=actor, reuse_any_active=True)
+        return await self._create_scan(
+            source_id,
+            scan_type,
+            actor=actor,
+            reuse_any_active=True,
+            resume_from_checkpoint=scan_type == ScanType.FULL,
+        )
 
     async def _create_scan(
         self,
@@ -435,18 +441,26 @@ class ScanService:
                         "resume scan must be a failed or partial scan for the same source/type"
                     )
             elif resume_from_checkpoint:
-                previous = await session.scalar(
-                    select(ScanRun)
-                    .where(
-                        ScanRun.source_id == source_id,
-                        ScanRun.scan_type == scan_type,
-                        ScanRun.status.in_([RunStatus.FAILED, RunStatus.PARTIAL]),
-                    )
-                    .order_by(
-                        desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast()
-                    )
-                    .limit(1)
+                previous_query = select(ScanRun).where(
+                    ScanRun.source_id == source_id,
+                    ScanRun.scan_type == scan_type,
                 )
+                if not reuse_any_active:
+                    previous_query = previous_query.where(
+                        ScanRun.status.in_([RunStatus.FAILED, RunStatus.PARTIAL])
+                    )
+                previous = await session.scalar(
+                    previous_query.order_by(
+                        desc(func.coalesce(ScanRun.finished_at, ScanRun.started_at)).nullslast()
+                    ).limit(1)
+                )
+                # A manual full retry continues the latest unfinished attempt. A later
+                # successful full scan must prevent resuming an older stale cursor.
+                if previous is not None and previous.status not in {
+                    RunStatus.FAILED,
+                    RunStatus.PARTIAL,
+                }:
+                    previous = None
 
             checkpoint: dict[str, Any] = {}
             diagnostics: dict[str, Any] = {}

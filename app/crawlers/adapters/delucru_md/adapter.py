@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar, Literal
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -1173,39 +1173,52 @@ class DelucruMdAdapter:
 
     def _next_page_url(self, html: str, page_url: str, visited: set[str]) -> str | None:
         tree = HTMLParser(html)
-        # 1. rel="next"
-        next_node = tree.css_first("a[rel='next'][href]")
-        if next_node:
-            href = next_node.attributes.get("href")
-            cand = self._candidate_public_url(page_url, href or "")
-            if cand:
-                if cand in visited:
-                    raise DelucruMdDegradedError("pagination loop in listing")
-                return cand
-
-        # 2. Page links containing > or next
-        for a in tree.css("a.page-link, ul.pagination a"):
-            text = self._clean_text(a.text(separator=" ", strip=True)).lower()
-            if text in {"următoarea", "urmatoarea", "следующая", ">", "»"}:
-                href = a.attributes.get("href")
-                cand = self._candidate_public_url(page_url, href or "")
-                if cand:
-                    if cand in visited:
-                        raise DelucruMdDegradedError("pagination loop in listing")
-                    return cand
-
-        # 3. Numeric page increment fallback
-        m_page = re.search(r"[?&]page=(\d+)", page_url)
-        curr_page = int(m_page.group(1)) if m_page else 1
-        next_page = curr_page + 1
-        parts = urlsplit(page_url)
-        query = [(key, value) for key, value in parse_qsl(parts.query) if key != "page"]
-        cand = urlunsplit(parts._replace(query=urlencode([*query, ("page", str(next_page))])))
-        # Only suggest if there are job links on the current page
-        if cand not in visited and tree.css_first("a[href*='/job/']"):
-            active_p = tree.css_first(".page-item.active")
-            if active_p and str(curr_page) in active_p.text():
-                return cand
+        current_query = dict(parse_qsl(urlsplit(page_url).query))
+        try:
+            current_page = int(current_query.get("page", "1"))
+        except ValueError as exc:
+            raise DelucruMdParseError("pagination page number is invalid") from exc
+        for link in tree.css("a[rel~='next'][href], a.page-link, ul.pagination a"):
+            parent = link.parent
+            classes = (link.attributes.get("class") or "").split()
+            parent_classes = (parent.attributes.get("class") or "").split() if parent else []
+            if (
+                "disabled" in classes
+                or "disabled" in parent_classes
+                or link.attributes.get("aria-disabled") == "true"
+            ):
+                continue
+            text = self._clean_text(link.text(separator=" ", strip=True)).casefold()
+            is_next = "next" in (link.attributes.get("rel") or "").split() or text in {
+                "următoarea",
+                "urmatoarea",
+                "следующая",
+                "next",
+                ">",
+                "»",
+                "›",
+            }
+            is_next_number = text.isdecimal() and int(text) == current_page + 1
+            if not (is_next or is_next_number):
+                continue
+            href = link.attributes.get("href")
+            if not href or href.startswith("#"):
+                continue
+            candidate = self._candidate_public_url(page_url, href)
+            if candidate is None:
+                continue
+            if candidate in visited:
+                raise DelucruMdDegradedError("pagination loop in listing")
+            if is_next_number:
+                candidate_parts = urlsplit(candidate)
+                candidate_query = dict(parse_qsl(candidate_parts.query))
+                if candidate_parts.path != urlsplit(page_url).path or candidate_query.get(
+                    "page"
+                ) != str(current_page + 1):
+                    continue
+            return candidate
+        # A current-page marker does not imply another page exists. Never invent
+        # page=N+1 after the last page of a finite category.
         return None
 
     async def _ensure_access(self) -> None:
@@ -1233,10 +1246,20 @@ class DelucruMdAdapter:
 
     def _validate_listing(self, html: str) -> None:
         tree = HTMLParser(html)
-        if tree.css_first("a[href*='/job/'], .empty-results") is None:
-            raise DelucruMdDegradedError(
-                "public response does not contain a recognizable jobs listing"
-            )
+        if tree.css_first("a[href*='/job/'], .empty-results") is not None:
+            return
+        empty_messages = (
+            "pentru această căutare nu au fost găsite locuri de muncă.",
+            "по данному запросу не было найдено доступных вакансий.",
+        )
+        if any(
+            self._clean_text(node.text(separator=" ", strip=True))
+            .casefold()
+            .startswith(empty_messages)
+            for node in tree.css(".alert.alert-info")
+        ):
+            return
+        raise DelucruMdDegradedError("public response does not contain a recognizable jobs listing")
 
     @staticmethod
     def _require_success(response: httpx.Response, url: str) -> None:

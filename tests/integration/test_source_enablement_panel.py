@@ -23,7 +23,7 @@ from app.models.enums import AccountRole, AccountStatus, RunStatus, ScanType, So
 from app.security.auth import AccountSessionSigner, SessionSigner, hash_password
 from tests.integration.test_user_invite_auth import UserAuthContext
 from tests.integration.test_user_invite_auth import user_auth_context as user_auth_context
-from tests.unit.test_delucru_adapter import FixtureFetcher, default_routes
+from tests.unit.test_delucru_adapter import FixtureFetcher, finite_category_routes
 
 pytestmark = pytest.mark.integration
 
@@ -302,7 +302,14 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
         )
         await session.delete(missing)
         await session.commit()
-    registry = build_default_registry(client_factory=lambda _: FixtureFetcher(default_routes()))
+    fetchers = []
+
+    def local_fetcher(_):
+        fetcher = FixtureFetcher(finite_category_routes())
+        fetchers.append(fetcher)
+        return fetcher
+
+    registry = build_default_registry(client_factory=local_fetcher)
     original = registry.source_definitions()["delucru_md"]
     registry.register(
         "delucru_md",
@@ -401,6 +408,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                         source = await session.get(JobSource, source_id)
                         source.enabled = False
                         source.health_status = SourceHealth.PAUSED
+                        source.automatic_actions_paused = True
                         source.last_scan_status = None
                         source.configuration = {
                             "live_mode": True,
@@ -507,11 +515,17 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             active.status = RunStatus.QUEUED
                             await session.commit()
                         # Run the actual adapter/pipeline entirely against saved local HTML.
+                        fetchers.clear()
                         completed = await ScanService(context.session_factory, registry).run_scan(
                             queued.id
                         )
                         assert completed.status == RunStatus.SUCCEEDED
                         assert completed.found_jobs > 0
+                        assert not any(
+                            url.endswith("acquisitions?page=3")
+                            for fetcher in fetchers
+                            for url in fetcher.requested
+                        )
                         # Polling unlocks both controls and updates health without reloading.
                         for button in await scan_buttons.all():
                             await expect(button).to_be_enabled(timeout=12000)
@@ -539,6 +553,67 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             )
                             assert source.configuration["operator_setting"] == "keep"
                             assert source.health_status == SourceHealth.HEALTHY
+                        # Reproduce the cursor saved by the previous adapter after it
+                        # fabricated page 3, then continue through the actual UI route.
+                        async with context.session_factory() as session:
+                            saved = await session.get(ScanRun, completed.id)
+                            saved.status = RunStatus.PARTIAL
+                            checkpoint = dict(saved.checkpoint)
+                            checkpoint.update(
+                                page_url="https://www.delucru.md/jobs/acquisitions?page=3",
+                                entrypoint_index=0,
+                                completed_entrypoints=[],
+                            )
+                            adapter_state = dict(checkpoint.get("adapter_state", {}))
+                            adapter_state["scan_entrypoints"] = [
+                                {
+                                    "url": "https://www.delucru.md/jobs/acquisitions",
+                                    "category": "acquisitions",
+                                    "region": None,
+                                },
+                                {
+                                    "url": "https://www.delucru.md/jobs",
+                                    "category": None,
+                                    "region": None,
+                                },
+                            ]
+                            checkpoint["adapter_state"] = adapter_state
+                            saved.checkpoint = checkpoint
+                            source = await session.get(JobSource, source_id)
+                            source.health_status = SourceHealth.DEGRADED
+                            source.last_scan_status = RunStatus.PARTIAL
+                            source.automatic_actions_paused = True
+                            await session.commit()
+                        await page.reload()
+                        await page.locator(
+                            f"#source-controls-{source_id} [data-source-scan] button"
+                        ).click()
+                        await expect(page).to_have_url(re.compile("notice=scan_started"))
+                        async with context.session_factory() as session:
+                            continued = await session.scalar(
+                                select(ScanRun).where(
+                                    ScanRun.source_id == source_id,
+                                    ScanRun.status == RunStatus.QUEUED,
+                                )
+                            )
+                            assert continued is not None
+                            assert continued.diagnostics["resume_parent_scan_id"] == str(
+                                completed.id
+                            )
+                            assert continued.checkpoint["page_url"].endswith("acquisitions?page=3")
+                        recovered = await ScanService(context.session_factory, registry).run_scan(
+                            continued.id
+                        )
+                        assert recovered.status == RunStatus.SUCCEEDED
+                        assert recovered.new_jobs == 0 and recovered.found_jobs == 0
+                        for button in await page.locator(
+                            f'[data-source-scan="{source_id}"] button'
+                        ).all():
+                            await expect(button).to_be_enabled(timeout=12000)
+                        await expect(page.locator(f"#source-{source_id}")).to_contain_text(
+                            "Работает"
+                        )
+                        await check_user_panel("Работает", 390 if index == 1 else 1440)
                     finally:
                         await browser_context.close()
             finally:

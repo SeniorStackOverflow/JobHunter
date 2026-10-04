@@ -78,6 +78,15 @@ def default_routes() -> dict[str, str | tuple[int, str]]:
     }
 
 
+def finite_category_routes():
+    routes = default_routes()
+    routes[f"{BASE}/jobs/by-category"] = '<html><a href="/jobs/acquisitions">Achiziții</a></html>'
+    routes[f"{BASE}/jobs/acquisitions"] = fixture("finite_category_first.html")
+    routes[f"{BASE}/jobs/acquisitions?page=2"] = fixture("finite_category_last.html")
+    routes[f"{BASE}/jobs/acquisitions?page=3"] = fixture("empty_results_ro.html")
+    return routes
+
+
 def adapter_config(**overrides: Any) -> DelucruMdConfig:
     values: dict[str, Any] = {
         "live_mode": False,
@@ -590,10 +599,12 @@ async def test_internal_actions_are_metadata_only_and_never_fetched() -> None:
 @pytest.mark.parametrize("page_url", [f"{BASE}/jobs?page=2", f"{BASE}/jobs?page=2&filter=active"])
 def test_numeric_pagination_keeps_valid_query(page_url: str) -> None:
     adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
-    html = '<div class="page-item active">2</div><a href="/job/88409">Job</a>'
-    next_url = adapter._next_page_url(html, page_url, {page_url})
     expected = f"{BASE}/jobs?" + ("filter=active&" if "filter=" in page_url else "") + "page=3"
-    assert next_url == expected
+    html = (
+        '<ul class="pagination"><li class="page-item active">2</li>'
+        f'<li><a href="{expected}">3</a></li></ul>'
+    )
+    assert adapter._next_page_url(html, page_url, {page_url}) == expected
 
 
 def test_pagination_loop_is_degraded_instead_of_successfully_completed() -> None:
@@ -617,3 +628,35 @@ async def test_selected_category_is_scanned_in_both_locales_when_directory_link_
     references = await collect(adapter.iterate_incremental_scan(None))
     assert "99999" in {reference.external_id for reference in references}
     assert url in fetcher.requested
+
+
+def test_finite_category_uses_real_numeric_link_and_stops_on_last_page():
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    url = f"{BASE}/jobs/acquisitions"
+    second = url + "?page=2"
+    assert adapter._next_page_url(fixture("finite_category_first.html"), url, {url}) == second
+    assert (
+        adapter._next_page_url(fixture("finite_category_last.html"), second, {url, second}) is None
+    )
+
+
+def test_disabled_next_control_does_not_create_a_pagination_loop():
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    url = f"{BASE}/jobs"
+    html = '<li class="page-item disabled"><a rel="next" href="#">Next</a></li>'
+    assert adapter._next_page_url(html, url, {url}) is None
+
+
+@pytest.mark.parametrize("locale", ["ro", "ru"])
+def test_official_empty_results_are_valid_without_fixture_only_selector(locale):
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    adapter._validate_listing(fixture(f"empty_results_{locale}.html"))
+
+
+@pytest.mark.parametrize(
+    "message", ["Access denied", "Please complete CAPTCHA", "Server unavailable"]
+)
+def test_unrecognized_alert_does_not_count_as_empty_results(message):
+    adapter = DelucruMdAdapter(adapter_config(), client=FixtureFetcher())
+    with pytest.raises(DelucruMdDegradedError, match="recognizable jobs listing"):
+        adapter._validate_listing(f'<div class="alert alert-info">{message}</div>')

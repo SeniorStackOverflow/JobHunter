@@ -20,7 +20,7 @@ from app.models.entities import JobSource, SourceJob
 from app.models.enums import RunStatus, ScanType, SourceHealth
 from app.settings import Settings
 from tests.integration.test_delucru_pipeline import source_record
-from tests.unit.test_delucru_adapter import BASE, default_routes, fixture
+from tests.unit.test_delucru_adapter import BASE, finite_category_routes, fixture
 
 
 def tls_contexts(path):
@@ -59,7 +59,7 @@ def tls_contexts(path):
 
 @asynccontextmanager
 async def offline_https_socks(server_tls):
-    routes = default_routes()
+    routes = finite_category_routes()
     seen = []
     tasks = set()
 

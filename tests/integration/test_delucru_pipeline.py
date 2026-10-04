@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 
 from app.crawlers.pipeline import ScanService
 from app.crawlers.registry import build_default_registry
-from app.models.entities import Alert, JobSnapshot, JobSource, SourceJob
+from app.models.entities import Alert, JobSnapshot, JobSource, ScanRun, SourceJob
 from app.models.enums import RunStatus, ScanType, SourceHealth
 from tests.unit.test_delucru_adapter import BASE, FixtureFetcher, default_routes, fixture
 
@@ -133,3 +133,64 @@ async def test_page_cap_is_partial_and_resume_completes_remaining_pages(sqlite_s
     assert second.new_jobs == 1
     async with sqlite_session_factory() as session:
         assert await session.scalar(select(func.count(SourceJob.id))) == 4
+
+
+async def test_manual_full_continues_saved_cursor_without_refetching_committed_jobs(
+    sqlite_session_factory,
+):
+    from tests.unit.test_delucru_adapter import finite_category_routes
+
+    routes = finite_category_routes()
+    page2 = f"{BASE}/jobs/acquisitions?page=2"
+    saved_last = routes[page2]
+    routes[page2] = (403, "Temporarily blocked")
+    fetcher = FixtureFetcher(routes)
+    source_id = await source_record(sqlite_session_factory)
+    scanner = ScanService(
+        sqlite_session_factory, build_default_registry(client_factory=lambda _: fetcher)
+    )
+    first, created = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    assert created
+    partial = await scanner.run_scan(first.id)
+    assert partial.status == RunStatus.PARTIAL
+    assert partial.checkpoint["page_url"] == page2
+    assert partial.new_jobs == 1
+    routes[page2] = saved_last
+    continued, created = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    assert created and continued.id != first.id
+    assert continued.checkpoint["page_url"] == page2
+    assert continued.diagnostics["resume_parent_scan_id"] == str(first.id)
+    duplicate, created = await scanner.request_manual_scan(source_id, ScanType.INCREMENTAL)
+    assert not created and duplicate.id == continued.id
+    completed = await scanner.run_scan(continued.id)
+    assert completed.status == RunStatus.SUCCEEDED and completed.new_jobs == 2
+    assert fetcher.requested.count(f"{BASE}/job/junior-data-scientist-88409") == 1
+    assert f"{BASE}/jobs/acquisitions?page=3" not in fetcher.requested
+    async with sqlite_session_factory() as session:
+        assert await session.scalar(select(func.count(SourceJob.id))) == 3
+        source = await session.get(JobSource, source_id)
+        assert source.health_status == SourceHealth.HEALTHY
+
+
+async def test_manual_full_after_success_does_not_resume_older_partial_cursor(
+    sqlite_session_factory,
+):
+    fetcher = FixtureFetcher(default_routes())
+    source_id = await source_record(sqlite_session_factory)
+    scanner = ScanService(
+        sqlite_session_factory, build_default_registry(client_factory=lambda _: fetcher)
+    )
+    first = await scanner.run_scan((await scanner.create_scan(source_id, ScanType.FULL)).id)
+    async with sqlite_session_factory() as session:
+        old = await session.get(ScanRun, first.id)
+        old.status = RunStatus.PARTIAL
+        old.checkpoint = {"page_url": f"{BASE}/jobs?page=999", "yielded_external_ids": ["88409"]}
+        await session.commit()
+    succeeded = await scanner.run_scan((await scanner.create_scan(source_id, ScanType.FULL)).id)
+    assert succeeded.status == RunStatus.SUCCEEDED
+    fresh, created = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    assert created and fresh.checkpoint == {}
+    assert "resume_parent_scan_id" not in fresh.diagnostics
+    completed = await scanner.run_scan(fresh.id)
+    assert completed.status == RunStatus.SUCCEEDED and completed.found_jobs == 3
+    assert fetcher.requested.count(f"{BASE}/job/junior-data-scientist-88409") == 3
