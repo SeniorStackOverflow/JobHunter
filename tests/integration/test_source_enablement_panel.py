@@ -314,6 +314,16 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
     detail_layout = {"current": False}
     new_city_id = "99001"
     many_cities = ["Chișinău", "Ialoveni", *(f"Destination {i:03d}" for i in range(80))]
+    hold_duplicate_page = asyncio.Event()
+    duplicate_page_reached = asyncio.Event()
+    release_duplicate_page = asyncio.Event()
+
+    class HeldListingFetcher(FixtureFetcher):
+        async def get(self, url, **kwargs):
+            if hold_duplicate_page.is_set() and url.endswith("acquisitions?page=2"):
+                duplicate_page_reached.set()
+                await release_duplicate_page.wait()
+            return await super().get(url, **kwargs)
 
     def local_fetcher(_):
         routes = finite_category_routes()
@@ -333,7 +343,7 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                 "Fixture vacancy", "Multi-city storage regression"
             )
         routes["https://www.delucru.md/job/junior-data-scientist-88409"] = detail
-        fetcher = FixtureFetcher(routes)
+        fetcher = HeldListingFetcher(routes)
         fetchers.append(fetcher)
         return fetcher
 
@@ -680,6 +690,73 @@ async def test_startup_catalog_and_source_confirmation_three_clean_browsers(
                             "Работает"
                         )
                         await check_user_panel("Работает", 390 if index == 1 else 1440)
+                        # A duplicate-only continuation must publish its progress while
+                        # waiting for the next listing, rather than at scan completion.
+                        async with context.session_factory() as session:
+                            saved = await session.get(ScanRun, recovered.id)
+                            saved.status = RunStatus.PARTIAL
+                            saved.checkpoint = {
+                                "yielded_external_ids": saved.checkpoint["yielded_external_ids"],
+                                "adapter_state": {
+                                    "scan_entrypoints": [
+                                        {
+                                            "url": "https://www.delucru.md/jobs/acquisitions",
+                                            "category": "browser-duplicate-progress",
+                                            "region": None,
+                                        }
+                                    ]
+                                },
+                            }
+                            await session.commit()
+                        await page.reload()
+                        await page.locator(
+                            f"#source-controls-{source_id} [data-source-scan] button"
+                        ).click()
+                        await expect(page).to_have_url(re.compile("notice=scan_started"))
+                        async with context.session_factory() as session:
+                            duplicate_run = await session.scalar(
+                                select(ScanRun).where(
+                                    ScanRun.source_id == source_id,
+                                    ScanRun.status == RunStatus.QUEUED,
+                                )
+                            )
+                        hold_duplicate_page.set()
+                        duplicate_page_reached.clear()
+                        release_duplicate_page.clear()
+                        duplicate_task = asyncio.create_task(
+                            ScanService(context.session_factory, registry).run_scan(
+                                duplicate_run.id
+                            )
+                        )
+                        try:
+                            await asyncio.wait_for(duplicate_page_reached.wait(), timeout=15)
+                            async with context.session_factory() as session:
+                                running = await session.get(ScanRun, duplicate_run.id)
+                                assert running.checkpoint["page_url"].endswith("/jobs/acquisitions")
+                                existing = await session.scalar(
+                                    select(SourceJob).where(
+                                        SourceJob.source_id == source_id,
+                                        SourceJob.external_job_id == "88409",
+                                    )
+                                )
+                                assert "browser-duplicate-progress" in existing.categories_seen
+                            for button in await page.locator(
+                                f'[data-source-scan="{source_id}"] button'
+                            ).all():
+                                await expect(button).to_be_disabled(timeout=12000)
+                            release_duplicate_page.set()
+                            duplicate_completed = await asyncio.wait_for(duplicate_task, timeout=15)
+                            assert duplicate_completed.status == RunStatus.SUCCEEDED
+                            assert duplicate_completed.found_jobs == 0
+                        finally:
+                            release_duplicate_page.set()
+                            hold_duplicate_page.clear()
+                            duplicate_task.cancel()
+                            await asyncio.gather(duplicate_task, return_exceptions=True)
+                        for button in await page.locator(
+                            f'[data-source-scan="{source_id}"] button'
+                        ).all():
+                            await expect(button).to_be_enabled(timeout=12000)
                     finally:
                         await browser_context.close()
             finally:

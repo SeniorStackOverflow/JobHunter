@@ -706,6 +706,7 @@ class ScanService:
                     if reference.external_id in processed_ids:
                         await self._merge_reference_metadata(session, source.id, reference)
                         await self._save_checkpoint(session, run, reference, succeeded=True)
+                        await session.commit()
                         continue
                     processed_ids.add(reference.external_id)
                     run.found_jobs += 1

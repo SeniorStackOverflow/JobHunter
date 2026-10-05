@@ -221,6 +221,74 @@ async def test_postgres_scan_records_failed_insert_and_resumes_committed_cursor(
     assert fetcher.requested.count("https://www.delucru.md/job/junior-data-scientist-88409") == 1
 
 
+async def test_postgres_duplicate_reference_commits_progress_before_cancellation(dedup_postgres):
+    from app.crawlers.pipeline import ScanService
+    from app.models.entities import ScanRun, SourceJob
+    from app.models.enums import RunStatus, ScanType
+    from tests.integration.test_delucru_pipeline import source_record
+    from tests.unit.test_delucru_adapter import BASE, FixtureFetcher, finite_category_routes
+
+    class HeldListingFetcher(FixtureFetcher):
+        def __init__(self):
+            super().__init__(finite_category_routes())
+            self.hold = False
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def get(self, url, **kwargs):
+            if self.hold and url == f"{BASE}/jobs/acquisitions?page=2":
+                self.entered.set()
+                await self.release.wait()
+            return await super().get(url, **kwargs)
+
+    source_id = await source_record(dedup_postgres)
+    fetcher = HeldListingFetcher()
+    scanner = ScanService(dedup_postgres, build_default_registry(client_factory=lambda _: fetcher))
+    parent = await scanner.run_scan((await scanner.create_scan(source_id, ScanType.FULL)).id)
+    assert parent.status == RunStatus.SUCCEEDED
+    async with dedup_postgres() as session:
+        saved = await session.get(ScanRun, parent.id)
+        saved.status = RunStatus.PARTIAL
+        saved.checkpoint = {
+            "yielded_external_ids": list(await session.scalars(select(SourceJob.external_job_id))),
+            "adapter_state": {
+                "scan_entrypoints": [
+                    {
+                        "url": f"{BASE}/jobs/acquisitions",
+                        "category": "offline-retry",
+                        "region": None,
+                    }
+                ]
+            },
+        }
+        await session.commit()
+    resumed, _ = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    fetcher.hold = True
+    task = asyncio.create_task(scanner.run_scan(resumed.id))
+    try:
+        await asyncio.wait_for(fetcher.entered.wait(), timeout=15)
+        # Observe through a separate connection while the worker awaits the next page.
+        async with dedup_postgres() as session:
+            running = await session.get(ScanRun, resumed.id)
+            assert running.checkpoint["page_url"] == f"{BASE}/jobs/acquisitions"
+            existing = await session.scalar(
+                select(SourceJob).where(SourceJob.external_job_id == "88409")
+            )
+            assert "offline-retry" in existing.categories_seen
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    interrupted = await scanner.interrupt_scan(resumed.id, reason="runtime_timeout")
+    assert interrupted.checkpoint["page_url"] == f"{BASE}/jobs/acquisitions"
+    fetcher.hold = False
+    retry, _ = await scanner.request_manual_scan(source_id, ScanType.FULL)
+    completed = await scanner.run_scan(retry.id)
+    assert completed.status == RunStatus.SUCCEEDED and completed.found_jobs == 0
+    async with dedup_postgres() as session:
+        assert await session.scalar(select(func.count(SourceJob.id))) == 3
+    assert fetcher.requested.count(f"{BASE}/job/junior-data-scientist-88409") == 1
+
+
 async def test_postgres_canonical_text_migration_keeps_rows_and_rejects_lossy_downgrade(
     dedup_postgres,
 ):
