@@ -49,6 +49,10 @@ if [ ! -x "$ROOT/bin/docker-proxy" ]; then
   cp /data/local/tmp/codex-a51-docker-bin/docker-proxy "$ROOT/bin/docker-proxy"
 fi
 chmod 700 "$ROOT/bin/docker-proxy"
+running() {
+  kill -0 "$1" 2>/dev/null &&
+    ! "$BUSYBOX" grep -q '^State:.*Z' "/proc/$1/status" 2>/dev/null
+}
 relay() {
   NAME=$1 HOST_IP=$2 HOST_PORT=$3 TARGET_IP=$4 TARGET_PORT=$5 NETNS=${6:-}
   BOOT=$(cat /proc/sys/kernel/random/boot_id)
@@ -59,7 +63,7 @@ relay() {
     PREVIOUS_BOOT=$(cat "$ROOT/$NAME.boot" 2>/dev/null || true)
     # A PID saved before reboot may now belong to an unrelated Android process.
     if [ -z "$PREVIOUS_BOOT" ] || [ "$PREVIOUS_BOOT" = "$BOOT" ]; then
-      if [ -r "/proc/$PID/cmdline" ]; then
+      if running "$PID"; then
         COMMAND=$(tr '\000' ' ' < "/proc/$PID/cmdline")
         case "$COMMAND" in
           "$ROOT/bin/docker-proxy -proto tcp -host-ip $HOST_IP -host-port $HOST_PORT -container-ip "*" -container-port $TARGET_PORT "*) ;;
@@ -71,11 +75,14 @@ relay() {
         fi
         # Only replace the verified owned relay when the DEV container IP changes.
         kill "$PID"
-        for _attempt in 1 2 3 4 5; do
-          [ ! -e "/proc/$PID" ] && break
+        for _attempt in $(seq 1 30); do
+          running "$PID" || break
           sleep 1
         done
-        [ ! -e "/proc/$PID" ] || { echo 'Owned relay did not stop' >&2; exit 1; }
+        if running "$PID"; then
+          echo 'Owned relay did not stop within 30 seconds' >&2
+          exit 1
+        fi
       fi
     fi
   fi
