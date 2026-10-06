@@ -47,7 +47,7 @@ auth_codes: dict[str, bool | dict[str, str]] = {}
 
 
 async def openid_config(request):
-    host = request.headers.get("host", "jobhunter.46-225-103-75.sslip.io")
+    host = request.headers.get("host", "jobhunter.nodeforege.win")
     base_url = f"https://{host}"
     return JSONResponse(
         {
@@ -70,7 +70,7 @@ async def openid_config(request):
 
 
 async def protected_resource_config(request):
-    host = request.headers.get("host", "jobhunter.46-225-103-75.sslip.io")
+    host = request.headers.get("host", "jobhunter.nodeforege.win")
     base_url = f"https://{host}"
     return JSONResponse(
         {

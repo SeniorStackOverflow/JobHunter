@@ -253,7 +253,7 @@ phone_health_stale_after_seconds: int = Field(default=90, ge=10, le=3600)
 - `validate_secure_production`: if `phone_agent_enabled` and
   `phonegate_auth_token is None` → raise.
 - `.env.example` gets commented placeholders. The real `phonegate_url`
-  (`https://phonegate.46-225-103-75.sslip.io`) and token go in `.env`.
+  (`https://phonegate.nodeforege.win`) and token go in `.env`.
 - `readiness_status()` is **not** modified.
 
 ### 5.4 Concurrency and safety

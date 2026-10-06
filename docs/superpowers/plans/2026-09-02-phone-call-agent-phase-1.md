@@ -687,7 +687,7 @@ In `.env.example`, add a commented block:
 ```dotenv
 # Phone call agent (Phase 1: read-only observer). Off by default.
 # PHONE_AGENT_ENABLED=false
-# PHONEGATE_URL=https://phonegate.46-225-103-75.sslip.io
+# PHONEGATE_URL=https://phonegate.nodeforege.win
 # PHONEGATE_AUTH_TOKEN=
 # PHONE_CALLER_REGION=MD
 ```

@@ -2752,7 +2752,7 @@ Write `test_realcall_greeting_and_capture`, `test_realcall_runtime_stop_aborts`,
 
 ## Run
     ENABLE_REALCALL_TESTS=true \
-    PHONEGATE_URL=https://phonegate.46-225-103-75.sslip.io \
+    PHONEGATE_URL=https://phonegate.nodeforege.win \
     PHONEGATE_AUTH_TOKEN=... \
     REALCALL_A14_NUMBER=... REALCALL_A06_NUMBER=... \
     REALCALL_A14_SERIAL=... REALCALL_A06_SERIAL=... \

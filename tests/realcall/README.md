@@ -39,7 +39,7 @@
 
 ```bash
 ENABLE_REALCALL_TESTS=true \
-PHONEGATE_URL=https://phonegate.46-225-103-75.sslip.io \
+PHONEGATE_URL=https://phonegate.nodeforege.win \
 PHONEGATE_AUTH_TOKEN=... \
 REALCALL_GROQ_API_KEY=... \
 REALCALL_A14_NUMBER=... REALCALL_A06_NUMBER=... \

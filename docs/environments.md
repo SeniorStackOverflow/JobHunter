@@ -13,7 +13,7 @@
 | Namespace DEV image | `jobhunter-dev:*` |
 | Namespace PROD image | `jobhunter-prod:<12-символьный SHA>` |
 | Runtime и семантика проверок | Python 3.12 |
-| Публичный PROD origin | `https://jobhunter.46-225-103-75.sslip.io` |
+| Публичный PROD origin | `https://jobhunter.nodeforege.win` |
 | PROD API на host | `127.0.0.1:8091` |
 
 DEV checkout может находиться на feature-ветке. Это не меняет источник
