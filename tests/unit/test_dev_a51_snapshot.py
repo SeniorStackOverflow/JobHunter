@@ -156,7 +156,7 @@ def test_native_docker_pins_socket_and_preserves_binary_stdin(monkeypatch):
 def test_cleanup_keeps_shared_daemon_cache_and_other_applications(monkeypatch):
     commands = []
     monkeypatch.setattr(dev_a51, "remote", commands.append)
-    monkeypatch.setattr(dev_a51, "android", commands.append)
+    monkeypatch.setattr(dev_a51, "android", lambda command, **kwargs: commands.append(command))
     dev_a51.cleanup()
     command = commands[0]
     assert "--filter label=org.opencontainers.image.jobhunter-project=dev-a51" in command

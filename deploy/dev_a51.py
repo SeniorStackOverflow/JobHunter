@@ -333,7 +333,8 @@ def deploy():
         f"available=$(nsenter -t \"$pid\" -m -- df -Pk {DOCKER_DATA} | awk 'NR==2 {{print $4}}'); "
         'test "$available" -ge 2097152 || '
         "{ echo 'A51 native Docker has less than 2 GiB free before build' >&2; exit 1; }; "
-        "df -h /data"
+        "/data/adb/magisk/busybox df -h /data",
+        timeout=30,
     )
     remote("docker system df")
     print("Building ARM64 DEV candidate on A51:", revision, flush=True)
@@ -362,9 +363,10 @@ def cleanup():
         "docker system df"
     )
     android(
-        "df -h /data; "
+        "/data/adb/magisk/busybox df -h /data; "
         "pid=$(cat /data/local/tmp/codex-a51-docker/dockerd.pid); "
-        f'nsenter -t "$pid" -m -- df -h {DOCKER_DATA}'
+        f'nsenter -t "$pid" -m -- df -h {DOCKER_DATA}',
+        timeout=30,
     )
 
 

@@ -77,6 +77,9 @@ inside encrypted Android `/data`, consuming blocks as Docker writes them.
 Deployment requires at least 2 GiB free in Docker storage and checks Android
 space too. Do not recreate/format its backing file. A fresh installation needs
 an adequately sized native Docker filesystem before building JobHunter.
+Android `/data` disk reporting uses Magisk BusyBox: the stock Android `df -h /data`
+was observed spinning without returning. Disk checks have a 30-second timeout;
+an unresponsive check blocks deployment rather than silently skipping the check.
 
 Memory/swap and process limits bound each DEV service so it cannot grow without
 limit into Android's RAM or zRAM. On this Android kernel, application UID 10001
