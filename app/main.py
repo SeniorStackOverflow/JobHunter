@@ -20,6 +20,7 @@ from app.api import router as api_router
 from app.api.phone_routes import router as phone_router
 from app.auth.routes import router as auth_router
 from app.auth.session import RememberSessionMiddleware
+from app.deployment import DeploymentIdentityMiddleware
 from app.mcp.server import streamable_http_app
 from app.observability.health import router as health_router
 from app.observability.logging import configure_logging
@@ -102,7 +103,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="job-agent",
+    title="[DEV] JobHunter" if settings.environment == "development" else "job-agent",
+    description=(
+        "DEV version with isolated test data. Revision: " + settings.app_revision
+        if settings.environment == "development"
+        else ""
+    ),
     version="0.1.0",
     docs_url="/api/docs",
     redoc_url=None,
@@ -187,6 +193,7 @@ app.add_middleware(SecurityMiddleware)
 app.add_middleware(RememberSessionMiddleware)
 app.add_middleware(LocalRateLimitMiddleware)
 app.add_middleware(ObservabilityMiddleware)
+app.add_middleware(DeploymentIdentityMiddleware)
 app.include_router(health_router)
 app.include_router(api_router)
 app.include_router(auth_router)

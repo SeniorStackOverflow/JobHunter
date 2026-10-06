@@ -5,12 +5,14 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
   <link rel="icon" href="{{ admin_asset_url('favicon.svg') }}" type="image/svg+xml">
-  <title>{% block title %}JobHunter{% endblock %}</title>
+  {% set deployment = deployment_identity() %}
+  <title>{% if deployment.is_dev %}[DEV] {% endif %}{% block title %}JobHunter{% endblock %}</title>
   <link rel="stylesheet" href="{{ admin_asset_url('panel.css') }}">
   <script src="{{ admin_asset_url('admin.js') }}" defer></script>
   {% block head %}{% endblock %}
 </head>
-<body class="{% block body_class %}{% endblock %}">
+<body class="{% if deployment.is_dev %}dev-deployment {% endif %}{% block body_class %}{% endblock %}">
+  {% if deployment.is_dev %}<div class="dev-banner" role="note" aria-label="DEV версия"><strong>DEV</strong><span>Тестовая версия JobHunter · отдельные данные</span><code>{{ deployment.revision }}</code></div>{% endif %}
   {% block body %}{% endblock %}
   <dialog class="confirm-dialog" data-confirm-dialog aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <div class="confirm-shell">

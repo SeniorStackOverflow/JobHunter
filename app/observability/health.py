@@ -9,6 +9,7 @@ from sqlalchemy import text
 from starlette.responses import JSONResponse, Response
 
 from app.database import async_session_factory
+from app.deployment import deployment_identity
 from app.observability.logging import safe_exception_name
 from app.observability.metrics import metrics_response
 from app.settings import get_settings
@@ -60,14 +61,23 @@ async def celery_health_status() -> tuple[bool, int]:
 
 @router.get("/health", include_in_schema=False)
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    settings = get_settings()
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "revision": settings.app_revision,
+    }
 
 
 @router.get("/ready", include_in_schema=False)
 async def ready() -> JSONResponse:
     is_ready, checks = await readiness_status()
     return JSONResponse(
-        {"status": "ready" if is_ready else "not_ready", "checks": checks},
+        {
+            "status": "ready" if is_ready else "not_ready",
+            "checks": checks,
+            "deployment": deployment_identity(),
+        },
         status_code=200 if is_ready else 503,
     )
 

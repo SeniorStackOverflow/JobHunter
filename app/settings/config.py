@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     )
 
     environment: Literal["development", "test", "production"] = "development"
+    app_revision: str = Field(default="local", max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
     database_url: str = "sqlite+aiosqlite:///./job-agent.db"
     redis_url: str = "redis://localhost:6379/0"
     public_base_url: str = "http://localhost:8000"

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.templating import Jinja2Templates
 
+from app.deployment import deployment_identity
 from app.email.failures import mentions_tls_failure
 from app.models.entities import Application
 from app.security.ssrf import public_url_shape_is_safe
@@ -45,6 +46,7 @@ def _safe_external_link(value: str | None) -> str | None:
 
 templates.env.globals["safe_external_link"] = _safe_external_link
 templates.env.globals["admin_asset_url"] = _admin_asset_url
+templates.env.globals["deployment_identity"] = deployment_identity
 
 
 _LOCAL_TZ = ZoneInfo("Europe/Chisinau")

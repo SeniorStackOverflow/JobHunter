@@ -19,6 +19,7 @@ playwright-report/
 .codegraph/
 .superpowers/
 .worktrees/
+.dev-a51/
 
 # Local secrets
 .admin-password

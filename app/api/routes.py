@@ -97,6 +97,8 @@ async def _validate_source_configuration(source: JobSource) -> None:
 
 @router.get("/status", dependencies=[Depends(require_api_actor)])
 async def system_status(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from app.deployment import deployment_identity
+
     sources = list((await session.scalars(select(JobSource))).all())
     running = len(
         list(
@@ -106,6 +108,7 @@ async def system_status(session: AsyncSession = Depends(get_session)) -> dict[st
         )
     )
     return {
+        "deployment": deployment_identity(get_settings()),
         "sources": len(sources),
         "healthy_sources": sum(item.health_status == SourceHealth.HEALTHY for item in sources),
         "running_scans": running,

@@ -1,0 +1,192 @@
+name: jobhunter-dev-a51
+
+x-environment: &environment
+  ENVIRONMENT: development
+  APP_REVISION: ${JOBHUNTER_DEV_REVISION:?Use scripts/dev-a51.sh deploy}
+  APP_BUILD_FLAVOR: development
+  PUBLIC_BASE_URL: ${DEV_PUBLIC_BASE_URL:-http://100.123.23.6:8881}
+  SECRET_KEY: ${DEV_SECRET_KEY:?DEV credentials are missing}
+  ADMIN_PASSWORD_HASH: ${DEV_ADMIN_PASSWORD_HASH:?DEV credentials are missing}
+  MCP_API_KEYS_HASHED: ${DEV_MCP_API_KEYS_HASHED:?DEV credentials are missing}
+  DATABASE_URL: postgresql+asyncpg://jobhunter_dev:${DEV_DATABASE_PASSWORD:?DEV credentials are missing}@postgres:5432/jobhunter_dev
+  REDIS_URL: redis://redis:6379/0
+  RESUME_STORAGE_PATH: /data/resumes
+  PHONE_EVIDENCE_DIR: /data/phone_evidence
+  EMAIL_PROVIDER: fake
+  REAL_EMAIL_DELIVERY_ENABLED: "false"
+  EMERGENCY_EMAIL_KILL_SWITCH: "false"
+  MAIL_ROUTING_PREFLIGHT_ENABLED: "false"
+  LLM_PROVIDER: mock
+  MATCHING_INTER_JOB_DELAY_SECONDS: "0"
+  # Fixture-only scans have a small, bounded memory footprint on the phone.
+  CRAWLER_MIN_MEM_AVAILABLE_MB: "128"
+  PHONE_AGENT_ENABLED: "false"
+  PHONE_AUTO_ANSWER_ENABLED: "false"
+  PHONE_SUMMARY_LLM_ENABLED: "false"
+  TELEGRAM_ENABLED: "false"
+  USER_ACCOUNTS_ENABLED: "true"
+  INVITE_REGISTRATION_ENABLED: "true"
+
+x-app: &app
+  image: jobhunter-dev-a51:${JOBHUNTER_DEV_REVISION:?Use scripts/dev-a51.sh deploy}
+  build:
+    context: .
+    target: runtime
+    args:
+      APP_REVISION: ${JOBHUNTER_DEV_REVISION:?Use scripts/dev-a51.sh deploy}
+      APP_BUILD_FLAVOR: development
+      COMPILE_BYTECODE: "0"
+      JOBHUNTER_DEV_PROJECT: dev-a51
+      # Android restricts socket creation for application UIDs starting at 10000.
+      APP_UID: "9999"
+      APP_GID: "9999"
+  environment: *environment
+  restart: unless-stopped
+  mem_limit: 384m
+  memswap_limit: 384m
+  pids_limit: 128
+  networks: [dev]
+  volumes:
+    - resumes:/data/resumes
+    - phone_evidence:/data/phone_evidence
+  logging:
+    driver: json-file
+    options: {max-size: 5m, max-file: "2"}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jobhunter_dev
+      POSTGRES_USER: jobhunter_dev
+      POSTGRES_PASSWORD: ${DEV_DATABASE_PASSWORD:?DEV credentials are missing}
+    command: [postgres, -c, shared_buffers=32MB, -c, max_connections=40]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [dev]
+    restart: unless-stopped
+    mem_limit: 192m
+    memswap_limit: 192m
+    pids_limit: 128
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U jobhunter_dev -d jobhunter_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, "yes", --maxmemory, 32mb, --maxmemory-policy, noeviction]
+    volumes: [redis_data:/data]
+    networks: [dev]
+    restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 64
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+  init-storage:
+    <<: *app
+    user: "0:0"
+    command: [chown, -R, "jobagent:jobagent", /data/resumes, /data/phone_evidence]
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    networks: []
+    network_mode: none
+    restart: "no"
+    healthcheck: {disable: true}
+  migrate:
+    <<: *app
+    command: [alembic, upgrade, head]
+    restart: "no"
+    healthcheck: {disable: true}
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    <<: *app
+    command: [uvicorn, app.main:app, --host, 0.0.0.0, --port, "8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).read()"]
+      interval: 30s
+      timeout: 15s
+      start_period: 180s
+      retries: 10
+  worker:
+    <<: *app
+    mem_limit: 512m
+    memswap_limit: 512m
+    command: [celery, -A, app.scheduler.celery_app:celery_app, worker, --loglevel=INFO, --hostname=dev-a51@%h, "--queues=crawling,matching,applications,email,reports,maintenance,proxy-maintenance,celery,phone", --pool=solo]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, "test -r /proc/1/status"]
+      interval: 30s
+      timeout: 10s
+  beat:
+    <<: *app
+    mem_limit: 192m
+    memswap_limit: 192m
+    command: [celery, -A, app.scheduler.celery_app:celery_app, beat, --loglevel=INFO, --pidfile=/tmp/celerybeat.pid, --schedule=/tmp/celerybeat-schedule]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, 'test -s /tmp/celerybeat.pid && kill -0 "$$(cat /tmp/celerybeat.pid)"']
+      interval: 30s
+      timeout: 10s
+  fixture-site:
+    <<: *app
+    mem_limit: 192m
+    memswap_limit: 192m
+    command: [uvicorn, fixture_site.main:app, --host, 0.0.0.0, --port, "8090"]
+    volumes: []
+    healthcheck: {disable: true}
+  validation:
+    <<: *app
+    mem_limit: 512m
+    memswap_limit: 512m
+    profiles: [validation]
+    image: jobhunter-dev-a51-validation:${JOBHUNTER_DEV_REVISION:?Use scripts/dev-a51.sh deploy}
+    build:
+      context: .
+      target: validation
+      args:
+        APP_REVISION: ${JOBHUNTER_DEV_REVISION:?Use scripts/dev-a51.sh deploy}
+        APP_BUILD_FLAVOR: development
+        COMPILE_BYTECODE: "0"
+        JOBHUNTER_DEV_PROJECT: dev-a51
+        APP_UID: "9999"
+        APP_GID: "9999"
+    environment:
+      ENVIRONMENT: test
+      APP_REVISION: ${JOBHUNTER_DEV_REVISION}
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+      REDIS_URL: redis://redis:6379/15
+      EMAIL_PROVIDER: fake
+      REAL_EMAIL_DELIVERY_ENABLED: "false"
+      LLM_PROVIDER: mock
+      PHONE_AGENT_ENABLED: "false"
+      ENABLE_REALCALL_TESTS: "false"
+      ENABLE_LIVE_RABOTA_SMOKE_TEST: "false"
+      ENABLE_LIVE_DELUCRU_SMOKE_TEST: "false"
+      ENABLE_LIVE_PHONEGATE_SMOKE_TEST: "false"
+      RUN_SERVICE_INTEGRATION_TESTS: "0"
+      RUN_PLAYWRIGHT_TESTS: "0"
+    volumes: []
+    tmpfs: [/data/resumes]
+    restart: "no"
+    healthcheck: {disable: true}
+    command: [python, -m, pytest, -q, tests/unit/test_deployment_identity.py, tests/unit/test_dev_a51_snapshot.py, tests/e2e/test_autonomous_pipeline.py, tests/e2e/test_cross_board_deduplication.py, tests/unit/test_source_catalog.py, tests/unit/test_daily_hard_maximum.py]
+
+networks:
+  dev: {internal: true}
+volumes:
+  postgres_data:
+  redis_data:
+  resumes:
+  phone_evidence:

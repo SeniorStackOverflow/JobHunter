@@ -2721,7 +2721,9 @@ async def test_mcp_streamable_http_auth_tools_secret_redaction_and_policy_gate(
 
         health = await client.get("/health")
         assert health.status_code == 200
-        assert health.json() == {"status": "ok"}
+        assert health.json()["status"] == "ok"
+        assert health.json()["environment"] in {"test", "production"}
+        assert health.json()["revision"]
 
     async with sqlite_session_factory() as session:
         stored = await session.get(Application, blocked_application.id)

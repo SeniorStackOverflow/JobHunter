@@ -1,4 +1,10 @@
 *,*::before,*::after{box-sizing:border-box}
+    .dev-banner{position:fixed;inset:0 0 auto;z-index:100;min-height:38px;display:flex;align-items:center;justify-content:center;gap:10px;padding:7px 12px;background:#5a3500;color:#fff3dc;font-size:12px;line-height:24px;box-shadow:0 2px 8px #0003}
+    .dev-banner strong{border:1px solid currentColor;border-radius:5px;padding:0 6px;font-size:11px;line-height:20px;letter-spacing:.06em}
+    .dev-banner code{max-width:25vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+    body.dev-deployment{padding-top:38px}
+    .dev-deployment .sidebar{top:38px;height:calc(100vh - 38px)}
+    @media(max-width:480px){.dev-banner{font-size:10px;gap:6px}.dev-banner code{max-width:20vw}}
     :root{
       --bg:#f4f6fa;--panel:#fff;--panel-2:#f8fafc;--panel-3:#eef2f7;
       --text:#172033;--muted:#657087;--muted-2:#8d97aa;--border:#dfe4ec;

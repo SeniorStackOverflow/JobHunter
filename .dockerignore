@@ -14,5 +14,5 @@ backups
 deploy-credentials*.txt
 htmlcov
 .coverage
-tests
+.dev-a51
 docs

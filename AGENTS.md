@@ -38,6 +38,49 @@ Develop and validate JobHunter changes in the local WSL checkout by default. Do 
 pull commits, build images, run migrations, restart services, or deploy changes on the production
 server while implementing or debugging a change.
 
+### Required Samsung A51 DEV deployment
+
+The dedicated DEV target is the rooted Samsung A51, ADB serial `100.123.23.6:39285`.
+Use its operator-installed native Docker kernel/runtime; do not start the old emulated VM.
+The ADB port can change after reboot: discover the connected endpoint on `100.123.23.6`
+and verify `SM-A515F` and root before operating. Never substitute another phone or the
+workstation Docker daemon. Preserve unrelated containers/images on the shared native daemon.
+Building images, installing the isolated JobHunter DEV runtime, applying DEV migrations,
+deploying, restarting and testing this DEV environment are explicitly authorized and must
+be performed without requesting operator permission. This authorization does not include
+PROD, PhoneGate, unrelated phone services, changing the phone kernel, or disabling SELinux.
+Keep DEV Docker images, containers, databases, queues, volumes and credentials separate
+from PROD and from other applications on the phone. Never copy PROD secrets or databases.
+
+A51 and A14 are physically adjacent and share Wi-Fi as well as Tailscale. Consider a
+verified direct LAN path for A51's primary proxy on A14; do not assume that the shared
+subnet permits peer traffic or that A14's loopback SOCKS listener is LAN-accessible.
+Discover current addresses and verify connectivity/listener exposure before configuring
+a route. Keep the existing A14 proxy/tunnel and PhoneGate unchanged under DEV authorization.
+Changing an A14 production listener, allowlist or tunnel requires its own validated rollout
+and explicit authorization. Default offline DEV checks do not use the live A14 proxy.
+
+Every DEV surface must identify itself as a DEV version: all browser pages (including login,
+registration and both panels), page titles, API/OpenAPI, health/status and MCP status.
+Real email delivery, live crawling, PhoneGate actions and other external actions remain
+disabled in default DEV acceptance checks; use isolated fixture/mock providers.
+
+Before asking for PROD deployment permission, build and deploy the exact candidate to A51
+and thoroughly verify that deployed revision: migrations, health/readiness, API, worker/Beat,
+source registration, ownership/authentication, relevant complete workflows and regression
+tests. Browser/integration-sensitive workflows must pass through Playwright in at least
+three consecutive clean browser contexts against the DEV deployment. Record the revision,
+image digests and verification evidence; a local-only or mocked route check cannot replace
+verification of the actual DEV deployment. Then report results and rollout/rollback plan
+before requesting PROD authorization. The production testing gate below still applies.
+
+If A51 DEV deployment cannot be completed or verified (ADB/root unavailable, unsupported
+kernel/Docker, storage/memory pressure, build/startup/test failure), immediately notify the
+operator with the concrete blocker and evidence. Continue independent safe preparation,
+but do not claim DEV acceptance, silently substitute a different host, or request a normal
+PROD rollout before the required DEV gate succeeds. An emergency override requires the
+operator's explicit instruction.
+
 Before any production mutation, the exact changed behavior must pass the relevant focused tests,
 the project checks above, and an end-to-end test in a local or non-production environment. Browser,
 authentication, OAuth, redirect, cookie, and other integration-sensitive changes must be exercised

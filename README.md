@@ -345,6 +345,16 @@ ENABLE_LIVE_RABOTA_SMOKE_TEST=true uv run pytest -m live
 
 Запускайте его только после собственного актуального policy review.
 
+## DEV на Samsung A51
+
+Изолированная Docker-среда на rooted A51 управляется из DEV checkout:
+`scripts/dev-a51.sh deploy`, `verify`, `status`, `logs`, `console`, `down`.
+Сборка выполняется на телефоне, перед заменой API применяются DEV миграции;
+после запуска проверяются fixture-обход, worker и три чистых браузерных прохода.
+Интерфейсы показывают метку DEV и ревизию. Доступ через ADB: `http://127.0.0.1:18881`.
+Подробности, ограничения Android, доступ к primary proxy на соседнем A14 и обязательный
+gate перед PROD: [runbook DEV A51](docs/operations/dev-a51.md).
+
 ## Production-развёртывание
 
 После заполнения production `.env` и secret manager используйте только
